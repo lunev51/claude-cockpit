@@ -133,7 +133,9 @@ function registerIpc(win, opts = {}) {
 
   // Живой манифест воркспейса (Task 3): renderer читает его на старте (Task 4)
   // и репортит активную вкладку при каждом переключении.
-  ipcMain.handle('workspace:get', () => store.load());
+  // smoke-изоляция: headless-прогон не должен видеть оверлей restore — иначе
+  // он завис бы до таймаута (никто не жмёт Enter/Esc в smoke).
+  ipcMain.handle('workspace:get', () => (smoke ? null : store.load()));
 
   ipcMain.on('workspace:setActive', (_e, p) => {
     if (p && typeof p.tabId === 'string') {
