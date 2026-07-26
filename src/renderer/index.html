@@ -24,8 +24,16 @@
   </div>
   <div id="app">
     <div id="sidebar">
-      <div class="sidebar-section">Сессии</div>
-      <div id="tab-list"></div>
+      <div id="tab-groups">
+        <div class="sidebar-section wait hidden" data-group="waiting">Ждут тебя · <span class="count"></span></div>
+        <div class="group-body" data-body="waiting"></div>
+        <div class="sidebar-section hidden" data-group="working">Работают · <span class="count"></span></div>
+        <div class="group-body" data-body="working"></div>
+        <div class="sidebar-section hidden" data-group="done">Готово · <span class="count"></span></div>
+        <div class="group-body" data-body="done"></div>
+        <div class="sidebar-section hidden" data-group="trouble">Проблемы · <span class="count"></span></div>
+        <div class="group-body" data-body="trouble"></div>
+      </div>
       <div class="sidebar-footer">
         <button class="sidebar-btn" id="btn-new-tab">+ Проект</button>
       </div>

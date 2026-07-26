@@ -3,6 +3,8 @@
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
+.hidden { display: none !important; }
+
 html, body {
   height: 100%;
   overflow: hidden;
@@ -61,6 +63,8 @@ html, body {
 }
 .sidebar-section.wait { color: var(--accent); }
 
+.group-body { display: flex; flex-direction: column; gap: 2px; }
+
 .tab-row {
   display: flex;
   gap: 8px;
@@ -83,6 +87,8 @@ html, body {
 .tab-dot.waiting { background: var(--accent); box-shadow: 0 0 6px var(--accent); animation: pulse 1.6s ease-in-out infinite; }
 .tab-dot.done    { background: var(--ok); }
 .tab-dot.error   { background: var(--err); }
+.tab-dot.stuck { background: var(--warn); }
+.tab-dot.dead  { background: var(--err); }
 
 @keyframes pulse {
   0%, 100% { opacity: 1; }
@@ -112,6 +118,11 @@ html, body {
 }
 .tab-row:hover .tab-close { visibility: visible; }
 .tab-close:hover { color: var(--text); }
+.tab-connect {
+  border: none; background: none; color: var(--warn);
+  cursor: pointer; font-size: 12px; padding: 0 2px;
+}
+.tab-connect:hover { color: var(--text); }
 
 .sidebar-footer {
   margin-top: auto;

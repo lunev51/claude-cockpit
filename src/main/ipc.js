@@ -1,16 +1,46 @@
 'use strict';
 // Все IPC-каналы. PTY-парк живёт в sessions.js; ipc — тонкий адаптер.
 
-const { ipcMain, shell, dialog } = require('electron');
+const path = require('path');
+const { ipcMain, shell, dialog, app } = require('electron');
 const { getConfig, setConfig } = require('./config');
 const { createPty } = require('./pty');
 const { createSessionManager } = require('./sessions');
+const { createHookBridge } = require('./hook-bridge');
+const { connectProject, isConnected } = require('./connector');
+const { appRoot } = require('./paths');
 
 let manager = null;
 let smokeOutput = '';
+let bridge = null;       // текущий инстанс моста (может пересоздаваться при fallback на эфемерный порт)
+let stuckTimer = null;
 
 function getSmokeOutput() {
   return smokeOutput;
+}
+
+// Путь к файлу с фактическим портом моста (читает scripts/cockpit-hook.js).
+function bridgePortFile() {
+  return path.join(app.getPath('userData'), 'bridge-port');
+}
+
+// Стартует мост на сконфигурированном порту; если порт занят (EADDRINUSE
+// или что угодно другое) — пересоздаёт мост с эфемерным портом (0).
+// portFile в любом случае получает фактический порт того инстанса,
+// который в итоге успешно заслушал сокет.
+function startBridge(sessions, smoke = false) {
+  const desiredPort = getConfig().bridge?.port ?? 48200;
+  // В smoke-режиме НЕ пишем файл с портом, чтобы параллельный smoke run
+  // не перезаписывал port-файл живого инстанса умирающим эфемерным портом.
+  const portFile = smoke ? null : bridgePortFile();
+  bridge = createHookBridge({ sessions, port: desiredPort, portFile });
+  return bridge.start().catch((err) => {
+    console.warn(`[hook-bridge] порт ${desiredPort} занят, пробую эфемерный: ${err.message}`);
+    bridge = createHookBridge({ sessions, port: 0, portFile });
+    return bridge.start();
+  }).catch((err) => {
+    console.warn(`[hook-bridge] не удалось запустить мост даже на эфемерном порту: ${err.message}`);
+  });
 }
 
 // Проверка размеров терминала: целое в диапазоне 2..500.
@@ -24,11 +54,26 @@ function registerIpc(win, opts = {}) {
   manager = createSessionManager({
     ptyFactory: createPty,
     getTermConfig: () => getConfig().terminal,
+    // Ленивая: к моменту первого реального спавна мост почти наверняка уже
+    // слушает (start() кикнут чуть ниже), а если ещё нет — просто без env,
+    // хук-скрипт тогда шлёт события мимо (см. cockpit-hook.js, Task 3).
+    getExtraEnv: () => (bridge && bridge.port() ? { COCKPIT_BRIDGE_PORT: String(bridge.port()) } : {}),
     onEvent: (channel, payload) => {
       if (smoke && channel === 'term:data') smokeOutput += payload.data;
       if (!win.isDestroyed()) win.webContents.send(channel, payload);
     },
   });
+
+  // Мост создаётся ПОСЛЕ manager — ему нужен sessions (findBySessionId/
+  // findUnboundByCwd/applyHookEvent), а manager'у мост не нужен на старте.
+  // startBridge сама ловит все ошибки старта (в т.ч. фолбэк на эфемерный
+  // порт) — не роняем приложение из-за моста хуков.
+  startBridge(manager, smoke);
+
+  // Детект зависших вкладок (working без вывода дольше порога) — раз в 30с.
+  // unref — таймер не держит event loop живым сам по себе.
+  stuckTimer = setInterval(() => manager.checkStuck(), 30000);
+  stuckTimer.unref?.();
 
   ipcMain.handle('config:get', () => getConfig());
 
@@ -63,6 +108,24 @@ function registerIpc(win, opts = {}) {
     return result.filePaths[0];
   });
 
+  // Хуки Cockpit для проекта: прописываются в .claude/settings.json вкладки.
+  const hookOpts = () => ({
+    scriptPath: path.join(appRoot(), 'scripts', 'cockpit-hook.js'),
+    portFile: path.join(app.getPath('userData'), 'bridge-port'),
+  });
+  const tabCwd = (tabId) => manager.list().find((t) => t.tabId === tabId)?.cwd || null;
+
+  ipcMain.handle('project:connect', (_e, tabId) => {
+    const cwd = tabCwd(tabId);
+    if (!cwd) return { connected: false, error: 'вкладка не найдена' };
+    return connectProject(cwd, hookOpts());
+  });
+
+  ipcMain.handle('project:status', (_e, tabId) => {
+    const cwd = tabCwd(tabId);
+    return { connected: cwd ? isConnected(cwd) : false };
+  });
+
   ipcMain.on('term:start', (_e, payload) => {
     // Payload может прийти не объектом (null и т.п.) — деструктуризация упала
     // бы через uncaughtException прямо в app.exit(1). Отсекаем заранее.
@@ -95,8 +158,22 @@ function registerIpc(win, opts = {}) {
   });
 }
 
+// Идемпотентно гасит мост хуков (безопасно звать повторно — например,
+// window-all-closed и before-quit оба доходят до disposeSessions).
+function stopBridge() {
+  if (bridge) {
+    bridge.stop();
+    bridge = null;
+  }
+}
+
 function disposeSessions() {
+  if (stuckTimer) {
+    clearInterval(stuckTimer);
+    stuckTimer = null;
+  }
+  stopBridge();
   if (manager) manager.disposeAll();
 }
 
-module.exports = { registerIpc, disposeSessions, getSmokeOutput };
+module.exports = { registerIpc, disposeSessions, stopBridge, getSmokeOutput };
