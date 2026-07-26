@@ -76,3 +76,16 @@ test('hookCommand содержит node, скрипт в кавычках, им�
   assert.ok(cmd.includes('cockpit-hook.js" Stop'));
   assert.ok(cmd.includes('--port-file "C:\\cockpit\\bridge-port"'));
 });
+
+test('проект с hooks-как-массив (некорректная структура) — конвертируется, события пишутся', () => {
+  const dir = tmpProject(JSON.stringify({ hooks: [] }));
+  const res = connectProject(dir, OPTS);
+  assert.strictEqual(res.connected, true);
+  const s = readSettings(dir);
+  for (const ev of ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'Notification', 'Stop']) {
+    assert.ok(Array.isArray(s.hooks[ev]), `нет ${ev}`);
+    const cmds = JSON.stringify(s.hooks[ev]);
+    assert.ok(cmds.includes('cockpit-hook.js'), `нет нашей команды в ${ev}`);
+  }
+  assert.strictEqual(isConnected(dir, OPTS), true);
+});

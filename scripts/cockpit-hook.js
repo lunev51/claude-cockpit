@@ -9,11 +9,21 @@
 const http = require('http');
 const fs = require('fs');
 
+function isValidPort(port) {
+  return Number.isInteger(port) && port > 0 && port < 65536;
+}
+
 function resolvePort(argv) {
-  if (process.env.COCKPIT_BRIDGE_PORT) return Number(process.env.COCKPIT_BRIDGE_PORT);
+  if (process.env.COCKPIT_BRIDGE_PORT) {
+    const p = Number(process.env.COCKPIT_BRIDGE_PORT);
+    if (isValidPort(p)) return p;
+  }
   const i = argv.indexOf('--port-file');
   if (i !== -1 && argv[i + 1]) {
-    try { return Number(fs.readFileSync(argv[i + 1], 'utf8').trim()); } catch { /* нет файла */ }
+    try {
+      const p = Number(fs.readFileSync(argv[i + 1], 'utf8').trim());
+      if (isValidPort(p)) return p;
+    } catch { /* нет файла */ }
   }
   return 0;
 }
@@ -29,17 +39,19 @@ function main() {
     let data = {};
     try { data = JSON.parse(stdin); } catch { /* хук без JSON — шлём пустой */ }
     const payload = JSON.stringify({ event, data });
-    const req = http.request({
-      host: '127.0.0.1',
-      port,
-      path: '/event',
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) },
-      timeout: 400,
-    }, (res) => { res.resume(); res.on('end', () => process.exit(0)); });
-    req.on('timeout', () => { req.destroy(); process.exit(0); });
-    req.on('error', () => process.exit(0));
-    req.end(payload);
+    try {
+      const req = http.request({
+        host: '127.0.0.1',
+        port,
+        path: '/event',
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) },
+        timeout: 400,
+      }, (res) => { res.resume(); res.on('end', () => process.exit(0)); });
+      req.on('timeout', () => { req.destroy(); process.exit(0); });
+      req.on('error', () => process.exit(0));
+      req.end(payload);
+    } catch { process.exit(0); }
   });
   // Стража: даже если stdin не закроется — выходим.
   setTimeout(() => process.exit(0), 1500).unref();

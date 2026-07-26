@@ -32,7 +32,7 @@ function connectProject(projectDir, opts) {
       return { connected: false, error: `settings.json повреждён: ${err.message}` };
     }
   }
-  if (!settings.hooks || typeof settings.hooks !== 'object') settings.hooks = {};
+  if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) settings.hooks = {};
 
   for (const event of EVENTS) {
     const entry = { hooks: [{ type: 'command', command: hookCommand(event, opts) }] };
