@@ -28,9 +28,9 @@ html, body {
   background: var(--accent);
 }
 #titlebar-text {
-  font-family: var(--font-serif);
-  font-size: 14px;
-  letter-spacing: -0.3px;
+  /* Моноширинный, как сам терминал — по просьбе пользователя (серифный не зашёл). */
+  font-family: var(--font-mono);
+  font-size: 13px;
 }
 #titlebar-sub { color: var(--text-dim); font-size: 11px; }
 
