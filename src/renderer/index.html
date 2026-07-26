@@ -17,10 +17,23 @@
   <script src="../../node_modules/@xterm/addon-webgl/lib/addon-webgl.js"></script>
 </head>
 <body>
-  <div id="titlebar"><span class="dot"></span><span id="titlebar-text">Cockpit</span></div>
+  <div id="titlebar">
+    <span class="dot"></span>
+    <span id="titlebar-text">Cockpit</span>
+    <span id="titlebar-sub"></span>
+  </div>
   <div id="app">
-    <div id="terminal-pane">
-      <div id="terminal"></div>
+    <div id="sidebar">
+      <div class="sidebar-section">Сессии</div>
+      <div id="tab-list"></div>
+      <div class="sidebar-footer">
+        <button class="sidebar-btn" id="btn-new-tab">+ Проект</button>
+      </div>
+    </div>
+    <div id="main">
+      <div id="terminal-host">
+        <div id="terminal" class="term-view"></div>
+      </div>
     </div>
   </div>
   <div id="status-bar">
