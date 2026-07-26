@@ -2,6 +2,7 @@
 // Все IPC-каналы. PTY-парк живёт в sessions.js; ipc — тонкий адаптер.
 
 const path = require('path');
+const fs = require('fs');
 const { ipcMain, shell, dialog, app } = require('electron');
 const { getConfig, setConfig } = require('./config');
 const { createPty } = require('./pty');
@@ -27,6 +28,18 @@ function getSmokeOutput() {
 function bridgePortFile() {
   return path.join(app.getPath('userData'), 'bridge-port');
 }
+
+// Путь к ghost-файлу вкладки (Task 5) — снимок скроллбека для мгновенного
+// восстановления «вчерашнего вывода» до подъёма живого pty.
+function ghostDir() {
+  return path.join(app.getPath('userData'), 'ghosts');
+}
+
+function ghostFile(ghostId) {
+  return path.join(ghostDir(), `${ghostId}.txt`);
+}
+
+const GHOST_MAX_BYTES = 512 * 1024;
 
 // Стартует мост на сконфигурированном порту; если порт занят (EADDRINUSE
 // или что угодно другое) — пересоздаёт мост с эфемерным портом (0).
@@ -128,7 +141,53 @@ function registerIpc(win, opts = {}) {
   });
 
   ipcMain.handle('tabs:close', (_e, tabId) => {
-    if (typeof tabId === 'string') manager.close(tabId);
+    if (typeof tabId !== 'string') return;
+    // Резолвим ghostId ДО manager.close (Task 5) — close() удаляет вкладку
+    // из менеджера, и list() её больше не найдёт; отдельного ghost:delete
+    // IPC не заводим — подчистка ghost-файла естественно живёт здесь же,
+    // рядом с самим закрытием вкладки.
+    const tab = manager.list().find((t) => t.tabId === tabId);
+    manager.close(tabId);
+    if (!smoke && tab && tab.ghostId) {
+      try {
+        fs.unlinkSync(ghostFile(tab.ghostId));
+      } catch { /* файла могло не быть — не страшно */ }
+    }
+  });
+
+  // Ghost-буферы (Task 5): снимок скроллбека вкладки на диск, чтобы при
+  // восстановлении показать «вчерашний вывод» мгновенно, пока живой pty ещё
+  // поднимается. Best-effort — ошибка записи не должна ронять приложение.
+  // smoke: no-op — headless-прогон не должен трогать userData.
+  ipcMain.handle('ghost:save', (_e, payload) => {
+    if (smoke) return;
+    if (!payload || typeof payload !== 'object') return;
+    const { tabId, text } = payload;
+    if (typeof tabId !== 'string' || typeof text !== 'string') return;
+    const tab = manager.list().find((t) => t.tabId === tabId);
+    if (!tab || !tab.ghostId) return;
+    try {
+      fs.mkdirSync(ghostDir(), { recursive: true });
+      // Ограничиваем размер: длинный скроллбек режем с конца — хвост
+      // (последний вывод) ценнее шапки.
+      let out = text;
+      if (Buffer.byteLength(out, 'utf8') > GHOST_MAX_BYTES) {
+        const buf = Buffer.from(out, 'utf8');
+        out = buf.subarray(buf.length - GHOST_MAX_BYTES).toString('utf8');
+      }
+      fs.writeFileSync(ghostFile(tab.ghostId), out, 'utf8');
+    } catch (err) {
+      console.warn(`[ghost] не удалось сохранить буфер вкладки ${tabId}: ${err.message}`);
+    }
+  });
+
+  ipcMain.handle('ghost:load', (_e, ghostId) => {
+    if (typeof ghostId !== 'string' || !ghostId) return null;
+    try {
+      return fs.readFileSync(ghostFile(ghostId), 'utf8');
+    } catch {
+      return null;
+    }
   });
 
   // Живой манифест воркспейса (Task 3): renderer читает его на старте (Task 4)

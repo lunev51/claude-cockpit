@@ -39,4 +39,8 @@ contextBridge.exposeInMainWorld('api', {
     get: () => ipcRenderer.invoke('workspace:get'),
     setActive: (tabId) => ipcRenderer.send('workspace:setActive', { tabId }),
   },
+  ghost: {
+    save: (tabId, text) => ipcRenderer.invoke('ghost:save', { tabId, text }),
+    load: (ghostId) => ipcRenderer.invoke('ghost:load', ghostId),
+  },
 });

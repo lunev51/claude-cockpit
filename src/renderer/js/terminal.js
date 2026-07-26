@@ -27,7 +27,9 @@ const THEME = {
   brightWhite: '#FAF9F5',
 };
 
-export function initTerminal(container, config, { tabId, onPtyStatus, onFontSize = () => {} }) {
+export function initTerminal(container, config, {
+  tabId, onPtyStatus, onFontSize = () => {}, preludeText = null,
+}) {
   const cfg = config.terminal;
   const term = new window.Terminal({
     fontSize: cfg.fontSize,
@@ -51,6 +53,12 @@ export function initTerminal(container, config, { tabId, onPtyStatus, onFontSize
   // Поиск по буферу (UI создаётся ниже динамически).
   const search = new window.SearchAddon.SearchAddon();
   term.loadAddon(search);
+
+  // Сериализация буфера в ANSI-текст (Task 5, ghost-буферы) — лёгкий аддон,
+  // грузим безусловно (без конфиг-флага): app.js использует его снимки при
+  // сохранении «вчерашнего вывода» и восстановлении вкладки.
+  const serializeAddon = new window.SerializeAddon.SerializeAddon();
+  term.loadAddon(serializeAddon);
 
   // Unicode-11 ширины: ТОЛЬКО по явному флагу. ConPTY считает ширины по
   // собственной таблице — при расхождении xterm рисует символы в чужие клетки.
@@ -274,6 +282,15 @@ export function initTerminal(container, config, { tabId, onPtyStatus, onFontSize
     term.focus();
   });
 
+  // Ghost-буфер (Task 5): вчерашний скроллбек, приглушённый, ДО старта живого
+  // pty — восстановленная вкладка мгновенно показывает контекст, пока за
+  // кулисами поднимается (или резюмится) настоящая сессия Claude Code.
+  if (preludeText) {
+    term.write('\x1b[2m');
+    term.write(preludeText);
+    term.write('\x1b[0m\r\n\x1b[2m— вчерашний вывод · сессия поднимается —\x1b[0m\r\n');
+  }
+
   // --- статус и запуск PTY ---
   onPtyStatus('запускается…');
   window.api.term.start(tabId, term.cols, term.rows);
@@ -306,5 +323,10 @@ export function initTerminal(container, config, { tabId, onPtyStatus, onFontSize
     },
   };
   term.focus();
-  return { term, search, setFontSize, focus: () => term.focus(), openSearch, handlers };
+  return {
+    term, search, setFontSize, focus: () => term.focus(), openSearch, handlers,
+    // Ghost-снимок буфера (Task 5): scrollback:2000 — достаточно контекста для
+    // «о чём мы говорили», не раздувая ghost-файл на диске.
+    serialize: () => serializeAddon.serialize({ scrollback: 2000 }),
+  };
 }

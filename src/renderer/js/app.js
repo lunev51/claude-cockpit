@@ -16,7 +16,9 @@ const statusFont = () => $('status-font');
 // Создать вкладку: контейнер + xterm + запись в стор. activate — переключиться сразу.
 // command/args — оверрайд команды на этот спавн (Task 4: staggered-resume
 // шлёт 'claude' + ['--resume', sessionId] при восстановлении воркспейса).
-async function openTab(cwd, { activate = true, command = null, args = null } = {}) {
+async function openTab(cwd, {
+  activate = true, command = null, args = null, preludeText = null,
+} = {}) {
   const tab = await window.api.tabs.open({ cwd, command, args });
   if (!tab) return null;
 
@@ -29,6 +31,7 @@ async function openTab(cwd, { activate = true, command = null, args = null } = {
 
   const view = initTerminal(container, config, {
     tabId: tab.tabId,
+    preludeText,
     onPtyStatus: (s) => {
       entry.lastPtyStatus = s;
       if (tabStore.activeId === tab.tabId) statusPty().textContent = `⌨ ${s}`;
@@ -60,6 +63,14 @@ function activateTab(tabId) {
   requestAnimationFrame(() => {
     entry.view.term.focus();
   });
+}
+
+// Ghost-буфер (Task 5): сериализовать буфер вкладки и отдать main на запись.
+// main сам резолвит ghostId по tabId (manager.list()) — здесь просто снимок.
+function saveGhost(tabId) {
+  const entry = views.get(tabId);
+  if (!entry || !entry.view) return;
+  window.api.ghost.save(tabId, entry.view.serialize());
 }
 
 async function closeTab(tabId) {
@@ -193,6 +204,9 @@ async function restoreFlow(chosen, activeIndex, overlay) {
     const { t, i } = chosen[idx];
     let tab = null;
     try {
+      // Ghost-буфер (Task 5): вчерашний скроллбек этой вкладки, если сохранён —
+      // initTerminal впечатает его приглушённым до старта живого pty.
+      const preludeText = t.ghostId ? await window.api.ghost.load(t.ghostId) : null;
       tab = await openTab(t.cwd, {
         // Первая УСПЕШНО поднятая вкладка становится видимой сразу — иначе
         // при 2+ вкладках пользователь весь стаггер смотрит в пустой терминал
@@ -201,6 +215,7 @@ async function restoreFlow(chosen, activeIndex, overlay) {
         activate: !firstRestored,
         command: 'claude',
         args: t.sessionId ? ['--resume', t.sessionId] : null,
+        preludeText,
       });
     } catch (err) {
       // Одна упавшая вкладка не должна обрывать восстановление остальных
@@ -304,6 +319,10 @@ async function boot() {
   // term:started/term:exit статус больше не выставляют (был двойной источник).
   window.api.tab.onStatus(({ tabId, status, subtitle }) => {
     tabStore.setStatus(tabId, status, subtitle);
+    // Ghost-буфер (Task 5): переход в done/waiting — момент «Claude закончил
+    // ход», самый ценный кадр скроллбека — сериализуем именно эту вкладку
+    // сразу, не дожидаясь общего 30-секундного таймера ниже.
+    if (status === 'done' || status === 'waiting') saveGhost(tabId);
   });
 
   $('btn-new-tab').addEventListener('click', async () => {
@@ -312,6 +331,14 @@ async function boot() {
   });
 
   bindHotkeys();
+
+  // Ghost-буфер (Task 5): периодический снимок ТОЛЬКО активной вкладки —
+  // сериализация всех открытых вкладок каждые 30с дорога при нескольких
+  // терминалах, а точечный снимок при переходе в done/waiting (см. onStatus
+  // выше) уже ловит самый ценный кадр для фоновых вкладок.
+  setInterval(() => {
+    if (tabStore.activeId) saveGhost(tabStore.activeId);
+  }, 30000);
 
   // Манифест воркспейса (Task 3): пуст/отсутствует — старое поведение
   // (стартовая вкладка из конфига). Непуст — оверлей restore (Task 4).
