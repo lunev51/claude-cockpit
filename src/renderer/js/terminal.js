@@ -27,7 +27,7 @@ const THEME = {
   brightWhite: '#FAF9F5',
 };
 
-export function initTerminal(container, config, { onPtyStatus, onFontSize = () => {} }) {
+export function initTerminal(container, config, { tabId, onPtyStatus, onFontSize = () => {} }) {
   const cfg = config.terminal;
   const term = new window.Terminal({
     fontSize: cfg.fontSize,
@@ -194,7 +194,7 @@ export function initTerminal(container, config, { onPtyStatus, onFontSize = () =
     fontSize = Math.min(32, Math.max(8, Math.round(size)));
     term.options.fontSize = fontSize;
     fit.fit();
-    window.api.term.resize(term.cols, term.rows);
+    window.api.term.resize(tabId, term.cols, term.rows);
     onFontSize(fontSize);
     // Персист размера шрифта в конфиг с дебаунсом.
     clearTimeout(persistTimer);
@@ -210,7 +210,7 @@ export function initTerminal(container, config, { onPtyStatus, onFontSize = () =
     if (ev.ctrlKey && ev.shiftKey && !ev.altKey && !ev.metaKey
         && (ev.key === 'R' || ev.key === 'r' || ev.code === 'KeyR')) {
       ev.preventDefault();
-      window.api.term.restart();
+      window.api.term.restart(tabId);
       return false;
     }
 
@@ -276,16 +276,10 @@ export function initTerminal(container, config, { onPtyStatus, onFontSize = () =
 
   // --- статус и запуск PTY ---
   onPtyStatus('запускается…');
-  window.api.term.start(term.cols, term.rows);
+  window.api.term.start(tabId, term.cols, term.rows);
 
   // Двусторонний поток: клавиатура → PTY (только при живом процессе), PTY → экран.
-  term.onData((data) => { if (alive) window.api.term.write(data); });
-  window.api.term.onData((data) => term.write(data));
-
-  window.api.term.onStarted(({ pid }) => {
-    alive = true;
-    onPtyStatus(`работает · pid ${pid}`);
-  });
+  term.onData((data) => { if (alive) window.api.term.write(tabId, data); });
 
   // Подгонка размеров при изменении контейнера (с дебаунсом ~100 мс).
   let resizeTimer = null;
@@ -293,17 +287,24 @@ export function initTerminal(container, config, { onPtyStatus, onFontSize = () =
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
       fit.fit();
-      window.api.term.resize(term.cols, term.rows);
+      window.api.term.resize(tabId, term.cols, term.rows);
     }, 100);
   });
   observer.observe(container);
 
-  window.api.term.onExit(({ exitCode }) => {
-    alive = false;
-    onPtyStatus(`процесс завершён (код ${exitCode})`);
-    term.write(`\r\n\x1b[31m[процесс завершён (код ${exitCode}) — Ctrl+Shift+R для перезапуска]\x1b[0m\r\n`);
-  });
-
+  // Приём маршрутизированных событий (диспатч по tabId делает app.js).
+  const handlers = {
+    onData: (data) => term.write(data),
+    onStarted: ({ pid }) => {
+      alive = true;
+      onPtyStatus(`работает · pid ${pid}`);
+    },
+    onExit: ({ exitCode }) => {
+      alive = false;
+      onPtyStatus(`процесс завершён (код ${exitCode})`);
+      term.write(`\r\n\x1b[31m[процесс завершён (код ${exitCode}) — Ctrl+Shift+R для перезапуска]\x1b[0m\r\n`);
+    },
+  };
   term.focus();
-  return { term, search, setFontSize, focus: () => term.focus(), openSearch };
+  return { term, search, setFontSize, focus: () => term.focus(), openSearch, handlers };
 }
