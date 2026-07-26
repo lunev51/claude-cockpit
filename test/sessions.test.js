@@ -157,3 +157,52 @@ test('restart: опоздавший onData старого pty не порожд�
   const last = events.filter((e) => e.channel === 'term:data').pop();
   assert.deepStrictEqual(last.payload, { tabId: a.tabId, data: 'fresh-output' });
 });
+
+test('restart: опоздавший onExit старого pty не эмитит term:exit, естественный exit нового — ровно один', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.restart(a.tabId);
+
+  const countExit = () => events.filter((e) => e.channel === 'term:exit').length;
+  const before = countExit();
+
+  // Старый (убитый рестартом) pty шлёт onExit с опозданием — событие наружу не идёт.
+  factory.spawned[0].opts.onExit(0);
+  assert.strictEqual(countExit(), before);
+
+  // Естественный exit НОВОГО (текущего) процесса вкладки эмитится ровно один раз.
+  factory.spawned[1].opts.onExit(0);
+  assert.strictEqual(countExit(), before + 1);
+  const last = events.filter((e) => e.channel === 'term:exit').pop();
+  assert.deepStrictEqual(last.payload, { tabId: a.tabId, exitCode: 0 });
+});
+
+test('spawn: фабрика бросает исключение — term:data с сообщением об ошибке + term:exit(-1), tab.alive остаётся false', () => {
+  const throwingFactory = () => { throw new Error('boom'); };
+  const { mgr, events } = makeManager(throwingFactory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+
+  const dataEvents = events.filter((e) => e.channel === 'term:data');
+  assert.strictEqual(dataEvents.length, 1);
+  assert.ok(dataEvents[0].payload.data.includes('не удалось запустить'));
+
+  const exitEvents = events.filter((e) => e.channel === 'term:exit');
+  assert.strictEqual(exitEvents.length, 1);
+  assert.strictEqual(exitEvents[0].payload.exitCode, -1);
+
+  assert.strictEqual(mgr.list().find((x) => x.tabId === a.tabId).alive, false);
+});
+
+test('двойной start() на одной вкладке — no-op, фабрика вызывается один раз', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.start(a.tabId, 100, 30);
+  assert.strictEqual(factory.spawned.length, 1);
+  assert.strictEqual(factory.spawned[0].opts.cols, 80);
+  assert.strictEqual(factory.spawned[0].opts.rows, 24);
+});

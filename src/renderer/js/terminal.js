@@ -94,10 +94,10 @@ export function initTerminal(container, config, { tabId, onPtyStatus, onFontSize
     'align-items:center',
     'gap:4px',
     'padding:4px 6px',
-    'background:#12121a',
-    'border:1px solid #1f1f2a',
+    'background:#1F1E1B',
+    'border:1px solid #3A3733',
     'border-radius:6px',
-    'color:#c7cad1',
+    'color:#FAF9F5',
     'font-family:sans-serif',
     'font-size:12px',
   ].join(';');
@@ -110,7 +110,7 @@ export function initTerminal(container, config, { tabId, onPtyStatus, onFontSize
     'border:none',
     'outline:none',
     'background:transparent',
-    'color:#c7cad1',
+    'color:#FAF9F5',
     'font-size:12px',
   ].join(';');
 
@@ -120,7 +120,7 @@ export function initTerminal(container, config, { tabId, onPtyStatus, onFontSize
     b.style.cssText = [
       'border:none',
       'background:transparent',
-      'color:#6b6f7b',
+      'color:#8F8D83',
       'cursor:pointer',
       'font-size:12px',
       'padding:2px 4px',

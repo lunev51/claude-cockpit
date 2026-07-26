@@ -63,22 +63,32 @@ function registerIpc(win, opts = {}) {
     return result.filePaths[0];
   });
 
-  ipcMain.on('term:start', (_e, { tabId, cols, rows } = {}) => {
+  ipcMain.on('term:start', (_e, payload) => {
+    // Payload может прийти не объектом (null и т.п.) — деструктуризация упала
+    // бы через uncaughtException прямо в app.exit(1). Отсекаем заранее.
+    if (!payload || typeof payload !== 'object') return;
+    const { tabId, cols, rows } = payload;
     if (typeof tabId !== 'string') return;
     if (!validDim(cols) || !validDim(rows)) return;
     manager.start(tabId, cols, rows);
   });
 
-  ipcMain.on('term:restart', (_e, { tabId } = {}) => {
+  ipcMain.on('term:restart', (_e, payload) => {
+    if (!payload || typeof payload !== 'object') return;
+    const { tabId } = payload;
     if (typeof tabId === 'string') manager.restart(tabId);
   });
 
-  ipcMain.on('term:write', (_e, { tabId, data } = {}) => {
+  ipcMain.on('term:write', (_e, payload) => {
+    if (!payload || typeof payload !== 'object') return;
+    const { tabId, data } = payload;
     if (typeof tabId !== 'string' || typeof data !== 'string') return;
     manager.write(tabId, data);
   });
 
-  ipcMain.on('term:resize', (_e, { tabId, cols, rows } = {}) => {
+  ipcMain.on('term:resize', (_e, payload) => {
+    if (!payload || typeof payload !== 'object') return;
+    const { tabId, cols, rows } = payload;
     if (typeof tabId !== 'string') return;
     if (!validDim(cols) || !validDim(rows)) return;
     manager.resize(tabId, cols, rows);

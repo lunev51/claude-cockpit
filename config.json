@@ -2,7 +2,7 @@
   "terminal": {
     "command": "claude",
     "args": ["--model", "sonnet"],
-    "cwd": "C:\\Users\\Lunev\\AssistClaude\\companion-home",
+    "cwd": "C:\\Users\\Lunev\\helper",
     "fontSize": 14,
     "fontFamily": "\"JetBrainsMono NF\", \"Cascadia Mono\", Consolas, monospace",
     "scrollback": 5000,

@@ -44,11 +44,14 @@ function createSessionManager({ ptyFactory, getTermConfig, onEvent }) {
           onEvent('term:data', { tabId: tab.tabId, data });
         },
         onExit: (exitCode) => {
-          // Обнуляем только свой процесс: рестарт мог уже подменить proc.
-          if (tab.proc === myProc) {
-            tab.proc = null;
-            tab.alive = false;
-          }
+          // Гасим опоздавший exit от процесса, которого уже подменил рестарт
+          // (тот же принцип, что и в onData выше): иначе состояние вкладки
+          // затирается и наружу летит фантомный term:exit по живому процессу —
+          // красный "процесс завершён" и мёртвая клавиатура после
+          // Ctrl+Shift+R на реально работающем терминале.
+          if (tab.proc && tab.proc !== myProc) return;
+          tab.proc = null;
+          tab.alive = false;
           onEvent('term:exit', { tabId: tab.tabId, exitCode });
         },
       });

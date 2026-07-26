@@ -22,15 +22,22 @@ async function openTab(cwd, { activate = true } = {}) {
   container.className = 'term-view hidden';
   $('terminal-host').appendChild(container);
 
+  const entry = { view: null, container, lastPtyStatus: '', fontSize: config.terminal.fontSize };
+  views.set(tab.tabId, entry);
+
   const view = initTerminal(container, config, {
     tabId: tab.tabId,
     onPtyStatus: (s) => {
+      entry.lastPtyStatus = s;
       if (tabStore.activeId === tab.tabId) statusPty().textContent = `⌨ ${s}`;
     },
-    onFontSize: (px) => { statusFont().textContent = `A ${px}`; },
+    onFontSize: (px) => {
+      entry.fontSize = px;
+      if (tabStore.activeId === tab.tabId) statusFont().textContent = `A ${px}`;
+    },
   });
+  entry.view = view;
 
-  views.set(tab.tabId, { view, container });
   tabStore.add(tab);
   if (activate) activateTab(tab.tabId);
   return tab;
@@ -41,10 +48,13 @@ function activateTab(tabId) {
   if (!entry) return;
   for (const [id, v] of views) v.container.classList.toggle('hidden', id !== tabId);
   tabStore.setActive(tabId);
-  // fit после показа: скрытый контейнер имеет нулевые размеры.
+  // Статус-бар должен отражать активную вкладку, а не последнюю, что его обновляла.
+  statusPty().textContent = entry.lastPtyStatus ? `⌨ ${entry.lastPtyStatus}` : '⌨ …';
+  statusFont().textContent = `A ${entry.fontSize ?? config.terminal.fontSize}`;
+  // fit после показа: скрытый контейнер имеет нулевые размеры (рефит запускает
+  // ResizeObserver в terminal.js сам, когда контейнер становится видимым).
   requestAnimationFrame(() => {
     entry.view.term.focus();
-    window.dispatchEvent(new Event('resize'));
   });
 }
 
@@ -69,12 +79,16 @@ function bindHotkeys() {
   window.addEventListener('keydown', (ev) => {
     // Ctrl+1..9 — вкладка по индексу.
     if (ev.ctrlKey && !ev.shiftKey && !ev.altKey && ev.key >= '1' && ev.key <= '9') {
+      // preventDefault+stopPropagation — для ЛЮБОГО Ctrl+цифра, даже если
+      // вкладки с таким индексом нет: xterm.evaluateKeyboardEvent маппит
+      // Ctrl+3..8 на ESC/FS/GS/RS/US/DEL и шлёт их в pty независимо от
+      // defaultPrevented, если событие дошло до textarea терминала (Ctrl+3
+      // отправлял ESC и обрывал генерацию Claude в фокусной вкладке).
+      ev.preventDefault();
+      ev.stopPropagation();
       const idx = Number(ev.key) - 1;
       const ids = tabStore.order();
-      if (ids[idx]) {
-        ev.preventDefault();
-        activateTab(ids[idx]);
-      }
+      if (ids[idx]) activateTab(ids[idx]);
       return;
     }
     // Ctrl+Tab / Ctrl+Shift+Tab — циклическое переключение.
