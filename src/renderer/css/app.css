@@ -1,173 +1,160 @@
-/* Тёмный минимализм: почти чёрный фон, плоские поверхности,
-   один акцент — мягкий фиолетовый. Без градиентов и лишних рамок. */
-:root {
-  --bg: #0e0e13;
-  --bg-panel: #12121a;
-  --border: #1f1f2a;
-  --fg: #c7cad1;
-  --fg-muted: #6b6f7b;
-  --accent: #8b7ff4;
-  --titlebar-h: 34px;
-  --statusbar-h: 24px;
-}
+/* Каркас Cockpit: титлбар / сайдбар / терминал / статус-бар. */
+@import url('./tokens.css');
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
 html, body {
   height: 100%;
   overflow: hidden;
-  background: var(--bg);
-  font-family: "Segoe UI", system-ui, sans-serif;
+  background: var(--bg-window);
+  color: var(--text);
+  font-family: var(--font-ui);
 }
 
-/* --- Кастомный тайтлбар (системный скрыт, окно тащится за эту полосу) --- */
+/* --- Титлбар: drag-полоса, кнопки окна рисует Windows (overlay) --- */
 #titlebar {
-  height: var(--titlebar-h);
+  height: 36px;
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 0 14px;
-  -webkit-app-region: drag;           /* перетаскивание окна */
-  background: var(--bg);
-  color: var(--fg-muted);
-  font-size: 12px;
-  letter-spacing: .08em;
+  gap: 10px;
+  padding: 0 12px;
+  background: var(--bg-window);
+  border-bottom: 1px solid var(--border);
+  -webkit-app-region: drag;
   user-select: none;
 }
 #titlebar .dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
+  width: 8px; height: 8px; border-radius: 50%;
   background: var(--accent);
-  flex: 0 0 auto;
 }
+#titlebar-text {
+  /* Моноширинный, как сам терминал — по просьбе пользователя (серифный не зашёл). */
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+#titlebar-sub { color: var(--text-dim); font-size: 11px; }
 
+/* --- Основная сетка --- */
 #app {
   display: flex;
-  flex-direction: row;
-  height: calc(100vh - var(--titlebar-h) - var(--statusbar-h));
+  height: calc(100% - 36px - 26px); /* минус титлбар и статус-бар */
 }
 
-/* --- Терминал --- */
-#terminal-pane {
-  flex: 1 1 auto;
-  min-width: 320px;
-  background: var(--bg);
-  padding: 10px 0 10px 14px;
+/* --- Сайдбар --- */
+#sidebar {
+  width: 240px;
+  flex: none;
+  background: var(--bg-panel);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  padding: 8px 6px;
+  gap: 2px;
+  overflow-y: auto;
 }
-
-#terminal { width: 100%; height: 100%; }
-
-/* Тонкий скроллбар xterm */
-.xterm-viewport::-webkit-scrollbar { width: 8px; }
-.xterm-viewport::-webkit-scrollbar-track { background: transparent; }
-.xterm-viewport::-webkit-scrollbar-thumb {
-  background: var(--border);
-  border-radius: 4px;
+.sidebar-section {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-dim);
+  padding: 6px 6px 4px;
 }
-.xterm-viewport::-webkit-scrollbar-thumb:hover { background: #2c2c3c; }
+.sidebar-section.wait { color: var(--accent); }
 
-/* --- Сплиттер --- */
-#splitter {
-  flex: 0 0 6px;
-  cursor: col-resize;
-  background: transparent;
-  transition: background .15s;
-}
-#splitter:hover,
-#splitter.dragging { background: var(--accent); }
-
-/* --- Панель аватара: радиальное свечение за персонажем --- */
-#avatar-pane {
-  flex: 0 0 36%;
-  position: relative;
-  background: radial-gradient(ellipse 65% 50% at 50% 36%, #2c2750 0%, #1a1830 45%, var(--bg-panel) 100%);
-  border-left: 1px solid var(--border);
-  transition: box-shadow .3s;
-}
-
-/* лёгкая виньетка снизу */
-#avatar-pane::after {
-  content: '';
-  position: absolute;
-  inset: auto 0 0 0;
-  height: 38%;
-  background: linear-gradient(to bottom, transparent, rgba(0,0,0,.35));
-  pointer-events: none;
-}
-
-#avatar-pane canvas { display: block; width: 100%; height: 100%; }
-
-/* Субтитры озвучки */
-#subtitles {
-  position: absolute;
-  left: 8%;
-  right: 8%;
-  bottom: 40px;
-  text-align: center;
-  color: #d6d9e0;
-  font-size: 13px;
-  line-height: 1.45;
-  text-shadow: 0 1px 8px rgba(0,0,0,.9);
-  opacity: 0;
-  transition: opacity .35s;
-  pointer-events: none;
-  z-index: 10;
-}
-#subtitles.visible { opacity: .95; }
-
-/* Подсветка панели во время записи */
-#avatar-pane.recording {
-  box-shadow: inset 0 0 40px rgba(226,106,117,.30);
-}
-
-/* Кнопка остановки озвучки: видна только пока есть речь */
-#status-stop {
-  opacity: 0;
-  pointer-events: none;
+.tab-row {
+  display: flex;
+  gap: 8px;
+  padding: 7px 8px;
+  border-radius: var(--radius-s);
   cursor: pointer;
-  color: var(--fg);
-  transition: opacity .2s;
+  align-items: flex-start;
 }
-#status-stop.on { opacity: .9; pointer-events: auto; }
-#status-stop:hover { color: #e26a75; }
+.tab-row:hover { background: var(--bg-hover); }
+.tab-row.active { background: var(--bg-card); }
+.tab-row.waiting { background: var(--bg-wait); border: 1px solid var(--border-wait); }
 
-/* Индикатор голоса в статус-баре */
-#voice-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--fg-muted);
-  transition: background .2s;
-  flex: 0 0 auto;
+.tab-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  margin-top: 4px;
+  flex: none;
+  background: var(--text-dim);
 }
-#voice-dot.rec    { background: #e26a75; animation: pulse 1.2s infinite; }
-#voice-dot.listen { background: var(--accent); animation: pulse 1.6s infinite; }
-#voice-dot.speak  { background: #8fbf7f; }
+.tab-dot.working { background: var(--working); }
+.tab-dot.waiting { background: var(--accent); box-shadow: 0 0 6px var(--accent); animation: pulse 1.6s ease-in-out infinite; }
+.tab-dot.done    { background: var(--ok); }
+.tab-dot.error   { background: var(--err); }
 
 @keyframes pulse {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(255,255,255,.0); }
-  50%       { box-shadow: 0 0 6px 2px rgba(255,255,255,.12); }
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
 }
 
-.hidden { display: none !important; }
+.tab-info { min-width: 0; flex: 1; }
+.tab-name {
+  font-size: 13px;
+  font-weight: 500;
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+}
+.tab-name .meta { font-size: 10px; color: var(--text-dim); font-weight: 400; }
+.tab-sub {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tab-close {
+  border: none; background: none; color: var(--text-dim);
+  cursor: pointer; font-size: 12px; padding: 0 2px;
+  visibility: hidden;
+}
+.tab-row:hover .tab-close { visibility: visible; }
+.tab-close:hover { color: var(--text); }
+
+.sidebar-footer {
+  margin-top: auto;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+  display: flex;
+  gap: 6px;
+}
+.sidebar-btn {
+  flex: 1;
+  background: var(--bg-card);
+  border: none;
+  border-radius: var(--radius-s);
+  color: var(--text-muted);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  padding: 7px 4px;
+  cursor: pointer;
+}
+.sidebar-btn:hover { background: var(--bg-hover); color: var(--text); }
+
+/* --- Главная область --- */
+#main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+#terminal-host { flex: 1; min-height: 0; position: relative; }
+/* Контейнеры терминалов вкладок (Task 4 создаёт .term-view на вкладку) */
+.term-view { position: absolute; inset: 0; padding: 4px 0 0 8px; }
+.term-view.hidden { display: none; }
 
 /* --- Статус-бар --- */
 #status-bar {
-  height: var(--statusbar-h);
+  height: 26px;
   display: flex;
   align-items: center;
   gap: 16px;
-  padding: 0 14px;
-  background: var(--bg);
+  padding: 0 12px;
+  background: var(--bg-panel);
   border-top: 1px solid var(--border);
-  color: var(--fg-muted);
   font-size: 11px;
-  letter-spacing: .03em;
+  color: var(--text-muted);
   user-select: none;
-}
-/* Эмодзи в статусах — приглушаем до монохрома */
-#status-bar span:not(#voice-dot) {
-  filter: grayscale(1) brightness(1.15);
-  opacity: .85;
 }

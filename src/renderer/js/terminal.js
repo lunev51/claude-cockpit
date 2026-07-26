@@ -1,33 +1,33 @@
 // Терминал на xterm.js. UMD-сборки подключены в index.html,
 // поэтому берём глобали window.Terminal и window.FitAddon (не import).
 
-// Тёмный минимализм: почти чёрный фон, приглушённая палитра,
-// единственный акцент — мягкий фиолетовый (курсор).
+// Тёплая тёмная палитра Cockpit (спека §7): фон окна, кремовый текст,
+// терракотовый курсор. ANSI-цвета подогнаны под тёплую гамму.
 const THEME = {
-  background: '#0e0e13',
-  foreground: '#c7cad1',
-  cursor: '#8b7ff4',
-  cursorAccent: '#0e0e13',
-  selectionBackground: '#26263a',
-  black: '#16161e',
-  red: '#d97781',
-  green: '#93b98a',
-  yellow: '#cfae7e',
-  blue: '#82a3e8',
-  magenta: '#a99aef',
-  cyan: '#83bdb9',
-  white: '#aeb1ba',
-  brightBlack: '#494b59',
-  brightRed: '#e2949c',
-  brightGreen: '#a7cb9e',
-  brightYellow: '#ddc295',
-  brightBlue: '#9cb8f0',
-  brightMagenta: '#bdb1f3',
-  brightCyan: '#9bcdc9',
-  brightWhite: '#c7cad1',
+  background: '#141413',
+  foreground: '#E8E6E1',
+  cursor: '#D97757',
+  cursorAccent: '#141413',
+  selectionBackground: '#3A3733',
+  black: '#1F1E1B',
+  red: '#C64545',
+  green: '#5DB872',
+  yellow: '#E8A55A',
+  blue: '#8CA8C8',
+  magenta: '#B08BBF',
+  cyan: '#5DB8A6',
+  white: '#A09D96',
+  brightBlack: '#57544E',
+  brightRed: '#D97781',
+  brightGreen: '#7BC98F',
+  brightYellow: '#EFBE7E',
+  brightBlue: '#A6BDD8',
+  brightMagenta: '#C5A3D1',
+  brightCyan: '#7FCDBD',
+  brightWhite: '#FAF9F5',
 };
 
-export function initTerminal(container, config, { onPtyStatus, onFontSize = () => {} }) {
+export function initTerminal(container, config, { tabId, onPtyStatus, onFontSize = () => {} }) {
   const cfg = config.terminal;
   const term = new window.Terminal({
     fontSize: cfg.fontSize,
@@ -94,10 +94,10 @@ export function initTerminal(container, config, { onPtyStatus, onFontSize = () =
     'align-items:center',
     'gap:4px',
     'padding:4px 6px',
-    'background:#12121a',
-    'border:1px solid #1f1f2a',
+    'background:#1F1E1B',
+    'border:1px solid #3A3733',
     'border-radius:6px',
-    'color:#c7cad1',
+    'color:#FAF9F5',
     'font-family:sans-serif',
     'font-size:12px',
   ].join(';');
@@ -110,7 +110,7 @@ export function initTerminal(container, config, { onPtyStatus, onFontSize = () =
     'border:none',
     'outline:none',
     'background:transparent',
-    'color:#c7cad1',
+    'color:#FAF9F5',
     'font-size:12px',
   ].join(';');
 
@@ -120,7 +120,7 @@ export function initTerminal(container, config, { onPtyStatus, onFontSize = () =
     b.style.cssText = [
       'border:none',
       'background:transparent',
-      'color:#6b6f7b',
+      'color:#8F8D83',
       'cursor:pointer',
       'font-size:12px',
       'padding:2px 4px',
@@ -194,7 +194,7 @@ export function initTerminal(container, config, { onPtyStatus, onFontSize = () =
     fontSize = Math.min(32, Math.max(8, Math.round(size)));
     term.options.fontSize = fontSize;
     fit.fit();
-    window.api.term.resize(term.cols, term.rows);
+    window.api.term.resize(tabId, term.cols, term.rows);
     onFontSize(fontSize);
     // Персист размера шрифта в конфиг с дебаунсом.
     clearTimeout(persistTimer);
@@ -210,7 +210,7 @@ export function initTerminal(container, config, { onPtyStatus, onFontSize = () =
     if (ev.ctrlKey && ev.shiftKey && !ev.altKey && !ev.metaKey
         && (ev.key === 'R' || ev.key === 'r' || ev.code === 'KeyR')) {
       ev.preventDefault();
-      window.api.term.restart();
+      window.api.term.restart(tabId);
       return false;
     }
 
@@ -276,16 +276,10 @@ export function initTerminal(container, config, { onPtyStatus, onFontSize = () =
 
   // --- статус и запуск PTY ---
   onPtyStatus('запускается…');
-  window.api.term.start(term.cols, term.rows);
+  window.api.term.start(tabId, term.cols, term.rows);
 
   // Двусторонний поток: клавиатура → PTY (только при живом процессе), PTY → экран.
-  term.onData((data) => { if (alive) window.api.term.write(data); });
-  window.api.term.onData((data) => term.write(data));
-
-  window.api.term.onStarted(({ pid }) => {
-    alive = true;
-    onPtyStatus(`работает · pid ${pid}`);
-  });
+  term.onData((data) => { if (alive) window.api.term.write(tabId, data); });
 
   // Подгонка размеров при изменении контейнера (с дебаунсом ~100 мс).
   let resizeTimer = null;
@@ -293,17 +287,24 @@ export function initTerminal(container, config, { onPtyStatus, onFontSize = () =
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
       fit.fit();
-      window.api.term.resize(term.cols, term.rows);
+      window.api.term.resize(tabId, term.cols, term.rows);
     }, 100);
   });
   observer.observe(container);
 
-  window.api.term.onExit(({ exitCode }) => {
-    alive = false;
-    onPtyStatus(`процесс завершён (код ${exitCode})`);
-    term.write(`\r\n\x1b[31m[процесс завершён (код ${exitCode}) — Ctrl+Shift+R для перезапуска]\x1b[0m\r\n`);
-  });
-
+  // Приём маршрутизированных событий (диспатч по tabId делает app.js).
+  const handlers = {
+    onData: (data) => term.write(data),
+    onStarted: ({ pid }) => {
+      alive = true;
+      onPtyStatus(`работает · pid ${pid}`);
+    },
+    onExit: ({ exitCode }) => {
+      alive = false;
+      onPtyStatus(`процесс завершён (код ${exitCode})`);
+      term.write(`\r\n\x1b[31m[процесс завершён (код ${exitCode}) — Ctrl+Shift+R для перезапуска]\x1b[0m\r\n`);
+    },
+  };
   term.focus();
-  return { term, search, setFontSize, focus: () => term.focus(), openSearch };
+  return { term, search, setFontSize, focus: () => term.focus(), openSearch, handlers };
 }

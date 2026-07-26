@@ -1,0 +1,33 @@
+/* Дизайн-токены Cockpit — «Claude, но темнее» (спека §7).
+   Вся серая шкала тёплая (hue 40-70); холодных серых в проекте нет. */
+:root {
+  --bg-window: #141413;
+  --bg-panel:  #1F1E1B;
+  --bg-card:   #262624;
+  --bg-hover:  #30302E;
+  --bg-wait:   #2e2320; /* подложка «ждёт тебя» */
+
+  --border:      #3A3733;
+  --border-soft: #403D38;
+  --border-wait: #4a3227;
+
+  --text:       #FAF9F5;
+  --text-muted: #A09D96;
+  --text-dim:   #8F8D83;
+
+  --accent:        #D97757; /* терракота: ТОЛЬКО «ждёт тебя» и главные CTA */
+  --accent-hover:  #A9583E;
+  --accent-soft:   #CC785C;
+  --ok:            #5DB872;
+  --working:       #5DB8A6;
+  --warn:          #E8A55A;
+  --err:           #C64545;
+
+  --radius-s: 8px;
+  --radius-m: 12px;
+  --radius-l: 16px;
+
+  --font-ui: 'Inter', 'Segoe UI', sans-serif;
+  --font-serif: 'Lora', Georgia, 'Times New Roman', serif;
+  --font-mono: 'JetBrainsMono NF', 'Cascadia Mono', Consolas, monospace;
+}

@@ -8,35 +8,24 @@ contextBridge.exposeInMainWorld('api', {
     get: () => ipcRenderer.invoke('config:get'),
     set: (partial) => ipcRenderer.invoke('config:set', partial),
   },
+  tabs: {
+    open: (opts) => ipcRenderer.invoke('tabs:open', opts),
+    close: (tabId) => ipcRenderer.invoke('tabs:close', tabId),
+    chooseFolder: () => ipcRenderer.invoke('tabs:chooseFolder'),
+  },
   term: {
-    start: (cols, rows) => ipcRenderer.send('term:start', { cols, rows }),
-    write: (data) => ipcRenderer.send('term:write', data),
-    resize: (cols, rows) => ipcRenderer.send('term:resize', { cols, rows }),
-    restart: () => ipcRenderer.send('term:restart'),
-    onData: (cb) => ipcRenderer.on('term:data', (_e, d) => cb(d)),
-    onExit: (cb) => ipcRenderer.on('term:exit', (_e, info) => cb(info)),
-    onStarted: (cb) => ipcRenderer.on('term:started', (_e, info) => cb(info)),
+    start: (tabId, cols, rows) => ipcRenderer.send('term:start', { tabId, cols, rows }),
+    write: (tabId, data) => ipcRenderer.send('term:write', { tabId, data }),
+    resize: (tabId, cols, rows) => ipcRenderer.send('term:resize', { tabId, cols, rows }),
+    restart: (tabId) => ipcRenderer.send('term:restart', { tabId }),
+    onData: (cb) => ipcRenderer.on('term:data', (_e, p) => cb(p)),
+    onExit: (cb) => ipcRenderer.on('term:exit', (_e, p) => cb(p)),
+    onStarted: (cb) => ipcRenderer.on('term:started', (_e, p) => cb(p)),
   },
   shell: {
     openExternal: (url) => ipcRenderer.invoke('shell:openExternal', url),
   },
-  stt: {
-    transcribe: (buf) => ipcRenderer.invoke('stt:transcribe', buf),
-    onPttToggle: (cb) => ipcRenderer.on('stt:ptt-toggle', () => cb()),
-    onPttDown: (cb) => ipcRenderer.on('stt:ptt-down', () => cb()),
-    onPttUp: (cb) => ipcRenderer.on('stt:ptt-up', () => cb()),
-    onPttHook: (cb) => ipcRenderer.on('stt:ptt-hook', (_e, info) => cb(info)),
-  },
-  tts: {
-    onSpeak: (cb) => ipcRenderer.on('tts:speak', (_e, p) => cb(p)),
-  },
-  cmd: {
-    onInject: (cb) => ipcRenderer.on('cmd:inject', (_e, p) => cb(p)),
-  },
   app: {
     onNotice: (cb) => ipcRenderer.on('app:notice', (_e, n) => cb(n)),
-  },
-  workdir: {
-    choose: () => ipcRenderer.invoke('workdir:choose'),
   },
 });
