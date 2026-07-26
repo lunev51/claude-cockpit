@@ -18,11 +18,12 @@ function makeFakeSessions() {
   };
 }
 
-function post(port, body) {
+function post(port, body, headersOverride = {}) {
   return new Promise((resolve, reject) => {
     const payload = typeof body === 'string' ? body : JSON.stringify(body);
+    const headers = { 'content-type': 'application/json', ...headersOverride };
     const req = http.request(
-      { host: '127.0.0.1', port, path: '/event', method: 'POST', headers: { 'content-type': 'application/json' } },
+      { host: '127.0.0.1', port, path: '/event', method: 'POST', headers },
       (res) => {
         let buf = '';
         res.on('data', (c) => { buf += c; });
@@ -91,5 +92,16 @@ test('portFile получает фактический порт', async () => {
   const bridge = createHookBridge({ sessions, port: 0, portFile: pf });
   const port = await bridge.start();
   assert.strictEqual(Number(fs.readFileSync(pf, 'utf8').trim()), port);
+  bridge.stop();
+});
+
+test('POST с text/plain content-type → 400, applyHookEvent не зовётся', async () => {
+  const sessions = makeFakeSessions();
+  sessions.bySession.set('sess-1', 'tab-1');
+  const bridge = createHookBridge({ sessions, port: 0 });
+  const port = await bridge.start();
+  const res = await post(port, { event: 'Stop', data: { session_id: 'sess-1' } }, { 'content-type': 'text/plain' });
+  assert.strictEqual(res.status, 400);
+  assert.strictEqual(sessions.calls.length, 0);
   bridge.stop();
 });

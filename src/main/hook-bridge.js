@@ -27,6 +27,13 @@ function createHookBridge({ sessions, port = 0, portFile = null }) {
       res.writeHead(404).end();
       return;
     }
+    // Требуем application/json: браузерный fetch с text/plain (no-cors) отсекается,
+    // а на JSON content-type браузер требует CORS-preflight, на который мост не отвечает.
+    const ct = String(req.headers['content-type'] || '').toLowerCase();
+    if (!ct.startsWith('application/json')) {
+      res.writeHead(400, { 'content-type': 'application/json' }).end('{"ok":false}');
+      return;
+    }
     let body = '';
     req.on('data', (c) => {
       body += c;

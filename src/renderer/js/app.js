@@ -79,15 +79,23 @@ async function closeTab(tabId) {
 
 // Клик по ⚡: прописать хуки Cockpit в .claude/settings.json проекта вкладки.
 async function connectProject(tabId) {
-  const res = await window.api.project.connect(tabId);
-  if (res && res.connected) tabStore.setConnectVisible(tabId, false);
-  else console.warn(`[connect] не удалось: ${res && res.error}`);
+  try {
+    const res = await window.api.project.connect(tabId);
+    if (res && res.connected) tabStore.setConnectVisible(tabId, false);
+    else console.warn(`[connect] не удалось: ${res && res.error}`);
+  } catch (err) {
+    console.warn('[connect] ошибка IPC', err);
+  }
 }
 
 // Показать ⚡, если проект ещё не подключён к хукам (статусы будут молчать).
 async function refreshConnectBadge(tabId) {
-  const { connected } = await window.api.project.status(tabId);
-  tabStore.setConnectVisible(tabId, !connected);
+  try {
+    const { connected } = await window.api.project.status(tabId);
+    tabStore.setConnectVisible(tabId, !connected);
+  } catch (err) {
+    console.warn('[connect] ошибка при обновлении статуса', err);
+  }
 }
 
 function bindHotkeys() {

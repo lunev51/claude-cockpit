@@ -28,9 +28,11 @@ function bridgePortFile() {
 // или что угодно другое) — пересоздаёт мост с эфемерным портом (0).
 // portFile в любом случае получает фактический порт того инстанса,
 // который в итоге успешно заслушал сокет.
-function startBridge(sessions) {
+function startBridge(sessions, smoke = false) {
   const desiredPort = getConfig().bridge?.port ?? 48200;
-  const portFile = bridgePortFile();
+  // В smoke-режиме НЕ пишем файл с портом, чтобы параллельный smoke run
+  // не перезаписывал port-файл живого инстанса умирающим эфемерным портом.
+  const portFile = smoke ? null : bridgePortFile();
   bridge = createHookBridge({ sessions, port: desiredPort, portFile });
   return bridge.start().catch((err) => {
     console.warn(`[hook-bridge] порт ${desiredPort} занят, пробую эфемерный: ${err.message}`);
@@ -66,7 +68,7 @@ function registerIpc(win, opts = {}) {
   // findUnboundByCwd/applyHookEvent), а manager'у мост не нужен на старте.
   // startBridge сама ловит все ошибки старта (в т.ч. фолбэк на эфемерный
   // порт) — не роняем приложение из-за моста хуков.
-  startBridge(manager);
+  startBridge(manager, smoke);
 
   // Детект зависших вкладок (working без вывода дольше порога) — раз в 30с.
   // unref — таймер не держит event loop живым сам по себе.
