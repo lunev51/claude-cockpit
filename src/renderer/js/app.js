@@ -39,6 +39,7 @@ async function openTab(cwd, { activate = true } = {}) {
   entry.view = view;
 
   tabStore.add(tab);
+  refreshConnectBadge(tab.tabId);
   if (activate) activateTab(tab.tabId);
   return tab;
 }
@@ -62,6 +63,8 @@ async function closeTab(tabId) {
   const entry = views.get(tabId);
   if (!entry) return;
   const wasActive = tabStore.activeId === tabId;
+  // Сосед считаем ДО tabStore.remove — после удаления ряда его позиции в order() уже нет.
+  const fallback = tabStore.neighborOf(tabId);
   await window.api.tabs.close(tabId);
   entry.view.term.dispose();
   entry.container.remove();
@@ -70,9 +73,21 @@ async function closeTab(tabId) {
   // Переключаемся на соседнюю вкладку, только если закрыли активную —
   // закрытие фоновой вкладки не должно перебивать фокус пользователя.
   if (!wasActive) return;
-  const rest = tabStore.order();
-  if (rest.length) activateTab(rest[rest.length - 1]);
+  if (fallback) activateTab(fallback);
   else statusPty().textContent = '⌨ нет вкладок';
+}
+
+// Клик по ⚡: прописать хуки Cockpit в .claude/settings.json проекта вкладки.
+async function connectProject(tabId) {
+  const res = await window.api.project.connect(tabId);
+  if (res && res.connected) tabStore.setConnectVisible(tabId, false);
+  else console.warn(`[connect] не удалось: ${res && res.error}`);
+}
+
+// Показать ⚡, если проект ещё не подключён к хукам (статусы будут молчать).
+async function refreshConnectBadge(tabId) {
+  const { connected } = await window.api.project.status(tabId);
+  tabStore.setConnectVisible(tabId, !connected);
 }
 
 function bindHotkeys() {
@@ -113,20 +128,24 @@ async function boot() {
   config = await window.api.config.get();
 
   tabStore = createTabStore({
-    container: $('tab-list'),
+    root: $('tab-groups'),
     onActivate: activateTab,
     onClose: closeTab,
+    onConnect: connectProject,
   });
 
   // Глобальный диспатч событий терминалов по tabId.
   window.api.term.onData(({ tabId, data }) => views.get(tabId)?.view.handlers.onData(data));
   window.api.term.onStarted((p) => {
     views.get(p.tabId)?.view.handlers.onStarted(p);
-    tabStore.setStatus(p.tabId, 'working');
   });
   window.api.term.onExit((p) => {
     views.get(p.tabId)?.view.handlers.onExit(p);
-    tabStore.setStatus(p.tabId, 'error', `процесс завершён (код ${p.exitCode})`);
+  });
+  // Статусы приходят из хуков Claude Code (sessions.js) — единый источник,
+  // term:started/term:exit статус больше не выставляют (был двойной источник).
+  window.api.tab.onStatus(({ tabId, status, subtitle }) => {
+    tabStore.setStatus(tabId, status, subtitle);
   });
 
   $('btn-new-tab').addEventListener('click', async () => {
@@ -139,7 +158,6 @@ async function boot() {
   // Стартовая вкладка: cwd из конфига.
   await openTab(config.terminal.cwd || '.');
 
-  statusFont().textContent = `A ${config.terminal.fontSize}`;
   window.api.app.onNotice(({ text }) => console.warn(`[notice] ${text}`));
 }
 
