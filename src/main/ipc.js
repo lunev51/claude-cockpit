@@ -64,8 +64,8 @@ function registerIpc(win, opts = {}) {
     },
   });
 
-  // Мост создаётся ПОСЛЕ manager — ему нужен sessions (findBySessionId/
-  // findUnboundByCwd/applyHookEvent), а manager'у мост не нужен на старте.
+  // Мост создаётся ПОСЛЕ manager — маршрутизация по tabId из env pty,
+  // session_id — fallback (findBySessionId/applyHookEvent).
   // startBridge сама ловит все ошибки старта (в т.ч. фолбэк на эфемерный
   // порт) — не роняем приложение из-за моста хуков.
   startBridge(manager, smoke);

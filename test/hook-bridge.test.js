@@ -148,6 +148,7 @@ test('portFile получает фактический порт', async () => {
     assert.strictEqual(Number(fs.readFileSync(pf, 'utf8').trim()), port);
   } finally {
     bridge.stop();
+    assert.strictEqual(fs.existsSync(pf), false);
   }
 });
 

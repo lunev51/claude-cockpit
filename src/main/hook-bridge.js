@@ -92,6 +92,9 @@ function createHookBridge({ sessions, port = 0, portFile = null }) {
       try { server.close(); } catch { /* уже */ }
       server = null;
     }
+    if (portFile) {
+      try { fs.unlinkSync(portFile); } catch { /* нет файла — ок */ }
+    }
   }
 
   return { start, stop, port: () => actualPort };
