@@ -23,12 +23,19 @@ function createSessionManager({
 }) {
   const tabs = new Map();
 
-  function open({ cwd, command = null, args = null, smoke = false }) {
+  function open({
+    cwd, command = null, args = null, smoke = false, ghostId = null,
+  }) {
     const tabId = crypto.randomUUID();
     const name = path.basename(cwd) || cwd;
-    const ghostId = crypto.randomUUID(); // id ghost-буфера вкладки (Task 5) — стабилен на весь жизненный цикл вкладки
+    // id ghost-буфера вкладки (Task 5) — стабилен на весь жизненный цикл вкладки.
+    // Восстановление (Task 4/5) передаёт исходный ghostId из манифеста явно —
+    // иначе каждый restore минтил бы новый id, а старый ghost-файл осиротевал
+    // бы навсегда (ревью, finding 1a). Новая вкладка (без ghostId) получает
+    // свежий как раньше.
+    const resolvedGhostId = typeof ghostId === 'string' && ghostId ? ghostId : crypto.randomUUID();
     tabs.set(tabId, {
-      tabId, cwd, name, smoke, ghostId,
+      tabId, cwd, name, smoke, ghostId: resolvedGhostId,
       command, args,           // per-tab переопределение (claude --resume <id> в фазе 2b)
       proc: null, cols: 80, rows: 24, alive: false,
       gen: 0,                  // поколение спавна: гардит все колбэки от гонок

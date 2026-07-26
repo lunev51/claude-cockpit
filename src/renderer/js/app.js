@@ -17,9 +17,11 @@ const statusFont = () => $('status-font');
 // command/args — оверрайд команды на этот спавн (Task 4: staggered-resume
 // шлёт 'claude' + ['--resume', sessionId] при восстановлении воркспейса).
 async function openTab(cwd, {
-  activate = true, command = null, args = null, preludeText = null,
+  activate = true, command = null, args = null, preludeText = null, ghostId = null,
 } = {}) {
-  const tab = await window.api.tabs.open({ cwd, command, args });
+  // ghostId (Task 5, ревью finding 1a) — восстановление передаёт исходный id
+  // вкладки, иначе main всегда минтит новый и старый ghost-файл осиротеет.
+  const tab = await window.api.tabs.open({ cwd, command, args, ghostId });
   if (!tab) return null;
 
   const container = document.createElement('div');
@@ -216,6 +218,7 @@ async function restoreFlow(chosen, activeIndex, overlay) {
         command: 'claude',
         args: t.sessionId ? ['--resume', t.sessionId] : null,
         preludeText,
+        ghostId: t.ghostId,
       });
     } catch (err) {
       // Одна упавшая вкладка не должна обрывать восстановление остальных

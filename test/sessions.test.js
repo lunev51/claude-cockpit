@@ -68,6 +68,21 @@ test('start спавнит pty с cwd вкладки, write/resize маршру�
   assert.strictEqual(started.length, 2);
 });
 
+test('open с явным ghostId переиспользует его; без него — минтит новый (ревью Task 5, finding 1a)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+
+  const fixed = mgr.open({ cwd: 'C:\\proj\\alpha', ghostId: 'g-fixed' });
+  const fixedGhostId = mgr.list().find((t) => t.tabId === fixed.tabId).ghostId;
+  assert.strictEqual(fixedGhostId, 'g-fixed');
+
+  const fresh = mgr.open({ cwd: 'C:\\proj\\beta' });
+  const freshGhostId = mgr.list().find((t) => t.tabId === fresh.tabId).ghostId;
+  assert.strictEqual(typeof freshGhostId, 'string');
+  assert.strictEqual(freshGhostId.length, 36); // UUID
+  assert.notStrictEqual(freshGhostId, 'g-fixed');
+});
+
 test('per-tab command/args переопределяют конфиг', () => {
   const factory = makeFakePtyFactory();
   const { mgr } = makeManager(factory);

@@ -74,6 +74,31 @@ function registerIpc(win, opts = {}) {
   // никогда не пишется, см. syncWorkspace ниже).
   store = createWorkspaceStore({ file: path.join(app.getPath('userData'), 'workspace.json') });
 
+  // Разовая уборка ghost-файлов-сирот (Task 5, ревью finding 1b). До фикса
+  // finding 1a восстановление минтило новый ghostId на каждый запуск —
+  // старый файл предыдущей жизни вкладки становился недостижим навсегда
+  // (никто его больше не читает/не перезаписывает/не удаляет). Теперь
+  // ghostId стабилен через restore, но старые сироты от прошлых запусков
+  // до фикса всё ещё могут лежать на диске — сверяем userData/ghosts/ с
+  // текущим манифестом и удаляем всё лишнее. smoke — не трогаем userData.
+  if (!smoke) {
+    try {
+      const dir = ghostDir();
+      const known = new Set((store.load()?.tabs || []).map((t) => t.ghostId).filter(Boolean));
+      if (fs.existsSync(dir)) {
+        for (const file of fs.readdirSync(dir)) {
+          if (!file.endsWith('.txt')) continue;
+          const id = file.slice(0, -'.txt'.length);
+          if (!known.has(id)) {
+            try { fs.unlinkSync(path.join(dir, file)); } catch { /* не критично */ }
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(`[ghost] уборка файлов-сирот не удалась: ${err.message}`);
+    }
+  }
+
   // Пересобирает манифест из живого состояния manager'а. activeIndex — позиция
   // activeTabId в manager.list() (renderer сообщает её через workspace:setActive);
   // не найдена/ещё не сообщена → 0 (совпадает со стартовой вкладкой).
@@ -133,11 +158,15 @@ function registerIpc(win, opts = {}) {
   // command/args — прозрачный проброс (Task 4): staggered-resume шлёт
   // 'claude' + ['--resume', sessionId] на восстановлении вкладки. Тайпчек
   // здесь, а не в sessions.js — renderer недоверенный источник IPC-пейлоада.
-  ipcMain.handle('tabs:open', (_e, { cwd, command, args } = {}) => {
+  // ghostId (Task 5, ревью finding 1a) — восстановление передаёт исходный id
+  // вкладки из манифеста, чтобы не заводить новый ghost-файл при каждом
+  // restore и не осиротить старый.
+  ipcMain.handle('tabs:open', (_e, { cwd, command, args, ghostId } = {}) => {
     if (typeof cwd !== 'string' || !cwd) return null;
     const cmd = typeof command === 'string' ? command : undefined;
     const a = Array.isArray(args) && args.every((x) => typeof x === 'string') ? args : undefined;
-    return manager.open({ cwd, smoke, command: cmd, args: a });
+    const gid = typeof ghostId === 'string' && ghostId ? ghostId : undefined;
+    return manager.open({ cwd, smoke, command: cmd, args: a, ghostId: gid });
   });
 
   ipcMain.handle('tabs:close', (_e, tabId) => {
@@ -182,6 +211,9 @@ function registerIpc(win, opts = {}) {
   });
 
   ipcMain.handle('ghost:load', (_e, ghostId) => {
+    // smoke-гейт для консистентности с ghost:save (ревью, finding 2) —
+    // headless-прогон не должен трогать userData.
+    if (smoke) return null;
     if (typeof ghostId !== 'string' || !ghostId) return null;
     try {
       return fs.readFileSync(ghostFile(ghostId), 'utf8');
