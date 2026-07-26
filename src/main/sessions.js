@@ -33,7 +33,16 @@ function createSessionManager({ ptyFactory, getTermConfig, onEvent }) {
         useConpty: t.useConpty !== false,
         useConptyDll: t.useConptyDll !== false,
         env: { ...process.env, COCKPIT: '1', COCKPIT_TAB_ID: tab.tabId },
-        onData: (data) => onEvent('term:data', { tabId: tab.tabId, data }),
+        onData: (data) => {
+          // Гасим "осиротевший" вывод процесса, которого рестарт уже подменил
+          // (тот же принцип, что и в onExit ниже). tab.proc в момент вызова
+          // может ещё быть null — если ptyFactory успевает синхронно отдать
+          // первые данные ДО того, как строка "tab.proc = myProc" ниже
+          // выполнится. Сравниваем только когда tab.proc уже назначен —
+          // иначе легитимный первый вывод свежего процесса был бы проглочен.
+          if (tab.proc && tab.proc !== myProc) return;
+          onEvent('term:data', { tabId: tab.tabId, data });
+        },
         onExit: (exitCode) => {
           // Обнуляем только свой процесс: рестарт мог уже подменить proc.
           if (tab.proc === myProc) {

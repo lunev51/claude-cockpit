@@ -118,3 +118,42 @@ test('smoke-вкладка спавнит cmd.exe с echo PTY_OK', () => {
   assert.strictEqual(factory.spawned[0].opts.command, 'cmd.exe');
   assert.deepStrictEqual(factory.spawned[0].opts.args, ['/c', 'echo PTY_OK']);
 });
+
+test('restart: опоздавший onExit старого pty не убивает новый процесс вкладки', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.restart(a.tabId);
+  assert.strictEqual(factory.spawned.length, 2);
+
+  // Старый (уже убитый рестартом) pty шлёт onExit с опозданием.
+  factory.spawned[0].opts.onExit(0);
+
+  // Вкладка должна остаться живой с НОВЫМ процессом: write доходит до него.
+  assert.strictEqual(mgr.list().find((x) => x.tabId === a.tabId).alive, true);
+  mgr.write(a.tabId, 'ping');
+  assert.deepStrictEqual(factory.spawned[1].written, ['ping']);
+  assert.deepStrictEqual(factory.spawned[0].written, []);
+});
+
+test('restart: опоздавший onData старого pty не порождает term:data', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.restart(a.tabId);
+
+  const countData = () => events.filter((e) => e.channel === 'term:data').length;
+  const before = countData();
+
+  // Старый (уже убитый рестартом) pty шлёт данные с опозданием — должны быть проглочены.
+  factory.spawned[0].opts.onData('stale-output');
+  assert.strictEqual(countData(), before);
+
+  // Новый pty продолжает нормально слать данные.
+  factory.spawned[1].opts.onData('fresh-output');
+  assert.strictEqual(countData(), before + 1);
+  const last = events.filter((e) => e.channel === 'term:data').pop();
+  assert.deepStrictEqual(last.payload, { tabId: a.tabId, data: 'fresh-output' });
+});
