@@ -20,23 +20,7 @@ contextBridge.exposeInMainWorld('api', {
   shell: {
     openExternal: (url) => ipcRenderer.invoke('shell:openExternal', url),
   },
-  stt: {
-    transcribe: (buf) => ipcRenderer.invoke('stt:transcribe', buf),
-    onPttToggle: (cb) => ipcRenderer.on('stt:ptt-toggle', () => cb()),
-    onPttDown: (cb) => ipcRenderer.on('stt:ptt-down', () => cb()),
-    onPttUp: (cb) => ipcRenderer.on('stt:ptt-up', () => cb()),
-    onPttHook: (cb) => ipcRenderer.on('stt:ptt-hook', (_e, info) => cb(info)),
-  },
-  tts: {
-    onSpeak: (cb) => ipcRenderer.on('tts:speak', (_e, p) => cb(p)),
-  },
-  cmd: {
-    onInject: (cb) => ipcRenderer.on('cmd:inject', (_e, p) => cb(p)),
-  },
   app: {
     onNotice: (cb) => ipcRenderer.on('app:notice', (_e, n) => cb(n)),
-  },
-  workdir: {
-    choose: () => ipcRenderer.invoke('workdir:choose'),
   },
 });

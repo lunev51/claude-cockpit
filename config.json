@@ -11,51 +11,5 @@
     "webgl": false,
     "useConpty": true,
     "useConptyDll": true
-  },
-  "avatar": {
-    "visible": true,
-    "vrmPath": "assets/avatar.vrm",
-    "side": "right",
-    "widthPercent": 36,
-    "cameraFov": 22,
-    "lookAtCamera": true
-  },
-  "stt": {
-    "engine": "whisper.cpp",
-    "model": "large-v3-turbo-q5_0",
-    "language": "ru",
-    "prompt": "Юки, привет. Юки, открой проект и запусти тесты. Окей, сделай коммит.",
-    "hotkey": "ShiftRight",
-    "globalHotkey": "F8",
-    "globalPushToTalk": true,
-    "autoSubmit": true,
-    "mode": "push",
-    "wakeWords": ["юки", "yuki", "юкия", "йоки", "йокия", "еки", "юка", "уки", "иоки", "uk", "uki", "юке"],
-    "sleepWords": ["спи", "усни", "отключись"],
-    "vadThreshold": 0.02,
-    "silenceMs": 400,
-    "minSegmentMs": 500,
-    "debug": false,
-    "threads": 6,
-    "serverPort": 48752,
-    "micDeviceLabel": ""
-  },
-  "tts": {
-    "engine": "silero",
-    "speaker": "baya",
-    "venvPython": "C:\\Users\\Lunev\\AssistClaude\\claude-companion\\sidecar\\venv\\Scripts\\python.exe",
-    "sampleRate": 48000,
-    "enabled": true,
-    "port": 48751,
-    "maxChars": 600,
-    "volume": 0.9,
-    "fallback": "piper",
-    "piperVoiceEn": "en_US-amy-medium"
-  },
-  "telegram": {
-    "remote": true,
-    "commands": true,
-    "autoReply": true,
-    "python": "C:\\Users\\Lunev\\akto\\.venv\\Scripts\\python.exe"
   }
 }
