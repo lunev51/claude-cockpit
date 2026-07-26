@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <!-- script-src содержит sha256-хэш inline-importmap ниже. Если меняешь importmap —
+       возьми новый хэш из ошибки CSP в DevTools и обнови его здесь. -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self' 'sha256-t9gIXJnbXv4s2xNOcuG4wiTVH7Y02lhi9EJPpKnyWxQ='; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' blob:" />
+  <title>Claude Companion</title>
+  <link rel="stylesheet" href="../../node_modules/@xterm/xterm/css/xterm.css" />
+  <link rel="stylesheet" href="./css/app.css" />
+  <!-- xterm.js — UMD-сборки, глобали window.Terminal, window.FitAddon,
+       window.WebLinksAddon, window.SearchAddon, window.Unicode11Addon, window.WebglAddon -->
+  <script src="../../node_modules/@xterm/xterm/lib/xterm.js"></script>
+  <script src="../../node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
+  <script src="../../node_modules/@xterm/addon-web-links/lib/addon-web-links.js"></script>
+  <script src="../../node_modules/@xterm/addon-search/lib/addon-search.js"></script>
+  <script src="../../node_modules/@xterm/addon-unicode11/lib/addon-unicode11.js"></script>
+  <script src="../../node_modules/@xterm/addon-webgl/lib/addon-webgl.js"></script>
+  <!-- three.js / three-vrm — ES-модули через importmap, без бандлера -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "../../node_modules/three/build/three.module.js",
+      "three/addons/": "../../node_modules/three/examples/jsm/",
+      "@pixiv/three-vrm": "../../node_modules/@pixiv/three-vrm/lib/three-vrm.module.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="titlebar"><span class="dot"></span><span>claude companion</span></div>
+  <div id="app">
+    <div id="terminal-pane">
+      <div id="terminal"></div>
+    </div>
+    <div id="splitter" title="Перетащи; двойной клик — сброс; F9 — скрыть аватар"></div>
+    <div id="avatar-pane">
+      <!-- сюда avatar.js вставляет canvas three.js -->
+      <div id="subtitles"></div>
+    </div>
+  </div>
+  <div id="status-bar">
+    <span id="voice-dot"></span>
+    <span id="status-stt">🎤 —</span>
+    <span id="status-tts" title="Клик — выкл/вкл озвучку">🔊 —</span>
+    <span id="status-stop" title="Остановить озвучку (Ctrl+Shift+S)">⏹ стоп</span>
+    <span id="status-pty">⌨ запуск…</span>
+    <span id="status-font">A —</span>
+    <span id="status-cwd" title="Сменить рабочую папку Claude" style="cursor:pointer">📁 …</span>
+  </div>
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>
