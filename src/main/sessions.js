@@ -35,7 +35,7 @@ function createSessionManager({
       status: null, subtitle: '', waitingText: '',
       lastOutputAt: now(),
       pendingExtraArgs: null,  // одноразовый оверрайд args на следующий spawn() (хотфикс restart, спека §3.14)
-      resumePending: false,    // true = последний спавн ушёл с --resume/--continue и ещё не подтверждён SessionStart-хуком
+      overrideFailed: false,   // true = процесс с --resume/--continue умер, а SessionStart так и не привязал сессию
     });
     return { tabId, cwd, name };
   }
@@ -55,6 +55,7 @@ function createSessionManager({
     // потребляется здесь и сбрасывается, чтобы следующий обычный спавн был «голым».
     const extraArgs = tab.pendingExtraArgs;
     tab.pendingExtraArgs = null;
+    const usedOverride = extraArgs !== null; // этот спавн ушёл с --resume/--continue
     const baseArgs = tab.args || t.args;
     const spec = tab.smoke
       ? { command: 'cmd.exe', args: ['/c', 'echo PTY_OK'] }
@@ -84,7 +85,11 @@ function createSessionManager({
           onEvent('term:data', { tabId: tab.tabId, data });
         },
         onExit: (exitCode) => {
-          if (myGen !== tab.gen) return; // stale exit после рестарта
+          if (myGen !== tab.gen) return; // stale exit после рестарта (или намеренный kill — см. гард в restart())
+          // Провал резюма/continue: процесс с оверрайдом умер естественной смертью,
+          // а SessionStart так и не привязал session_id за время его жизни —
+          // следующий restart() уйдёт в голые args (не зацикливаемся).
+          if (usedOverride && !tab.sessionId) tab.overrideFailed = true;
           tab.proc = null;
           tab.alive = false;
           setStatus(tab, 'dead', `процесс завершён (код ${exitCode})`);
@@ -136,30 +141,36 @@ function createSessionManager({
   function restart(tabId) {
     const tab = tabs.get(tabId);
     if (!tab) return;
+
+    // Поколение растёт ДО kill() — так же, как в close(). Если фабрика (реальный
+    // node-pty) синхронно зовёt onExit прямо из kill(), этот exit уже попадёт на
+    // старое поколение и будет отсечён гардом внутри spawn() — намеренный рестарт
+    // не должен путать себя с провалом resume/continue и не должен слать dead-статус.
+    tab.gen += 1;
+
+    const boundSessionId = tab.sessionId;
+
     if (tab.proc) {
       try { tab.proc.kill(); } catch { /* мог уже завершиться */ }
       tab.proc = null;
       tab.alive = false;
     }
-    const boundSessionId = tab.sessionId;
+
     tab.sessionId = null; // новая жизнь — новый SessionStart перебиндит
 
     if (boundSessionId) {
       // 1. session_id уже известен (из прошлого SessionStart) — резюмируем именно его.
       tab.pendingExtraArgs = ['--resume', boundSessionId];
-      tab.resumePending = true;
-    } else if (!tab.resumePending) {
-      // 2. session_id ещё нет, и предыдущая попытка резюма/continue не провалилась —
-      //    пробуем --continue (последняя сессия этой папки). Это же включает хуки,
-      //    если вкладка была запущена до подключения хуков к проекту.
-      tab.pendingExtraArgs = ['--continue'];
-      tab.resumePending = true;
-    } else {
-      // 3. Предыдущий спавн уже уходил с --resume/--continue, но SessionStart так
-      //    и не пришёл (процесс умер, сессия не нашлась) — не зацикливаемся на
-      //    вечных попытках, спавним голые args как обычный старт.
+    } else if (tab.overrideFailed) {
+      // 3. Предыдущий спавн с оверрайдом (--resume/--continue) реально умер, не
+      //    привязав сессию — не зацикливаемся на вечных попытках, голые args.
       tab.pendingExtraArgs = null;
-      tab.resumePending = false;
+      tab.overrideFailed = false;
+    } else {
+      // 2. session_id ещё нет, и прошлый оверрайд не проваливался (либо его не
+      //    было, либо процесс всё ещё жив) — пробуем --continue (последняя сессия
+      //    этой папки). Это же включает хуки, если вкладка стартовала раньше их.
+      tab.pendingExtraArgs = ['--continue'];
     }
 
     spawn(tab);
@@ -204,7 +215,7 @@ function createSessionManager({
       case 'SessionStart':
         if (data.session_id) {
           bindSession(tabId, data.session_id);
-          tab.resumePending = false; // resume/continue подтверждён хуком — попытка удалась
+          tab.overrideFailed = false; // resume/continue подтверждён хуком — попытка удалась
         }
         setStatus(tab, 'working', 'сессия запущена');
         break;
