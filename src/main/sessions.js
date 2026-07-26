@@ -35,7 +35,7 @@ function createSessionManager({
       status: null, subtitle: '', waitingText: '',
       lastOutputAt: now(),
       pendingExtraArgs: null,  // одноразовый оверрайд args на следующий spawn() (хотфикс restart, спека §3.14)
-      overrideFailed: false,   // true = процесс с --resume/--continue умер, а SessionStart так и не привязал сессию
+      overrideFailed: false,   // true = процесс с оверрайдом (--resume <id>/--resume) умер, а SessionStart так и не привязал сессию
     });
     return { tabId, cwd, name };
   }
@@ -51,11 +51,12 @@ function createSessionManager({
 
   function spawn(tab) {
     const t = getTermConfig();
-    // pendingExtraArgs — одноразовый оверрайд от restart() (--resume/--continue),
-    // потребляется здесь и сбрасывается, чтобы следующий обычный спавн был «голым».
+    // pendingExtraArgs — одноразовый оверрайд от restart() (--resume <id> или
+    // голый --resume), потребляется здесь и сбрасывается, чтобы следующий
+    // обычный спавн был «голым».
     const extraArgs = tab.pendingExtraArgs;
     tab.pendingExtraArgs = null;
-    const usedOverride = extraArgs !== null; // этот спавн ушёл с --resume/--continue
+    const usedOverride = extraArgs !== null; // этот спавн ушёл с оверрайдом --resume
     const baseArgs = tab.args || t.args;
     const spec = tab.smoke
       ? { command: 'cmd.exe', args: ['/c', 'echo PTY_OK'] }
@@ -162,15 +163,20 @@ function createSessionManager({
       // 1. session_id уже известен (из прошлого SessionStart) — резюмируем именно его.
       tab.pendingExtraArgs = ['--resume', boundSessionId];
     } else if (tab.overrideFailed) {
-      // 3. Предыдущий спавн с оверрайдом (--resume/--continue) реально умер, не
-      //    привязав сессию — не зацикливаемся на вечных попытках, голые args.
+      // 3. Предыдущий спавн с оверрайдом (--resume <id> либо голый --resume) реально
+      //    умер, не привязав сессию — не зацикливаемся на вечных попытках, голые args.
       tab.pendingExtraArgs = null;
       tab.overrideFailed = false;
     } else {
       // 2. session_id ещё нет, и прошлый оверрайд не проваливался (либо его не
-      //    было, либо процесс всё ещё жив) — пробуем --continue (последняя сессия
-      //    этой папки). Это же включает хуки, если вкладка стартовала раньше их.
-      tab.pendingExtraArgs = ['--continue'];
+      //    было, либо процесс всё ещё жив). Раньше здесь был --continue —
+      //    но он берёт «самую свежую» сессию ЭТОЙ cwd вслепую, а cwd бывает
+      //    общей (несколько вкладок/CLI-сессий в одной папке): --continue мог
+      //    подцепить ЧУЖУЮ, живую сессию пользователя, и она падает при
+      //    попытке её загрузить (exit 1). Голый --resume вместо этого
+      //    открывает интерактивный пикер сессий Claude Code прямо во вкладке —
+      //    пользователь выбирает нужную сессию визуально, никакой угадайки.
+      tab.pendingExtraArgs = ['--resume'];
     }
 
     spawn(tab);
@@ -191,6 +197,12 @@ function createSessionManager({
   function bindSession(tabId, sessionId) {
     const tab = tabs.get(tabId);
     if (tab) tab.sessionId = sessionId;
+  }
+
+  // Знает ли менеджер такой tabId вообще (для точной адресации хуков по
+  // COCKPIT_TAB_ID в hook-bridge.js — см. Фикс 2, спека приоритета маршрутизации).
+  function has(tabId) {
+    return tabs.has(tabId);
   }
 
   function findBySessionId(sessionId) {
@@ -264,7 +276,7 @@ function createSessionManager({
 
   return {
     open, start, write, resize, restart, close, list, disposeAll,
-    bindSession, findBySessionId, findUnboundByCwd, applyHookEvent, checkStuck,
+    bindSession, has, findBySessionId, findUnboundByCwd, applyHookEvent, checkStuck,
   };
 }
 

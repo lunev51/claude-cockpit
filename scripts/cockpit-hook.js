@@ -38,7 +38,12 @@ function main() {
   process.stdin.on('end', () => {
     let data = {};
     try { data = JSON.parse(stdin); } catch { /* хук без JSON — шлём пустой */ }
-    const payload = JSON.stringify({ event, data });
+    // tabId — точный канал адресации моста (hook-bridge.js): COCKPIT_TAB_ID
+    // наследуется из env pty-процесса кокпита, если этот хук — потомок именно
+    // его вкладки. У СТОРОННИХ claude-сессий той же папки (запущенных вручную,
+    // не из кокпита) такой переменной нет — им достанется tabId: null, и мост
+    // не сможет спутать их с чужой вкладкой по одному лишь cwd/session_id.
+    const payload = JSON.stringify({ event, data, tabId: process.env.COCKPIT_TAB_ID || null });
     try {
       const req = http.request({
         host: '127.0.0.1',

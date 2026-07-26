@@ -311,14 +311,14 @@ test('restart с привязанным session_id — второй спавн �
   assert.deepStrictEqual(factory.spawned[1].opts.args, ['--foo', 'bar', '--resume', 'sess-1']);
 });
 
-test('restart без session_id — второй спавн получает --continue', () => {
+test('restart без session_id — второй спавн открывает голый --resume (пикер сессий)', () => {
   const factory = makeFakePtyFactory();
   const { mgr } = makeManager(factory);
   const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
   mgr.restart(a.tabId);
   assert.strictEqual(factory.spawned.length, 2);
-  assert.deepStrictEqual(factory.spawned[1].opts.args, ['--continue']);
+  assert.deepStrictEqual(factory.spawned[1].opts.args, ['--resume']);
 });
 
 test('restart: НАСТОЯЩИЙ провал (спавн с оверрайдом умер естественной смертью, SessionStart не пришёл) — следующий рестарт спавнит голые args', () => {
@@ -326,12 +326,12 @@ test('restart: НАСТОЯЩИЙ провал (спавн с оверрайдо
   const { mgr } = makeManager(factory);
   const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
-  mgr.restart(a.tabId); // спавн #2: --continue (session_id ещё не привязан)
-  assert.deepStrictEqual(factory.spawned[1].opts.args, ['--continue']);
+  mgr.restart(a.tabId); // спавн #2: голый --resume, пикер (session_id ещё не привязан)
+  assert.deepStrictEqual(factory.spawned[1].opts.args, ['--resume']);
   // Естественная смерть спавна #2 (gen совпадает — это НЕ хвост убитого рестартом
-  // процесса): SessionStart за время его жизни так и не пришёл.
+  // процесса): SessionStart за время его жизни так и не пришёл (пикер брошен/провалился).
   factory.spawned[1].opts.onExit(1);
-  mgr.restart(a.tabId); // спавн #3: без деградации в бесконечный --continue-цикл
+  mgr.restart(a.tabId); // спавн #3: без деградации в бесконечный цикл пикера
   assert.strictEqual(factory.spawned.length, 3);
   assert.deepStrictEqual(factory.spawned[2].opts.args, []);
 });
@@ -341,26 +341,27 @@ test('restart: восстановление после неудачи — Sessio
   const { mgr } = makeManager(factory);
   const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
-  mgr.restart(a.tabId); // спавн #2: --continue
-  assert.deepStrictEqual(factory.spawned[1].opts.args, ['--continue']);
+  mgr.restart(a.tabId); // спавн #2: голый --resume, пикер
+  assert.deepStrictEqual(factory.spawned[1].opts.args, ['--resume']);
   mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'sess-9' });
   mgr.restart(a.tabId); // спавн #3: теперь есть id — резюмим именно его
   assert.strictEqual(factory.spawned.length, 3);
   assert.deepStrictEqual(factory.spawned[2].opts.args, ['--resume', 'sess-9']);
 });
 
-test('restart: разрыв с хуками (proc жив, SessionStart не приходит) — второй рестарт подряд ТОЖЕ получает --continue, не голые args (регрессия чередования)', () => {
+test('restart: разрыв с хуками (proc жив, SessionStart не приходит) — второй рестарт подряд ТОЖЕ получает голый --resume, не голые args (регрессия чередования)', () => {
   const factory = makeFakePtyFactory();
   const { mgr } = makeManager(factory);
   const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24); // спавн #1
-  mgr.restart(a.tabId); // спавн #2: --continue
-  assert.deepStrictEqual(factory.spawned[1].opts.args, ['--continue']);
+  mgr.restart(a.tabId); // спавн #2: голый --resume (пикер)
+  assert.deepStrictEqual(factory.spawned[1].opts.args, ['--resume']);
   // Процесс #2 остаётся ЖИВЫМ — onExit не зовём, SessionStart тоже не приходит
-  // (хуки не подключены к проекту). Это не провал, это устойчивое «пока без хуков».
-  mgr.restart(a.tabId); // спавн #3: должен снова получить --continue, а не откат
+  // (хуки не подключены к проекту, либо пикер ещё открыт). Это не провал, это
+  // устойчивое «пока без хуков».
+  mgr.restart(a.tabId); // спавн #3: должен снова получить голый --resume, а не откат
   assert.strictEqual(factory.spawned.length, 3);
-  assert.deepStrictEqual(factory.spawned[2].opts.args, ['--continue']);
+  assert.deepStrictEqual(factory.spawned[2].opts.args, ['--resume']);
 });
 
 test('restart: kill() фабрики синхронно зовёт свой onExit — гард по поколению не путает это с провалом resume/continue', () => {
@@ -389,12 +390,12 @@ test('restart: kill() фабрики синхронно зовёт свой onEx
   const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24); // спавн #1
   mgr.restart(a.tabId); // kill() спавна #1 синхронно зовёт onExit — должен быть отсечён
-  assert.deepStrictEqual(spawned[1].opts.args, ['--continue']);
+  assert.deepStrictEqual(spawned[1].opts.args, ['--resume']);
   assert.strictEqual(
     events.some((e) => e.channel === 'tab:status' && e.payload.status === 'dead'),
     false,
   );
-  mgr.restart(a.tabId); // тот же гард — снова --continue, не откат на голые args
+  mgr.restart(a.tabId); // тот же гард — снова голый --resume, не откат на голые args
   assert.strictEqual(spawned.length, 3);
-  assert.deepStrictEqual(spawned[2].opts.args, ['--continue']);
+  assert.deepStrictEqual(spawned[2].opts.args, ['--resume']);
 });
