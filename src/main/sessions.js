@@ -34,6 +34,8 @@ function createSessionManager({
       sessionId: null,         // session_id Claude Code из SessionStart-хука
       status: null, subtitle: '', waitingText: '',
       lastOutputAt: now(),
+      pendingExtraArgs: null,  // одноразовый оверрайд args на следующий spawn() (хотфикс restart, спека §3.14)
+      resumePending: false,    // true = последний спавн ушёл с --resume/--continue и ещё не подтверждён SessionStart-хуком
     });
     return { tabId, cwd, name };
   }
@@ -49,9 +51,14 @@ function createSessionManager({
 
   function spawn(tab) {
     const t = getTermConfig();
+    // pendingExtraArgs — одноразовый оверрайд от restart() (--resume/--continue),
+    // потребляется здесь и сбрасывается, чтобы следующий обычный спавн был «голым».
+    const extraArgs = tab.pendingExtraArgs;
+    tab.pendingExtraArgs = null;
+    const baseArgs = tab.args || t.args;
     const spec = tab.smoke
       ? { command: 'cmd.exe', args: ['/c', 'echo PTY_OK'] }
-      : { command: tab.command || t.command, args: tab.args || t.args };
+      : { command: tab.command || t.command, args: extraArgs ? [...baseArgs, ...extraArgs] : baseArgs };
     // Поколение растёт ДО вызова фабрики: синхронные колбэки нового процесса
     // проходят гард, а все колбэки предыдущего поколения — отсекаются.
     tab.gen += 1;
@@ -124,6 +131,8 @@ function createSessionManager({
     if (tab.proc) tab.proc.resize(cols, rows);
   }
 
+  // Рестарт «на месте» (Ctrl+Shift+R) не должен терять сессию — три уровня
+  // деградации из спеки §3.14:
   function restart(tabId) {
     const tab = tabs.get(tabId);
     if (!tab) return;
@@ -132,7 +141,27 @@ function createSessionManager({
       tab.proc = null;
       tab.alive = false;
     }
+    const boundSessionId = tab.sessionId;
     tab.sessionId = null; // новая жизнь — новый SessionStart перебиндит
+
+    if (boundSessionId) {
+      // 1. session_id уже известен (из прошлого SessionStart) — резюмируем именно его.
+      tab.pendingExtraArgs = ['--resume', boundSessionId];
+      tab.resumePending = true;
+    } else if (!tab.resumePending) {
+      // 2. session_id ещё нет, и предыдущая попытка резюма/continue не провалилась —
+      //    пробуем --continue (последняя сессия этой папки). Это же включает хуки,
+      //    если вкладка была запущена до подключения хуков к проекту.
+      tab.pendingExtraArgs = ['--continue'];
+      tab.resumePending = true;
+    } else {
+      // 3. Предыдущий спавн уже уходил с --resume/--continue, но SessionStart так
+      //    и не пришёл (процесс умер, сессия не нашлась) — не зацикливаемся на
+      //    вечных попытках, спавним голые args как обычный старт.
+      tab.pendingExtraArgs = null;
+      tab.resumePending = false;
+    }
+
     spawn(tab);
   }
 
@@ -173,7 +202,10 @@ function createSessionManager({
     if (!tab) return;
     switch (event) {
       case 'SessionStart':
-        if (data.session_id) bindSession(tabId, data.session_id);
+        if (data.session_id) {
+          bindSession(tabId, data.session_id);
+          tab.resumePending = false; // resume/continue подтверждён хуком — попытка удалась
+        }
         setStatus(tab, 'working', 'сессия запущена');
         break;
       case 'UserPromptSubmit':

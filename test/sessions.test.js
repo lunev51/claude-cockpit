@@ -297,3 +297,52 @@ test('extraEnv попадает в env pty', () => {
   mgr.start(a.tabId, 80, 24);
   assert.strictEqual(factory.spawned[0].opts.env.COCKPIT_BRIDGE_PORT, '48200');
 });
+
+// ---------- хотфикс: restart резюмит ту же сессию (спека §3.14) ----------
+
+test('restart с привязанным session_id — второй спавн получает --resume <id> поверх базовых args', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha', args: ['--foo', 'bar'] });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'sess-1' });
+  mgr.restart(a.tabId);
+  assert.strictEqual(factory.spawned.length, 2);
+  assert.deepStrictEqual(factory.spawned[1].opts.args, ['--foo', 'bar', '--resume', 'sess-1']);
+});
+
+test('restart без session_id — второй спавн получает --continue', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.restart(a.tabId);
+  assert.strictEqual(factory.spawned.length, 2);
+  assert.deepStrictEqual(factory.spawned[1].opts.args, ['--continue']);
+});
+
+test('restart: неудачная попытка resume/continue (процесс умер без SessionStart) — следующий рестарт спавнит голые args', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.restart(a.tabId); // спавн #2: --continue (session_id ещё не привязан)
+  assert.deepStrictEqual(factory.spawned[1].opts.args, ['--continue']);
+  factory.spawned[1].opts.onExit(1); // умер без SessionStart — попытка не подтвердилась
+  mgr.restart(a.tabId); // спавн #3: без деградации в бесконечный --continue-цикл
+  assert.strictEqual(factory.spawned.length, 3);
+  assert.deepStrictEqual(factory.spawned[2].opts.args, []);
+});
+
+test('restart: восстановление после неудачи — SessionStart привязал id, следующий рестарт снова резюмит', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.restart(a.tabId); // спавн #2: --continue
+  assert.deepStrictEqual(factory.spawned[1].opts.args, ['--continue']);
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'sess-9' });
+  mgr.restart(a.tabId); // спавн #3: теперь есть id — резюмим именно его
+  assert.strictEqual(factory.spawned.length, 3);
+  assert.deepStrictEqual(factory.spawned[2].opts.args, ['--resume', 'sess-9']);
+});
