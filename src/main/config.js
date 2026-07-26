@@ -21,6 +21,7 @@ const DEFAULTS = {
     useConpty: true,
     useConptyDll: true,
   },
+  bridge: { port: 48200 },
 };
 
 let cached = null;
