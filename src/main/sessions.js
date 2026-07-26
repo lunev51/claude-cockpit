@@ -182,6 +182,10 @@ function createSessionManager({
     }
 
     spawn(tab);
+    // sessionId вкладки мог обнулиться (провал резюма) — манифест должен это
+    // узнать, иначе следующий запуск приложения снова попробует резюмить уже
+    // протухший id и уйдёт в тот же фейл-луп (Task 4, ревью Task 3).
+    onEvent('tabs:changed', {});
   }
 
   function close(tabId) {

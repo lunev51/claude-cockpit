@@ -375,6 +375,17 @@ test('open→close эмитят tabs:changed (лёгкий сигнал «пер
   assert.strictEqual(changed.length, 2);
 });
 
+test('restart эмитит tabs:changed — манифест пересобирается даже при проваленном резюме (не зацикливаемся на протухшем session_id)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  const before = events.filter((e) => e.channel === 'tabs:changed').length;
+  mgr.restart(a.tabId);
+  const after = events.filter((e) => e.channel === 'tabs:changed').length;
+  assert.strictEqual(after, before + 1);
+});
+
 test('restart: kill() фабрики синхронно зовёт свой onExit — гард по поколению не путает это с провалом resume/continue', () => {
   // Некоторые реализации pty (в т.ч. реальный node-pty) могут вызвать onExit
   // синхронно прямо из kill(). restart() бампает tab.gen ДО kill() именно чтобы

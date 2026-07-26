@@ -117,9 +117,14 @@ function registerIpc(win, opts = {}) {
 
   // Регистрация вкладки. cwd обязателен — renderer берёт его из диалога
   // или из конфига; smoke-режим подменяет команду в sessions.js.
-  ipcMain.handle('tabs:open', (_e, { cwd } = {}) => {
+  // command/args — прозрачный проброс (Task 4): staggered-resume шлёт
+  // 'claude' + ['--resume', sessionId] на восстановлении вкладки. Тайпчек
+  // здесь, а не в sessions.js — renderer недоверенный источник IPC-пейлоада.
+  ipcMain.handle('tabs:open', (_e, { cwd, command, args } = {}) => {
     if (typeof cwd !== 'string' || !cwd) return null;
-    return manager.open({ cwd, smoke });
+    const cmd = typeof command === 'string' ? command : undefined;
+    const a = Array.isArray(args) && args.every((x) => typeof x === 'string') ? args : undefined;
+    return manager.open({ cwd, smoke, command: cmd, args: a });
   });
 
   ipcMain.handle('tabs:close', (_e, tabId) => {

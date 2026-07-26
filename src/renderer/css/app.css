@@ -150,11 +150,81 @@ html, body {
   min-width: 0;
   display: flex;
   flex-direction: column;
+  position: relative; /* якорь для #restore-overlay */
 }
 #terminal-host { flex: 1; min-height: 0; position: relative; }
 /* Контейнеры терминалов вкладок (Task 4 создаёт .term-view на вкладку) */
 .term-view { position: absolute; inset: 0; padding: 4px 0 0 8px; }
 .term-view.hidden { display: none; }
+
+/* --- Оверлей восстановления воркспейса (Task 4): показывается на boot,
+   если манифест воркспейса непуст — накрывает всю главную область. --- */
+#restore-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(20, 20, 19, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 30;
+}
+.restore-card {
+  width: 90%;
+  max-width: 460px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-l);
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.restore-title {
+  font-family: var(--font-serif);
+  font-size: 18px;
+  color: var(--text);
+}
+#restore-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+.restore-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px;
+  border-radius: var(--radius-s);
+  cursor: pointer;
+}
+.restore-row:hover { background: var(--bg-hover); }
+.restore-row input[type="checkbox"] { flex: none; }
+.restore-row-info { min-width: 0; flex: 1; }
+.restore-row-name { font-size: 13px; color: var(--text); }
+.restore-row-cwd {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.restore-badge {
+  flex: none;
+  background: var(--bg-card);
+  color: var(--ok);
+  font-size: 10px;
+  padding: 2px 7px;
+  border-radius: 999px;
+}
+.restore-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+/* Кнопки оверлея не должны тянуться на всю ширину, как в sidebar-footer. */
+.restore-actions .sidebar-btn { flex: none; }
 
 /* --- Статус-бар --- */
 #status-bar {

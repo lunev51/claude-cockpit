@@ -14,8 +14,10 @@ const statusPty = () => $('status-pty');
 const statusFont = () => $('status-font');
 
 // Создать вкладку: контейнер + xterm + запись в стор. activate — переключиться сразу.
-async function openTab(cwd, { activate = true } = {}) {
-  const tab = await window.api.tabs.open({ cwd });
+// command/args — оверрайд команды на этот спавн (Task 4: staggered-resume
+// шлёт 'claude' + ['--resume', sessionId] при восстановлении воркспейса).
+async function openTab(cwd, { activate = true, command = null, args = null } = {}) {
+  const tab = await window.api.tabs.open({ cwd, command, args });
   if (!tab) return null;
 
   const container = document.createElement('div');
@@ -133,6 +135,134 @@ function bindHotkeys() {
   }, { capture: true });
 }
 
+// --- Экран восстановления воркспейса (Task 4) ---
+
+// Строит список чекбоксов оверлея из манифеста; возвращает чекбоксы в
+// порядке manifest.tabs (индекс совпадает — нужно для маппинга activeIndex).
+function renderRestoreList(tabs) {
+  const list = $('restore-list');
+  list.innerHTML = '';
+  const checkboxes = [];
+  tabs.forEach((t) => {
+    const row = document.createElement('label');
+    row.className = 'restore-row';
+
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = true;
+
+    const info = document.createElement('div');
+    info.className = 'restore-row-info';
+    const name = document.createElement('div');
+    name.className = 'restore-row-name';
+    name.textContent = t.name || t.cwd;
+    const cwd = document.createElement('div');
+    cwd.className = 'restore-row-cwd';
+    cwd.textContent = t.cwd;
+    cwd.title = t.cwd;
+    info.append(name, cwd);
+
+    row.append(cb, info);
+
+    if (t.sessionId) {
+      const badge = document.createElement('span');
+      badge.className = 'restore-badge';
+      badge.textContent = 'сессия сохранена';
+      row.appendChild(badge);
+    }
+
+    list.appendChild(row);
+    checkboxes.push(cb);
+  });
+  return checkboxes;
+}
+
+// Последовательный подъём отмеченных вкладок со стаггером: Claude CLI
+// успевает прочитать свою сессию/хуки до того, как поднимется следующая —
+// параллельный залп на несколько вкладок наблюдался нестабильным.
+async function restoreFlow(chosen, activeIndex, overlay) {
+  let restoredActive = null;  // вкладка с исходным manifest.activeIndex, если восстановлена
+  let firstRestored = null;
+  let overlayHidden = false;
+
+  for (let idx = 0; idx < chosen.length; idx++) {
+    const { t, i } = chosen[idx];
+    const tab = await openTab(t.cwd, {
+      activate: false,
+      command: 'claude',
+      args: t.sessionId ? ['--resume', t.sessionId] : null,
+    });
+    // Оверлей прячем сразу после старта ПЕРВОЙ вкладки — не ждём весь стаггер.
+    if (!overlayHidden) {
+      overlay.classList.add('hidden');
+      overlayHidden = true;
+    }
+    if (tab) {
+      if (!firstRestored) firstRestored = tab;
+      if (i === activeIndex) restoredActive = tab;
+    }
+    if (idx < chosen.length - 1) {
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  }
+
+  const toActivate = restoredActive || firstRestored;
+  if (toActivate) activateTab(toActivate.tabId);
+}
+
+// Показывает оверлей restore, слушает Enter/Esc и кнопки. Разрешается, когда
+// пользователь принял решение (сам подъём вкладок восстановления идёт дальше
+// асинхронно — оверлей к этому моменту уже спрятан либо прячется сам).
+function showRestoreOverlay(manifest) {
+  const overlay = $('restore-overlay');
+  const btnAll = $('btn-restore-all');
+  const btnNone = $('btn-restore-none');
+  const checkboxes = renderRestoreList(manifest.tabs);
+  overlay.classList.remove('hidden');
+
+  function detach() {
+    document.removeEventListener('keydown', onKey, true);
+    btnAll.removeEventListener('click', startRestore);
+    btnNone.removeEventListener('click', startEmpty);
+  }
+
+  function startEmpty() {
+    detach();
+    overlay.classList.add('hidden');
+    // Манифест НЕ трогаем — следующее открытие/закрытие вкладки перепишет
+    // его естественным образом (syncWorkspace в main реагирует на tabs:changed).
+    statusPty().textContent = '⌨ нет вкладок';
+  }
+
+  function startRestore() {
+    detach();
+    const chosen = manifest.tabs
+      .map((t, i) => ({ t, i }))
+      .filter(({ i }) => checkboxes[i].checked);
+    if (!chosen.length) {
+      overlay.classList.add('hidden');
+      statusPty().textContent = '⌨ нет вкладок';
+      return;
+    }
+    restoreFlow(chosen, manifest.activeIndex, overlay);
+  }
+
+  function onKey(ev) {
+    if (ev.key === 'Enter') {
+      ev.preventDefault();
+      startRestore();
+    } else if (ev.key === 'Escape') {
+      ev.preventDefault();
+      startEmpty();
+    }
+  }
+
+  // Горячие клавиши активны, только пока оверлей на экране.
+  document.addEventListener('keydown', onKey, true);
+  btnAll.addEventListener('click', startRestore);
+  btnNone.addEventListener('click', startEmpty);
+}
+
 async function boot() {
   config = await window.api.config.get();
 
@@ -164,8 +294,14 @@ async function boot() {
 
   bindHotkeys();
 
-  // Стартовая вкладка: cwd из конфига.
-  await openTab(config.terminal.cwd || '.');
+  // Манифест воркспейса (Task 3): пуст/отсутствует — старое поведение
+  // (стартовая вкладка из конфига). Непуст — оверлей restore (Task 4).
+  const manifest = await window.api.workspace.get();
+  if (!manifest || !Array.isArray(manifest.tabs) || manifest.tabs.length === 0) {
+    await openTab(config.terminal.cwd || '.');
+  } else {
+    showRestoreOverlay(manifest);
+  }
 
   window.api.app.onNotice(({ text }) => console.warn(`[notice] ${text}`));
 }
