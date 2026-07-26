@@ -51,12 +51,15 @@ function activateTab(tabId) {
 async function closeTab(tabId) {
   const entry = views.get(tabId);
   if (!entry) return;
+  const wasActive = tabStore.activeId === tabId;
   await window.api.tabs.close(tabId);
   entry.view.term.dispose();
   entry.container.remove();
   views.delete(tabId);
   tabStore.remove(tabId);
-  // Переключаемся на соседнюю вкладку, если закрыли активную.
+  // Переключаемся на соседнюю вкладку, только если закрыли активную —
+  // закрытие фоновой вкладки не должно перебивать фокус пользователя.
+  if (!wasActive) return;
   const rest = tabStore.order();
   if (rest.length) activateTab(rest[rest.length - 1]);
   else statusPty().textContent = '⌨ нет вкладок';
@@ -77,6 +80,10 @@ function bindHotkeys() {
     // Ctrl+Tab / Ctrl+Shift+Tab — циклическое переключение.
     if (ev.ctrlKey && ev.key === 'Tab') {
       ev.preventDefault();
+      // stopPropagation обязателен: иначе событие всё равно доходит до
+      // textarea xterm, и evaluateKeyboardEvent шлёт \t/ESC[Z в pty вкладки,
+      // которую мы как раз покидаем.
+      ev.stopPropagation();
       const ids = tabStore.order();
       if (!ids.length) return;
       const cur = ids.indexOf(tabStore.activeId);
