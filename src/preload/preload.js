@@ -28,4 +28,11 @@ contextBridge.exposeInMainWorld('api', {
   app: {
     onNotice: (cb) => ipcRenderer.on('app:notice', (_e, n) => cb(n)),
   },
+  project: {
+    connect: (tabId) => ipcRenderer.invoke('project:connect', tabId),
+    status: (tabId) => ipcRenderer.invoke('project:status', tabId),
+  },
+  tab: {
+    onStatus: (cb) => ipcRenderer.on('tab:status', (_e, p) => cb(p)),
+  },
 });

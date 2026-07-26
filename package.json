@@ -36,6 +36,7 @@
       "src/**",
       "assets/**",
       "config.json",
+      "scripts/**",
       "node_modules/**"
     ],
     "win": {

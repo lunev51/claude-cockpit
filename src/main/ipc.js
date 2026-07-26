@@ -7,6 +7,8 @@ const { getConfig, setConfig } = require('./config');
 const { createPty } = require('./pty');
 const { createSessionManager } = require('./sessions');
 const { createHookBridge } = require('./hook-bridge');
+const { connectProject, isConnected } = require('./connector');
+const { appRoot } = require('./paths');
 
 let manager = null;
 let smokeOutput = '';
@@ -102,6 +104,24 @@ function registerIpc(win, opts = {}) {
     });
     if (result.canceled || !result.filePaths.length) return null;
     return result.filePaths[0];
+  });
+
+  // Хуки Cockpit для проекта: прописываются в .claude/settings.json вкладки.
+  const hookOpts = () => ({
+    scriptPath: path.join(appRoot(), 'scripts', 'cockpit-hook.js'),
+    portFile: path.join(app.getPath('userData'), 'bridge-port'),
+  });
+  const tabCwd = (tabId) => manager.list().find((t) => t.tabId === tabId)?.cwd || null;
+
+  ipcMain.handle('project:connect', (_e, tabId) => {
+    const cwd = tabCwd(tabId);
+    if (!cwd) return { connected: false, error: 'вкладка не найдена' };
+    return connectProject(cwd, hookOpts());
+  });
+
+  ipcMain.handle('project:status', (_e, tabId) => {
+    const cwd = tabCwd(tabId);
+    return { connected: cwd ? isConnected(cwd) : false };
   });
 
   ipcMain.on('term:start', (_e, payload) => {
