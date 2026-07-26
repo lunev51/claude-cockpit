@@ -181,21 +181,31 @@ function renderRestoreList(tabs) {
 // успевает прочитать свою сессию/хуки до того, как поднимется следующая —
 // параллельный залп на несколько вкладок наблюдался нестабильным.
 async function restoreFlow(chosen, activeIndex, overlay) {
+  // Прячем оверлей СРАЗУ, не дожидаясь даже первой вкладки: решение уже
+  // принято, а гарантия «оверлей не должен зависнуть» так проще и надёжнее,
+  // чем прятать его условно внутри цикла (ревью, finding 2b).
+  overlay.classList.add('hidden');
+
   let restoredActive = null;  // вкладка с исходным manifest.activeIndex, если восстановлена
   let firstRestored = null;
-  let overlayHidden = false;
 
   for (let idx = 0; idx < chosen.length; idx++) {
     const { t, i } = chosen[idx];
-    const tab = await openTab(t.cwd, {
-      activate: false,
-      command: 'claude',
-      args: t.sessionId ? ['--resume', t.sessionId] : null,
-    });
-    // Оверлей прячем сразу после старта ПЕРВОЙ вкладки — не ждём весь стаггер.
-    if (!overlayHidden) {
-      overlay.classList.add('hidden');
-      overlayHidden = true;
+    let tab = null;
+    try {
+      tab = await openTab(t.cwd, {
+        // Первая УСПЕШНО поднятая вкладка становится видимой сразу — иначе
+        // при 2+ вкладках пользователь весь стаггер смотрит в пустой терминал
+        // (ревью, finding 1). Остальные — activate:false, финальная активация
+        // ниже решает, какая вкладка останется на экране.
+        activate: !firstRestored,
+        command: 'claude',
+        args: t.sessionId ? ['--resume', t.sessionId] : null,
+      });
+    } catch (err) {
+      // Одна упавшая вкладка не должна обрывать восстановление остальных
+      // (ревью, finding 2a) — пропускаем и идём дальше.
+      console.warn(`[restore] не удалось открыть вкладку ${t.cwd}:`, err);
     }
     if (tab) {
       if (!firstRestored) firstRestored = tab;
@@ -206,6 +216,9 @@ async function restoreFlow(chosen, activeIndex, overlay) {
     }
   }
 
+  // Может повторно активировать ту же вкладку, что уже показана первой
+  // (безвредно, activateTab идемпотентна) — либо переключить на вкладку
+  // исходного manifest.activeIndex, если она восстановилась позже первой.
   const toActivate = restoredActive || firstRestored;
   if (toActivate) activateTab(toActivate.tabId);
 }
@@ -244,7 +257,13 @@ function showRestoreOverlay(manifest) {
       statusPty().textContent = '⌨ нет вкладок';
       return;
     }
-    restoreFlow(chosen, manifest.activeIndex, overlay);
+    // restoreFlow — fire-and-forget; per-tab ошибки уже гасятся внутри неё
+    // (finding 2a), но подстраховка на случай непредвиденного throw снаружи
+    // цикла (finding 2c) — необработанный reject не должен уйти в консоль
+    // как unhandledrejection незамеченным.
+    restoreFlow(chosen, manifest.activeIndex, overlay).catch((err) => {
+      console.warn('[restore] restoreFlow упал:', err);
+    });
   }
 
   function onKey(ev) {

@@ -379,11 +379,24 @@ test('restart эмитит tabs:changed — манифест пересобир�
   const factory = makeFakePtyFactory();
   const { mgr, events } = makeManager(factory);
   const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
-  mgr.start(a.tabId, 80, 24);
-  const before = events.filter((e) => e.channel === 'tabs:changed').length;
-  mgr.restart(a.tabId);
-  const after = events.filter((e) => e.channel === 'tabs:changed').length;
-  assert.strictEqual(after, before + 1);
+  mgr.start(a.tabId, 80, 24); // спавн #1
+  const beforeFirstRestart = events.filter((e) => e.channel === 'tabs:changed').length;
+
+  mgr.restart(a.tabId); // спавн #2: session_id ещё не привязан — голый --resume (пикер)
+  const afterFirstRestart = events.filter((e) => e.channel === 'tabs:changed').length;
+  assert.strictEqual(afterFirstRestart, beforeFirstRestart + 1);
+
+  // Проваленное резюме: спавн #2 умирает естественной смертью, SessionStart за
+  // время его жизни так и не пришёл — onExit помечает tab.overrideFailed=true.
+  factory.spawned[1].opts.onExit(1);
+
+  mgr.restart(a.tabId); // спавн #3: overrideFailed=true → голые args (без цикла на пикере)
+  assert.deepStrictEqual(factory.spawned[2].opts.args, []);
+  const afterSecondRestart = events.filter((e) => e.channel === 'tabs:changed').length;
+  // Именно это и было целью теста: манифест пересобирается СНОВА даже на
+  // рестарте, вызванном провалом резюма, — иначе следующий запуск приложения
+  // продолжал бы пытаться резюмить уже протухший session_id.
+  assert.strictEqual(afterSecondRestart, afterFirstRestart + 1);
 });
 
 test('restart: kill() фабрики синхронно зовёт свой onExit — гард по поколению не путает это с провалом resume/continue', () => {
