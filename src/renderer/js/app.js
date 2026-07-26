@@ -49,6 +49,7 @@ function activateTab(tabId) {
   if (!entry) return;
   for (const [id, v] of views) v.container.classList.toggle('hidden', id !== tabId);
   tabStore.setActive(tabId);
+  window.api.workspace.setActive(tabId); // main пересчитает activeIndex манифеста
   // Статус-бар должен отражать активную вкладку, а не последнюю, что его обновляла.
   statusPty().textContent = entry.lastPtyStatus ? `⌨ ${entry.lastPtyStatus}` : '⌨ …';
   statusFont().textContent = `A ${entry.fontSize ?? config.terminal.fontSize}`;

@@ -8,12 +8,16 @@ const { createPty } = require('./pty');
 const { createSessionManager } = require('./sessions');
 const { createHookBridge } = require('./hook-bridge');
 const { connectProject, isConnected } = require('./connector');
+const { createWorkspaceStore } = require('./workspace');
 const { appRoot } = require('./paths');
 
 let manager = null;
 let smokeOutput = '';
 let bridge = null;       // текущий инстанс моста (может пересоздаваться при fallback на эфемерный порт)
 let stuckTimer = null;
+let store = null;        // стор манифеста воркспейса (workspace.js)
+let activeTabId = null;  // последний tabId, о котором сообщил renderer через workspace:setActive
+let smokeMode = false;   // копия флага smoke на уровне модуля — нужна flushWorkspace() снаружи registerIpc
 
 function getSmokeOutput() {
   return smokeOutput;
@@ -50,6 +54,28 @@ function validDim(n) {
 
 function registerIpc(win, opts = {}) {
   const { smoke = false } = opts;
+  smokeMode = smoke;
+
+  // Стор манифеста создаётся один раз на регистрацию — независимо от smoke,
+  // чтобы workspace:get всегда мог отдать хоть что-то (в smoke он просто
+  // никогда не пишется, см. syncWorkspace ниже).
+  store = createWorkspaceStore({ file: path.join(app.getPath('userData'), 'workspace.json') });
+
+  // Пересобирает манифест из живого состояния manager'а. activeIndex — позиция
+  // activeTabId в manager.list() (renderer сообщает её через workspace:setActive);
+  // не найдена/ещё не сообщена → 0 (совпадает со стартовой вкладкой).
+  // В smoke-режиме — no-op: параллельный smoke run не должен затирать
+  // манифест живого инстанса (тот же урок, что и с bridge-port-файлом).
+  function syncWorkspace() {
+    if (smoke) return;
+    const list = manager.list();
+    const idx = list.findIndex((t) => t.tabId === activeTabId);
+    store.set({
+      version: 1,
+      activeIndex: idx === -1 ? 0 : idx,
+      tabs: list.map(({ cwd, name, sessionId, ghostId }) => ({ cwd, name, sessionId, ghostId })),
+    });
+  }
 
   manager = createSessionManager({
     ptyFactory: createPty,
@@ -60,6 +86,7 @@ function registerIpc(win, opts = {}) {
     getExtraEnv: () => (bridge && bridge.port() ? { COCKPIT_BRIDGE_PORT: String(bridge.port()) } : {}),
     onEvent: (channel, payload) => {
       if (smoke && channel === 'term:data') smokeOutput += payload.data;
+      if (channel === 'tabs:changed') syncWorkspace();
       if (!win.isDestroyed()) win.webContents.send(channel, payload);
     },
   });
@@ -97,6 +124,17 @@ function registerIpc(win, opts = {}) {
 
   ipcMain.handle('tabs:close', (_e, tabId) => {
     if (typeof tabId === 'string') manager.close(tabId);
+  });
+
+  // Живой манифест воркспейса (Task 3): renderer читает его на старте (Task 4)
+  // и репортит активную вкладку при каждом переключении.
+  ipcMain.handle('workspace:get', () => store.load());
+
+  ipcMain.on('workspace:setActive', (_e, p) => {
+    if (p && typeof p.tabId === 'string') {
+      activeTabId = p.tabId;
+      if (!smoke) syncWorkspace();
+    }
   });
 
   ipcMain.handle('tabs:chooseFolder', async () => {
@@ -158,6 +196,15 @@ function registerIpc(win, opts = {}) {
   });
 }
 
+// Форсирует немедленную запись манифеста (debounce workspace.js иначе может
+// не успеть до выхода процесса). Зовётся ДО disposeSessions — иначе к моменту
+// flush() список вкладок уже опустеет из-за disposeAll() внутри неё.
+// В smoke — no-op: манифест там и так никогда не писался (см. syncWorkspace).
+function flushWorkspace() {
+  if (smokeMode) return;
+  if (store) store.flush();
+}
+
 // Идемпотентно гасит мост хуков (безопасно звать повторно — например,
 // window-all-closed и before-quit оба доходят до disposeSessions).
 function stopBridge() {
@@ -176,4 +223,4 @@ function disposeSessions() {
   if (manager) manager.disposeAll();
 }
 
-module.exports = { registerIpc, disposeSessions, stopBridge, getSmokeOutput };
+module.exports = { registerIpc, disposeSessions, stopBridge, getSmokeOutput, flushWorkspace };

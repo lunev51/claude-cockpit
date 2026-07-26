@@ -26,8 +26,9 @@ function createSessionManager({
   function open({ cwd, command = null, args = null, smoke = false }) {
     const tabId = crypto.randomUUID();
     const name = path.basename(cwd) || cwd;
+    const ghostId = crypto.randomUUID(); // id ghost-буфера вкладки (Task 5) — стабилен на весь жизненный цикл вкладки
     tabs.set(tabId, {
-      tabId, cwd, name, smoke,
+      tabId, cwd, name, smoke, ghostId,
       command, args,           // per-tab переопределение (claude --resume <id> в фазе 2b)
       proc: null, cols: 80, rows: 24, alive: false,
       gen: 0,                  // поколение спавна: гардит все колбэки от гонок
@@ -37,6 +38,7 @@ function createSessionManager({
       pendingExtraArgs: null,  // одноразовый оверрайд args на следующий spawn() (хотфикс restart, спека §3.14)
       overrideFailed: false,   // true = процесс с оверрайдом (--resume <id>/--resume) умер, а SessionStart так и не привязал сессию
     });
+    onEvent('tabs:changed', {}); // состав вкладок изменился — main пересоберёт манифест
     return { tabId, cwd, name };
   }
 
@@ -190,6 +192,7 @@ function createSessionManager({
       try { tab.proc.kill(); } catch { /* мог уже завершиться */ }
     }
     tabs.delete(tabId);
+    onEvent('tabs:changed', {}); // состав вкладок изменился — main пересоберёт манифест
   }
 
   // --- привязка session_id и события хуков ---
@@ -197,6 +200,7 @@ function createSessionManager({
   function bindSession(tabId, sessionId) {
     const tab = tabs.get(tabId);
     if (tab) tab.sessionId = sessionId;
+    onEvent('tabs:changed', {}); // sessionId вкладки мог измениться — манифест должен это узнать
   }
 
   // Знает ли менеджер такой tabId вообще (для точной адресации хуков по
@@ -265,8 +269,8 @@ function createSessionManager({
   }
 
   function list() {
-    return [...tabs.values()].map(({ tabId, cwd, name, alive, status, subtitle, sessionId }) => (
-      { tabId, cwd, name, alive, status, subtitle, sessionId }
+    return [...tabs.values()].map(({ tabId, cwd, name, alive, status, subtitle, sessionId, ghostId }) => (
+      { tabId, cwd, name, alive, status, subtitle, sessionId, ghostId }
     ));
   }
 

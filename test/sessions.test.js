@@ -364,6 +364,17 @@ test('restart: разрыв с хуками (proc жив, SessionStart не пр
   assert.deepStrictEqual(factory.spawned[2].opts.args, ['--resume']);
 });
 
+// ---------- Phase 2b Task 3: живой манифест воркспейса ----------
+
+test('open→close эмитят tabs:changed (лёгкий сигнал «пересобери манифест»)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.close(a.tabId);
+  const changed = events.filter((e) => e.channel === 'tabs:changed');
+  assert.strictEqual(changed.length, 2);
+});
+
 test('restart: kill() фабрики синхронно зовёт свой onExit — гард по поколению не путает это с провалом resume/continue', () => {
   // Некоторые реализации pty (в т.ч. реальный node-pty) могут вызвать onExit
   // синхронно прямо из kill(). restart() бампает tab.gen ДО kill() именно чтобы

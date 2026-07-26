@@ -35,4 +35,8 @@ contextBridge.exposeInMainWorld('api', {
   tab: {
     onStatus: (cb) => ipcRenderer.on('tab:status', (_e, p) => cb(p)),
   },
+  workspace: {
+    get: () => ipcRenderer.invoke('workspace:get'),
+    setActive: (tabId) => ipcRenderer.send('workspace:setActive', { tabId }),
+  },
 });
