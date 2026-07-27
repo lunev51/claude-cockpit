@@ -333,7 +333,14 @@ function bindHotkeys() {
       ev.preventDefault();
       ev.stopPropagation();
       peek?.hide();
-      if (palette.isOpen()) palette.close(); else palette.open();
+      // Fix round 1 (ревью): peek?.hide() выше уже мог схлопнуть
+      // document.activeElement на <body> (см. подробный разбор в palette.js/
+      // open) — передаём терминал активной вкладки как fallback НА СЛУЧАЙ
+      // именно этой ситуации; в обычном случае (Ctrl+P прямо из терминала)
+      // palette.open() им не воспользуется, т.к. document.activeElement и так
+      // валиден.
+      if (palette.isOpen()) palette.close();
+      else palette.open(views.get(tabStore.activeId)?.view);
       return;
     }
     // Ctrl+1..9 — вкладка по индексу.

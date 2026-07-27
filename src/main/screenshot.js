@@ -20,6 +20,22 @@ function timestampName(now) {
   return `${date}-${time}.png`;
 }
 
+// Разрешение timestampName — 1с: две вставки в один и тот же буфер в течение
+// одной секунды дают одинаковое имя файла. Без этой проверки второй write
+// молча затёр бы первый PNG. Ищем первое свободное имя, добавляя суффикс
+// -2, -3, … (первая попытка — без суффикса, как раньше).
+function uniqueFile(shotsDir, now) {
+  const base = timestampName(now);
+  const stem = base.slice(0, -'.png'.length);
+  let candidate = path.join(shotsDir, base);
+  let n = 2;
+  while (fs.existsSync(candidate)) {
+    candidate = path.join(shotsDir, `${stem}-${n}.png`);
+    n += 1;
+  }
+  return candidate;
+}
+
 // saveClipboardImage({ readImage, dir, now }) → { path } | null.
 // readImage() — Electron-подобный nativeImage: isEmpty()/toPNG(). Если в
 // буфере не картинка (isEmpty() === true) — возвращаем null, ничего не пишем.
@@ -40,7 +56,7 @@ function saveClipboardImage({ readImage, dir, now }) {
     } catch { /* best-effort — отсутствие .gitignore не критично */ }
   }
 
-  const file = path.join(shotsDir, timestampName(now));
+  const file = uniqueFile(shotsDir, now);
   fs.writeFileSync(file, image.toPNG());
   return { path: file };
 }

@@ -139,9 +139,25 @@ export function createPalette({ root, getActions }) {
     return overlay;
   }
 
-  function open() {
+  // open(fallbackFocus): fallbackFocus — необязательный объект с .focus() (DOM-
+  // элемент или что угодно с таким методом, например возвращаемый initTerminal()
+  // { focus, ... } из app.js) — используется, ТОЛЬКО если document.activeElement
+  // в момент открытия не годится сам по себе.
+  function open(fallbackFocus = null) {
     if (isOpenFlag) return; // повторный Ctrl+P — app.js сам решает закрыть (toggle)
-    previousActive = document.activeElement;
+    const active = document.activeElement;
+    // Fix round 1 (ревью): app.js зовёт peek?.hide() ПЕРЕД palette.open(), а
+    // peek.hide() синхронно убирает из DOM свой сфокусированный <input> —
+    // браузер в этот момент откатывает document.activeElement на <body>
+    // (стандартное поведение при удалении сфокусированного элемента). Если
+    // бы мы наивно запомнили document.activeElement как есть, close() потом
+    // вызвал бы .focus() на <body> — no-op, и фокус повисал бы «в никуда»
+    // вместо терминала (репро: клик по waiting-строке → peek открылся →
+    // Ctrl+P → Esc → терминал НЕ в фокусе). document.contains(active) той же
+    // веткой отсекает и вообще любой отсоединённый от DOM элемент.
+    previousActive = (active && active !== document.body && document.contains(active))
+      ? active
+      : fallbackFocus;
     actions = getActions() || [];
     filtered = filterActions(actions, '');
     selected = 0;

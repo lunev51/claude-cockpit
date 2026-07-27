@@ -87,3 +87,32 @@ test('readImage() возвращающий null/undefined (а не объект 
   const res = saveClipboardImage({ readImage: () => null, dir, now: Date.now() });
   assert.strictEqual(res, null);
 });
+
+test('две вставки с ОДИНАКОВЫМ now (разрешение timestampName — 1с) → разные файлы, оба существуют, первый НЕ затёрт', () => {
+  const dir = tmpDir();
+  const now = new Date(2026, 6, 27, 10, 0, 0).getTime();
+  const pngA = Buffer.from([9, 9, 9]);
+  const pngB = Buffer.from([8, 8, 8]);
+
+  const resA = saveClipboardImage({ readImage: () => fakeImage(pngA), dir, now });
+  const resB = saveClipboardImage({ readImage: () => fakeImage(pngB), dir, now });
+
+  assert.notStrictEqual(resA.path, resB.path);
+  assert.ok(fs.existsSync(resA.path));
+  assert.ok(fs.existsSync(resB.path));
+  assert.deepStrictEqual(fs.readFileSync(resA.path), pngA); // первый не затёрт вторым
+  assert.deepStrictEqual(fs.readFileSync(resB.path), pngB);
+});
+
+test('третья и последующие вставки в ту же секунду продолжают счётчик суффиксов (-2, -3, …)', () => {
+  const dir = tmpDir();
+  const now = new Date(2026, 6, 27, 10, 0, 0).getTime();
+  const results = [Buffer.from([1]), Buffer.from([2]), Buffer.from([3])].map(
+    (png) => saveClipboardImage({ readImage: () => fakeImage(png), dir, now }),
+  );
+  assert.deepStrictEqual(results.map((r) => path.basename(r.path)), [
+    '20260727-100000.png',
+    '20260727-100000-2.png',
+    '20260727-100000-3.png',
+  ]);
+});
