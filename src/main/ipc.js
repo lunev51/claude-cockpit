@@ -10,6 +10,7 @@ const { createSessionManager } = require('./sessions');
 const { createHookBridge } = require('./hook-bridge');
 const { connectProject, isConnected } = require('./connector');
 const { createWorkspaceStore } = require('./workspace');
+const { createWorkspaceSync } = require('./workspace-sync');
 const { appRoot } = require('./paths');
 
 let manager = null;
@@ -17,8 +18,8 @@ let smokeOutput = '';
 let bridge = null;       // текущий инстанс моста (может пересоздаваться при fallback на эфемерный порт)
 let stuckTimer = null;
 let store = null;        // стор манифеста воркспейса (workspace.js)
+let wsync = null;        // гейт синхронизации манифеста (workspace-sync.js) — FIX 1/2 ревью
 let activeTabId = null;  // последний tabId, о котором сообщил renderer через workspace:setActive
-let smokeMode = false;   // копия флага smoke на уровне модуля — нужна flushWorkspace() снаружи registerIpc
 
 function getSmokeOutput() {
   return smokeOutput;
@@ -67,12 +68,17 @@ function validDim(n) {
 
 function registerIpc(win, opts = {}) {
   const { smoke = false } = opts;
-  smokeMode = smoke;
 
   // Стор манифеста создаётся один раз на регистрацию — независимо от smoke,
   // чтобы workspace:get всегда мог отдать хоть что-то (в smoke он просто
-  // никогда не пишется, см. syncWorkspace ниже).
+  // никогда не пишется, см. wsync ниже).
   store = createWorkspaceStore({ file: path.join(app.getPath('userData'), 'workspace.json') });
+  // wsync — гейт поверх store (workspace-sync.js): sync() инертен, пока
+  // renderer не отрапортует workspace:ready (FIX 2, восстановление ещё не
+  // завершено), и НАВСЕГДА инертен после markQuitting() (FIX 1, критический
+  // баг ревью — см. подробный разбор в workspace-sync.js). listTabs — ленивая
+  // ссылка на manager, который будет присвоен чуть ниже в этой же функции.
+  wsync = createWorkspaceSync({ store, listTabs: () => manager.list(), smoke });
 
   // Разовая уборка ghost-файлов-сирот (Task 5, ревью finding 1b). До фикса
   // finding 1a восстановление минтило новый ghostId на каждый запуск —
@@ -110,20 +116,12 @@ function registerIpc(win, opts = {}) {
     }
   }
 
-  // Пересобирает манифест из живого состояния manager'а. activeIndex — позиция
-  // activeTabId в manager.list() (renderer сообщает её через workspace:setActive);
-  // не найдена/ещё не сообщена → 0 (совпадает со стартовой вкладкой).
-  // В smoke-режиме — no-op: параллельный smoke run не должен затирать
-  // манифест живого инстанса (тот же урок, что и с bridge-port-файлом).
+  // Пересобирает манифест из живого состояния manager'а — тонкая обёртка над
+  // wsync.sync(), которая сама решает, писать ли вообще (smoke/не-ready/quitting,
+  // см. workspace-sync.js). activeTabId — последний tabId, о котором сообщил
+  // renderer через workspace:setActive; не найден/ещё не сообщён → 0.
   function syncWorkspace() {
-    if (smoke) return;
-    const list = manager.list();
-    const idx = list.findIndex((t) => t.tabId === activeTabId);
-    store.set({
-      version: 1,
-      activeIndex: idx === -1 ? 0 : idx,
-      tabs: list.map(({ cwd, name, sessionId, ghostId }) => ({ cwd, name, sessionId, ghostId })),
-    });
+    wsync.sync(activeTabId);
   }
 
   manager = createSessionManager({
@@ -166,18 +164,27 @@ function registerIpc(win, opts = {}) {
 
   // Регистрация вкладки. cwd обязателен — renderer берёт его из диалога
   // или из конфига; smoke-режим подменяет команду в sessions.js.
-  // command/args — прозрачный проброс (Task 4): staggered-resume шлёт
-  // 'claude' + ['--resume', sessionId] на восстановлении вкладки. Тайпчек
-  // здесь, а не в sessions.js — renderer недоверенный источник IPC-пейлоада.
+  // command/args — прозрачный проброс: явный оверрайд конкретного спавна
+  // (используется, например, Ctrl+Shift+R-подобными сценариями расширений).
+  // Восстановление воркспейса (FIX 3, ревью) command/args больше НЕ шлёт —
+  // вместо этого передаёт sessionId, а sessions.js сам решает, как резюмить,
+  // не теряя при этом конфигурационные args (--model и т.п.) и не игнорируя
+  // config.terminal.command. Тайпчек здесь, а не в sessions.js — renderer
+  // недоверенный источник IPC-пейлоада.
   // ghostId (Task 5, ревью finding 1a) — восстановление передаёт исходный id
   // вкладки из манифеста, чтобы не заводить новый ghost-файл при каждом
   // restore и не осиротить старый.
-  ipcMain.handle('tabs:open', (_e, { cwd, command, args, ghostId } = {}) => {
+  ipcMain.handle('tabs:open', (_e, {
+    cwd, command, args, ghostId, sessionId,
+  } = {}) => {
     if (typeof cwd !== 'string' || !cwd) return null;
     const cmd = typeof command === 'string' ? command : undefined;
     const a = Array.isArray(args) && args.every((x) => typeof x === 'string') ? args : undefined;
     const gid = typeof ghostId === 'string' && ghostId ? ghostId : undefined;
-    return manager.open({ cwd, smoke, command: cmd, args: a, ghostId: gid });
+    const sid = typeof sessionId === 'string' && sessionId ? sessionId : undefined;
+    return manager.open({
+      cwd, smoke, command: cmd, args: a, ghostId: gid, sessionId: sid,
+    });
   });
 
   ipcMain.handle('tabs:close', (_e, tabId) => {
@@ -209,11 +216,18 @@ function registerIpc(win, opts = {}) {
     try {
       fs.mkdirSync(ghostDir(), { recursive: true });
       // Ограничиваем размер: длинный скроллбек режем с конца — хвост
-      // (последний вывод) ценнее шапки.
+      // (последний вывод) ценнее шапки. FIX 7 (ревью): режем не строго по
+      // байту точки среза, а по ближайшему '\n' ПОСЛЕ неё — иначе prelude
+      // может начаться с середины многобайтового UTF-8 символа или с обрывка
+      // escape-последовательности (терминал получит мусорные байты первой
+      // же строкой). Если после точки среза переноса строки не нашлось —
+      // строка длиннее лимита сама по себе, режем по байту как раньше.
       let out = text;
       if (Buffer.byteLength(out, 'utf8') > GHOST_MAX_BYTES) {
         const buf = Buffer.from(out, 'utf8');
-        out = buf.subarray(buf.length - GHOST_MAX_BYTES).toString('utf8');
+        const cut = buf.length - GHOST_MAX_BYTES;
+        const nl = buf.indexOf(0x0A, cut); // '\n' — единственный байт даже внутри UTF-8
+        out = buf.subarray(nl === -1 ? cut : nl + 1).toString('utf8');
       }
       fs.writeFileSync(ghostFile(tab.ghostId), out, 'utf8');
     } catch (err) {
@@ -242,8 +256,18 @@ function registerIpc(win, opts = {}) {
   ipcMain.on('workspace:setActive', (_e, p) => {
     if (p && typeof p.tabId === 'string') {
       activeTabId = p.tabId;
-      if (!smoke) syncWorkspace();
+      syncWorkspace();
     }
+  });
+
+  // FIX 2 (ревью): renderer шлёт это, когда восстановление воркспейса на
+  // старте полностью завершено (либо решено начать пусто) — до этого момента
+  // wsync.sync() молчит, так что промежуточные (неполные) составы вкладок
+  // из стаггера restoreFlow никогда не попадают в манифест. См. app.js —
+  // три места вызова window.api.workspace.ready().
+  ipcMain.on('workspace:ready', () => {
+    wsync.markReady();
+    syncWorkspace();
   });
 
   ipcMain.handle('tabs:chooseFolder', async () => {
@@ -306,12 +330,20 @@ function registerIpc(win, opts = {}) {
 }
 
 // Форсирует немедленную запись манифеста (debounce workspace.js иначе может
-// не успеть до выхода процесса). Зовётся ДО disposeSessions — иначе к моменту
-// flush() список вкладок уже опустеет из-за disposeAll() внутри неё.
-// В smoke — no-op: манифест там и так никогда не писался (см. syncWorkspace).
+// не успеть до выхода процесса) и НАВСЕГДА глушит дальнейшую синхронизацию —
+// FIX 1 (КРИТИЧЕСКИЙ, ревью). main.js зовёт flushWorkspace() дважды за один
+// выход (window-all-closed, потом before-quit), а между этими двумя вызовами
+// disposeSessions() закрывает все вкладки одну за другой — каждое закрытие
+// шлёт tabs:changed, который раньше писал в pending уже опустевший список.
+// Порядок здесь важен: сначала flush() коммитит на диск последнее ХОРОШЕЕ
+// состояние (то, что успел собрать sync() до этого момента), и ТОЛЬКО ПОТОМ
+// markQuitting() отрезает любые дальнейшие sync() — так закрытие вкладок
+// внутри disposeSessions(), которое происходит СРАЗУ вслед за этим вызовом,
+// уже не может затереть pending пустым списком к моменту второго flush().
 function flushWorkspace() {
-  if (smokeMode) return;
-  if (store) store.flush();
+  if (!wsync) return;
+  wsync.flush();
+  wsync.markQuitting();
 }
 
 // Идемпотентно гасит мост хуков (безопасно звать повторно — например,

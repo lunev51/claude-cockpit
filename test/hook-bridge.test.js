@@ -152,6 +152,38 @@ test('portFile получает фактический порт', async () => {
   }
 });
 
+// FIX 9 (ревью): второй инстанс, проигравший single-instance-lock, доходит до
+// stop() своего (никогда реально не слушавшего publично) моста — не должен
+// удалять port-файл живого первого инстанса, если тот уже переписал его своим
+// портом.
+test('FIX 9: stop() НЕ удаляет portFile, если в нём чужой (не наш) порт', async () => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const pf = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'cockpit-test-')), 'bridge-port');
+  const sessions = makeFakeSessions();
+  const bridge = createHookBridge({ sessions, port: 0, portFile: pf });
+  await bridge.start();
+  // Живой (другой) инстанс успел переписать файл своим портом ПОСЛЕ того,
+  // как этот bridge стартовал и записал туда свой актуальный порт.
+  fs.writeFileSync(pf, '99999', 'utf8');
+  bridge.stop();
+  assert.strictEqual(fs.existsSync(pf), true);
+  assert.strictEqual(fs.readFileSync(pf, 'utf8').trim(), '99999');
+});
+
+test('FIX 9: stop() удаляет portFile, если содержимое всё ещё совпадает с нашим фактическим портом', async () => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const pf = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'cockpit-test-')), 'bridge-port');
+  const sessions = makeFakeSessions();
+  const bridge = createHookBridge({ sessions, port: 0, portFile: pf });
+  await bridge.start();
+  bridge.stop();
+  assert.strictEqual(fs.existsSync(pf), false);
+});
+
 test('POST с text/plain content-type → 400, applyHookEvent не зовётся', async () => {
   const sessions = makeFakeSessions();
   sessions.bySession.set('sess-1', 'tab-1');

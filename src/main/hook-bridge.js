@@ -93,7 +93,21 @@ function createHookBridge({ sessions, port = 0, portFile = null }) {
       server = null;
     }
     if (portFile) {
-      try { fs.unlinkSync(portFile); } catch { /* нет файла — ок */ }
+      // FIX 9 (ревью): второй запуск, проигравший requestSingleInstanceLock()
+      // в main.js, зовёт app.quit() — но модуль продолжает выполняться дальше
+      // синхронно, доходит до before-quit/window-all-closed и до этого stop()
+      // тоже. Раньше он безусловно удалял portFile — то есть проигравший
+      // инстанс стирал port-файл ЖИВОГО первого инстанса, и внешние
+      // claude-сессии теряли доставку хуков в уже работающий Cockpit.
+      // Удаляем файл, только если его содержимое всё ещё совпадает с портом,
+      // который слушали именно МЫ: если там другое число — значит файл уже
+      // переписан реально живым (другим) инстансом, и трогать его нельзя.
+      try {
+        const contents = fs.readFileSync(portFile, 'utf8').trim();
+        if (Number(contents) === actualPort) {
+          fs.unlinkSync(portFile);
+        }
+      } catch { /* нет файла или не прочитать — не страшно */ }
     }
   }
 

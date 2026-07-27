@@ -73,3 +73,34 @@ test('flush без set — no-op, файла нет', () => {
   createWorkspaceStore({ file }).flush();
   assert.strictEqual(fs.existsSync(file), false);
 });
+
+// FIX 8 (ревью): битый file не должен затирать хороший .bak при следующей записи.
+test('FIX 8: если текущий file побит (внешняя порча), writeNow НЕ копирует его в .bak — старый .bak переживает', () => {
+  const file = tmpFile();
+  const store = createWorkspaceStore({ file, debounceMs: 10000 });
+  // Поколение 1 (STATE) — валидное; file ещё не существовал, копировать в .bak
+  // нечего. После этой записи: file=STATE, .bak отсутствует.
+  store.set(STATE);
+  store.flush();
+  // Поколение 2 (gen2) — тоже валидная запись через store. ПЕРЕД записью
+  // gen2 в file лежал STATE (валиден) → он уходит в .bak. После: file=gen2, .bak=STATE.
+  const gen2 = { ...STATE, activeIndex: 0 };
+  store.set(gen2);
+  store.flush();
+  assert.deepStrictEqual(createWorkspaceStore({ file }).load(), gen2);
+  // Внешний процесс портит file НАПРЯМУЮ, в обход store (например, сбойный
+  // сторонний писатель, обрыв диска). .bak при этом не трогается — всё ещё STATE.
+  fs.writeFileSync(file, '{broken external corruption', 'utf8');
+  // Следующая штатная запись через store (gen3): БЕЗ фикса writeNow увидела бы
+  // fs.existsSync(file)===true и скопировала бы ПОБИТОЕ содержимое поверх
+  // хорошего .bak=STATE, уничтожив последнее валидное поколение навсегда.
+  const gen3 = { ...STATE, activeIndex: 1, tabs: [STATE.tabs[0]] };
+  store.set(gen3);
+  store.flush();
+  // С фиксом: readValid(file) вернул null (file побит) → копирования не было →
+  // .bak остался STATE (последнее, что реально туда легло) — не побитым и не gen2.
+  const bakStore = createWorkspaceStore({ file: `${file}.bak` });
+  assert.deepStrictEqual(bakStore.load(), STATE);
+  // И актуальный file — это уже свежая gen3-запись поверх бывшей порчи.
+  assert.deepStrictEqual(createWorkspaceStore({ file }).load(), gen3);
+});

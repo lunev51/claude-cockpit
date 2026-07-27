@@ -43,7 +43,7 @@ function createSessionManager({
   const tabs = new Map();
 
   function open({
-    cwd, command = null, args = null, smoke = false, ghostId = null,
+    cwd, command = null, args = null, smoke = false, ghostId = null, sessionId = null,
   }) {
     const tabId = crypto.randomUUID();
     const name = path.basename(cwd) || cwd;
@@ -55,10 +55,17 @@ function createSessionManager({
     const resolvedGhostId = typeof ghostId === 'string' && ghostId ? ghostId : crypto.randomUUID();
     tabs.set(tabId, {
       tabId, cwd, name, smoke, ghostId: resolvedGhostId,
-      command, args,           // per-tab переопределение (claude --resume <id> в фазе 2b)
+      command, args,           // per-tab переопределение (явный оверрайд конкретного спавна)
       proc: null, cols: 80, rows: 24, alive: false,
       gen: 0,                  // поколение спавна: гардит все колбэки от гонок
-      sessionId: null,         // session_id Claude Code из SessionStart-хука
+      // FIX 3 (ревью): sessionId восстановления передаётся ОТДЕЛЬНО от args —
+      // раньше restoreFlow слал command:'claude'+args:['--resume', id], что (а)
+      // подменяло конфигурационные args вкладки (--model и т.п. молча терялись)
+      // и (б) игнорировало config.terminal.command. Теперь spawn() сам достраивает
+      // ['--resume', sessionId] ПОВЕРХ базовых args на первый же спавн вкладки.
+      sessionId: sessionId || null,
+      resumeOnFirstSpawn: !!sessionId, // одноразовый флаг: спавн #1 добавит --resume <id>
+      sessionBound: false,     // true, только когда SessionStart реально привязал сессию (bindSession)
       status: null, subtitle: '', waitingText: '',
       lastOutputAt: now(),
       pendingExtraArgs: null,  // одноразовый оверрайд args на следующий spawn() (хотфикс restart, спека §3.14)
@@ -87,10 +94,20 @@ function createSessionManager({
     // pendingExtraArgs — одноразовый оверрайд от restart() (--resume <id> или
     // голый --resume), потребляется здесь и сбрасывается, чтобы следующий
     // обычный спавн был «голым».
-    const extraArgs = tab.pendingExtraArgs;
+    let extraArgs = tab.pendingExtraArgs;
     tab.pendingExtraArgs = null;
-    const usedOverride = extraArgs !== null; // этот спавн ушёл с оверрайдом --resume
+    let usedOverride = extraArgs !== null; // этот спавн ушёл с оверрайдом --resume
     const baseArgs = tab.args || t.args;
+    // FIX 3 (ревью): если restart() не заказал явный оверрайд, а вкладка
+    // восстановлена с известным sessionId и это её самый первый спавн —
+    // достраиваем --resume <id> ПОВЕРХ конфигурационных baseArgs (а не вместо
+    // них, как раньше делал restoreFlow через args:['--resume', id]). Флаг
+    // одноразовый — второй и далее спавны этой вкладки идут без него.
+    if (extraArgs === null && tab.resumeOnFirstSpawn && tab.sessionId) {
+      extraArgs = ['--resume', tab.sessionId];
+      tab.resumeOnFirstSpawn = false;
+      usedOverride = true;
+    }
     const spec = tab.smoke
       ? { command: 'cmd.exe', args: ['/c', 'echo PTY_OK'] }
       : { command: tab.command || t.command, args: extraArgs ? [...baseArgs, ...extraArgs] : baseArgs };
@@ -121,9 +138,18 @@ function createSessionManager({
         onExit: (exitCode) => {
           if (myGen !== tab.gen) return; // stale exit после рестарта (или намеренный kill — см. гард в restart())
           // Провал резюма/continue: процесс с оверрайдом умер естественной смертью,
-          // а SessionStart так и не привязал session_id за время его жизни —
-          // следующий restart() уйдёт в голые args (не зацикливаемся).
-          if (usedOverride && !tab.sessionId) tab.overrideFailed = true;
+          // а SessionStart так и не привязал сессию за время его жизни —
+          // следующий restart() уйдёт в голые args (не зацикливаемся). FIX 3
+          // (ревью): проверяем ПО ФАКТУ привязки (sessionBound), а не по
+          // наличию sessionId — иначе восстановленная вкладка (у которой
+          // sessionId уже был известен ДО спавна, из манифеста) никогда не
+          // считалась бы провалившейся, даже если resume реально не удался.
+          // Плюс обнуляем протухший sessionId — иначе он уедет в манифест и
+          // следующий запуск снова попробует резюмить уже мёртвую сессию.
+          if (usedOverride && !tab.sessionBound) {
+            tab.overrideFailed = true;
+            tab.sessionId = null;
+          }
           tab.proc = null;
           tab.alive = false;
           setStatus(tab, 'dead', `процесс завершён (код ${exitCode})`);
@@ -191,6 +217,7 @@ function createSessionManager({
     }
 
     tab.sessionId = null; // новая жизнь — новый SessionStart перебиндит
+    tab.sessionBound = false; // FIX 3: привязка тоже сбрасывается — новый спавн ещё не подтверждён
 
     if (boundSessionId) {
       // 1. session_id уже известен (из прошлого SessionStart) — резюмируем именно его.
@@ -234,7 +261,10 @@ function createSessionManager({
 
   function bindSession(tabId, sessionId) {
     const tab = tabs.get(tabId);
-    if (tab) tab.sessionId = sessionId;
+    if (tab) {
+      tab.sessionId = sessionId;
+      tab.sessionBound = true; // FIX 3: единственное место, где привязка считается ПОДТВЕРЖДЁННОЙ
+    }
     onEvent('tabs:changed', {}); // sessionId вкладки мог измениться — манифест должен это узнать
   }
 

@@ -478,6 +478,69 @@ test('checkStuck: после первого хук-события (hookActive=tr
 
 // ---------- Phase 2b Task 6: зачистка унаследованных маркеров Claude Code ----------
 
+// ---------- FIX 3 (ревью): sessionId восстановления не теряется, конфигурационные args сохраняются ----------
+
+test('open с sessionId — list() отдаёт его сразу; первый spawn получает [...configArgs, "--resume", id], конфигурационные args СОХРАНЕНЫ', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory, {
+    // getTermConfig с пользовательскими args (--model sonnet) — ключевая
+    // проверка: раньше restoreFlow слал args:['--resume', id], который
+    // ПОДМЕНЯЛ конфигурационные args вкладки, и пользователь молча получал
+    // другую модель на восстановленной вкладке.
+    getTermConfig: () => ({ command: 'claude', args: ['--model', 'sonnet'], useConpty: true, useConptyDll: true }),
+  });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha', sessionId: 'sess-restored' });
+  // sessionId виден в list() ДО первого спавна и до какого-либо SessionStart —
+  // манифест не должен ждать хук-события, чтобы узнать восстанавливаемый id.
+  assert.strictEqual(mgr.list().find((t) => t.tabId === a.tabId).sessionId, 'sess-restored');
+
+  mgr.start(a.tabId, 80, 24);
+  assert.strictEqual(factory.spawned[0].opts.command, 'claude');
+  assert.deepStrictEqual(factory.spawned[0].opts.args, ['--model', 'sonnet', '--resume', 'sess-restored']);
+});
+
+test('после restore-спавна restart() даёт РОВНО один --resume (резюм-флаги больше не живут в tab.args)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory, {
+    getTermConfig: () => ({ command: 'claude', args: ['--model', 'sonnet'], useConpty: true, useConptyDll: true }),
+  });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha', sessionId: 'sess-restored' });
+  mgr.start(a.tabId, 80, 24); // спавн #1: ['--model','sonnet','--resume','sess-restored']
+  assert.deepStrictEqual(factory.spawned[0].opts.args, ['--model', 'sonnet', '--resume', 'sess-restored']);
+
+  // Хук подтверждает привязку той же сессии (обычный путь для успешного resume).
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'sess-restored' });
+
+  // Ctrl+Shift+R на восстановленной вкладке — раньше tab.args УЖЕ содержал
+  // '--resume sess-restored' (если бы restoreFlow клал его в args), и restart()
+  // дописывал бы ещё один '--resume', давая дубль ['--resume','s','--resume','s'].
+  // Теперь tab.args — это только конфигурационные args, дубля нет.
+  mgr.restart(a.tabId); // спавн #2
+  assert.strictEqual(factory.spawned.length, 2);
+  assert.deepStrictEqual(factory.spawned[1].opts.args, ['--model', 'sonnet', '--resume', 'sess-restored']);
+  const resumeCount = factory.spawned[1].opts.args.filter((x) => x === '--resume').length;
+  assert.strictEqual(resumeCount, 1);
+});
+
+test('провал restore-резюма (естественный onExit без SessionStart) — sessionId обнуляется в list(), следующий restart идёт на чистых args', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory, {
+    getTermConfig: () => ({ command: 'claude', args: ['--model', 'sonnet'], useConpty: true, useConptyDll: true }),
+  });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha', sessionId: 'stale-session' });
+  mgr.start(a.tabId, 80, 24); // спавн #1: пытается резюмить stale-session
+  assert.deepStrictEqual(factory.spawned[0].opts.args, ['--model', 'sonnet', '--resume', 'stale-session']);
+
+  // Естественная смерть без единого SessionStart за время жизни процесса —
+  // resume реально не удался (сессия протухла/не существует).
+  factory.spawned[0].opts.onExit(1);
+  assert.strictEqual(mgr.list().find((t) => t.tabId === a.tabId).sessionId, null);
+
+  mgr.restart(a.tabId); // спавн #2: overrideFailed=true → голые (конфигурационные) args, без цикла
+  assert.strictEqual(factory.spawned.length, 2);
+  assert.deepStrictEqual(factory.spawned[1].opts.args, ['--model', 'sonnet']);
+});
+
 test('spawn: унаследованные CLAUDE_CODE_*/CLAUDECODE вычищены из env pty — кокпит, запущенный из-под другого Claude Code, не должен передавать вкладке чужую сессию', () => {
   const originalChildSession = process.env.CLAUDE_CODE_CHILD_SESSION;
   const originalClaudecode = process.env.CLAUDECODE;
