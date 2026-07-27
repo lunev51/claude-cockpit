@@ -17,8 +17,22 @@ let tabStore = null;
 // по восстановлению ещё не принято (см. btn-new-tab ниже и showRestoreOverlay).
 let restoreOverlaySkip = null;
 
-const statusPty = () => $('status-pty');
-const statusFont = () => $('status-font');
+// Панель действий: кнопки шлют слэш-команду в pty активной вкладки (фича 23/26).
+function renderActionBar() {
+  const host = $('action-commands');
+  host.textContent = '';
+  for (const { label, command } of (config.actionBar?.commands || [])) {
+    const btn = document.createElement('button');
+    btn.className = 'action-btn';
+    btn.textContent = label;
+    btn.title = `Отправить ${command} в активную вкладку`;
+    btn.addEventListener('click', () => {
+      const id = tabStore.activeId;
+      if (id) window.api.term.write(id, `${command}\r`);
+    });
+    host.appendChild(btn);
+  }
+}
 
 // Создать вкладку: контейнер + xterm + запись в стор. activate — переключиться сразу.
 // command/args — явный оверрайд конкретного спавна (не используется восстановлением
@@ -47,13 +61,14 @@ async function openTab(cwd, {
   const view = initTerminal(container, config, {
     tabId: tab.tabId,
     preludeText,
+    // Отладочная статус-строка убрана (панель действий заняла её место), но
+    // initTerminal всё равно безусловно зовёт эти колбэки — оставляем их
+    // валидными функциями, поля entry просто больше никуда не выводятся.
     onPtyStatus: (s) => {
       entry.lastPtyStatus = s;
-      if (tabStore.activeId === tab.tabId) statusPty().textContent = `⌨ ${s}`;
     },
     onFontSize: (px) => {
       entry.fontSize = px;
-      if (tabStore.activeId === tab.tabId) statusFont().textContent = `A ${px}`;
     },
   });
   entry.view = view;
@@ -70,9 +85,6 @@ function activateTab(tabId) {
   for (const [id, v] of views) v.container.classList.toggle('hidden', id !== tabId);
   tabStore.setActive(tabId);
   window.api.workspace.setActive(tabId); // main пересчитает activeIndex манифеста
-  // Статус-бар должен отражать активную вкладку, а не последнюю, что его обновляла.
-  statusPty().textContent = entry.lastPtyStatus ? `⌨ ${entry.lastPtyStatus}` : '⌨ …';
-  statusFont().textContent = `A ${entry.fontSize ?? config.terminal.fontSize}`;
   // fit после показа: скрытый контейнер имеет нулевые размеры (рефит запускает
   // ResizeObserver в terminal.js сам, когда контейнер становится видимым).
   requestAnimationFrame(() => {
@@ -103,7 +115,6 @@ async function closeTab(tabId) {
   // закрытие фоновой вкладки не должно перебивать фокус пользователя.
   if (!wasActive) return;
   if (fallback) activateTab(fallback);
-  else statusPty().textContent = '⌨ нет вкладок';
 }
 
 // Клик по ⚡: прописать хуки Cockpit в .claude/settings.json проекта вкладки.
@@ -289,7 +300,6 @@ function showRestoreOverlay(manifest) {
     overlay.classList.add('hidden');
     // Манифест НЕ трогаем — следующее открытие/закрытие вкладки перепишет
     // его естественным образом (syncWorkspace в main реагирует на tabs:changed).
-    statusPty().textContent = '⌨ нет вкладок';
     // FIX 2 (ревью): решение «начать пусто» тоже завершает восстановление —
     // разблокируем sync сразу, ждать здесь больше нечего.
     window.api.workspace.ready();
@@ -303,7 +313,6 @@ function showRestoreOverlay(manifest) {
       .filter(({ i }) => checkboxes[i].checked);
     if (!chosen.length) {
       overlay.classList.add('hidden');
-      statusPty().textContent = '⌨ нет вкладок';
       // FIX 2 (ревью): пустой выбор — тоже финал восстановления, а не его начало.
       window.api.workspace.ready();
       return;
@@ -348,6 +357,8 @@ async function boot() {
     onClose: closeTab,
     onConnect: connectProject,
   });
+
+  renderActionBar();
 
   // Глобальный диспатч событий терминалов по tabId.
   window.api.term.onData(({ tabId, data }) => views.get(tabId)?.view.handlers.onData(data));
@@ -414,7 +425,6 @@ async function boot() {
       // тот же эффект заморозки манифеста, что и в ветке выше. Деградируем:
       // считаем, что восстанавливать нечего (как при отсутствии манифеста).
       console.warn('[restore] оверлей восстановления не показался:', err);
-      statusPty().textContent = '⌨ нет вкладок';
       window.api.workspace.ready();
     }
   }

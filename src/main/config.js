@@ -22,6 +22,13 @@ const DEFAULTS = {
     useConptyDll: true,
   },
   bridge: { port: 48200 },
+  actionBar: {
+    commands: [
+      { label: '/remote-control', command: '/remote-control' },
+      { label: '/compact', command: '/compact' },
+      { label: '/usage', command: '/usage' },
+    ],
+  },
 };
 
 let cached = null;
