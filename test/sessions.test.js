@@ -160,7 +160,7 @@ test('restart: опоздавший onData старого pty не порожд�
 
 test('restart: опоздавший onExit старого pty не эмитит term:exit, естественный exit нового — ровно один', () => {
   const factory = makeFakePtyFactory();
-  const { mgr, events } = makeManager(factory);
+  const { mgr, events, tick } = makeManager(factory);
   const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
   mgr.restart(a.tabId);
@@ -168,6 +168,10 @@ test('restart: опоздавший onExit старого pty не эмитит 
   assert.strictEqual(events.filter((e) => e.channel === 'term:exit').length, 0);
   mgr.write(a.tabId, 'ok');
   assert.ok(factory.spawned[1].written.includes('ok'));
+  // Долгоживущий процесс (дольше окна авто-восстановления, спека §6) — этот
+  // тест про gen-guard плумбинг, а не про авто-восстановление провала резюма;
+  // tick разводит два механизма, чтобы не путать один с другим.
+  tick(20000);
   factory.spawned[1].opts.onExit(0);
   assert.strictEqual(events.filter((e) => e.channel === 'term:exit').length, 1);
 });
@@ -339,7 +343,7 @@ test('restart без session_id — второй спавн открывает �
   assert.deepStrictEqual(factory.spawned[1].opts.args, ['--resume']);
 });
 
-test('restart: НАСТОЯЩИЙ провал (спавн с оверрайдом умер естественной смертью, SessionStart не пришёл) — следующий рестарт спавнит голые args', () => {
+test('restart: НАСТОЯЩИЙ провал (спавн с оверрайдом умер естественной смертью, SessionStart не пришёл) — авто-восстановление подхватывает немедленно, ручной рестарт поверх него всё ещё не зацикливается', () => {
   const factory = makeFakePtyFactory();
   const { mgr } = makeManager(factory);
   const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
@@ -348,10 +352,17 @@ test('restart: НАСТОЯЩИЙ провал (спавн с оверрайдо
   assert.deepStrictEqual(factory.spawned[1].opts.args, ['--resume']);
   // Естественная смерть спавна #2 (gen совпадает — это НЕ хвост убитого рестартом
   // процесса): SessionStart за время его жизни так и не пришёл (пикер брошен/провалился).
+  // Спека §6: это тоже провал оверрайда (usedOverride && !sessionBound) —
+  // авто-восстановление срабатывает ТУТ ЖЕ, спавн #3 уже с голыми args, без
+  // участия пользователя.
   factory.spawned[1].opts.onExit(1);
-  mgr.restart(a.tabId); // спавн #3: без деградации в бесконечный цикл пикера
   assert.strictEqual(factory.spawned.length, 3);
   assert.deepStrictEqual(factory.spawned[2].opts.args, []);
+  // Ручной рестарт поверх уже авто-восстановленной вкладки тоже не должен
+  // деградировать в бесконечный цикл пикера.
+  mgr.restart(a.tabId); // спавн #4
+  assert.strictEqual(factory.spawned.length, 4);
+  assert.deepStrictEqual(factory.spawned[3].opts.args, []);
 });
 
 test('restart: восстановление после неудачи — SessionStart привязал id, следующий рестарт снова резюмит', () => {
@@ -529,7 +540,7 @@ test('после restore-спавна restart() даёт РОВНО один --r
   assert.strictEqual(resumeCount, 1);
 });
 
-test('провал restore-резюма (естественный onExit без SessionStart) — sessionId обнуляется в list(), следующий restart идёт на чистых args', () => {
+test('провал restore-резюма (естественный onExit без SessionStart) — sessionId обнуляется в list(), авто-восстановление уже даёт чистые args, ручной restart поверх него тоже без цикла', () => {
   const factory = makeFakePtyFactory();
   const { mgr } = makeManager(factory, {
     getTermConfig: () => ({ command: 'claude', args: ['--model', 'sonnet'], useConpty: true, useConptyDll: true }),
@@ -539,13 +550,18 @@ test('провал restore-резюма (естественный onExit без 
   assert.deepStrictEqual(factory.spawned[0].opts.args, ['--model', 'sonnet', '--resume', 'stale-session']);
 
   // Естественная смерть без единого SessionStart за время жизни процесса —
-  // resume реально не удался (сессия протухла/не существует).
+  // resume реально не удался (сессия протухла/не существует). Это ровно баг
+  // пользователя ("No conversation found...", спека §6) — авто-восстановление
+  // срабатывает НЕМЕДЛЕННО: спавн #2 уже идёт на чистых конфигурационных args,
+  // без ожидания ручного restart().
   factory.spawned[0].opts.onExit(1);
   assert.strictEqual(mgr.list().find((t) => t.tabId === a.tabId).sessionId, null);
-
-  mgr.restart(a.tabId); // спавн #2: overrideFailed=true → голые (конфигурационные) args, без цикла
   assert.strictEqual(factory.spawned.length, 2);
   assert.deepStrictEqual(factory.spawned[1].opts.args, ['--model', 'sonnet']);
+
+  mgr.restart(a.tabId); // спавн #3: ручной рестарт поверх авто-восстановленной — тоже без цикла
+  assert.strictEqual(factory.spawned.length, 3);
+  assert.deepStrictEqual(factory.spawned[2].opts.args, ['--model', 'sonnet']);
 });
 
 // ---------- FIX 4 (carryover 3): протухший sessionId должен долетать до манифеста немедленно ----------
@@ -595,4 +611,110 @@ test('spawn: унаследованные CLAUDE_CODE_*/CLAUDECODE вычище�
     if (originalClaudecode === undefined) delete process.env.CLAUDECODE;
     else process.env.CLAUDECODE = originalClaudecode;
   }
+});
+
+// ---------- Мягкая деградация провала резюма (спека §6) ----------
+// Фантомная сессия: SessionStart отдал id, но транскрипт так и не создался
+// (claude был закрыт до первого сообщения) — следующий запуск резюмит
+// несуществующий id, claude падает с exit 1 сразу. Раньше вкладка так и
+// оставалась dead — пользователь чинил её руками (Ctrl+Shift+R). Теперь
+// кокпит сам один раз перезапускает вкладку с чистыми (голыми) args.
+
+test('провал резюма (короткоживущий процесс, SessionStart не пришёл) → авто-восстановление одной чистой попыткой, статус working', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events, tick } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha', sessionId: 'ghost-session' });
+  mgr.start(a.tabId, 80, 24); // спавн #1: --resume ghost-session
+  assert.deepStrictEqual(factory.spawned[0].opts.args, ['--resume', 'ghost-session']);
+
+  tick(2000); // процесс прожил недолго — меньше порога 15с
+  factory.spawned[0].opts.onExit(1); // SessionStart так и не пришёл — резюм провалился
+
+  assert.strictEqual(factory.spawned.length, 2, 'должен произойти ровно один авто-спавн');
+  assert.deepStrictEqual(
+    factory.spawned[1].opts.args,
+    [],
+    'авто-спавн идёт БЕЗ --resume — чистая новая сессия',
+  );
+
+  const st = statusOf(events, a.tabId);
+  assert.strictEqual(st.status, 'working', 'вкладка должна остаться working, а не dead');
+
+  const notice = events.find(
+    (e) => e.channel === 'term:data' && e.payload.data.includes('сессия не найдена'),
+  );
+  assert.ok(notice, 'должно быть term:data сообщение о фолбэке перед чистым спавном');
+  assert.strictEqual(notice.payload.tabId, a.tabId);
+});
+
+test('долгоживущий процесс с оверрайдом (прожил дольше 15с), умерший сам — НЕ авто-восстанавливается, остаётся dead', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events, tick } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha', sessionId: 'ghost-session' });
+  mgr.start(a.tabId, 80, 24); // спавн #1: --resume ghost-session
+
+  tick(60000); // прожил долго — дольше порога
+  factory.spawned[0].opts.onExit(1);
+
+  assert.strictEqual(
+    factory.spawned.length,
+    1,
+    'долгоживущий процесс не должен триггерить авто-восстановление',
+  );
+  assert.strictEqual(statusOf(events, a.tabId).status, 'dead');
+});
+
+test('авто-восстановление срабатывает не более одного раза на вкладку — без петли', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events, tick } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha', sessionId: 'ghost-session' });
+  mgr.start(a.tabId, 80, 24); // спавн #1: --resume ghost-session
+
+  tick(2000);
+  factory.spawned[0].opts.onExit(1); // провал → авто-спавн #2
+  assert.strictEqual(factory.spawned.length, 2);
+
+  tick(2000);
+  factory.spawned[1].opts.onExit(1); // авто-спавн #2 тоже умирает быстро
+
+  assert.strictEqual(
+    factory.spawned.length,
+    2,
+    'третьего (авто-)спавна быть не должно — одна попытка на вкладку',
+  );
+  assert.strictEqual(statusOf(events, a.tabId).status, 'dead');
+});
+
+test('успешная привязка сессии и/или ручной restart() сбрасывают флаг — авто-восстановление может сработать снова', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events, tick } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha', sessionId: 'ghost-session' });
+  mgr.start(a.tabId, 80, 24); // спавн #1: --resume ghost-session
+
+  tick(2000);
+  factory.spawned[0].opts.onExit(1); // провал → авто-спавн #2 (флаг взведён)
+  assert.strictEqual(factory.spawned.length, 2);
+  assert.deepStrictEqual(factory.spawned[1].opts.args, []);
+
+  // Авто-спавн #2 прижился по-настоящему: SessionStart реально привязал сессию.
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'sess-real' });
+
+  // Ручной рестарт резюмит уже привязанную сессию (спавн #3, снова с оверрайдом).
+  mgr.restart(a.tabId);
+  assert.strictEqual(factory.spawned.length, 3);
+  assert.deepStrictEqual(factory.spawned[2].opts.args, ['--resume', 'sess-real']);
+
+  // Этот резюм тоже проваливается быстро без SessionStart — раз флаг был
+  // сброшен (успешной привязкой и/или ручным restart()), авто-восстановление
+  // должно сработать СНОВА, а не молчать из-за «уже использованной» попытки.
+  tick(2000);
+  factory.spawned[2].opts.onExit(1);
+
+  assert.strictEqual(
+    factory.spawned.length,
+    4,
+    'авто-восстановление должно снова сработать после сброса флага',
+  );
+  assert.deepStrictEqual(factory.spawned[3].opts.args, []);
+  assert.strictEqual(statusOf(events, a.tabId).status, 'working');
 });
