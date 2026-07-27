@@ -149,6 +149,16 @@ function createSessionManager({
           if (usedOverride && !tab.sessionBound) {
             tab.overrideFailed = true;
             tab.sessionId = null;
+            // FIX 4 (carryover 3): manager.list() отдаёт sessionId, но
+            // syncWorkspace в ipc.js пересобирает манифест только по событию
+            // 'tabs:changed' — а его здесь не было. Без этой строки протухший
+            // id оставался бы в manifest.tabs (обнулился только в памяти),
+            // и следующий запуск снова попытался бы --resume уже мёртвую
+            // сессию. restart() (см. ниже) шлёт tabs:changed сам по себе,
+            // но это НЕ покрывает провал самого первого спавна восстановленной
+            // вкладки (open() с sessionId из манифеста → start() → сюда) —
+            // restart() в этом пути ещё не вызывался.
+            onEvent('tabs:changed', {});
           }
           tab.proc = null;
           tab.alive = false;
