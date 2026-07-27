@@ -30,9 +30,11 @@ html, body {
   background: var(--accent);
 }
 #titlebar-text {
-  /* Моноширинный, как сам терминал — по просьбе пользователя (серифный не зашёл). */
-  font-family: var(--font-mono);
-  font-size: 13px;
+  /* Плотность Warp: рубленый UI-шрифт, не серифный и не моно. */
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: -0.1px;
 }
 #titlebar-sub { color: var(--text-dim); font-size: 11px; }
 
@@ -44,7 +46,7 @@ html, body {
 
 /* --- Сайдбар --- */
 #sidebar {
-  width: 240px;
+  width: 200px;
   flex: none;
   background: var(--bg-panel);
   border-right: 1px solid var(--border);
@@ -55,9 +57,10 @@ html, body {
   overflow-y: auto;
 }
 .sidebar-section {
-  font-size: 10px;
+  font-size: 9px;
+  font-weight: 500;
   text-transform: uppercase;
-  letter-spacing: 0.6px;
+  letter-spacing: 0.5px;
   color: var(--text-dim);
   padding: 6px 6px 4px;
 }
@@ -67,15 +70,20 @@ html, body {
 
 .tab-row {
   display: flex;
-  gap: 8px;
-  padding: 7px 8px;
+  gap: 7px;
+  padding: 6px 8px;
   border-radius: var(--radius-s);
   cursor: pointer;
   align-items: flex-start;
 }
 .tab-row:hover { background: var(--bg-hover); }
 .tab-row.active { background: var(--bg-card); }
-.tab-row.waiting { background: var(--bg-wait); border: 1px solid var(--border-wait); }
+.tab-row.waiting {
+  background: var(--bg-wait);
+  border-left: 2px solid var(--accent);
+  /* компенсация border-left: 6px + 2px = 8px, как у остальных строк (не «прыгает») */
+  padding-left: 6px;
+}
 
 .tab-dot {
   width: 8px; height: 8px; border-radius: 50%;
@@ -97,7 +105,7 @@ html, body {
 
 .tab-info { min-width: 0; flex: 1; }
 .tab-name {
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 500;
   display: flex;
   gap: 6px;
@@ -105,7 +113,7 @@ html, body {
 }
 .tab-name .meta { font-size: 10px; color: var(--text-dim); font-weight: 400; }
 .tab-sub {
-  font-size: 11px;
+  font-size: 10px;
   color: var(--text-muted);
   white-space: nowrap;
   overflow: hidden;
@@ -134,12 +142,12 @@ html, body {
 .sidebar-btn {
   flex: 1;
   background: var(--bg-card);
-  border: none;
+  border: 1px solid var(--border);
   border-radius: var(--radius-s);
   color: var(--text-muted);
   font-family: var(--font-ui);
   font-size: 12px;
-  padding: 7px 4px;
+  padding: 5px;
   cursor: pointer;
 }
 .sidebar-btn:hover { background: var(--bg-hover); color: var(--text); }
@@ -162,7 +170,7 @@ html, body {
 #restore-overlay {
   position: absolute;
   inset: 0;
-  background: rgba(20, 20, 19, 0.85);
+  background: color-mix(in srgb, var(--bg-window) 85%, transparent);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -180,8 +188,9 @@ html, body {
   gap: 14px;
 }
 .restore-title {
-  font-family: var(--font-serif);
-  font-size: 18px;
+  font-family: var(--font-ui);
+  font-size: 15px;
+  font-weight: 500;
   color: var(--text);
 }
 #restore-list {

@@ -117,10 +117,10 @@ export function initTerminal(container, config, {
     'align-items:center',
     'gap:4px',
     'padding:4px 6px',
-    'background:#1F1E1B',
-    'border:1px solid #3A3733',
+    'background:#141414',
+    'border:1px solid #2A2A2A',
     'border-radius:6px',
-    'color:#FAF9F5',
+    'color:#E8E8E8',
     'font-family:sans-serif',
     'font-size:12px',
   ].join(';');
@@ -133,7 +133,7 @@ export function initTerminal(container, config, {
     'border:none',
     'outline:none',
     'background:transparent',
-    'color:#FAF9F5',
+    'color:#E8E8E8',
     'font-size:12px',
   ].join(';');
 
@@ -143,7 +143,7 @@ export function initTerminal(container, config, {
     b.style.cssText = [
       'border:none',
       'background:transparent',
-      'color:#8F8D83',
+      'color:#8A8A8A',
       'cursor:pointer',
       'font-size:12px',
       'padding:2px 4px',
