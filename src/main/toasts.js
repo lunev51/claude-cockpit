@@ -34,8 +34,17 @@ function truncate(text, max = BODY_MAX) {
 function createToaster({
   isWindowFocused, getActiveTabId, showNotification, focusTab, now = Date.now,
 }) {
-  // tabId → момент (now()), когда вкладка в последний раз перешла в 'working'.
+  // tabId → момент (now()) НАСТОЯЩЕГО перехода в 'working' (не повторного пинга).
   const workingSince = new Map();
+  // tabId → последний виденный статус. Нужен, чтобы отличить настоящий переход
+  // в working (waiting/stuck/done/… → working, начало нового хода) от повторного
+  // working-пинга ВНУТРИ уже идущего хода — sessions.js шлёт статус 'working'
+  // не только на SessionStart/UserPromptSubmit, но и на КАЖДЫЙ PreToolUse
+  // (каждый вызов инструмента). Без этой памяти workingSince уезжал бы вперёд
+  // на каждый такой пинг, и done мерил бы «время с последнего инструмента»
+  // вместо «время с начала хода» — тост подавлялся бы тем чаще, чем содержательнее
+  // работа (ревью, finding 1 — прямо обратное задуманному).
+  const lastStatus = new Map();
 
   // Пользователь смотрит именно на эту вкладку прямо сейчас — уведомлять не о чем.
   function isSuppressed(tabId) {
@@ -49,13 +58,27 @@ function createToaster({
   function onStatus({
     tabId, tabName, status, waitingText,
   }) {
+    const prevStatus = lastStatus.get(tabId);
+
     if (status === 'working') {
-      workingSince.set(tabId, now()); // база для порога done — обновляется, но сама 'working' молчит
+      // Переход в working только если ДО этого статус не был working —
+      // иначе это просто очередной PreToolUse того же хода, отметку не трогаем.
+      if (prevStatus !== 'working') workingSince.set(tabId, now());
+      lastStatus.set(tabId, status);
       return;
     }
 
+    lastStatus.set(tabId, status);
+
     // stuck и любые прочие статусы — тишина по контракту (working обработан выше).
     if (status !== 'waiting' && status !== 'done' && status !== 'dead') return;
+
+    if (status === 'dead') {
+      // Вкладка мертва — дальше по этому tabId событий не будет; чистим карты,
+      // чтобы они не копились бесконечно на каждую закрытую вкладку (finding 3).
+      workingSince.delete(tabId);
+      lastStatus.delete(tabId);
+    }
 
     if (isSuppressed(tabId)) return;
 

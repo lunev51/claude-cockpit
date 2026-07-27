@@ -122,6 +122,28 @@ test('done через 60с после working → тост', () => {
   assert.strictEqual(h.notifications[0].title, 'proj: готово');
 });
 
+test('done: каденция PreToolUse (working-пинги каждые 10с) НЕ откатывает таймер — тост показывается по суммарному времени с НАЧАЛА хода, а не с последнего пинга', () => {
+  const h = makeToaster();
+  h.setClock(0);
+  h.toaster.onStatus({
+    tabId: 't1', tabName: 'proj', status: 'working', waitingText: '',
+  }); // начало хода (SessionStart/UserPromptSubmit)
+  h.setClock(10000);
+  h.toaster.onStatus({
+    tabId: 't1', tabName: 'proj', status: 'working', waitingText: '',
+  }); // PreToolUse #1 — повторный пинг, НЕ новый переход, не должен сдвигать базу
+  h.setClock(20000);
+  h.toaster.onStatus({
+    tabId: 't1', tabName: 'proj', status: 'working', waitingText: '',
+  }); // PreToolUse #2 — тоже повторный пинг
+  h.setClock(35000);
+  h.toaster.onStatus({
+    tabId: 't1', tabName: 'proj', status: 'done', waitingText: '',
+  }); // Stop — 35с С НАЧАЛА хода (не 15с с последнего PreToolUse)
+  assert.strictEqual(h.notifications.length, 1);
+  assert.strictEqual(h.notifications[0].title, 'proj: готово');
+});
+
 test('done: подавление активная+фокус работает так же, как для waiting', () => {
   const h = makeToaster();
   h.setFocused(true);
@@ -144,6 +166,28 @@ test('dead → тост «сессия завершилась» независи
   });
   assert.strictEqual(h.notifications.length, 1);
   assert.strictEqual(h.notifications[0].title, 'proj: сессия завершилась');
+});
+
+test('dead чистит внутренние карты по tabId — done сразу после dead не подавляется старой working-отметкой', () => {
+  const h = makeToaster();
+  h.setClock(0);
+  h.toaster.onStatus({
+    tabId: 't1', tabName: 'proj', status: 'working', waitingText: '',
+  });
+  h.setClock(1000);
+  h.toaster.onStatus({
+    tabId: 't1', tabName: 'proj', status: 'dead', waitingText: '',
+  });
+  assert.strictEqual(h.notifications.length, 1); // тост «сессия завершилась»
+  h.setClock(1500);
+  h.toaster.onStatus({
+    tabId: 't1', tabName: 'proj', status: 'done', waitingText: '',
+  });
+  // Без чистки workingSince на dead здесь elapsed=1500-0=1500мс ≤30с → тишина
+  // (без чистки notifications.length осталось бы 1). После чистки записи для
+  // t1 нет → elapsed=Infinity → тост показывается.
+  assert.strictEqual(h.notifications.length, 2);
+  assert.strictEqual(h.notifications[1].title, 'proj: готово');
 });
 
 test('working/stuck: тишина, но working обновляет отметку времени для done-порога', () => {

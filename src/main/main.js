@@ -175,6 +175,10 @@ app.whenReady().then(() => {
     },
     focusTab: (tabId) => {
       if (win.isDestroyed()) return;
+      // Свёрнутое окно — самый вероятный случай клика по тосту (ревью, finding 2):
+      // одного show() недостаточно, нужен restore() (та же идиома, что уже
+      // используется в обработчике 'second-instance' чуть выше).
+      if (win.isMinimized()) win.restore();
       win.show();
       win.focus();
       win.webContents.send('tab:activate', { tabId });
