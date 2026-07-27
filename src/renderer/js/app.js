@@ -4,12 +4,19 @@
 import { initTerminal } from './terminal.js';
 import { createTabStore } from './tabs.js';
 import { renderBadge } from './badge.js';
+import { createPeek } from './peek.js';
 
 const $ = (id) => document.getElementById(id);
 
 const views = new Map(); // tabId → {view, container}
 let config = null;
 let tabStore = null;
+let peek = null;
+// Task 3 фазы 4 (peek): tabId, для которого сейчас открыт поповер (или null).
+// Нужен, чтобы обработчик tab:status закрывал peek ТОЛЬКО когда статус меняет
+// именно ту вкладку, что сейчас показана в поповере — peek.hide() идемпотентна,
+// так что устаревшее значение здесь безвредно (см. app.js/onPeek и tab:status).
+let peekedTabId = null;
 // FIX 3 (carryover 3): пока оверлей restore на экране и решение ещё не принято,
 // здесь лежит функция «начать пусто» этого оверлея — null, если оверлея нет
 // или он уже решён. Оверлей накрывает только #main (position:absolute; inset:0
@@ -122,6 +129,10 @@ async function openTab(cwd, {
 function activateTab(tabId) {
   const entry = views.get(tabId);
   if (!entry) return;
+  // Task 3 фазы 4 (peek): смена активной вкладки закрывает открытый поповер
+  // безусловно — контекст (какая строка ждёт) сменился, отвечать «в сторону»
+  // от текущего экрана не место.
+  peek?.hide();
   for (const [id, v] of views) v.container.classList.toggle('hidden', id !== tabId);
   tabStore.setActive(tabId);
   window.api.workspace.setActive(tabId); // main пересчитает activeIndex манифеста
@@ -156,10 +167,44 @@ async function closeTab(tabId) {
   waitingTabs.delete(tabId);
   updateTitlebarAlert();
   pushAttention();
+  // Task 3 фазы 4 (peek): закрытая вкладка не должна оставлять поповер,
+  // указывающий на уже мёртвый tabId (закрытие вкладки — не единственный, но
+  // реальный путь «из-под» открытого peek).
+  if (peekedTabId === tabId) {
+    peek?.hide();
+    peekedTabId = null;
+  }
   // Переключаемся на соседнюю вкладку, только если закрыли активную —
   // закрытие фоновой вкладки не должно перебивать фокус пользователя.
   if (!wasActive) return;
   if (fallback) activateTab(fallback);
+}
+
+// Task 3 фазы 4 (peek): клик (или Space) по строке waiting — открыть поповер
+// вместо переключения вкладки. Текст вопроса и имя проекта уже лежат в
+// tabStore (setStatus зеркалит waitingText из tab:status, см. boot()).
+function openPeek(tabId, rowEl) {
+  const info = tabStore.peekInfo(tabId);
+  if (!info) return;
+  peekedTabId = tabId;
+  peek.show({
+    tabId, name: info.name, text: info.waitingText, anchorEl: rowEl,
+  });
+}
+
+// onSend поповера: дописать текст (или цифру варианта) в pty вкладки, ЧЬЁ
+// имя показывал поповер — НЕ обязательно активной. Фокус терминала после
+// отправки возвращается активной вкладке (той, что реально на экране),
+// как бы peek ни закрылся сам — тем же путём, что action-bar (renderActionBar).
+function sendPeek(tabId, text) {
+  window.api.term.write(tabId, `${text}\r`);
+  const activeId = tabStore.activeId;
+  if (activeId) views.get(activeId)?.view.focus();
+}
+
+// Ctrl+Enter в поповере — перейти во вкладку вместо ответа из сайдбара.
+function openTabFromPeek(tabId) {
+  activateTab(tabId);
 }
 
 // Клик по ⚡: прописать хуки Cockpit в .claude/settings.json проекта вкладки.
@@ -401,6 +446,14 @@ async function boot() {
     onActivate: activateTab,
     onClose: closeTab,
     onConnect: connectProject,
+    onPeek: openPeek,
+  });
+
+  // Task 3 фазы 4: peek — ответить Claude из сайдбара, не переключая вкладку.
+  peek = createPeek({
+    root: $('peek-root'),
+    onSend: sendPeek,
+    onOpenTab: openTabFromPeek,
   });
 
   renderActionBar();
@@ -420,8 +473,19 @@ async function boot() {
 
   // Статусы приходят из хуков Claude Code (sessions.js) — единый источник,
   // term:started/term:exit статус больше не выставляют (был двойной источник).
-  window.api.tab.onStatus(({ tabId, status, subtitle }) => {
-    tabStore.setStatus(tabId, status, subtitle);
+  window.api.tab.onStatus(({
+    tabId, status, subtitle, waitingText,
+  }) => {
+    tabStore.setStatus(tabId, status, subtitle, waitingText);
+    // Task 3 фазы 4 (peek): вкладка, чей поповер сейчас на экране, перестала
+    // ждать (ответили из терминала напрямую, стала stuck/dead и т.п.) —
+    // закрываем поповер, чтобы он не молчал про уже неактуальный вопрос.
+    // peekedTabId — «последний показанный», сверка по tabId защищает от
+    // закрытия чужого (уже открытого позже, для другой вкладки) поповера.
+    if (status !== 'waiting' && tabId === peekedTabId) {
+      peek?.hide();
+      peekedTabId = null;
+    }
     // Fix 8: терракота в титлбаре горит, только пока есть хотя бы одна
     // вкладка в статусе waiting — снимаем, когда ждущих не осталось.
     if (status === 'waiting') waitingTabs.add(tabId); else waitingTabs.delete(tabId);

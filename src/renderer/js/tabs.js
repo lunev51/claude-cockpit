@@ -12,8 +12,10 @@ const GROUP_OF = {
   idle: 'working', // idle пока живёт в «Работают» (реальный idle появится в 2b)
 };
 
-export function createTabStore({ root, onActivate, onClose, onConnect }) {
-  const rows = new Map(); // tabId → {row, dot, sub, connectBtn, name, cwd, status}
+export function createTabStore({
+  root, onActivate, onClose, onConnect, onPeek,
+}) {
+  const rows = new Map(); // tabId → {row, dot, sub, connectBtn, name, cwd, status, waitingText}
   const order = [];
   let activeId = null;
 
@@ -73,9 +75,26 @@ export function createTabStore({ root, onActivate, onClose, onConnect }) {
     });
 
     row.append(dot, info, connectBtn, close);
-    row.addEventListener('click', () => onActivate(tabId));
 
-    const r = { row, dot, sub, connectBtn, name, cwd, status: 'working' };
+    // Task 3 фазы 4 (peek): строка со статусом waiting открывает поповер
+    // ВМЕСТО переключения вкладки — остальные статусы ведут себя как раньше.
+    // Space активирует то же самое, когда фокус на строке (tabindex ниже).
+    function trigger() {
+      if (r.status === 'waiting') onPeek(tabId, row);
+      else onActivate(tabId);
+    }
+    row.tabIndex = 0;
+    row.addEventListener('click', trigger);
+    row.addEventListener('keydown', (ev) => {
+      if (ev.key === ' ' || ev.key === 'Spacebar') {
+        ev.preventDefault();
+        trigger();
+      }
+    });
+
+    const r = {
+      row, dot, sub, connectBtn, name, cwd, status: 'working', waitingText: '',
+    };
     rows.set(tabId, r);
     order.push(tabId);
     placeRow(r);
@@ -97,7 +116,7 @@ export function createTabStore({ root, onActivate, onClose, onConnect }) {
     activeId = tabId;
   }
 
-  function setStatus(tabId, status, subtitle) {
+  function setStatus(tabId, status, subtitle, waitingText) {
     const r = rows.get(tabId);
     if (!r) return;
     const regroup = GROUP_OF[r.status] !== GROUP_OF[status];
@@ -111,7 +130,19 @@ export function createTabStore({ root, onActivate, onClose, onConnect }) {
       r.sub.textContent = r.cwd;
       r.sub.title = r.cwd;
     }
+    // Task 3 фазы 4 (peek): полный текст вопроса из хука Notification —
+    // sessions.js сам чистит его на стороне main, когда статус уходит от
+    // waiting (tab.waitingText = ''), так что здесь просто зеркалим payload.
+    if (typeof waitingText === 'string') r.waitingText = waitingText;
     if (regroup) placeRow(r);
+  }
+
+  // Peek (Task 3 фазы 4): имя проекта + полный текст вопроса по tabId —
+  // всё, что нужно createPeek().show() для отрисовки поповера.
+  function peekInfo(tabId) {
+    const r = rows.get(tabId);
+    if (!r) return null;
+    return { name: r.name, waitingText: r.waitingText };
   }
 
   function setConnectVisible(tabId, visible) {
@@ -133,6 +164,7 @@ export function createTabStore({ root, onActivate, onClose, onConnect }) {
     setStatus,
     setConnectVisible,
     neighborOf,
+    peekInfo,
     order: () => [...order],
     get activeId() { return activeId; },
   };

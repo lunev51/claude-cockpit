@@ -288,10 +288,84 @@ html, body {
 #limit-5h:empty { display: none; }
 
 /* Fix 9 (ревью, спека §7): «focus — 2px кольцо терракотой» вместо дефолтного
-   кольца Chromium. */
+   кольца Chromium. Task 3 фазы 4: .tab-row теперь focusable (tabindex=0, для
+   Space → peek) — то же кольцо. */
 .action-btn:focus-visible,
 .sidebar-btn:focus-visible,
+.tab-row:focus-visible,
 .restore-row input[type="checkbox"]:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
+}
+
+/* --- Peek-поповер (Task 3 фазы 4): ответить Claude из сайдбара, не
+   переключая активную вкладку. Корень #peek-root — прямой ребёнок <body>
+   (см. index.html), сам поповер — position:fixed, координаты считает
+   peek.js (рядом со строкой сайдбара, упирается — сдвигается вверх/влево). --- */
+.peek-popover {
+  position: fixed;
+  width: 420px;
+  max-width: 420px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-m);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 40;
+  font-family: var(--font-ui);
+}
+.peek-name {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+}
+.peek-text {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 220px;
+  overflow-y: auto;
+  background: var(--bg-window);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  padding: 8px;
+}
+.peek-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.peek-option {
+  background: var(--bg-window);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  padding: 5px 10px;
+  cursor: pointer;
+  text-align: left;
+}
+.peek-option:hover { background: var(--bg-hover); border-color: var(--accent); }
+.peek-input {
+  background: var(--bg-window);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  padding: 6px 8px;
+}
+.peek-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.peek-hint {
+  font-size: 10px;
+  color: var(--text-dim);
 }
