@@ -266,20 +266,24 @@ function registerIpc(win, opts = {}) {
   // из стаггера restoreFlow никогда не попадают в манифест. См. app.js —
   // места вызова window.api.workspace.ready().
   //
-  // FIX 1 (carryover 3): markReady() зовём ВСЕГДА, а немедленный syncWorkspace()
-  // — ТОЛЬКО если в manager уже есть хоть одна вкладка. Раньше eager-sync звался
-  // безусловно: на ветках отказа («начать пусто» / Esc / пустой выбор чекбоксов)
-  // в этот момент manager.list() пуст, и sync писал в workspace.json валидно-
-  // пустой манифест — .bak переставал быть нужен для восстановления, а следующий
-  // запуск считал known-набор ghost-вкладок пустым и сметал уборкой сирот ВСЕ
-  // ghost-файлы. Комментарий в app.js (startEmpty) обещает «манифест НЕ трогаем» —
-  // теперь это действительно так: manager.list().length === 0 → sync не зовём,
-  // старый workspace.json (вчерашний состав) остаётся на диске нетронутым до
-  // первого РЕАЛЬНОГО изменения состава вкладок (открытия/закрытия), которое
-  // само придёт через tabs:changed → syncWorkspace().
+  // FIX 1 (carryover 3) + ARCHITECTURE Fix 13 (ревью): markReady() зовём
+  // ВСЕГДА, а немедленный sync() — ТОЛЬКО если в manager уже есть хоть одна
+  // вкладка. Раньше eager-sync звался безусловно: на ветках отказа («начать
+  // пусто» / Esc / пустой выбор чекбоксов) в этот момент manager.list() пуст,
+  // и sync писал в workspace.json валидно-пустой манифест — .bak переставал
+  // быть нужен для восстановления, а следующий запуск считал known-набор
+  // ghost-вкладок пустым и сметал уборкой сирот ВСЕ ghost-файлы. Комментарий
+  // в app.js (startEmpty) обещает «манифест НЕ трогаем» — теперь это
+  // действительно так: manager.list().length === 0 → sync не зовём, старый
+  // workspace.json (вчерашний состав) остаётся на диске нетронутым до первого
+  // РЕАЛЬНОГО изменения состава вкладок (открытия/закрытия), которое само
+  // придёт через tabs:changed → syncWorkspace().
+  //
+  // Сама логика (markReady + условный sync) вынесена в wsync.readyAndSync —
+  // это чистый (без Electron) код workspace-sync.js, покрытый test/workspace-sync.test.js;
+  // ipc.js больше не содержит непокрытой тестами ветки этого хотфикса.
   ipcMain.on('workspace:ready', () => {
-    wsync.markReady();
-    if (manager.list().length > 0) syncWorkspace();
+    wsync.readyAndSync(activeTabId);
   });
 
   ipcMain.handle('tabs:chooseFolder', async () => {

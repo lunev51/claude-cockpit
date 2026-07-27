@@ -550,7 +550,7 @@ test('провал restore-резюма (естественный onExit без 
 
 // ---------- FIX 4 (carryover 3): протухший sessionId должен долетать до манифеста немедленно ----------
 
-test('FIX 4: онExit без SessionStart (первый спавн restore, ДО какого-либо restart) эмитит tabs:changed сразу — манифест узнаёт о протухшем sessionId, не дожидаясь следующего restart/open/close', () => {
+test('FIX 4: onExit без SessionStart (первый спавн restore, ДО какого-либо restart) эмитит tabs:changed сразу — манифест узнаёт о протухшем sessionId, не дожидаясь следующего restart/open/close', () => {
   const factory = makeFakePtyFactory();
   const { mgr, events } = makeManager(factory);
   const a = mgr.open({ cwd: 'C:\\proj\\alpha', sessionId: 'stale-session' });

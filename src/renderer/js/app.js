@@ -17,6 +17,15 @@ let tabStore = null;
 // по восстановлению ещё не принято (см. btn-new-tab ниже и showRestoreOverlay).
 let restoreOverlaySkip = null;
 
+// Fix 8 (ревью): точка в титлбаре терракотовая, только пока есть хотя бы одна
+// вкладка в статусе waiting — локальный Set, потому что удобного агрегата
+// «сколько вкладок ждут» у tabStore нет.
+const waitingTabs = new Set();
+const titlebarDot = document.querySelector('#titlebar .dot');
+function updateTitlebarAlert() {
+  titlebarDot?.classList.toggle('alert', waitingTabs.size > 0);
+}
+
 // Панель действий: кнопки шлют слэш-команду в pty активной вкладки (фича 23/26).
 function renderActionBar() {
   const host = $('action-commands');
@@ -25,18 +34,33 @@ function renderActionBar() {
   // {0:…,1:…} вместо массива — Array.isArray отсекает такой и любой другой
   // некорректный actionBar.commands, чтобы не уронить boot() на итерации.
   const raw = config.actionBar?.commands;
-  const commands = Array.isArray(raw) ? raw : [];
+  const rawArray = Array.isArray(raw) ? raw : [];
   if (raw !== undefined && !Array.isArray(raw)) {
     console.warn('[actionBar] config.actionBar.commands не массив — панель действий пуста', raw);
   }
+  // Fix 4 (ревью): гард выше проверял только сам массив, а не его элементы —
+  // commands: [null] бросал TypeError на деструктуризации { label, command }
+  // ДО регистрации всего остального в boot() (хоткеи, IPC-подписки и т.д.).
+  const commands = rawArray.filter(
+    (c) => c && typeof c.command === 'string' && typeof c.label === 'string',
+  );
   for (const { label, command } of commands) {
     const btn = document.createElement('button');
     btn.className = 'action-btn';
     btn.textContent = label;
     btn.title = `Отправить ${command} в активную вкладку`;
+    // Fix 3 (ревью): без preventDefault на mousedown кнопка забирает фокус
+    // ДО click — обычный ввод в терминал перестаёт работать, а рефлекторный
+    // Enter повторно жмёт кнопку и шлёт команду второй раз.
+    btn.addEventListener('mousedown', (e) => e.preventDefault());
     btn.addEventListener('click', () => {
       const id = tabStore.activeId;
-      if (id) window.api.term.write(id, `${command}\r`);
+      if (id) {
+        window.api.term.write(id, `${command}\r`);
+        // Возвращаем фокус терминалу активной вкладки на случай, если он
+        // всё же ушёл на кнопку (например, при активации с клавиатуры).
+        views.get(id)?.view.focus();
+      }
     });
     host.appendChild(btn);
   }
@@ -119,6 +143,10 @@ async function closeTab(tabId) {
   entry.container.remove();
   views.delete(tabId);
   tabStore.remove(tabId);
+  // Fix 8: закрытая вкладка больше не может «ждать» — иначе терракота в
+  // титлбаре могла бы залипнуть, если закрыли последнюю waiting-вкладку.
+  waitingTabs.delete(tabId);
+  updateTitlebarAlert();
   // Переключаемся на соседнюю вкладку, только если закрыли активную —
   // закрытие фоновой вкладки не должно перебивать фокус пользователя.
   if (!wasActive) return;
@@ -380,6 +408,10 @@ async function boot() {
   // term:started/term:exit статус больше не выставляют (был двойной источник).
   window.api.tab.onStatus(({ tabId, status, subtitle }) => {
     tabStore.setStatus(tabId, status, subtitle);
+    // Fix 8: терракота в титлбаре горит, только пока есть хотя бы одна
+    // вкладка в статусе waiting — снимаем, когда ждущих не осталось.
+    if (status === 'waiting') waitingTabs.add(tabId); else waitingTabs.delete(tabId);
+    updateTitlebarAlert();
     // Ghost-буфер (Task 5): переход в done/waiting — момент «Claude закончил
     // ход», самый ценный кадр скроллбека — сериализуем именно эту вкладку
     // сразу, не дожидаясь общего 30-секундного таймера ниже.
@@ -387,14 +419,21 @@ async function boot() {
   });
 
   $('btn-new-tab').addEventListener('click', async () => {
+    // Fix 5 (ревью): restoreOverlaySkip() раньше звался ДО chooseFolder() —
+    // отмена системного диалога папки гасила оверлей без единой вкладки и
+    // без возможности восстановиться. Сначала спрашиваем папку, и только при
+    // реальном выборе (folder не null) гасим restore и открываем вкладку.
+    //
     // FIX 3 (carryover 3): оверлей restore накрывает только #main, а эта
     // кнопка живёт в сайдбаре — без этого крючка можно было открыть вкладку,
     // пока решение по восстановлению ещё не принято, и ничего не писалось
     // бы на диск до решения. Открытие вкладки = неявный отказ от restore:
     // прогоняем ту же ветку «начать пусто», что и Esc/кнопка в оверлее.
-    if (restoreOverlaySkip) restoreOverlaySkip();
     const folder = await window.api.tabs.chooseFolder();
-    if (folder) openTab(folder);
+    if (folder) {
+      if (restoreOverlaySkip) restoreOverlaySkip();
+      openTab(folder);
+    }
   });
 
   bindHotkeys();
@@ -433,6 +472,11 @@ async function boot() {
       // тот же эффект заморозки манифеста, что и в ветке выше. Деградируем:
       // считаем, что восстанавливать нечего (как при отсутствии манифеста).
       console.warn('[restore] оверлей восстановления не показался:', err);
+      // Fix 11 (ревью): showRestoreOverlay могла успеть показать оверлей
+      // (overlay.classList.remove('hidden')) и упасть уже ПОСЛЕ этого,
+      // внутри своего локального замыкания — без явного скрытия здесь
+      // модалка залипала бы навсегда поверх главной области.
+      $('restore-overlay')?.classList.add('hidden');
       window.api.workspace.ready();
     }
   }

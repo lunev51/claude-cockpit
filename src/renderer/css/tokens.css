@@ -8,16 +8,13 @@
   --bg-hover:  #2A2A2A;
   --bg-wait:   #231A16; /* подложка «ждёт тебя» — единственная тёплая поверхность */
 
-  --border:      #2A2A2A;
-  --border-soft: #333333;
+  --border: #2A2A2A;
 
   --text:       #E8E8E8;
   --text-muted: #9E9E9E;
   --text-dim:   #8A8A8A;
 
-  --accent:       #D97757; /* ТОЛЬКО «ждёт тебя» и главные CTA */
-  --accent-hover: #A9583E;
-  --accent-soft:  #D97757;
+  --accent: #D97757; /* ТОЛЬКО «ждёт тебя» и главные CTA */
 
   /* Статусы — ANSI Warp default_dark */
   --ok:      #a1b56c;
@@ -27,11 +24,9 @@
 
   /* Геометрия Warp: жёстко, без щедрых пилюль */
   --radius-s: 3px;
-  --radius-m: 4px;
   --radius-l: 6px;
 
-  --font-ui:    'Inter', 'Segoe UI', sans-serif;
-  --font-serif: 'Inter', 'Segoe UI', sans-serif; /* серифов в v2 нет; алиас для совместимости */
+  --font-ui: 'Inter', 'Segoe UI', sans-serif;
   /* DM Mono отменён 27.07: нет кириллицы. Берём тот же шрифт, что и терминал. */
-  --font-mono:  'JetBrainsMono NF', 'JetBrains Mono', 'Cascadia Mono', Consolas, monospace;
+  --font-mono: 'JetBrainsMono NF', 'JetBrains Mono', 'Cascadia Mono', Consolas, monospace;
 }

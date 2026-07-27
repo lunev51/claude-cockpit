@@ -107,6 +107,8 @@ export function initTerminal(container, config, {
   let alive = false;
 
   // --- панель поиска (создаётся динамически внутри container) ---
+  // Fix 6 (ревью): инлайн-стили были зашиты хексами мимо дизайн-токенов —
+  // cssText прекрасно принимает custom properties, заменяем на var(--...).
   const searchBar = document.createElement('div');
   searchBar.style.cssText = [
     'position:absolute',
@@ -117,11 +119,11 @@ export function initTerminal(container, config, {
     'align-items:center',
     'gap:4px',
     'padding:4px 6px',
-    'background:#141414',
-    'border:1px solid #2A2A2A',
+    'background:var(--bg-panel)',
+    'border:1px solid var(--border)',
     'border-radius:6px',
-    'color:#E8E8E8',
-    'font-family:sans-serif',
+    'color:var(--text)',
+    'font-family:var(--font-ui)',
     'font-size:12px',
   ].join(';');
 
@@ -133,7 +135,7 @@ export function initTerminal(container, config, {
     'border:none',
     'outline:none',
     'background:transparent',
-    'color:#E8E8E8',
+    'color:var(--text)',
     'font-size:12px',
   ].join(';');
 
@@ -143,7 +145,7 @@ export function initTerminal(container, config, {
     b.style.cssText = [
       'border:none',
       'background:transparent',
-      'color:#8A8A8A',
+      'color:var(--text-dim)',
       'cursor:pointer',
       'font-size:12px',
       'padding:2px 4px',

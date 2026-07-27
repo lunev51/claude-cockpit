@@ -11,6 +11,10 @@ html, body {
   background: var(--bg-window);
   color: var(--text);
   font-family: var(--font-ui);
+  /* Fix 2 (ревью): без этого Chromium рисует нативные элементы (скроллбары
+     сайдбара/списка восстановления, чекбоксы) светлой темой по умолчанию —
+     светлый скроллбар и белые чекбоксы с системным синим прямо на тёмной модалке. */
+  color-scheme: dark;
 }
 
 /* --- Титлбар: drag-полоса, кнопки окна рисует Windows (overlay) --- */
@@ -27,7 +31,14 @@ html, body {
 }
 #titlebar .dot {
   width: 8px; height: 8px; border-radius: 50%;
+  /* Fix 8 (ревью): терракота — только «ждёт тебя» (проект). По умолчанию
+     нейтральный дим; .alert (терракота + свечение) вешает app.js, пока
+     есть хотя бы одна вкладка в статусе waiting. */
+  background: var(--text-dim);
+}
+#titlebar .dot.alert {
   background: var(--accent);
+  box-shadow: 0 0 6px var(--accent);
 }
 #titlebar-text {
   /* Плотность Warp: рубленый UI-шрифт, не серифный и не моно. */
@@ -83,6 +94,12 @@ html, body {
   border-left: 2px solid var(--accent);
   /* компенсация border-left: 6px + 2px = 8px, как у остальных строк (не «прыгает») */
   padding-left: 6px;
+}
+/* Fix 7 (ревью): .tab-row.waiting идёт после .tab-row.active в исходнике при
+   равной специфичности — у активной ждущей вкладки терялся признак активности.
+   Отдельное правило с двойным классом побеждает оба по специфичности. */
+.tab-row.waiting.active {
+  background: color-mix(in srgb, var(--bg-wait) 70%, var(--bg-card));
 }
 
 .tab-dot {
@@ -209,7 +226,7 @@ html, body {
   cursor: pointer;
 }
 .restore-row:hover { background: var(--bg-hover); }
-.restore-row input[type="checkbox"] { flex: none; }
+.restore-row input[type="checkbox"] { flex: none; accent-color: var(--accent); }
 .restore-row-info { min-width: 0; flex: 1; }
 .restore-row-name { font-size: 13px; color: var(--text); }
 .restore-row-cwd {
@@ -264,3 +281,12 @@ html, body {
 #action-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
 /* Виджет лимита пока не наполняется (дашборд — следующая фаза) — скрыт, пока пуст. */
 #limit-5h:empty { display: none; }
+
+/* Fix 9 (ревью, спека §7): «focus — 2px кольцо терракотой» вместо дефолтного
+   кольца Chromium. */
+.action-btn:focus-visible,
+.sidebar-btn:focus-visible,
+.restore-row input[type="checkbox"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
