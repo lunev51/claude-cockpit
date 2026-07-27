@@ -420,12 +420,31 @@ test('restart эмитит tabs:changed — манифест пересобир�
   // И (FIX 4, carryover 3) сам эмитит tabs:changed НЕМЕДЛЕННО здесь же, не
   // дожидаясь следующего restart() — манифест узнаёт о протухшем sessionId
   // сразу, а не спустя произвольное время до следующего restart/open/close.
+  //
+  // ВАЖНО (ревью после первого прохода фикса §6): этот же onExit ТЕПЕРЬ ещё и
+  // короткоживущий провал оверрайда (livedMs=0 на клоке этого теста, tick()
+  // тут не звался) — авто-восстановление (спека §6) срабатывает СИНХРОННО
+  // прямо внутри этого вызова и само спавнит спавн #3 (голые args), не
+  // дожидаясь explicit mgr.restart() ниже. Без явной проверки длины
+  // factory.spawned здесь explicit restart() ниже тихо стал бы спавном #4
+  // вместо ожидаемого #3, а assert на .args прошёл бы «случайно» (голые args
+  // совпадают что у авто-спавна, что у ручного рестарта) — ровно то, на что
+  // указало ревью. Фиксируем длину явно, чтобы это никогда больше не
+  // проскочило незамеченным.
   factory.spawned[1].opts.onExit(1);
   const afterFailedExit = events.filter((e) => e.channel === 'tabs:changed').length;
   assert.strictEqual(afterFailedExit, afterFirstRestart + 1);
-
-  mgr.restart(a.tabId); // спавн #3: overrideFailed=true → голые args (без цикла на пикере)
+  assert.strictEqual(factory.spawned.length, 3, 'onExit уже произвёл авто-спавн #3 (голые args)');
   assert.deepStrictEqual(factory.spawned[2].opts.args, []);
+
+  // Ручной restart() ЗДЕСЬ — это спавн #4, ПОВЕРХ уже авто-восстановленной
+  // вкладки (не #3, как было до §6). tab.overrideFailed всё ещё true (его
+  // сбрасывает только restart()/успешный SessionStart, авто-восстановление
+  // его не трогает) — поэтому restart() опять идёт на голые args, без
+  // отката на пикер.
+  mgr.restart(a.tabId); // спавн #4: overrideFailed=true → голые args (без цикла на пикере)
+  assert.strictEqual(factory.spawned.length, 4, 'ручной restart() — это спавн #4, а не #3');
+  assert.deepStrictEqual(factory.spawned[3].opts.args, []);
   const afterSecondRestart = events.filter((e) => e.channel === 'tabs:changed').length;
   // Именно это и было целью теста: манифест пересобирается СНОВА даже на
   // рестарте, вызванном провалом резюма, — иначе следующий запуск приложения
@@ -579,6 +598,17 @@ test('FIX 4: onExit без SessionStart (первый спавн restore, ДО �
   // (который слушает исключительно 'tabs:changed') не пересобрал бы манифест
   // до следующего restart()/open()/close(), и протухший id мог уехать на диск
   // при выходе приложения ПРЯМО СЕЙЧАС (между этим onExit и любым restart).
+  //
+  // Аудит после ревью фикса §6: этот onExit (livedMs=0, tick() тут не звался)
+  // ТОЖЕ запускает авто-восстановление (спавн #2, голые args) — но assertions
+  // ниже намеренно НЕ зависят от того, какой именно спавн проверяется: `.some()`
+  // по каналу события (а не по индексу конкретного спавна) и sessionId в
+  // list() (auto-восстановление его не перепривязывает). Это ровно тот
+  // случай из ревью, когда тест НЕ проходит «случайно» — его утверждения
+  // остаются истинными независимо от появления авто-спавна, поэтому явная
+  // проверка длины factory.spawned здесь не нужна (в отличие от теста
+  // «restart эмитит tabs:changed…» выше, где assert индексировал ИМЕННО
+  // спавн — там разбор длины был обязателен).
   factory.spawned[0].opts.onExit(1);
 
   const added = events.slice(beforeLen);
@@ -716,5 +746,47 @@ test('успешная привязка сессии и/или ручной rest
     'авто-восстановление должно снова сработать после сброса флага',
   );
   assert.deepStrictEqual(factory.spawned[3].opts.args, []);
+  assert.strictEqual(statusOf(events, a.tabId).status, 'working');
+});
+
+test('ручной restart() САМ ПО СЕБЕ сбрасывает autoRecovered — без единого bindSession/SessionStart за весь тест', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events, tick } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha', sessionId: 'ghost-session' });
+  mgr.start(a.tabId, 80, 24); // спавн #1: --resume ghost-session
+
+  tick(2000);
+  factory.spawned[0].opts.onExit(1); // провал → авто-спавн #2 (autoRecovered=true, overrideFailed=true)
+  assert.strictEqual(factory.spawned.length, 2);
+  assert.deepStrictEqual(factory.spawned[1].opts.args, []);
+
+  // Ручной рестарт БЕЗ какой-либо привязки сессии: tab.overrideFailed всё ещё
+  // true (никто его не снимал через SessionStart) — restart() уходит в ветку
+  // «голые args» и попутно сбрасывает и overrideFailed, и autoRecovered.
+  mgr.restart(a.tabId); // спавн #3: голые args (overrideFailed=true → сброс)
+  assert.strictEqual(factory.spawned.length, 3);
+  assert.deepStrictEqual(factory.spawned[2].opts.args, []);
+
+  // Второй ручной рестарт подряд: overrideFailed теперь false (сброшен выше),
+  // sessionId по-прежнему не известен — restart() уходит в ветку голого
+  // --resume (пикер), это снова оверрайд.
+  mgr.restart(a.tabId); // спавн #4: голый --resume (пикер)
+  assert.strictEqual(factory.spawned.length, 4);
+  assert.deepStrictEqual(factory.spawned[3].opts.args, ['--resume']);
+
+  // Этот пикер тоже проваливается быстро — SessionStart за весь тест НИ РАЗУ
+  // не звался, значит единственный, кто мог снять autoRecovered к этому
+  // моменту, — сам restart() выше (а не успешная привязка сессии). Если бы
+  // restart() не сбрасывал флаг сам по себе, эта попытка молчала бы (флаг
+  // всё ещё true с самого первого провала), и пятого спавна не было бы.
+  tick(2000);
+  factory.spawned[3].opts.onExit(1);
+
+  assert.strictEqual(
+    factory.spawned.length,
+    5,
+    'restart() один сбросил autoRecovered — авто-восстановление сработало снова без единого SessionStart',
+  );
+  assert.deepStrictEqual(factory.spawned[4].opts.args, []);
   assert.strictEqual(statusOf(events, a.tabId).status, 'working');
 });
