@@ -25,6 +25,14 @@ function getSmokeOutput() {
   return smokeOutput;
 }
 
+// Task 2 фазы 4: активная вкладка (по мнению renderer, workspace:setActive) —
+// toasts.js получает этот геттер как getActiveTabId() при создании тостера в
+// main.js. Замыкание, а не снимок значения: main.js создаёт тостер один раз
+// на старте, а activeTabId дальше живёт и меняется здесь же, в ipc.js.
+function getActiveTabId() {
+  return activeTabId;
+}
+
 // Путь к файлу с фактическим портом моста (читает scripts/cockpit-hook.js).
 function bridgePortFile() {
   return path.join(app.getPath('userData'), 'bridge-port');
@@ -67,7 +75,7 @@ function validDim(n) {
 }
 
 function registerIpc(win, opts = {}) {
-  const { smoke = false, attention = null } = opts;
+  const { smoke = false, attention = null, toaster = null } = opts;
 
   // Стор манифеста создаётся один раз на регистрацию — независимо от smoke,
   // чтобы workspace:get всегда мог отдать хоть что-то (в smoke он просто
@@ -134,6 +142,20 @@ function registerIpc(win, opts = {}) {
     onEvent: (channel, payload) => {
       if (smoke && channel === 'term:data') smokeOutput += payload.data;
       if (channel === 'tabs:changed') syncWorkspace();
+      // Task 2 фазы 4: тот же поток, что шлёт tab:status в renderer, — тостер
+      // (toasts.js, чистый модуль) сам решает, показывать ли уведомление
+      // Windows, по правилу «не уведомлять о том, на что смотришь». Имя
+      // вкладки берём из manager.list() — payload статуса его не несёт.
+      // smoke: headless-прогон никогда не должен показывать тосты.
+      if (!smoke && channel === 'tab:status' && toaster) {
+        const tab = manager.list().find((t) => t.tabId === payload.tabId);
+        toaster.onStatus({
+          tabId: payload.tabId,
+          tabName: tab ? tab.name : payload.tabId,
+          status: payload.status,
+          waitingText: payload.waitingText,
+        });
+      }
       if (!win.isDestroyed()) win.webContents.send(channel, payload);
     },
   });
@@ -392,4 +414,6 @@ function disposeSessions() {
   if (manager) manager.disposeAll();
 }
 
-module.exports = { registerIpc, disposeSessions, stopBridge, getSmokeOutput, flushWorkspace };
+module.exports = {
+  registerIpc, disposeSessions, stopBridge, getSmokeOutput, flushWorkspace, getActiveTabId,
+};

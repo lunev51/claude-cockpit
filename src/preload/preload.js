@@ -34,6 +34,9 @@ contextBridge.exposeInMainWorld('api', {
   },
   tab: {
     onStatus: (cb) => ipcRenderer.on('tab:status', (_e, p) => cb(p)),
+    // Task 2 фазы 4: клик по Windows-тосту — main поднимает окно и шлёт сюда
+    // {tabId} вкладки тоста; app.js подписывается и зовёт activateTab(tabId).
+    onActivate: (cb) => ipcRenderer.on('tab:activate', (_e, p) => cb(p)),
   },
   workspace: {
     get: () => ipcRenderer.invoke('workspace:get'),

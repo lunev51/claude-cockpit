@@ -3,11 +3,16 @@
 
 const fs = require('fs');
 const path = require('path');
-const { app, BrowserWindow, screen, Menu, nativeImage } = require('electron');
-const { registerIpc, disposeSessions, getSmokeOutput, flushWorkspace } = require('./ipc');
+const {
+  app, BrowserWindow, screen, Menu, nativeImage, Notification,
+} = require('electron');
+const {
+  registerIpc, disposeSessions, getSmokeOutput, flushWorkspace, getActiveTabId,
+} = require('./ipc');
 const { getConfig, isRootConfigCorrupt } = require('./config');
 const { setWindow, notify } = require('./notify');
 const { createAttention } = require('./attention');
+const { createToaster } = require('./toasts');
 
 const SMOKE = process.argv.includes('--smoke');
 
@@ -148,6 +153,34 @@ app.whenReady().then(() => {
     },
   });
 
+  // Task 2 фазы 4: Windows-тосты «не про то, на что смотришь» — toasts.js
+  // чистый (без Electron), решает ТОЛЬКО «показывать или нет», а сами
+  // Electron-зависимые точки (Notification, фокус окна, переключение вкладки)
+  // инжектируются здесь же, рядом с attention (тот же паттерн). Проводка
+  // (вызов toaster.onStatus из потока tab:status, имя вкладки из manager.list())
+  // живёт в ipc.js — сюда только сборка зависимостей.
+  const toaster = createToaster({
+    isWindowFocused: () => win.isFocused(),
+    // activeTabId — состояние ipc.js (workspace:setActive из renderer);
+    // getActiveTabId — замыкание над ним, а не снимок на момент сборки.
+    getActiveTabId,
+    showNotification: ({ title, body, onClick }) => {
+      // Notification.isSupported() гардит редкие среды без центра уведомлений
+      // Windows (например, урезанный WORKGROUP-сервер) — тост тогда просто не
+      // показывается, приложение не падает.
+      if (!Notification.isSupported()) return;
+      const n = new Notification({ title, body });
+      n.on('click', onClick);
+      n.show();
+    },
+    focusTab: (tabId) => {
+      if (win.isDestroyed()) return;
+      win.show();
+      win.focus();
+      win.webContents.send('tab:activate', { tabId });
+    },
+  });
+
   if (!SMOKE) {
     win.webContents.once('did-finish-load', () => {
       if (isRootConfigCorrupt()) {
@@ -156,7 +189,7 @@ app.whenReady().then(() => {
     });
   }
 
-  registerIpc(win, { smoke: SMOKE, attention });
+  registerIpc(win, { smoke: SMOKE, attention, toaster });
 
   // Ошибки renderer всегда дублируем в stdout — иначе их не видно при фоновом запуске.
   win.webContents.on('console-message', (eventOrDetails, level, message) => {

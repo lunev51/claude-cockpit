@@ -413,6 +413,11 @@ async function boot() {
   window.api.term.onExit((p) => {
     views.get(p.tabId)?.view.handlers.onExit(p);
   });
+  // Task 2 фазы 4: клик по Windows-тосту — main прислал {tabId}. activateTab
+  // сама тихо игнорирует неизвестный/уже закрытый tabId (views.get → undefined
+  // → return), так что здесь ничего дополнительно проверять не нужно.
+  window.api.tab.onActivate(({ tabId }) => activateTab(tabId));
+
   // Статусы приходят из хуков Claude Code (sessions.js) — единый источник,
   // term:started/term:exit статус больше не выставляют (был двойной источник).
   window.api.tab.onStatus(({ tabId, status, subtitle }) => {
