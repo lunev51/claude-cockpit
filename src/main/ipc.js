@@ -67,7 +67,7 @@ function validDim(n) {
 }
 
 function registerIpc(win, opts = {}) {
-  const { smoke = false } = opts;
+  const { smoke = false, attention = null } = opts;
 
   // Стор манифеста создаётся один раз на регистрацию — независимо от smoke,
   // чтобы workspace:get всегда мог отдать хоть что-то (в smoke он просто
@@ -160,6 +160,18 @@ function registerIpc(win, opts = {}) {
 
   ipcMain.handle('shell:openExternal', (_e, url) => {
     if (typeof url === 'string' && /^https?:\/\//i.test(url)) shell.openExternal(url);
+  });
+
+  // Task 1 фазы 4: renderer шлёт агрегат «сколько вкладок ждут» + готовую
+  // PNG-иконку бейджа (канвас рисует badge.js, main про canvas не знает).
+  // attention — чистый модуль (attention.js), инстанс создаётся в main.js
+  // (там же живут nativeImage и win.setOverlayIcon) и прокидывается сюда
+  // через opts — ipc.js только маршрутизирует IPC-пейлоад.
+  ipcMain.on('attention:update', (_e, payload) => {
+    if (!attention || !payload || typeof payload !== 'object') return;
+    const { count, dataUrl } = payload;
+    if (typeof count !== 'number') return;
+    attention.update({ count, dataUrl: typeof dataUrl === 'string' ? dataUrl : null });
   });
 
   // Регистрация вкладки. cwd обязателен — renderer берёт его из диалога

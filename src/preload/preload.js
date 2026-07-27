@@ -47,4 +47,10 @@ contextBridge.exposeInMainWorld('api', {
     save: (tabId, text) => ipcRenderer.invoke('ghost:save', { tabId, text }),
     load: (ghostId) => ipcRenderer.invoke('ghost:load', ghostId),
   },
+  attention: {
+    // Task 1 фазы 4: агрегат «сколько вкладок ждут» → overlay-иконка
+    // таскбара + заголовок окна (main/attention.js). dataUrl рисует
+    // renderer (badge.js) — main про canvas ничего не знает.
+    update: (count, dataUrl) => ipcRenderer.send('attention:update', { count, dataUrl }),
+  },
 });

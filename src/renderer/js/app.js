@@ -3,6 +3,7 @@
 
 import { initTerminal } from './terminal.js';
 import { createTabStore } from './tabs.js';
+import { renderBadge } from './badge.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -24,6 +25,13 @@ const waitingTabs = new Set();
 const titlebarDot = document.querySelector('#titlebar .dot');
 function updateTitlebarAlert() {
   titlebarDot?.classList.toggle('alert', waitingTabs.size > 0);
+}
+
+// Task 1 фазы 4: тот же waitingTabs.size — агрегат для main-процесса
+// (overlay-иконка таскбара + заголовок окна, см. main/attention.js).
+// renderBadge рисует canvas здесь, в renderer — main про canvas не знает.
+function pushAttention() {
+  window.api.attention.update(waitingTabs.size, renderBadge(waitingTabs.size));
 }
 
 // Панель действий: кнопки шлют слэш-команду в pty активной вкладки (фича 23/26).
@@ -147,6 +155,7 @@ async function closeTab(tabId) {
   // титлбаре могла бы залипнуть, если закрыли последнюю waiting-вкладку.
   waitingTabs.delete(tabId);
   updateTitlebarAlert();
+  pushAttention();
   // Переключаемся на соседнюю вкладку, только если закрыли активную —
   // закрытие фоновой вкладки не должно перебивать фокус пользователя.
   if (!wasActive) return;
@@ -412,6 +421,7 @@ async function boot() {
     // вкладка в статусе waiting — снимаем, когда ждущих не осталось.
     if (status === 'waiting') waitingTabs.add(tabId); else waitingTabs.delete(tabId);
     updateTitlebarAlert();
+    pushAttention();
     // Ghost-буфер (Task 5): переход в done/waiting — момент «Claude закончил
     // ход», самый ценный кадр скроллбека — сериализуем именно эту вкладку
     // сразу, не дожидаясь общего 30-секундного таймера ниже.

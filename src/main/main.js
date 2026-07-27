@@ -3,10 +3,11 @@
 
 const fs = require('fs');
 const path = require('path');
-const { app, BrowserWindow, screen, Menu } = require('electron');
+const { app, BrowserWindow, screen, Menu, nativeImage } = require('electron');
 const { registerIpc, disposeSessions, getSmokeOutput, flushWorkspace } = require('./ipc');
 const { getConfig, isRootConfigCorrupt } = require('./config');
 const { setWindow, notify } = require('./notify');
+const { createAttention } = require('./attention');
 
 const SMOKE = process.argv.includes('--smoke');
 
@@ -108,6 +109,17 @@ function createWindow() {
   win.webContents.on('will-navigate', (e) => e.preventDefault());
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
 
+  // Carryover 1 (ревью): Menu.setApplicationMenu(null) ниже нужен ради Ctrl+R
+  // (Housekeeping #14), но заодно срубает стандартный F12-хоткей Electron —
+  // возвращаем его точечно через before-input-event. Фильтр на keyDown
+  // обязателен: событие приходит и на keyDown, и на keyUp — без фильтра
+  // toggleDevTools() дёрнулся бы дважды подряд (открыл и тут же закрыл).
+  win.webContents.on('before-input-event', (_e, input) => {
+    if (input.type === 'keyDown' && input.key === 'F12') {
+      win.webContents.toggleDevTools();
+    }
+  });
+
   win.loadFile(path.join(__dirname, '../renderer/index.html'));
   return win;
 }
@@ -124,6 +136,18 @@ app.whenReady().then(() => {
   const win = createWindow();
   setWindow(win);
 
+  // Task 1 фазы 4: агрегат «сколько вкладок ждут» → overlay-иконка таскбара +
+  // заголовок окна. attention.js — чистый модуль без Electron (тестируется
+  // node --test), setOverlay/getWindow — единственные Electron-зависимые
+  // точки, инжектируются здесь. dataUrl рисует renderer (badge.js) —
+  // main про canvas ничего не знает, только ставит готовую иконку.
+  const attention = createAttention({
+    getWindow: () => win,
+    setOverlay: (img, desc) => {
+      win.setOverlayIcon(img ? nativeImage.createFromDataURL(img) : null, desc);
+    },
+  });
+
   if (!SMOKE) {
     win.webContents.once('did-finish-load', () => {
       if (isRootConfigCorrupt()) {
@@ -132,7 +156,7 @@ app.whenReady().then(() => {
     });
   }
 
-  registerIpc(win, { smoke: SMOKE });
+  registerIpc(win, { smoke: SMOKE, attention });
 
   // Ошибки renderer всегда дублируем в stdout — иначе их не видно при фоновом запуске.
   win.webContents.on('console-message', (eventOrDetails, level, message) => {
