@@ -82,7 +82,7 @@ async function closeTab(tabId) {
   // Сосед считаем ДО tabStore.remove — после удаления ряда его позиции в order() уже нет.
   const fallback = tabStore.neighborOf(tabId);
   await window.api.tabs.close(tabId);
-  entry.view.term.dispose();
+  entry.view.dispose(); // отключает ResizeObserver и сам term (Task 6)
   entry.container.remove();
   views.delete(tabId);
   tabStore.remove(tabId);

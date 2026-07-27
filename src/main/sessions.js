@@ -9,6 +9,25 @@ const crypto = require('crypto');
 
 const STATUSES = ['working', 'waiting', 'done', 'stuck', 'dead'];
 
+// Выпиливает унаследованные маркеры родительского Claude Code из process.env
+// (Task 6). Если кокпит запущен из-под ДРУГОГО Claude Code (например, так
+// делают тестовые прогоны), переменные вроде CLAUDE_CODE_CHILD_SESSION /
+// CLAUDECODE / CLAUDE_CODE_* наследуются вниз по процессу — claude во
+// вкладке считает себя дочерней сессией: рисует урезанный монохромный UI,
+// не пишет транскрипт и наследует bypass-permissions родителя. Копируем
+// process.env и убираем всё, что начинается на CLAUDE_CODE (регистронезависимо),
+// плюс отдельно CLAUDECODE — ДО того как добавить свои COCKPIT_*.
+function sanitizedProcessEnv() {
+  const clean = { ...process.env };
+  for (const key of Object.keys(clean)) {
+    const upper = key.toUpperCase();
+    if (upper.startsWith('CLAUDE_CODE') || upper === 'CLAUDECODE') {
+      delete clean[key];
+    }
+  }
+  return clean;
+}
+
 // ptyFactory(opts) → {write, resize, kill, pid} — в проде createPty из pty.js.
 // getTermConfig() → config.terminal; onEvent(channel, payload) → webContents.send.
 // now() — клок (тестам нужен управляемый); stuckAfterMs — порог зависания;
@@ -44,6 +63,11 @@ function createSessionManager({
       lastOutputAt: now(),
       pendingExtraArgs: null,  // одноразовый оверрайд args на следующий spawn() (хотфикс restart, спека §3.14)
       overrideFailed: false,   // true = процесс с оверрайдом (--resume <id>/--resume) умер, а SessionStart так и не привязал сессию
+      // Идле-арминг детекта зависаний (Task 6): без подключённых хуков «working»
+      // означает лишь «терминал открыт» — вкладка, спокойно стоящая у промпта
+      // (пользователь ещё не подключил хуки), не должна уезжать в «Проблемы».
+      // Взводится ЛЮБЫМ хук-событием в applyHookEvent и живёт до конца вкладки.
+      hookActive: false,
     });
     onEvent('tabs:changed', {}); // состав вкладок изменился — main пересоберёт манифест
     return { tabId, cwd, name };
@@ -83,7 +107,7 @@ function createSessionManager({
         useConpty: t.useConpty !== false,
         useConptyDll: t.useConptyDll !== false,
         env: {
-          ...process.env,
+          ...sanitizedProcessEnv(),
           COCKPIT: '1',
           COCKPIT_TAB_ID: tab.tabId,
           ...getExtraEnv(),
@@ -238,6 +262,9 @@ function createSessionManager({
   function applyHookEvent(tabId, event, data = {}) {
     const tab = tabs.get(tabId);
     if (!tab) return;
+    // Любое хук-событие — доказательство, что хуки Cockpit подключены к
+    // проекту и статусы вкладки отныне честны; взводим idle-арминг один раз.
+    tab.hookActive = true;
     switch (event) {
       case 'SessionStart':
         if (data.session_id) {
@@ -272,6 +299,9 @@ function createSessionManager({
   function checkStuck() {
     const ts = now();
     for (const tab of tabs.values()) {
+      // Идле-арминг (Task 6): без единого хук-события «working» не отличить
+      // от «терминал просто открыт и стоит у промпта» — честно пропускаем.
+      if (!tab.hookActive) continue;
       if (tab.status === 'working' && tab.proc && ts - tab.lastOutputAt > stuckAfterMs) {
         const min = Math.max(1, Math.round((ts - tab.lastOutputAt) / 60000));
         setStatus(tab, 'stuck', `нет вывода ${min}м`);

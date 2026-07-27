@@ -328,5 +328,12 @@ export function initTerminal(container, config, {
     // Ghost-снимок буфера (Task 5): scrollback:2000 — достаточно контекста для
     // «о чём мы говорили», не раздувая ghost-файл на диске.
     serialize: () => serializeAddon.serialize({ scrollback: 2000 }),
+    // Task 6: закрытие вкладки должно гасить и ResizeObserver — он раньше
+    // не отключался (наблюдатель на удалённом из DOM container продолжал
+    // жить, утечка на каждое закрытие/переоткрытие вкладки).
+    dispose: () => {
+      observer.disconnect();
+      term.dispose();
+    },
   };
 }

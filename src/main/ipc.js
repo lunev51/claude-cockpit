@@ -83,14 +83,25 @@ function registerIpc(win, opts = {}) {
   // текущим манифестом и удаляем всё лишнее. smoke — не трогаем userData.
   if (!smoke) {
     try {
-      const dir = ghostDir();
-      const known = new Set((store.load()?.tabs || []).map((t) => t.ghostId).filter(Boolean));
-      if (fs.existsSync(dir)) {
-        for (const file of fs.readdirSync(dir)) {
-          if (!file.endsWith('.txt')) continue;
-          const id = file.slice(0, -'.txt'.length);
-          if (!known.has(id)) {
-            try { fs.unlinkSync(path.join(dir, file)); } catch { /* не критично */ }
+      // Task 6, защита от потери данных: если манифест не читается вообще
+      // (битый workspace.json И битый .bak — store.load() вернул null), мы
+      // НЕ знаем, какие ghost-файлы сироты, а какие — актуальные вкладки
+      // вчерашней сессии. Раньше `store.load()?.tabs || []` в этом случае
+      // давал known = пустой Set, и уборка сносила АБСОЛЮТНО ВСЕ ghost-файлы
+      // как «сирот» — то есть терялся весь вчерашний контекст всех вкладок
+      // из-за одной повреждённой пары файлов манифеста. Пропускаем уборку
+      // целиком, пока манифест не прочитается успешно.
+      const manifest = store.load();
+      if (manifest) {
+        const dir = ghostDir();
+        const known = new Set((manifest.tabs || []).map((t) => t.ghostId).filter(Boolean));
+        if (fs.existsSync(dir)) {
+          for (const file of fs.readdirSync(dir)) {
+            if (!file.endsWith('.txt')) continue;
+            const id = file.slice(0, -'.txt'.length);
+            if (!known.has(id)) {
+              try { fs.unlinkSync(path.join(dir, file)); } catch { /* не критично */ }
+            }
           }
         }
       }

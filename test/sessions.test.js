@@ -264,11 +264,14 @@ test('UserPromptSubmit переводит done в working', () => {
   assert.strictEqual(statusOf(events, a.tabId).status, 'working');
 });
 
-test('checkStuck: working без вывода дольше порога → stuck; вывод возвращает working', () => {
+test('checkStuck: working без вывода дольше порога (hookActive=true после хук-события) → stuck; вывод возвращает working', () => {
   const factory = makeFakePtyFactory();
   const { mgr, events, tick } = makeManager(factory);
   const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
+  // Армируем hookActive хук-событием — иначе checkStuck честно пропустит
+  // вкладку (см. тесты idle-арминга ниже).
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'sess-1' });
   tick(1500);
   mgr.checkStuck();
   assert.strictEqual(statusOf(events, a.tabId).status, 'stuck');
@@ -448,4 +451,51 @@ test('restart: kill() фабрики синхронно зовёт свой onEx
   mgr.restart(a.tabId); // тот же гард — снова голый --resume, не откат на голые args
   assert.strictEqual(spawned.length, 3);
   assert.deepStrictEqual(spawned[2].opts.args, ['--resume']);
+});
+
+// ---------- Phase 2b Task 6: idle-арминг stuck-детекта ----------
+
+test('checkStuck: без хук-событий (hookActive=false) stuck НЕ наступает даже после порога — без хуков "working" значит лишь "терминал открыт"', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events, tick } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  tick(1500); // дольше stuckAfterMs
+  mgr.checkStuck();
+  assert.strictEqual(statusOf(events, a.tabId).status, 'working');
+});
+
+test('checkStuck: после первого хук-события (hookActive=true) stuck наступает по порогу как раньше', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events, tick } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'PreToolUse', { tool_name: 'Bash' }); // любое хук-событие армирует
+  tick(1500);
+  mgr.checkStuck();
+  assert.strictEqual(statusOf(events, a.tabId).status, 'stuck');
+});
+
+// ---------- Phase 2b Task 6: зачистка унаследованных маркеров Claude Code ----------
+
+test('spawn: унаследованные CLAUDE_CODE_*/CLAUDECODE вычищены из env pty — кокпит, запущенный из-под другого Claude Code, не должен передавать вкладке чужую сессию', () => {
+  const originalChildSession = process.env.CLAUDE_CODE_CHILD_SESSION;
+  const originalClaudecode = process.env.CLAUDECODE;
+  try {
+    process.env.CLAUDE_CODE_CHILD_SESSION = '1';
+    process.env.CLAUDECODE = '1';
+    const factory = makeFakePtyFactory();
+    const { mgr } = makeManager(factory);
+    const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+    mgr.start(a.tabId, 80, 24);
+    const env = factory.spawned[0].opts.env;
+    assert.strictEqual('CLAUDE_CODE_CHILD_SESSION' in env, false);
+    assert.strictEqual('CLAUDECODE' in env, false);
+    assert.strictEqual(env.COCKPIT_TAB_ID, a.tabId);
+  } finally {
+    if (originalChildSession === undefined) delete process.env.CLAUDE_CODE_CHILD_SESSION;
+    else process.env.CLAUDE_CODE_CHILD_SESSION = originalChildSession;
+    if (originalClaudecode === undefined) delete process.env.CLAUDECODE;
+    else process.env.CLAUDECODE = originalClaudecode;
+  }
 });
