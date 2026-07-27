@@ -35,4 +35,16 @@ contextBridge.exposeInMainWorld('api', {
   tab: {
     onStatus: (cb) => ipcRenderer.on('tab:status', (_e, p) => cb(p)),
   },
+  workspace: {
+    get: () => ipcRenderer.invoke('workspace:get'),
+    setActive: (tabId) => ipcRenderer.send('workspace:setActive', { tabId }),
+    // FIX 2 (ревью): сигнал main'у, что восстановление воркспейса на старте
+    // завершено (или решено начать пусто) — до этого момента синхронизация
+    // манифеста заблокирована (см. workspace-sync.js, main/ipc.js).
+    ready: () => ipcRenderer.send('workspace:ready'),
+  },
+  ghost: {
+    save: (tabId, text) => ipcRenderer.invoke('ghost:save', { tabId, text }),
+    load: (ghostId) => ipcRenderer.invoke('ghost:load', ghostId),
+  },
 });

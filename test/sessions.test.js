@@ -68,6 +68,21 @@ test('start спавнит pty с cwd вкладки, write/resize маршру�
   assert.strictEqual(started.length, 2);
 });
 
+test('open с явным ghostId переиспользует его; без него — минтит новый (ревью Task 5, finding 1a)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+
+  const fixed = mgr.open({ cwd: 'C:\\proj\\alpha', ghostId: 'g-fixed' });
+  const fixedGhostId = mgr.list().find((t) => t.tabId === fixed.tabId).ghostId;
+  assert.strictEqual(fixedGhostId, 'g-fixed');
+
+  const fresh = mgr.open({ cwd: 'C:\\proj\\beta' });
+  const freshGhostId = mgr.list().find((t) => t.tabId === fresh.tabId).ghostId;
+  assert.strictEqual(typeof freshGhostId, 'string');
+  assert.strictEqual(freshGhostId.length, 36); // UUID
+  assert.notStrictEqual(freshGhostId, 'g-fixed');
+});
+
 test('per-tab command/args переопределяют конфиг', () => {
   const factory = makeFakePtyFactory();
   const { mgr } = makeManager(factory);
@@ -249,11 +264,14 @@ test('UserPromptSubmit переводит done в working', () => {
   assert.strictEqual(statusOf(events, a.tabId).status, 'working');
 });
 
-test('checkStuck: working без вывода дольше порога → stuck; вывод возвращает working', () => {
+test('checkStuck: working без вывода дольше порога (hookActive=true после хук-события) → stuck; вывод возвращает working', () => {
   const factory = makeFakePtyFactory();
   const { mgr, events, tick } = makeManager(factory);
   const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
+  // Армируем hookActive хук-событием — иначе checkStuck честно пропустит
+  // вкладку (см. тесты idle-арминга ниже).
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'sess-1' });
   tick(1500);
   mgr.checkStuck();
   assert.strictEqual(statusOf(events, a.tabId).status, 'stuck');
@@ -364,6 +382,41 @@ test('restart: разрыв с хуками (proc жив, SessionStart не пр
   assert.deepStrictEqual(factory.spawned[2].opts.args, ['--resume']);
 });
 
+// ---------- Phase 2b Task 3: живой манифест воркспейса ----------
+
+test('open→close эмитят tabs:changed (лёгкий сигнал «пересобери манифест»)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.close(a.tabId);
+  const changed = events.filter((e) => e.channel === 'tabs:changed');
+  assert.strictEqual(changed.length, 2);
+});
+
+test('restart эмитит tabs:changed — манифест пересобирается даже при проваленном резюме (не зацикливаемся на протухшем session_id)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24); // спавн #1
+  const beforeFirstRestart = events.filter((e) => e.channel === 'tabs:changed').length;
+
+  mgr.restart(a.tabId); // спавн #2: session_id ещё не привязан — голый --resume (пикер)
+  const afterFirstRestart = events.filter((e) => e.channel === 'tabs:changed').length;
+  assert.strictEqual(afterFirstRestart, beforeFirstRestart + 1);
+
+  // Проваленное резюме: спавн #2 умирает естественной смертью, SessionStart за
+  // время его жизни так и не пришёл — onExit помечает tab.overrideFailed=true.
+  factory.spawned[1].opts.onExit(1);
+
+  mgr.restart(a.tabId); // спавн #3: overrideFailed=true → голые args (без цикла на пикере)
+  assert.deepStrictEqual(factory.spawned[2].opts.args, []);
+  const afterSecondRestart = events.filter((e) => e.channel === 'tabs:changed').length;
+  // Именно это и было целью теста: манифест пересобирается СНОВА даже на
+  // рестарте, вызванном провалом резюма, — иначе следующий запуск приложения
+  // продолжал бы пытаться резюмить уже протухший session_id.
+  assert.strictEqual(afterSecondRestart, afterFirstRestart + 1);
+});
+
 test('restart: kill() фабрики синхронно зовёт свой onExit — гард по поколению не путает это с провалом resume/continue', () => {
   // Некоторые реализации pty (в т.ч. реальный node-pty) могут вызвать onExit
   // синхронно прямо из kill(). restart() бампает tab.gen ДО kill() именно чтобы
@@ -398,4 +451,114 @@ test('restart: kill() фабрики синхронно зовёт свой onEx
   mgr.restart(a.tabId); // тот же гард — снова голый --resume, не откат на голые args
   assert.strictEqual(spawned.length, 3);
   assert.deepStrictEqual(spawned[2].opts.args, ['--resume']);
+});
+
+// ---------- Phase 2b Task 6: idle-арминг stuck-детекта ----------
+
+test('checkStuck: без хук-событий (hookActive=false) stuck НЕ наступает даже после порога — без хуков "working" значит лишь "терминал открыт"', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events, tick } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  tick(1500); // дольше stuckAfterMs
+  mgr.checkStuck();
+  assert.strictEqual(statusOf(events, a.tabId).status, 'working');
+});
+
+test('checkStuck: после первого хук-события (hookActive=true) stuck наступает по порогу как раньше', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events, tick } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'PreToolUse', { tool_name: 'Bash' }); // любое хук-событие армирует
+  tick(1500);
+  mgr.checkStuck();
+  assert.strictEqual(statusOf(events, a.tabId).status, 'stuck');
+});
+
+// ---------- Phase 2b Task 6: зачистка унаследованных маркеров Claude Code ----------
+
+// ---------- FIX 3 (ревью): sessionId восстановления не теряется, конфигурационные args сохраняются ----------
+
+test('open с sessionId — list() отдаёт его сразу; первый spawn получает [...configArgs, "--resume", id], конфигурационные args СОХРАНЕНЫ', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory, {
+    // getTermConfig с пользовательскими args (--model sonnet) — ключевая
+    // проверка: раньше restoreFlow слал args:['--resume', id], который
+    // ПОДМЕНЯЛ конфигурационные args вкладки, и пользователь молча получал
+    // другую модель на восстановленной вкладке.
+    getTermConfig: () => ({ command: 'claude', args: ['--model', 'sonnet'], useConpty: true, useConptyDll: true }),
+  });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha', sessionId: 'sess-restored' });
+  // sessionId виден в list() ДО первого спавна и до какого-либо SessionStart —
+  // манифест не должен ждать хук-события, чтобы узнать восстанавливаемый id.
+  assert.strictEqual(mgr.list().find((t) => t.tabId === a.tabId).sessionId, 'sess-restored');
+
+  mgr.start(a.tabId, 80, 24);
+  assert.strictEqual(factory.spawned[0].opts.command, 'claude');
+  assert.deepStrictEqual(factory.spawned[0].opts.args, ['--model', 'sonnet', '--resume', 'sess-restored']);
+});
+
+test('после restore-спавна restart() даёт РОВНО один --resume (резюм-флаги больше не живут в tab.args)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory, {
+    getTermConfig: () => ({ command: 'claude', args: ['--model', 'sonnet'], useConpty: true, useConptyDll: true }),
+  });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha', sessionId: 'sess-restored' });
+  mgr.start(a.tabId, 80, 24); // спавн #1: ['--model','sonnet','--resume','sess-restored']
+  assert.deepStrictEqual(factory.spawned[0].opts.args, ['--model', 'sonnet', '--resume', 'sess-restored']);
+
+  // Хук подтверждает привязку той же сессии (обычный путь для успешного resume).
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'sess-restored' });
+
+  // Ctrl+Shift+R на восстановленной вкладке — раньше tab.args УЖЕ содержал
+  // '--resume sess-restored' (если бы restoreFlow клал его в args), и restart()
+  // дописывал бы ещё один '--resume', давая дубль ['--resume','s','--resume','s'].
+  // Теперь tab.args — это только конфигурационные args, дубля нет.
+  mgr.restart(a.tabId); // спавн #2
+  assert.strictEqual(factory.spawned.length, 2);
+  assert.deepStrictEqual(factory.spawned[1].opts.args, ['--model', 'sonnet', '--resume', 'sess-restored']);
+  const resumeCount = factory.spawned[1].opts.args.filter((x) => x === '--resume').length;
+  assert.strictEqual(resumeCount, 1);
+});
+
+test('провал restore-резюма (естественный onExit без SessionStart) — sessionId обнуляется в list(), следующий restart идёт на чистых args', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory, {
+    getTermConfig: () => ({ command: 'claude', args: ['--model', 'sonnet'], useConpty: true, useConptyDll: true }),
+  });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha', sessionId: 'stale-session' });
+  mgr.start(a.tabId, 80, 24); // спавн #1: пытается резюмить stale-session
+  assert.deepStrictEqual(factory.spawned[0].opts.args, ['--model', 'sonnet', '--resume', 'stale-session']);
+
+  // Естественная смерть без единого SessionStart за время жизни процесса —
+  // resume реально не удался (сессия протухла/не существует).
+  factory.spawned[0].opts.onExit(1);
+  assert.strictEqual(mgr.list().find((t) => t.tabId === a.tabId).sessionId, null);
+
+  mgr.restart(a.tabId); // спавн #2: overrideFailed=true → голые (конфигурационные) args, без цикла
+  assert.strictEqual(factory.spawned.length, 2);
+  assert.deepStrictEqual(factory.spawned[1].opts.args, ['--model', 'sonnet']);
+});
+
+test('spawn: унаследованные CLAUDE_CODE_*/CLAUDECODE вычищены из env pty — кокпит, запущенный из-под другого Claude Code, не должен передавать вкладке чужую сессию', () => {
+  const originalChildSession = process.env.CLAUDE_CODE_CHILD_SESSION;
+  const originalClaudecode = process.env.CLAUDECODE;
+  try {
+    process.env.CLAUDE_CODE_CHILD_SESSION = '1';
+    process.env.CLAUDECODE = '1';
+    const factory = makeFakePtyFactory();
+    const { mgr } = makeManager(factory);
+    const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+    mgr.start(a.tabId, 80, 24);
+    const env = factory.spawned[0].opts.env;
+    assert.strictEqual('CLAUDE_CODE_CHILD_SESSION' in env, false);
+    assert.strictEqual('CLAUDECODE' in env, false);
+    assert.strictEqual(env.COCKPIT_TAB_ID, a.tabId);
+  } finally {
+    if (originalChildSession === undefined) delete process.env.CLAUDE_CODE_CHILD_SESSION;
+    else process.env.CLAUDE_CODE_CHILD_SESSION = originalChildSession;
+    if (originalClaudecode === undefined) delete process.env.CLAUDECODE;
+    else process.env.CLAUDECODE = originalClaudecode;
+  }
 });

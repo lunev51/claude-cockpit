@@ -27,7 +27,25 @@ const THEME = {
   brightWhite: '#FAF9F5',
 };
 
-export function initTerminal(container, config, { tabId, onPtyStatus, onFontSize = () => {} }) {
+// FIX 6 (ревью): SerializeAddon вставляет SGR-сброс (\x1b[0m — возврат к
+// дефолтным атрибутам) внутри сериализованного текста при каждом переходе на
+// "обычные" атрибуты — это разрушает нашу внешнюю обёртку \x1b[2m ... \x1b[0m
+// уже на первом же таком переходе, и «вчерашний» ghost-текст горит в полную
+// яркость вместо приглушённой вместо того, чтобы явно отличаться от живого
+// вывода. Чиним вырезанием ВСЕХ escape-последовательностей из prelude целиком
+// (и CSI-формы вроде цветов/курсора, и OSC-формы вроде заголовка окна) —
+// ghost-буфер сознательно платит потерей исходных цветов и стилей ради того,
+// чтобы гарантированно остаться монохромно-приглушённым: единственная задача
+// этого текста — быть узнаваемо «не живым выводом», а не выглядеть красиво.
+function stripAnsi(text) {
+  return text
+    .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')
+    .replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, '');
+}
+
+export function initTerminal(container, config, {
+  tabId, onPtyStatus, onFontSize = () => {}, preludeText = null,
+}) {
   const cfg = config.terminal;
   const term = new window.Terminal({
     fontSize: cfg.fontSize,
@@ -51,6 +69,12 @@ export function initTerminal(container, config, { tabId, onPtyStatus, onFontSize
   // Поиск по буферу (UI создаётся ниже динамически).
   const search = new window.SearchAddon.SearchAddon();
   term.loadAddon(search);
+
+  // Сериализация буфера в ANSI-текст (Task 5, ghost-буферы) — лёгкий аддон,
+  // грузим безусловно (без конфиг-флага): app.js использует его снимки при
+  // сохранении «вчерашнего вывода» и восстановлении вкладки.
+  const serializeAddon = new window.SerializeAddon.SerializeAddon();
+  term.loadAddon(serializeAddon);
 
   // Unicode-11 ширины: ТОЛЬКО по явному флагу. ConPTY считает ширины по
   // собственной таблице — при расхождении xterm рисует символы в чужие клетки.
@@ -274,6 +298,15 @@ export function initTerminal(container, config, { tabId, onPtyStatus, onFontSize
     term.focus();
   });
 
+  // Ghost-буфер (Task 5): вчерашний скроллбек, приглушённый, ДО старта живого
+  // pty — восстановленная вкладка мгновенно показывает контекст, пока за
+  // кулисами поднимается (или резюмится) настоящая сессия Claude Code.
+  if (preludeText) {
+    term.write('\x1b[2m');
+    term.write(stripAnsi(preludeText));
+    term.write('\x1b[0m\r\n\x1b[2m— вчерашний вывод · сессия поднимается —\x1b[0m\r\n');
+  }
+
   // --- статус и запуск PTY ---
   onPtyStatus('запускается…');
   window.api.term.start(tabId, term.cols, term.rows);
@@ -306,5 +339,17 @@ export function initTerminal(container, config, { tabId, onPtyStatus, onFontSize
     },
   };
   term.focus();
-  return { term, search, setFontSize, focus: () => term.focus(), openSearch, handlers };
+  return {
+    term, search, setFontSize, focus: () => term.focus(), openSearch, handlers,
+    // Ghost-снимок буфера (Task 5): scrollback:2000 — достаточно контекста для
+    // «о чём мы говорили», не раздувая ghost-файл на диске.
+    serialize: () => serializeAddon.serialize({ scrollback: 2000 }),
+    // Task 6: закрытие вкладки должно гасить и ResizeObserver — он раньше
+    // не отключался (наблюдатель на удалённом из DOM container продолжал
+    // жить, утечка на каждое закрытие/переоткрытие вкладки).
+    dispose: () => {
+      observer.disconnect();
+      term.dispose();
+    },
+  };
 }

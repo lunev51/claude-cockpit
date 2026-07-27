@@ -4,7 +4,7 @@
 const fs = require('fs');
 const path = require('path');
 const { app, BrowserWindow, screen } = require('electron');
-const { registerIpc, disposeSessions, getSmokeOutput } = require('./ipc');
+const { registerIpc, disposeSessions, getSmokeOutput, flushWorkspace } = require('./ipc');
 const { getConfig, isRootConfigCorrupt } = require('./config');
 const { setWindow, notify } = require('./notify');
 
@@ -150,6 +150,7 @@ app.whenReady().then(() => {
       const ptyOutput = getSmokeOutput();
       console.log(`[smoke] pty=${ptyOutput.slice(0, 80)}`);
       console.log(`[smoke] renderer-errors=${rendererErrors}`);
+      flushWorkspace();
       disposeSessions();
       const ok = rendererErrors === 0 && ptyOutput.includes('PTY_OK');
       app.exit(ok ? 0 : 1);
@@ -158,16 +159,19 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', () => {
+  flushWorkspace();
   disposeSessions();
   app.quit();
 });
 
 app.on('before-quit', () => {
+  flushWorkspace();
   disposeSessions();
 });
 
 process.on('uncaughtException', (e) => {
   console.error(e);
+  flushWorkspace();
   disposeSessions();
   app.exit(1);
 });

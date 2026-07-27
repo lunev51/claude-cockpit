@@ -14,8 +14,20 @@ const statusPty = () => $('status-pty');
 const statusFont = () => $('status-font');
 
 // Создать вкладку: контейнер + xterm + запись в стор. activate — переключиться сразу.
-async function openTab(cwd, { activate = true } = {}) {
-  const tab = await window.api.tabs.open({ cwd });
+// command/args — явный оверрайд конкретного спавна (не используется восстановлением
+// воркспейса — см. sessionId ниже, FIX 3 ревью).
+async function openTab(cwd, {
+  activate = true, command = null, args = null, preludeText = null, ghostId = null, sessionId = null,
+} = {}) {
+  // ghostId (Task 5, ревью finding 1a) — восстановление передаёт исходный id
+  // вкладки, иначе main всегда минтит новый и старый ghost-файл осиротеет.
+  // sessionId (FIX 3, ревью) — восстановление передаёт session_id из манифеста
+  // ОТДЕЛЬНО от command/args: main/sessions.js сам достроит --resume поверх
+  // конфигурационных args вкладки, не подменяя их и не игнорируя
+  // config.terminal.command (раньше это делал сам restoreFlow, см. ниже).
+  const tab = await window.api.tabs.open({
+    cwd, command, args, ghostId, sessionId,
+  });
   if (!tab) return null;
 
   const container = document.createElement('div');
@@ -27,6 +39,7 @@ async function openTab(cwd, { activate = true } = {}) {
 
   const view = initTerminal(container, config, {
     tabId: tab.tabId,
+    preludeText,
     onPtyStatus: (s) => {
       entry.lastPtyStatus = s;
       if (tabStore.activeId === tab.tabId) statusPty().textContent = `⌨ ${s}`;
@@ -49,6 +62,7 @@ function activateTab(tabId) {
   if (!entry) return;
   for (const [id, v] of views) v.container.classList.toggle('hidden', id !== tabId);
   tabStore.setActive(tabId);
+  window.api.workspace.setActive(tabId); // main пересчитает activeIndex манифеста
   // Статус-бар должен отражать активную вкладку, а не последнюю, что его обновляла.
   statusPty().textContent = entry.lastPtyStatus ? `⌨ ${entry.lastPtyStatus}` : '⌨ …';
   statusFont().textContent = `A ${entry.fontSize ?? config.terminal.fontSize}`;
@@ -59,6 +73,14 @@ function activateTab(tabId) {
   });
 }
 
+// Ghost-буфер (Task 5): сериализовать буфер вкладки и отдать main на запись.
+// main сам резолвит ghostId по tabId (manager.list()) — здесь просто снимок.
+function saveGhost(tabId) {
+  const entry = views.get(tabId);
+  if (!entry || !entry.view) return;
+  window.api.ghost.save(tabId, entry.view.serialize());
+}
+
 async function closeTab(tabId) {
   const entry = views.get(tabId);
   if (!entry) return;
@@ -66,7 +88,7 @@ async function closeTab(tabId) {
   // Сосед считаем ДО tabStore.remove — после удаления ряда его позиции в order() уже нет.
   const fallback = tabStore.neighborOf(tabId);
   await window.api.tabs.close(tabId);
-  entry.view.term.dispose();
+  entry.view.dispose(); // отключает ResizeObserver и сам term (Task 6)
   entry.container.remove();
   views.delete(tabId);
   tabStore.remove(tabId);
@@ -132,6 +154,176 @@ function bindHotkeys() {
   }, { capture: true });
 }
 
+// --- Экран восстановления воркспейса (Task 4) ---
+
+// Строит список чекбоксов оверлея из манифеста; возвращает чекбоксы в
+// порядке manifest.tabs (индекс совпадает — нужно для маппинга activeIndex).
+function renderRestoreList(tabs) {
+  const list = $('restore-list');
+  list.innerHTML = '';
+  const checkboxes = [];
+  tabs.forEach((t) => {
+    const row = document.createElement('label');
+    row.className = 'restore-row';
+
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = true;
+
+    const info = document.createElement('div');
+    info.className = 'restore-row-info';
+    const name = document.createElement('div');
+    name.className = 'restore-row-name';
+    name.textContent = t.name || t.cwd;
+    const cwd = document.createElement('div');
+    cwd.className = 'restore-row-cwd';
+    cwd.textContent = t.cwd;
+    cwd.title = t.cwd;
+    info.append(name, cwd);
+
+    row.append(cb, info);
+
+    if (t.sessionId) {
+      const badge = document.createElement('span');
+      badge.className = 'restore-badge';
+      badge.textContent = 'сессия сохранена';
+      row.appendChild(badge);
+    }
+
+    list.appendChild(row);
+    checkboxes.push(cb);
+  });
+  return checkboxes;
+}
+
+// Последовательный подъём отмеченных вкладок со стаггером: Claude CLI
+// успевает прочитать свою сессию/хуки до того, как поднимется следующая —
+// параллельный залп на несколько вкладок наблюдался нестабильным.
+async function restoreFlow(chosen, activeIndex, overlay) {
+  // Прячем оверлей СРАЗУ, не дожидаясь даже первой вкладки: решение уже
+  // принято, а гарантия «оверлей не должен зависнуть» так проще и надёжнее,
+  // чем прятать его условно внутри цикла (ревью, finding 2b).
+  overlay.classList.add('hidden');
+
+  let restoredActive = null;  // вкладка с исходным manifest.activeIndex, если восстановлена
+  let firstRestored = null;
+
+  try {
+    for (let idx = 0; idx < chosen.length; idx++) {
+      const { t, i } = chosen[idx];
+      let tab = null;
+      try {
+        // Ghost-буфер (Task 5): вчерашний скроллбек этой вкладки, если сохранён —
+        // initTerminal впечатает его приглушённым до старта живого pty.
+        const preludeText = t.ghostId ? await window.api.ghost.load(t.ghostId) : null;
+        tab = await openTab(t.cwd, {
+          // Первая УСПЕШНО поднятая вкладка становится видимой сразу — иначе
+          // при 2+ вкладках пользователь весь стаггер смотрит в пустой терминал
+          // (ревью, finding 1). Остальные — activate:false, финальная активация
+          // ниже решает, какая вкладка останется на экране.
+          activate: !firstRestored,
+          // FIX 3 (ревью): command/args больше НЕ передаём — раньше это было
+          // command:'claude', args:['--resume', sessionId], что подменяло
+          // конфигурационные args вкладки (--model и т.п.) и игнорировало
+          // config.terminal.command. sessionId идёт отдельно — sessions.js
+          // сам достраивает --resume поверх конфигурационных args.
+          sessionId: t.sessionId,
+          preludeText,
+          ghostId: t.ghostId,
+        });
+      } catch (err) {
+        // Одна упавшая вкладка не должна обрывать восстановление остальных
+        // (ревью, finding 2a) — пропускаем и идём дальше.
+        console.warn(`[restore] не удалось открыть вкладку ${t.cwd}:`, err);
+      }
+      if (tab) {
+        if (!firstRestored) firstRestored = tab;
+        if (i === activeIndex) restoredActive = tab;
+      }
+      if (idx < chosen.length - 1) {
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+    }
+
+    // Может повторно активировать ту же вкладку, что уже показана первой
+    // (безвредно, activateTab идемпотентна) — либо переключить на вкладку
+    // исходного manifest.activeIndex, если она восстановилась позже первой.
+    const toActivate = restoredActive || firstRestored;
+    if (toActivate) activateTab(toActivate.tabId);
+  } finally {
+    // FIX 2 (ревью): sync манифеста разблокируется ТОЛЬКО теперь — весь
+    // стаггер восстановления (успешный или нет) закончен. Раньше каждый
+    // openTab() внутри цикла сразу писал в манифест текущий (неполный) состав
+    // вкладок — закрытие/краш посреди стаггера безвозвратно терял вкладки,
+    // которые ещё не успели подняться.
+    window.api.workspace.ready();
+  }
+}
+
+// Показывает оверлей restore, слушает Enter/Esc и кнопки. Разрешается, когда
+// пользователь принял решение (сам подъём вкладок восстановления идёт дальше
+// асинхронно — оверлей к этому моменту уже спрятан либо прячется сам).
+function showRestoreOverlay(manifest) {
+  const overlay = $('restore-overlay');
+  const btnAll = $('btn-restore-all');
+  const btnNone = $('btn-restore-none');
+  const checkboxes = renderRestoreList(manifest.tabs);
+  overlay.classList.remove('hidden');
+
+  function detach() {
+    document.removeEventListener('keydown', onKey, true);
+    btnAll.removeEventListener('click', startRestore);
+    btnNone.removeEventListener('click', startEmpty);
+  }
+
+  function startEmpty() {
+    detach();
+    overlay.classList.add('hidden');
+    // Манифест НЕ трогаем — следующее открытие/закрытие вкладки перепишет
+    // его естественным образом (syncWorkspace в main реагирует на tabs:changed).
+    statusPty().textContent = '⌨ нет вкладок';
+    // FIX 2 (ревью): решение «начать пусто» тоже завершает восстановление —
+    // разблокируем sync сразу, ждать здесь больше нечего.
+    window.api.workspace.ready();
+  }
+
+  function startRestore() {
+    detach();
+    const chosen = manifest.tabs
+      .map((t, i) => ({ t, i }))
+      .filter(({ i }) => checkboxes[i].checked);
+    if (!chosen.length) {
+      overlay.classList.add('hidden');
+      statusPty().textContent = '⌨ нет вкладок';
+      // FIX 2 (ревью): пустой выбор — тоже финал восстановления, а не его начало.
+      window.api.workspace.ready();
+      return;
+    }
+    // restoreFlow — fire-and-forget; per-tab ошибки уже гасятся внутри неё
+    // (finding 2a), но подстраховка на случай непредвиденного throw снаружи
+    // цикла (finding 2c) — необработанный reject не должен уйти в консоль
+    // как unhandledrejection незамеченным.
+    restoreFlow(chosen, manifest.activeIndex, overlay).catch((err) => {
+      console.warn('[restore] restoreFlow упал:', err);
+    });
+  }
+
+  function onKey(ev) {
+    if (ev.key === 'Enter') {
+      ev.preventDefault();
+      startRestore();
+    } else if (ev.key === 'Escape') {
+      ev.preventDefault();
+      startEmpty();
+    }
+  }
+
+  // Горячие клавиши активны, только пока оверлей на экране.
+  document.addEventListener('keydown', onKey, true);
+  btnAll.addEventListener('click', startRestore);
+  btnNone.addEventListener('click', startEmpty);
+}
+
 async function boot() {
   config = await window.api.config.get();
 
@@ -154,6 +346,10 @@ async function boot() {
   // term:started/term:exit статус больше не выставляют (был двойной источник).
   window.api.tab.onStatus(({ tabId, status, subtitle }) => {
     tabStore.setStatus(tabId, status, subtitle);
+    // Ghost-буфер (Task 5): переход в done/waiting — момент «Claude закончил
+    // ход», самый ценный кадр скроллбека — сериализуем именно эту вкладку
+    // сразу, не дожидаясь общего 30-секундного таймера ниже.
+    if (status === 'done' || status === 'waiting') saveGhost(tabId);
   });
 
   $('btn-new-tab').addEventListener('click', async () => {
@@ -163,8 +359,25 @@ async function boot() {
 
   bindHotkeys();
 
-  // Стартовая вкладка: cwd из конфига.
-  await openTab(config.terminal.cwd || '.');
+  // Ghost-буфер (Task 5): периодический снимок ТОЛЬКО активной вкладки —
+  // сериализация всех открытых вкладок каждые 30с дорога при нескольких
+  // терминалах, а точечный снимок при переходе в done/waiting (см. onStatus
+  // выше) уже ловит самый ценный кадр для фоновых вкладок.
+  setInterval(() => {
+    if (tabStore.activeId) saveGhost(tabStore.activeId);
+  }, 30000);
+
+  // Манифест воркспейса (Task 3): пуст/отсутствует — старое поведение
+  // (стартовая вкладка из конфига). Непуст — оверлей restore (Task 4).
+  const manifest = await window.api.workspace.get();
+  if (!manifest || !Array.isArray(manifest.tabs) || manifest.tabs.length === 0) {
+    await openTab(config.terminal.cwd || '.');
+    // FIX 2 (ревью): манифеста не было вообще — восстанавливать нечего,
+    // разблокируем sync сразу вместо ожидания несуществующего оверлея.
+    window.api.workspace.ready();
+  } else {
+    showRestoreOverlay(manifest);
+  }
 
   window.api.app.onNotice(({ text }) => console.warn(`[notice] ${text}`));
 }

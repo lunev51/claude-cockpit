@@ -29,6 +29,11 @@ function resolvePort(argv) {
 }
 
 function main() {
+  // Контракт абсолютен: НИКОГДА не мешать CLI. Любая непойманная ошибка — тихий выход 0.
+  process.on('uncaughtException', () => process.exit(0));
+  process.on('unhandledRejection', () => process.exit(0));
+  process.stdin.on('error', () => process.exit(0));
+
   const event = process.argv[2];
   const port = resolvePort(process.argv);
   if (!event || !port) process.exit(0);

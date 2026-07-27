@@ -8,13 +8,15 @@
   <link rel="stylesheet" href="../../node_modules/@xterm/xterm/css/xterm.css" />
   <link rel="stylesheet" href="./css/app.css" />
   <!-- xterm.js — UMD-сборки, глобали window.Terminal, window.FitAddon,
-       window.WebLinksAddon, window.SearchAddon, window.Unicode11Addon, window.WebglAddon -->
+       window.WebLinksAddon, window.SearchAddon, window.Unicode11Addon, window.WebglAddon,
+       window.SerializeAddon -->
   <script src="../../node_modules/@xterm/xterm/lib/xterm.js"></script>
   <script src="../../node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
   <script src="../../node_modules/@xterm/addon-web-links/lib/addon-web-links.js"></script>
   <script src="../../node_modules/@xterm/addon-search/lib/addon-search.js"></script>
   <script src="../../node_modules/@xterm/addon-unicode11/lib/addon-unicode11.js"></script>
   <script src="../../node_modules/@xterm/addon-webgl/lib/addon-webgl.js"></script>
+  <script src="../../node_modules/@xterm/addon-serialize/lib/addon-serialize.js"></script>
 </head>
 <body>
   <div id="titlebar">
@@ -40,6 +42,16 @@
     </div>
     <div id="main">
       <div id="terminal-host"></div>
+      <div id="restore-overlay" class="hidden">
+        <div class="restore-card">
+          <div class="restore-title">Восстановить воркспейс?</div>
+          <div id="restore-list"></div>
+          <div class="restore-actions">
+            <button class="sidebar-btn" id="btn-restore-all">Восстановить (Enter)</button>
+            <button class="sidebar-btn" id="btn-restore-none">Начать пусто (Esc)</button>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
   <div id="status-bar">

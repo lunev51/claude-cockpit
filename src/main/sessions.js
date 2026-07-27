@@ -9,6 +9,25 @@ const crypto = require('crypto');
 
 const STATUSES = ['working', 'waiting', 'done', 'stuck', 'dead'];
 
+// Выпиливает унаследованные маркеры родительского Claude Code из process.env
+// (Task 6). Если кокпит запущен из-под ДРУГОГО Claude Code (например, так
+// делают тестовые прогоны), переменные вроде CLAUDE_CODE_CHILD_SESSION /
+// CLAUDECODE / CLAUDE_CODE_* наследуются вниз по процессу — claude во
+// вкладке считает себя дочерней сессией: рисует урезанный монохромный UI,
+// не пишет транскрипт и наследует bypass-permissions родителя. Копируем
+// process.env и убираем всё, что начинается на CLAUDE_CODE (регистронезависимо),
+// плюс отдельно CLAUDECODE — ДО того как добавить свои COCKPIT_*.
+function sanitizedProcessEnv() {
+  const clean = { ...process.env };
+  for (const key of Object.keys(clean)) {
+    const upper = key.toUpperCase();
+    if (upper.startsWith('CLAUDE_CODE') || upper === 'CLAUDECODE') {
+      delete clean[key];
+    }
+  }
+  return clean;
+}
+
 // ptyFactory(opts) → {write, resize, kill, pid} — в проде createPty из pty.js.
 // getTermConfig() → config.terminal; onEvent(channel, payload) → webContents.send.
 // now() — клок (тестам нужен управляемый); stuckAfterMs — порог зависания;
@@ -23,20 +42,41 @@ function createSessionManager({
 }) {
   const tabs = new Map();
 
-  function open({ cwd, command = null, args = null, smoke = false }) {
+  function open({
+    cwd, command = null, args = null, smoke = false, ghostId = null, sessionId = null,
+  }) {
     const tabId = crypto.randomUUID();
     const name = path.basename(cwd) || cwd;
+    // id ghost-буфера вкладки (Task 5) — стабилен на весь жизненный цикл вкладки.
+    // Восстановление (Task 4/5) передаёт исходный ghostId из манифеста явно —
+    // иначе каждый restore минтил бы новый id, а старый ghost-файл осиротевал
+    // бы навсегда (ревью, finding 1a). Новая вкладка (без ghostId) получает
+    // свежий как раньше.
+    const resolvedGhostId = typeof ghostId === 'string' && ghostId ? ghostId : crypto.randomUUID();
     tabs.set(tabId, {
-      tabId, cwd, name, smoke,
-      command, args,           // per-tab переопределение (claude --resume <id> в фазе 2b)
+      tabId, cwd, name, smoke, ghostId: resolvedGhostId,
+      command, args,           // per-tab переопределение (явный оверрайд конкретного спавна)
       proc: null, cols: 80, rows: 24, alive: false,
       gen: 0,                  // поколение спавна: гардит все колбэки от гонок
-      sessionId: null,         // session_id Claude Code из SessionStart-хука
+      // FIX 3 (ревью): sessionId восстановления передаётся ОТДЕЛЬНО от args —
+      // раньше restoreFlow слал command:'claude'+args:['--resume', id], что (а)
+      // подменяло конфигурационные args вкладки (--model и т.п. молча терялись)
+      // и (б) игнорировало config.terminal.command. Теперь spawn() сам достраивает
+      // ['--resume', sessionId] ПОВЕРХ базовых args на первый же спавн вкладки.
+      sessionId: sessionId || null,
+      resumeOnFirstSpawn: !!sessionId, // одноразовый флаг: спавн #1 добавит --resume <id>
+      sessionBound: false,     // true, только когда SessionStart реально привязал сессию (bindSession)
       status: null, subtitle: '', waitingText: '',
       lastOutputAt: now(),
       pendingExtraArgs: null,  // одноразовый оверрайд args на следующий spawn() (хотфикс restart, спека §3.14)
       overrideFailed: false,   // true = процесс с оверрайдом (--resume <id>/--resume) умер, а SessionStart так и не привязал сессию
+      // Идле-арминг детекта зависаний (Task 6): без подключённых хуков «working»
+      // означает лишь «терминал открыт» — вкладка, спокойно стоящая у промпта
+      // (пользователь ещё не подключил хуки), не должна уезжать в «Проблемы».
+      // Взводится ЛЮБЫМ хук-событием в applyHookEvent и живёт до конца вкладки.
+      hookActive: false,
     });
+    onEvent('tabs:changed', {}); // состав вкладок изменился — main пересоберёт манифест
     return { tabId, cwd, name };
   }
 
@@ -54,10 +94,20 @@ function createSessionManager({
     // pendingExtraArgs — одноразовый оверрайд от restart() (--resume <id> или
     // голый --resume), потребляется здесь и сбрасывается, чтобы следующий
     // обычный спавн был «голым».
-    const extraArgs = tab.pendingExtraArgs;
+    let extraArgs = tab.pendingExtraArgs;
     tab.pendingExtraArgs = null;
-    const usedOverride = extraArgs !== null; // этот спавн ушёл с оверрайдом --resume
+    let usedOverride = extraArgs !== null; // этот спавн ушёл с оверрайдом --resume
     const baseArgs = tab.args || t.args;
+    // FIX 3 (ревью): если restart() не заказал явный оверрайд, а вкладка
+    // восстановлена с известным sessionId и это её самый первый спавн —
+    // достраиваем --resume <id> ПОВЕРХ конфигурационных baseArgs (а не вместо
+    // них, как раньше делал restoreFlow через args:['--resume', id]). Флаг
+    // одноразовый — второй и далее спавны этой вкладки идут без него.
+    if (extraArgs === null && tab.resumeOnFirstSpawn && tab.sessionId) {
+      extraArgs = ['--resume', tab.sessionId];
+      tab.resumeOnFirstSpawn = false;
+      usedOverride = true;
+    }
     const spec = tab.smoke
       ? { command: 'cmd.exe', args: ['/c', 'echo PTY_OK'] }
       : { command: tab.command || t.command, args: extraArgs ? [...baseArgs, ...extraArgs] : baseArgs };
@@ -74,7 +124,7 @@ function createSessionManager({
         useConpty: t.useConpty !== false,
         useConptyDll: t.useConptyDll !== false,
         env: {
-          ...process.env,
+          ...sanitizedProcessEnv(),
           COCKPIT: '1',
           COCKPIT_TAB_ID: tab.tabId,
           ...getExtraEnv(),
@@ -88,9 +138,18 @@ function createSessionManager({
         onExit: (exitCode) => {
           if (myGen !== tab.gen) return; // stale exit после рестарта (или намеренный kill — см. гард в restart())
           // Провал резюма/continue: процесс с оверрайдом умер естественной смертью,
-          // а SessionStart так и не привязал session_id за время его жизни —
-          // следующий restart() уйдёт в голые args (не зацикливаемся).
-          if (usedOverride && !tab.sessionId) tab.overrideFailed = true;
+          // а SessionStart так и не привязал сессию за время его жизни —
+          // следующий restart() уйдёт в голые args (не зацикливаемся). FIX 3
+          // (ревью): проверяем ПО ФАКТУ привязки (sessionBound), а не по
+          // наличию sessionId — иначе восстановленная вкладка (у которой
+          // sessionId уже был известен ДО спавна, из манифеста) никогда не
+          // считалась бы провалившейся, даже если resume реально не удался.
+          // Плюс обнуляем протухший sessionId — иначе он уедет в манифест и
+          // следующий запуск снова попробует резюмить уже мёртвую сессию.
+          if (usedOverride && !tab.sessionBound) {
+            tab.overrideFailed = true;
+            tab.sessionId = null;
+          }
           tab.proc = null;
           tab.alive = false;
           setStatus(tab, 'dead', `процесс завершён (код ${exitCode})`);
@@ -158,6 +217,7 @@ function createSessionManager({
     }
 
     tab.sessionId = null; // новая жизнь — новый SessionStart перебиндит
+    tab.sessionBound = false; // FIX 3: привязка тоже сбрасывается — новый спавн ещё не подтверждён
 
     if (boundSessionId) {
       // 1. session_id уже известен (из прошлого SessionStart) — резюмируем именно его.
@@ -180,6 +240,10 @@ function createSessionManager({
     }
 
     spawn(tab);
+    // sessionId вкладки мог обнулиться (провал резюма) — манифест должен это
+    // узнать, иначе следующий запуск приложения снова попробует резюмить уже
+    // протухший id и уйдёт в тот же фейл-луп (Task 4, ревью Task 3).
+    onEvent('tabs:changed', {});
   }
 
   function close(tabId) {
@@ -190,13 +254,18 @@ function createSessionManager({
       try { tab.proc.kill(); } catch { /* мог уже завершиться */ }
     }
     tabs.delete(tabId);
+    onEvent('tabs:changed', {}); // состав вкладок изменился — main пересоберёт манифест
   }
 
   // --- привязка session_id и события хуков ---
 
   function bindSession(tabId, sessionId) {
     const tab = tabs.get(tabId);
-    if (tab) tab.sessionId = sessionId;
+    if (tab) {
+      tab.sessionId = sessionId;
+      tab.sessionBound = true; // FIX 3: единственное место, где привязка считается ПОДТВЕРЖДЁННОЙ
+    }
+    onEvent('tabs:changed', {}); // sessionId вкладки мог измениться — манифест должен это узнать
   }
 
   // Знает ли менеджер такой tabId вообще (для точной адресации хуков по
@@ -223,6 +292,9 @@ function createSessionManager({
   function applyHookEvent(tabId, event, data = {}) {
     const tab = tabs.get(tabId);
     if (!tab) return;
+    // Любое хук-событие — доказательство, что хуки Cockpit подключены к
+    // проекту и статусы вкладки отныне честны; взводим idle-арминг один раз.
+    tab.hookActive = true;
     switch (event) {
       case 'SessionStart':
         if (data.session_id) {
@@ -257,6 +329,9 @@ function createSessionManager({
   function checkStuck() {
     const ts = now();
     for (const tab of tabs.values()) {
+      // Идле-арминг (Task 6): без единого хук-события «working» не отличить
+      // от «терминал просто открыт и стоит у промпта» — честно пропускаем.
+      if (!tab.hookActive) continue;
       if (tab.status === 'working' && tab.proc && ts - tab.lastOutputAt > stuckAfterMs) {
         const min = Math.max(1, Math.round((ts - tab.lastOutputAt) / 60000));
         setStatus(tab, 'stuck', `нет вывода ${min}м`);
@@ -265,8 +340,8 @@ function createSessionManager({
   }
 
   function list() {
-    return [...tabs.values()].map(({ tabId, cwd, name, alive, status, subtitle, sessionId }) => (
-      { tabId, cwd, name, alive, status, subtitle, sessionId }
+    return [...tabs.values()].map(({ tabId, cwd, name, alive, status, subtitle, sessionId, ghostId }) => (
+      { tabId, cwd, name, alive, status, subtitle, sessionId, ghostId }
     ));
   }
 
