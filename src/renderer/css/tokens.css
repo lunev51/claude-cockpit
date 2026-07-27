@@ -1,33 +1,38 @@
-/* Дизайн-токены Cockpit — «Claude, но темнее» (спека §7).
-   Вся серая шкала тёплая (hue 40-70); холодных серых в проекте нет. */
+/* Дизайн-токены Cockpit v2 (27.07): нейтральный чёрный в духе Warp.
+   Вся шкала R=G=B — прежняя тёплая гамма читалась «коричнево-серой».
+   Хроматика только у акцента и статусов (ANSI-палитра Warp default_dark, MIT). */
 :root {
-  --bg-window: #141413;
-  --bg-panel:  #1F1E1B;
-  --bg-card:   #262624;
-  --bg-hover:  #30302E;
-  --bg-wait:   #2e2320; /* подложка «ждёт тебя» */
+  --bg-window: #0F0F0F;
+  --bg-panel:  #141414;
+  --bg-card:   #1E1E1E;
+  --bg-hover:  #2A2A2A;
+  --bg-wait:   #231A16; /* подложка «ждёт тебя» — единственная тёплая поверхность */
 
-  --border:      #3A3733;
-  --border-soft: #403D38;
-  --border-wait: #4a3227;
+  --border:      #2A2A2A;
+  --border-soft: #333333;
+  --border-wait: #D97757;
 
-  --text:       #FAF9F5;
-  --text-muted: #A09D96;
-  --text-dim:   #8F8D83;
+  --text:       #E8E8E8;
+  --text-muted: #9E9E9E;
+  --text-dim:   #8A8A8A;
 
-  --accent:        #D97757; /* терракота: ТОЛЬКО «ждёт тебя» и главные CTA */
-  --accent-hover:  #A9583E;
-  --accent-soft:   #CC785C;
-  --ok:            #5DB872;
-  --working:       #5DB8A6;
-  --warn:          #E8A55A;
-  --err:           #C64545;
+  --accent:       #D97757; /* ТОЛЬКО «ждёт тебя» и главные CTA */
+  --accent-hover: #A9583E;
+  --accent-soft:  #D97757;
 
-  --radius-s: 8px;
-  --radius-m: 12px;
-  --radius-l: 16px;
+  /* Статусы — ANSI Warp default_dark */
+  --ok:      #a1b56c;
+  --working: #86c1b9;
+  --warn:    #f7ca88;
+  --err:     #ab4642;
 
-  --font-ui: 'Inter', 'Segoe UI', sans-serif;
-  --font-serif: 'Lora', Georgia, 'Times New Roman', serif;
-  --font-mono: 'JetBrainsMono NF', 'Cascadia Mono', Consolas, monospace;
+  /* Геометрия Warp: жёстко, без щедрых пилюль */
+  --radius-s: 3px;
+  --radius-m: 4px;
+  --radius-l: 6px;
+
+  --font-ui:    'Inter', 'Segoe UI', sans-serif;
+  --font-serif: 'Inter', 'Segoe UI', sans-serif; /* серифов в v2 нет; алиас для совместимости */
+  /* DM Mono отменён 27.07: нет кириллицы. Берём тот же шрифт, что и терминал. */
+  --font-mono:  'JetBrainsMono NF', 'JetBrains Mono', 'Cascadia Mono', Consolas, monospace;
 }

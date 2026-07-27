@@ -55,12 +55,12 @@ function createWindow() {
     height,
     minWidth: 900,
     minHeight: 600,
-    backgroundColor: '#141413',
+    backgroundColor: '#0F0F0F',
     title: 'Cockpit',
     // Системный тайтлбар скрыт — своя drag-полоса в renderer (#titlebar),
     // кнопки окна рисует Windows поверх (overlay).
     titleBarStyle: 'hidden',
-    titleBarOverlay: { color: '#141413', symbolColor: '#A09D96', height: 36 },
+    titleBarOverlay: { color: '#141414', symbolColor: '#9E9E9E', height: 36 },
     webPreferences: {
       preload: path.join(__dirname, '../preload/preload.js'),
       contextIsolation: true,
