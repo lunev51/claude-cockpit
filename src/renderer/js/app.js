@@ -3,12 +3,24 @@
 
 import { initTerminal } from './terminal.js';
 import { createTabStore } from './tabs.js';
+import { renderBadge } from './badge.js';
+import { createPeek } from './peek.js';
+import { createPalette } from './palette.js';
 
 const $ = (id) => document.getElementById(id);
 
 const views = new Map(); // tabId → {view, container}
 let config = null;
 let tabStore = null;
+let peek = null;
+// Task 4 фазы 4: палитра команд (Ctrl+P) — createPalette сама владеет своим
+// DOM-оверлеем (см. palette.js), здесь только держим ссылку для bindHotkeys.
+let palette = null;
+// Task 3 фазы 4 (peek): tabId, для которого сейчас открыт поповер (или null).
+// Нужен, чтобы обработчик tab:status закрывал peek ТОЛЬКО когда статус меняет
+// именно ту вкладку, что сейчас показана в поповере — peek.hide() идемпотентна,
+// так что устаревшее значение здесь безвредно (см. app.js/onPeek и tab:status).
+let peekedTabId = null;
 // FIX 3 (carryover 3): пока оверлей restore на экране и решение ещё не принято,
 // здесь лежит функция «начать пусто» этого оверлея — null, если оверлея нет
 // или он уже решён. Оверлей накрывает только #main (position:absolute; inset:0
@@ -24,6 +36,13 @@ const waitingTabs = new Set();
 const titlebarDot = document.querySelector('#titlebar .dot');
 function updateTitlebarAlert() {
   titlebarDot?.classList.toggle('alert', waitingTabs.size > 0);
+}
+
+// Task 1 фазы 4: тот же waitingTabs.size — агрегат для main-процесса
+// (overlay-иконка таскбара + заголовок окна, см. main/attention.js).
+// renderBadge рисует canvas здесь, в renderer — main про canvas не знает.
+function pushAttention() {
+  window.api.attention.update(waitingTabs.size, renderBadge(waitingTabs.size));
 }
 
 // Панель действий: кнопки шлют слэш-команду в pty активной вкладки (фича 23/26).
@@ -114,6 +133,15 @@ async function openTab(cwd, {
 function activateTab(tabId) {
   const entry = views.get(tabId);
   if (!entry) return;
+  // Task 3 фазы 4 (peek): смена активной вкладки закрывает открытый поповер
+  // безусловно — контекст (какая строка ждёт) сменился, отвечать «в сторону»
+  // от текущего экрана не место.
+  peek?.hide();
+  // Task 4 фазы 4 (палитра): та же логика — переключение вкладки (в т.ч. само
+  // действие «Перейти: …» из палитры, которая к этому моменту уже закрыла
+  // себя сама, см. palette.js/runAt) не должно оставлять палитру открытой
+  // «за спиной». close() идемпотентна — безвредно, если она уже закрыта.
+  palette?.close();
   for (const [id, v] of views) v.container.classList.toggle('hidden', id !== tabId);
   tabStore.setActive(tabId);
   window.api.workspace.setActive(tabId); // main пересчитает activeIndex манифеста
@@ -147,10 +175,43 @@ async function closeTab(tabId) {
   // титлбаре могла бы залипнуть, если закрыли последнюю waiting-вкладку.
   waitingTabs.delete(tabId);
   updateTitlebarAlert();
+  pushAttention();
+  // Task 3 фазы 4 (peek): закрытая вкладка не должна оставлять поповер,
+  // указывающий на уже мёртвый tabId (закрытие вкладки — не единственный, но
+  // реальный путь «из-под» открытого peek).
+  if (peekedTabId === tabId) {
+    peek?.hide();
+    peekedTabId = null;
+  }
   // Переключаемся на соседнюю вкладку, только если закрыли активную —
   // закрытие фоновой вкладки не должно перебивать фокус пользователя.
   if (!wasActive) return;
   if (fallback) activateTab(fallback);
+}
+
+// Task 3 фазы 4 (peek): клик (или Space) по строке waiting — открыть поповер
+// вместо переключения вкладки. Текст вопроса и имя проекта уже лежат в
+// tabStore (setStatus зеркалит waitingText из tab:status, см. boot()).
+function openPeek(tabId, rowEl) {
+  const info = tabStore.peekInfo(tabId);
+  if (!info) return;
+  peekedTabId = tabId;
+  peek.show({
+    tabId, name: info.name, text: info.waitingText, anchorEl: rowEl,
+  });
+}
+
+// onSend поповера: дописать текст (или цифру варианта) в pty вкладки, ЧЬЁ
+// имя показывал поповер — НЕ обязательно активной. Фокус терминала возвращает
+// сам peek.hide() через onHide (см. boot()) — он уже отработал к этому
+// моменту (send() внутри peek.js зовёт hide() ДО onSend).
+function sendPeek(tabId, text) {
+  window.api.term.write(tabId, `${text}\r`);
+}
+
+// Ctrl+Enter в поповере — перейти во вкладку вместо ответа из сайдбара.
+function openTabFromPeek(tabId) {
+  activateTab(tabId);
 }
 
 // Клик по ⚡: прописать хуки Cockpit в .claude/settings.json проекта вкладки.
@@ -174,8 +235,112 @@ async function refreshConnectBadge(tabId) {
   }
 }
 
+// «+ Проект»: выбор папки → новая вкладка. Вынесено в отдельную функцию
+// (Task 4 фазы 4) — тот же сценарий запускают и кнопка сайдбара (boot()), и
+// действие «Новый проект» в палитре команд (buildPaletteActions ниже).
+async function newProject() {
+  // Fix 5 (ревью): restoreOverlaySkip() раньше звался ДО chooseFolder() —
+  // отмена системного диалога папки гасила оверлей без единой вкладки и без
+  // возможности восстановиться. Сначала спрашиваем папку, и только при
+  // реальном выборе (folder не null) гасим restore и открываем вкладку.
+  //
+  // FIX 3 (carryover 3): оверлей restore накрывает только #main, а точки
+  // входа в это действие (кнопка сайдбара, палитра) живут вне этой области —
+  // без этого крючка можно было открыть вкладку, пока решение по
+  // восстановлению ещё не принято. Открытие вкладки = неявный отказ от
+  // restore: прогоняем ту же ветку «начать пусто», что и Esc/кнопка в оверлее.
+  const folder = await window.api.tabs.chooseFolder();
+  if (folder) {
+    if (restoreOverlaySkip) restoreOverlaySkip();
+    openTab(folder);
+  }
+}
+
+// Task 4 фазы 4 (палитра команд): полный список действий, собирается заново
+// при КАЖДОМ открытии палитры (palette.js зовёт getActions() внутри open()) —
+// состав вкладок мог измениться с прошлого раза. Действия над «активной»
+// вкладкой (restart/hooks/compact/remote-control) добавляются, только если
+// активная вкладка вообще есть — иначе им нечего делать.
+function buildPaletteActions() {
+  const actions = [];
+
+  for (const tabId of tabStore.order()) {
+    const info = tabStore.peekInfo(tabId);
+    actions.push({
+      id: `tab:${tabId}`,
+      title: `Перейти: ${info ? info.name : tabId}`,
+      hint: info ? info.cwd : '',
+      run: () => activateTab(tabId),
+    });
+  }
+
+  actions.push({
+    id: 'new-project',
+    title: 'Новый проект',
+    hint: 'Открыть папку',
+    run: () => newProject(),
+  });
+
+  const activeId = tabStore.activeId;
+  if (activeId) {
+    actions.push({
+      id: 'restart-session',
+      title: 'Перезапустить сессию',
+      hint: 'Ctrl+Shift+R',
+      run: () => window.api.term.restart(activeId),
+    });
+    actions.push({
+      id: 'connect-hooks',
+      title: 'Подключить хуки',
+      hint: '.claude/settings.json',
+      run: () => connectProject(activeId),
+    });
+    actions.push({
+      id: 'send-compact',
+      title: 'Отправить /compact',
+      hint: '/compact',
+      run: () => window.api.term.write(activeId, '/compact\r'),
+    });
+    actions.push({
+      id: 'send-remote-control',
+      title: 'Отправить /remote-control',
+      hint: '/remote-control',
+      run: () => window.api.term.write(activeId, '/remote-control\r'),
+    });
+  }
+
+  actions.push({
+    id: 'devtools',
+    title: 'Открыть DevTools',
+    hint: 'F12',
+    run: () => window.api.app.devtools(),
+  });
+
+  return actions;
+}
+
 function bindHotkeys() {
   window.addEventListener('keydown', (ev) => {
+    // Ctrl+P — палитра команд (Task 4 фазы 4). preventDefault+stopPropagation —
+    // тот же приём, что у Ctrl+Tab/Ctrl+1..9 ниже: иначе xterm получил бы
+    // печатный символ 'p'/'P' в активный терминал. Второе нажатие, пока
+    // палитра уже открыта, закрывает её (toggle) — открывать её заново тут
+    // же бессмысленно.
+    if (ev.ctrlKey && !ev.shiftKey && !ev.altKey
+        && (ev.key === 'p' || ev.key === 'P' || ev.code === 'KeyP')) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      peek?.hide();
+      // Fix round 1 (ревью): peek?.hide() выше уже мог схлопнуть
+      // document.activeElement на <body> (см. подробный разбор в palette.js/
+      // open) — передаём терминал активной вкладки как fallback НА СЛУЧАЙ
+      // именно этой ситуации; в обычном случае (Ctrl+P прямо из терминала)
+      // palette.open() им не воспользуется, т.к. document.activeElement и так
+      // валиден.
+      if (palette.isOpen()) palette.close();
+      else palette.open(views.get(tabStore.activeId)?.view);
+      return;
+    }
     // Ctrl+1..9 — вкладка по индексу.
     if (ev.ctrlKey && !ev.shiftKey && !ev.altKey && ev.key >= '1' && ev.key <= '9') {
       // preventDefault+stopPropagation — для ЛЮБОГО Ctrl+цифра, даже если
@@ -392,6 +557,30 @@ async function boot() {
     onActivate: activateTab,
     onClose: closeTab,
     onConnect: connectProject,
+    onPeek: openPeek,
+  });
+
+  // Task 3 фазы 4: peek — ответить Claude из сайдбара, не переключая вкладку.
+  // onHide (ревью, фикс): закрытие поповера (Esc / клик вне / автозакрытие
+  // при смене статуса вкладки — см. tab:status ниже) удаляет из DOM
+  // сфокусированный <input> peek, и браузер откатывает фокус на <body> —
+  // без этого набор шёл бы в никуда, пока пользователь не кликнет в терминал
+  // руками. Та же строка, что уже возвращала фокус после отправки ответа.
+  peek = createPeek({
+    root: $('peek-root'),
+    onSend: sendPeek,
+    onOpenTab: openTabFromPeek,
+    onHide: () => {
+      const activeId = tabStore.activeId;
+      if (activeId) views.get(activeId)?.view.focus();
+    },
+  });
+
+  // Task 4 фазы 4: палитра команд (Ctrl+P) — getActions собирает свежий
+  // список при каждом открытии (buildPaletteActions выше).
+  palette = createPalette({
+    root: $('palette-root'),
+    getActions: buildPaletteActions,
   });
 
   renderActionBar();
@@ -404,37 +593,51 @@ async function boot() {
   window.api.term.onExit((p) => {
     views.get(p.tabId)?.view.handlers.onExit(p);
   });
+  // Task 2 фазы 4: клик по Windows-тосту — main прислал {tabId}. activateTab
+  // сама тихо игнорирует неизвестный/уже закрытый tabId (views.get → undefined
+  // → return), так что здесь ничего дополнительно проверять не нужно.
+  window.api.tab.onActivate(({ tabId }) => activateTab(tabId));
+
   // Статусы приходят из хуков Claude Code (sessions.js) — единый источник,
   // term:started/term:exit статус больше не выставляют (был двойной источник).
-  window.api.tab.onStatus(({ tabId, status, subtitle }) => {
-    tabStore.setStatus(tabId, status, subtitle);
+  window.api.tab.onStatus(({
+    tabId, status, subtitle, waitingText,
+  }) => {
+    tabStore.setStatus(tabId, status, subtitle, waitingText);
+    // Ledger-фикс (ревью): текст в поповере — статичный снимок на момент
+    // открытия. Если Claude задаёт ВТОРОЙ вопрос той же вкладке, пока
+    // поповер всё ещё открыт (статус остаётся waiting), пользователь рискует
+    // ответить на вопрос №1, глядя на текст вопроса №1, хотя pty уже ждёт
+    // ответа на №2. peek.update() меняет только текст/кнопки-варианты, не
+    // трогая черновик пользователя в поле ввода — сверка tabId === peekedTabId
+    // (та же, что и в закрытии ниже) защищает чужой поповер от чужого статуса.
+    if (status === 'waiting' && tabId === peekedTabId) {
+      const info = tabStore.peekInfo(tabId);
+      if (info) peek?.update(info.waitingText);
+    }
+    // Task 3 фазы 4 (peek): вкладка, чей поповер сейчас на экране, перестала
+    // ждать (ответили из терминала напрямую, стала stuck/dead и т.п.) —
+    // закрываем поповер, чтобы он не молчал про уже неактуальный вопрос.
+    // peekedTabId — «последний показанный», сверка по tabId защищает от
+    // закрытия чужого (уже открытого позже, для другой вкладки) поповера.
+    if (status !== 'waiting' && tabId === peekedTabId) {
+      peek?.hide();
+      peekedTabId = null;
+    }
     // Fix 8: терракота в титлбаре горит, только пока есть хотя бы одна
     // вкладка в статусе waiting — снимаем, когда ждущих не осталось.
     if (status === 'waiting') waitingTabs.add(tabId); else waitingTabs.delete(tabId);
     updateTitlebarAlert();
+    pushAttention();
     // Ghost-буфер (Task 5): переход в done/waiting — момент «Claude закончил
     // ход», самый ценный кадр скроллбека — сериализуем именно эту вкладку
     // сразу, не дожидаясь общего 30-секундного таймера ниже.
     if (status === 'done' || status === 'waiting') saveGhost(tabId);
   });
 
-  $('btn-new-tab').addEventListener('click', async () => {
-    // Fix 5 (ревью): restoreOverlaySkip() раньше звался ДО chooseFolder() —
-    // отмена системного диалога папки гасила оверлей без единой вкладки и
-    // без возможности восстановиться. Сначала спрашиваем папку, и только при
-    // реальном выборе (folder не null) гасим restore и открываем вкладку.
-    //
-    // FIX 3 (carryover 3): оверлей restore накрывает только #main, а эта
-    // кнопка живёт в сайдбаре — без этого крючка можно было открыть вкладку,
-    // пока решение по восстановлению ещё не принято, и ничего не писалось
-    // бы на диск до решения. Открытие вкладки = неявный отказ от restore:
-    // прогоняем ту же ветку «начать пусто», что и Esc/кнопка в оверлее.
-    const folder = await window.api.tabs.chooseFolder();
-    if (folder) {
-      if (restoreOverlaySkip) restoreOverlaySkip();
-      openTab(folder);
-    }
-  });
+  // Task 4 фазы 4: обработчик вынесен в newProject() — тот же сценарий
+  // запускает и действие «Новый проект» в палитре команд.
+  $('btn-new-tab').addEventListener('click', newProject);
 
   bindHotkeys();
 

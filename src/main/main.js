@@ -3,10 +3,16 @@
 
 const fs = require('fs');
 const path = require('path');
-const { app, BrowserWindow, screen, Menu } = require('electron');
-const { registerIpc, disposeSessions, getSmokeOutput, flushWorkspace } = require('./ipc');
+const {
+  app, BrowserWindow, screen, Menu, nativeImage, Notification,
+} = require('electron');
+const {
+  registerIpc, disposeSessions, getSmokeOutput, flushWorkspace, getActiveTabId,
+} = require('./ipc');
 const { getConfig, isRootConfigCorrupt } = require('./config');
 const { setWindow, notify } = require('./notify');
+const { createAttention } = require('./attention');
+const { createToaster } = require('./toasts');
 
 const SMOKE = process.argv.includes('--smoke');
 
@@ -108,6 +114,22 @@ function createWindow() {
   win.webContents.on('will-navigate', (e) => e.preventDefault());
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
 
+  // Carryover 1 (ревью): Menu.setApplicationMenu(null) ниже нужен ради Ctrl+R
+  // (Housekeeping #14), но заодно срубает стандартный F12-хоткей Electron —
+  // возвращаем его точечно через before-input-event. Фильтр на keyDown
+  // обязателен: событие приходит и на keyDown, и на keyUp — без фильтра
+  // toggleDevTools() дёрнулся бы дважды подряд (открыл и тут же закрыл).
+  win.webContents.on('before-input-event', (e, input) => {
+    if (input.type === 'keyDown' && input.key === 'F12') {
+      // Fix (ревью): без preventDefault нажатие F12 не только открывает
+      // DevTools, но и беспрепятственно долетает до фокусной textarea xterm —
+      // ConPTY получает управляющую escape-последовательность F12 в живой pty
+      // (мусор перед курсором Claude Code), а не только открывает окно.
+      e.preventDefault();
+      win.webContents.toggleDevTools();
+    }
+  });
+
   win.loadFile(path.join(__dirname, '../renderer/index.html'));
   return win;
 }
@@ -118,11 +140,61 @@ function createWindow() {
 // win.webContents.openDevTools().
 Menu.setApplicationMenu(null);
 
+// Fix (ревью): без явного AUMID Windows не всегда сопоставляет тосты
+// (Task 2 фазы 4, Notification) именно с этим portable-приложением —
+// доставка в центр уведомлений не гарантирована. Тот же id, что build.appId
+// в package.json. Должен быть выставлен ДО whenReady().
+app.setAppUserModelId('com.lunev.claude-cockpit');
+
 app.whenReady().then(() => {
   let rendererErrors = 0;
 
   const win = createWindow();
   setWindow(win);
+
+  // Task 1 фазы 4: агрегат «сколько вкладок ждут» → overlay-иконка таскбара +
+  // заголовок окна. attention.js — чистый модуль без Electron (тестируется
+  // node --test), setOverlay/getWindow — единственные Electron-зависимые
+  // точки, инжектируются здесь. dataUrl рисует renderer (badge.js) —
+  // main про canvas ничего не знает, только ставит готовую иконку.
+  const attention = createAttention({
+    getWindow: () => win,
+    setOverlay: (img, desc) => {
+      win.setOverlayIcon(img ? nativeImage.createFromDataURL(img) : null, desc);
+    },
+  });
+
+  // Task 2 фазы 4: Windows-тосты «не про то, на что смотришь» — toasts.js
+  // чистый (без Electron), решает ТОЛЬКО «показывать или нет», а сами
+  // Electron-зависимые точки (Notification, фокус окна, переключение вкладки)
+  // инжектируются здесь же, рядом с attention (тот же паттерн). Проводка
+  // (вызов toaster.onStatus из потока tab:status, имя вкладки из manager.list())
+  // живёт в ipc.js — сюда только сборка зависимостей.
+  const toaster = createToaster({
+    isWindowFocused: () => win.isFocused(),
+    // activeTabId — состояние ipc.js (workspace:setActive из renderer);
+    // getActiveTabId — замыкание над ним, а не снимок на момент сборки.
+    getActiveTabId,
+    showNotification: ({ title, body, onClick }) => {
+      // Notification.isSupported() гардит редкие среды без центра уведомлений
+      // Windows (например, урезанный WORKGROUP-сервер) — тост тогда просто не
+      // показывается, приложение не падает.
+      if (!Notification.isSupported()) return;
+      const n = new Notification({ title, body });
+      n.on('click', onClick);
+      n.show();
+    },
+    focusTab: (tabId) => {
+      if (win.isDestroyed()) return;
+      // Свёрнутое окно — самый вероятный случай клика по тосту (ревью, finding 2):
+      // одного show() недостаточно, нужен restore() (та же идиома, что уже
+      // используется в обработчике 'second-instance' чуть выше).
+      if (win.isMinimized()) win.restore();
+      win.show();
+      win.focus();
+      win.webContents.send('tab:activate', { tabId });
+    },
+  });
 
   if (!SMOKE) {
     win.webContents.once('did-finish-load', () => {
@@ -132,7 +204,7 @@ app.whenReady().then(() => {
     });
   }
 
-  registerIpc(win, { smoke: SMOKE });
+  registerIpc(win, { smoke: SMOKE, attention, toaster });
 
   // Ошибки renderer всегда дублируем в stdout — иначе их не видно при фоновом запуске.
   win.webContents.on('console-message', (eventOrDetails, level, message) => {

@@ -3,7 +3,7 @@
 
 const path = require('path');
 const fs = require('fs');
-const { ipcMain, shell, dialog, app } = require('electron');
+const { ipcMain, shell, dialog, app, clipboard } = require('electron');
 const { getConfig, setConfig } = require('./config');
 const { createPty } = require('./pty');
 const { createSessionManager } = require('./sessions');
@@ -11,6 +11,7 @@ const { createHookBridge } = require('./hook-bridge');
 const { connectProject, isConnected } = require('./connector');
 const { createWorkspaceStore } = require('./workspace');
 const { createWorkspaceSync } = require('./workspace-sync');
+const { saveClipboardImage } = require('./screenshot');
 const { appRoot } = require('./paths');
 
 let manager = null;
@@ -23,6 +24,14 @@ let activeTabId = null;  // последний tabId, о котором сооб
 
 function getSmokeOutput() {
   return smokeOutput;
+}
+
+// Task 2 фазы 4: активная вкладка (по мнению renderer, workspace:setActive) —
+// toasts.js получает этот геттер как getActiveTabId() при создании тостера в
+// main.js. Замыкание, а не снимок значения: main.js создаёт тостер один раз
+// на старте, а activeTabId дальше живёт и меняется здесь же, в ipc.js.
+function getActiveTabId() {
+  return activeTabId;
 }
 
 // Путь к файлу с фактическим портом моста (читает scripts/cockpit-hook.js).
@@ -67,7 +76,7 @@ function validDim(n) {
 }
 
 function registerIpc(win, opts = {}) {
-  const { smoke = false } = opts;
+  const { smoke = false, attention = null, toaster = null } = opts;
 
   // Стор манифеста создаётся один раз на регистрацию — независимо от smoke,
   // чтобы workspace:get всегда мог отдать хоть что-то (в smoke он просто
@@ -134,6 +143,20 @@ function registerIpc(win, opts = {}) {
     onEvent: (channel, payload) => {
       if (smoke && channel === 'term:data') smokeOutput += payload.data;
       if (channel === 'tabs:changed') syncWorkspace();
+      // Task 2 фазы 4: тот же поток, что шлёт tab:status в renderer, — тостер
+      // (toasts.js, чистый модуль) сам решает, показывать ли уведомление
+      // Windows, по правилу «не уведомлять о том, на что смотришь». Имя
+      // вкладки берём из manager.list() — payload статуса его не несёт.
+      // smoke: headless-прогон никогда не должен показывать тосты.
+      if (!smoke && channel === 'tab:status' && toaster) {
+        const tab = manager.list().find((t) => t.tabId === payload.tabId);
+        toaster.onStatus({
+          tabId: payload.tabId,
+          tabName: tab ? tab.name : payload.tabId,
+          status: payload.status,
+          waitingText: payload.waitingText,
+        });
+      }
       if (!win.isDestroyed()) win.webContents.send(channel, payload);
     },
   });
@@ -160,6 +183,28 @@ function registerIpc(win, opts = {}) {
 
   ipcMain.handle('shell:openExternal', (_e, url) => {
     if (typeof url === 'string' && /^https?:\/\//i.test(url)) shell.openExternal(url);
+  });
+
+  // Task 4 фазы 4 (палитра команд): «Открыть DevTools» — то же самое, что
+  // делает F12 (см. main.js/before-input-event), просто доступное и из палитры.
+  ipcMain.handle('app:devtools', () => {
+    if (!win.isDestroyed()) win.webContents.toggleDevTools();
+  });
+
+  // Task 1 фазы 4: renderer шлёт агрегат «сколько вкладок ждут» + готовую
+  // PNG-иконку бейджа (канвас рисует badge.js, main про canvas не знает).
+  // attention — чистый модуль (attention.js), инстанс создаётся в main.js
+  // (там же живут nativeImage и win.setOverlayIcon) и прокидывается сюда
+  // через opts — ipc.js только маршрутизирует IPC-пейлоад.
+  ipcMain.on('attention:update', (_e, payload) => {
+    if (!attention || !payload || typeof payload !== 'object') return;
+    const { count, dataUrl } = payload;
+    // Fix (ревью): typeof count !== 'number' пропускал NaN (typeof NaN ===
+    // 'number') — NaN ломает дедупликацию в attention.js (NaN !== NaN всегда
+    // true, обновление никогда не гасится) и даёт заголовок окна вида
+    // «Cockpit — NaN ждут». count — количество вкладок, только целое ≥ 0.
+    if (!Number.isInteger(count) || count < 0) return;
+    attention.update({ count, dataUrl: typeof dataUrl === 'string' ? dataUrl : null });
   });
 
   // Регистрация вкладки. cwd обязателен — renderer берёт его из диалога
@@ -313,6 +358,23 @@ function registerIpc(win, opts = {}) {
     return { connected: cwd ? isConnected(cwd) : false };
   });
 
+  // Task 4 фазы 4 (вставка скриншотов): cwd вкладки резолвим тем же путём,
+  // что project:connect/status — tabCwd (manager.list()). saveClipboardImage —
+  // чистый модуль (screenshot.js), clipboard.readImage() инжектируется отсюда.
+  // Любая ошибка (в т.ч. пустой буфер, недоступный clipboard) → null — renderer
+  // (terminal.js) сам падает на обычную текстовую вставку в этом случае.
+  ipcMain.handle('screenshot:paste', (_e, tabId) => {
+    if (typeof tabId !== 'string') return null;
+    const cwd = tabCwd(tabId);
+    if (!cwd) return null;
+    try {
+      return saveClipboardImage({ readImage: () => clipboard.readImage(), dir: cwd, now: Date.now() });
+    } catch (err) {
+      console.warn(`[screenshot] не удалось сохранить скриншот: ${err.message}`);
+      return null;
+    }
+  });
+
   ipcMain.on('term:start', (_e, payload) => {
     // Payload может прийти не объектом (null и т.п.) — деструктуризация упала
     // бы через uncaughtException прямо в app.exit(1). Отсекаем заранее.
@@ -380,4 +442,6 @@ function disposeSessions() {
   if (manager) manager.disposeAll();
 }
 
-module.exports = { registerIpc, disposeSessions, stopBridge, getSmokeOutput, flushWorkspace };
+module.exports = {
+  registerIpc, disposeSessions, stopBridge, getSmokeOutput, flushWorkspace, getActiveTabId,
+};

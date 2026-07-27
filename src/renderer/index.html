@@ -43,6 +43,12 @@
     </div>
     <div id="main">
       <div id="terminal-host"></div>
+      <div id="action-bar">
+        <div id="action-commands"></div>
+        <div id="action-right">
+          <span id="limit-5h" title="5-часовое окно"></span>
+        </div>
+      </div>
       <div id="restore-overlay" class="hidden">
         <div class="restore-card">
           <div class="restore-title">Восстановить воркспейс?</div>
@@ -55,12 +61,16 @@
       </div>
     </div>
   </div>
-  <div id="action-bar">
-    <div id="action-commands"></div>
-    <div id="action-right">
-      <span id="limit-5h" title="5-часовое окно"></span>
-    </div>
-  </div>
+  <!-- Task 3 фазы 4 (peek): корень поповера — вне #sidebar/#main нарочно,
+       чтобы position:fixed внутри позиционировался относительно окна целиком,
+       не обрезаясь overflow:auto сайдбара. createPeek() сама наполняет/чистит
+       этот контейнер (см. src/renderer/js/peek.js). -->
+  <div id="peek-root"></div>
+  <!-- Task 4 фазы 4 (палитра команд): тот же приём, что peek-root — корень
+       вне #sidebar/#main, чтобы оверлей палитры накрывал окно целиком, а не
+       обрезался overflow:auto сайдбара. createPalette() наполняет/чистит
+       этот контейнер сама (см. src/renderer/js/palette.js). -->
+  <div id="palette-root"></div>
   <script type="module" src="./js/app.js"></script>
 </body>
 </html>

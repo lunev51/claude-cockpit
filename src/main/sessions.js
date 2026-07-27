@@ -9,6 +9,13 @@ const crypto = require('crypto');
 
 const STATUSES = ['working', 'waiting', 'done', 'stuck', 'dead'];
 
+// Мягкая деградация провала резюма (спека §6): процесс с оверрайдом (--resume
+// <id>/--resume), проживший меньше этого порога и умерший, не привязав
+// сессию, считается «фантомным» провалом (сессия протухла/транскрипт так и
+// не создался) — кокпит авто-восстанавливает вкладку. Дольше — считаем, что
+// процесс был живым и умер сам по себе; авто-восстановление не триггерим.
+const AUTO_RECOVER_MAX_LIFETIME_MS = 15000;
+
 // Выпиливает унаследованные маркеры родительского Claude Code из process.env
 // (Task 6). Если кокпит запущен из-под ДРУГОГО Claude Code (например, так
 // делают тестовые прогоны), переменные вроде CLAUDE_CODE_CHILD_SESSION /
@@ -70,6 +77,8 @@ function createSessionManager({
       lastOutputAt: now(),
       pendingExtraArgs: null,  // одноразовый оверрайд args на следующий spawn() (хотфикс restart, спека §3.14)
       overrideFailed: false,   // true = процесс с оверрайдом (--resume <id>/--resume) умер, а SessionStart так и не привязал сессию
+      spawnedAt: 0,            // now() на момент последнего spawn() — мерило «быстрой смерти» для авто-восстановления
+      autoRecovered: false,    // true = авто-восстановление уже сработало на этой вкладке (не более раза; сброс в bindSession/restart)
       // Идле-арминг детекта зависаний (Task 6): без подключённых хуков «working»
       // означает лишь «терминал открыт» — вкладка, спокойно стоящая у промпта
       // (пользователь ещё не подключил хуки), не должна уезжать в «Проблемы».
@@ -115,6 +124,7 @@ function createSessionManager({
     // проходят гард, а все колбэки предыдущего поколения — отсекаются.
     tab.gen += 1;
     const myGen = tab.gen;
+    tab.spawnedAt = now(); // момент ЭТОГО спавна — мерило «быстрой смерти» ниже, в onExit
     try {
       const proc = ptyFactory({
         ...spec,
@@ -136,7 +146,7 @@ function createSessionManager({
           onEvent('term:data', { tabId: tab.tabId, data });
         },
         onExit: (exitCode) => {
-          if (myGen !== tab.gen) return; // stale exit после рестарта (или намеренный kill — см. гард в restart())
+          if (myGen !== tab.gen) return; // stale exit после рестарта/close() (или намеренный kill — см. гард в restart())
           // Провал резюма/continue: процесс с оверрайдом умер естественной смертью,
           // а SessionStart так и не привязал сессию за время его жизни —
           // следующий restart() уйдёт в голые args (не зацикливаемся). FIX 3
@@ -144,10 +154,11 @@ function createSessionManager({
           // наличию sessionId — иначе восстановленная вкладка (у которой
           // sessionId уже был известен ДО спавна, из манифеста) никогда не
           // считалась бы провалившейся, даже если resume реально не удался.
-          // Плюс обнуляем протухший sessionId — иначе он уедет в манифест и
-          // следующий запуск снова попробует резюмить уже мёртвую сессию.
-          if (usedOverride && !tab.sessionBound) {
+          const failedOverride = usedOverride && !tab.sessionBound;
+          if (failedOverride) {
             tab.overrideFailed = true;
+            // Обнуляем протухший sessionId — иначе он уедет в манифест и
+            // следующий запуск снова попробует резюмить уже мёртвую сессию.
             tab.sessionId = null;
             // FIX 4 (carryover 3): manager.list() отдаёт sessionId, но
             // syncWorkspace в ipc.js пересобирает манифест только по событию
@@ -162,6 +173,35 @@ function createSessionManager({
           }
           tab.proc = null;
           tab.alive = false;
+
+          // Мягкая деградация (спека §6): «фантомная» сессия — SessionStart
+          // отдал session_id, но claude был закрыт до первого сообщения, и
+          // транскрипт так и не создался. Следующий запуск резюмит id,
+          // которого не существует, claude падает почти сразу (exit 1), и
+          // раньше вкладка так и оставалась dead — чинить приходилось руками
+          // (Ctrl+Shift+R). Гарды: (1) процесс должен быть короткоживущим —
+          // долгую сессию, умершую саму по себе, авто-перезапускать нельзя;
+          // (2) не более одного раза на вкладку (autoRecovered), иначе при
+          // системной проблеме (например, бинарник claude сломан) получим
+          // бесконечный цикл спавнов. Гард по поколению (проверка myGen
+          // выше) уже отсекает этот путь, если вкладку в это время закрывают
+          // (close() бампает gen ДО kill()) — авто-спавн после close() не
+          // выстрелит.
+          const livedMs = now() - tab.spawnedAt;
+          if (failedOverride && !tab.autoRecovered && livedMs < AUTO_RECOVER_MAX_LIFETIME_MS) {
+            tab.autoRecovered = true;
+            onEvent('term:data', {
+              tabId: tab.tabId,
+              data: '\r\n\x1b[2m[сессия не найдена — открываю новую]\x1b[0m\r\n',
+            });
+            // Чистый спавн: pendingExtraArgs уже null, resumeOnFirstSpawn уже
+            // потрачен первым спавном этой вкладки — extraArgs останется
+            // пустым, ровно тот же путь, что restart() использует для
+            // «плоских» args.
+            spawn(tab);
+            return;
+          }
+
           setStatus(tab, 'dead', `процесс завершён (код ${exitCode})`);
           onEvent('term:exit', { tabId: tab.tabId, exitCode });
         },
@@ -228,6 +268,7 @@ function createSessionManager({
 
     tab.sessionId = null; // новая жизнь — новый SessionStart перебиндит
     tab.sessionBound = false; // FIX 3: привязка тоже сбрасывается — новый спавн ещё не подтверждён
+    tab.autoRecovered = false; // ручной рестарт — гард одноразовости авто-восстановления взводится заново
 
     if (boundSessionId) {
       // 1. session_id уже известен (из прошлого SessionStart) — резюмируем именно его.
@@ -274,6 +315,7 @@ function createSessionManager({
     if (tab) {
       tab.sessionId = sessionId;
       tab.sessionBound = true; // FIX 3: единственное место, где привязка считается ПОДТВЕРЖДЁННОЙ
+      tab.autoRecovered = false; // резюм реально удался — авто-восстановление снова доступно на будущее
     }
     onEvent('tabs:changed', {}); // sessionId вкладки мог измениться — манифест должен это узнать
   }

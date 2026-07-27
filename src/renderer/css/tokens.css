@@ -24,6 +24,7 @@
 
   /* Геометрия Warp: жёстко, без щедрых пилюль */
   --radius-s: 3px;
+  --radius-m: 4px; /* восстановлен из phase3-design.md — Task 3 фазы 4 (peek) первый потребитель */
   --radius-l: 6px;
 
   --font-ui: 'Inter', 'Segoe UI', sans-serif;

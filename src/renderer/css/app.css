@@ -52,7 +52,7 @@ html, body {
 /* --- Основная сетка --- */
 #app {
   display: flex;
-  height: calc(100% - 36px - 32px); /* минус титлбар и панель действий */
+  height: calc(100% - 36px); /* минус титлбар; панель действий теперь внутри #main */
 }
 
 /* --- Сайдбар --- */
@@ -252,7 +252,12 @@ html, body {
 /* Кнопки оверлея не должны тянуться на всю ширину, как в sidebar-footer. */
 .restore-actions .sidebar-btn { flex: none; }
 
-/* --- Панель действий (вместо отладочной статус-строки) --- */
+/* --- Панель действий (вместо отладочной статус-строки).
+   Теперь внутри #main, после #terminal-host — flex-элемент колонки #main,
+   поэтому по ширине автоматически равна терминалу (align-items: stretch по
+   умолчанию), без явного width. Оверлей восстановления накрывает и её тоже
+   (position: absolute; inset: 0 относительно #main), пока идёт выбор
+   восстановления — кнопки действий недоступны, что логично. --- */
 #action-bar {
   height: 32px;
   display: flex;
@@ -283,10 +288,165 @@ html, body {
 #limit-5h:empty { display: none; }
 
 /* Fix 9 (ревью, спека §7): «focus — 2px кольцо терракотой» вместо дефолтного
-   кольца Chromium. */
+   кольца Chromium. Task 3 фазы 4: .tab-row теперь focusable (tabindex=0, для
+   Space → peek) — то же кольцо. */
 .action-btn:focus-visible,
 .sidebar-btn:focus-visible,
+.tab-row:focus-visible,
 .restore-row input[type="checkbox"]:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
+}
+
+/* --- Peek-поповер (Task 3 фазы 4): ответить Claude из сайдбара, не
+   переключая активную вкладку. Корень #peek-root — прямой ребёнок <body>
+   (см. index.html), сам поповер — position:fixed, координаты считает
+   peek.js (рядом со строкой сайдбара, упирается — сдвигается вверх/влево). --- */
+.peek-popover {
+  position: fixed;
+  width: 420px;
+  max-width: 420px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-m);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 40;
+  font-family: var(--font-ui);
+}
+.peek-name {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+}
+.peek-text {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 220px;
+  overflow-y: auto;
+  background: var(--bg-window);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  padding: 8px;
+}
+.peek-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.peek-option {
+  background: var(--bg-window);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  padding: 5px 10px;
+  cursor: pointer;
+  text-align: left;
+}
+.peek-option:hover { background: var(--bg-hover); border-color: var(--accent); }
+.peek-input {
+  background: var(--bg-window);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  padding: 6px 8px;
+}
+.peek-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.peek-hint {
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+/* --- Палитра команд (Task 4 фазы 4): Ctrl+P, по центру сверху окна, как в
+   редакторах. Корень #palette-root — прямой ребёнок <body> (см. index.html),
+   z-index выше peek (40), чтобы оверлей палитры не мог оказаться под ним. --- */
+.palette-overlay {
+  position: fixed;
+  inset: 0;
+  background: color-mix(in srgb, var(--bg-window) 55%, transparent);
+  display: flex;
+  justify-content: center;
+  padding-top: 96px;
+  z-index: 60;
+}
+.palette-panel {
+  width: 560px;
+  max-width: 90%;
+  max-height: 70vh;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-l);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+.palette-input {
+  background: var(--bg-window);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  padding: 8px 10px;
+}
+.palette-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.palette-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  /* ~8 строк видимых за раз (спека), остальное — прокрутка. */
+  max-height: 320px;
+  overflow-y: auto;
+}
+.palette-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  padding: 7px 9px;
+  border-radius: var(--radius-s);
+  cursor: pointer;
+}
+.palette-row:hover,
+.palette-row.active {
+  background: var(--bg-hover);
+}
+.palette-row-title {
+  font-size: 12px;
+  color: var(--text);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.palette-row-hint {
+  font-size: 10px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  flex: none;
+  white-space: nowrap;
+}
+.palette-empty {
+  font-size: 12px;
+  color: var(--text-dim);
+  padding: 10px 9px;
+  text-align: center;
 }
