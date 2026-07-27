@@ -21,7 +21,15 @@ let restoreOverlaySkip = null;
 function renderActionBar() {
   const host = $('action-commands');
   host.textContent = '';
-  for (const { label, command } of (config.actionBar?.commands || [])) {
+  // deepMerge (config.js) при частичном оверрайде массива объектом даёт
+  // {0:…,1:…} вместо массива — Array.isArray отсекает такой и любой другой
+  // некорректный actionBar.commands, чтобы не уронить boot() на итерации.
+  const raw = config.actionBar?.commands;
+  const commands = Array.isArray(raw) ? raw : [];
+  if (raw !== undefined && !Array.isArray(raw)) {
+    console.warn('[actionBar] config.actionBar.commands не массив — панель действий пуста', raw);
+  }
+  for (const { label, command } of commands) {
     const btn = document.createElement('button');
     btn.className = 'action-btn';
     btn.textContent = label;
@@ -432,4 +440,7 @@ async function boot() {
   window.api.app.onNotice(({ text }) => console.warn(`[notice] ${text}`));
 }
 
-boot();
+// Необработанный reject/throw внутри boot() раньше гас молча — приложение
+// оставалось полумёртвым (окно есть, но без вкладок/хоткеев) без единой
+// строки в консоли. Ловим явно.
+boot().catch((err) => console.error('[boot] не удалось инициализировать renderer:', err));
