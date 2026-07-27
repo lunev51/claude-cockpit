@@ -5,6 +5,7 @@ import { initTerminal } from './terminal.js';
 import { createTabStore } from './tabs.js';
 import { renderBadge } from './badge.js';
 import { createPeek } from './peek.js';
+import { createPalette } from './palette.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -12,6 +13,9 @@ const views = new Map(); // tabId → {view, container}
 let config = null;
 let tabStore = null;
 let peek = null;
+// Task 4 фазы 4: палитра команд (Ctrl+P) — createPalette сама владеет своим
+// DOM-оверлеем (см. palette.js), здесь только держим ссылку для bindHotkeys.
+let palette = null;
 // Task 3 фазы 4 (peek): tabId, для которого сейчас открыт поповер (или null).
 // Нужен, чтобы обработчик tab:status закрывал peek ТОЛЬКО когда статус меняет
 // именно ту вкладку, что сейчас показана в поповере — peek.hide() идемпотентна,
@@ -133,6 +137,11 @@ function activateTab(tabId) {
   // безусловно — контекст (какая строка ждёт) сменился, отвечать «в сторону»
   // от текущего экрана не место.
   peek?.hide();
+  // Task 4 фазы 4 (палитра): та же логика — переключение вкладки (в т.ч. само
+  // действие «Перейти: …» из палитры, которая к этому моменту уже закрыла
+  // себя сама, см. palette.js/runAt) не должно оставлять палитру открытой
+  // «за спиной». close() идемпотентна — безвредно, если она уже закрыта.
+  palette?.close();
   for (const [id, v] of views) v.container.classList.toggle('hidden', id !== tabId);
   tabStore.setActive(tabId);
   window.api.workspace.setActive(tabId); // main пересчитает activeIndex манифеста
@@ -228,8 +237,105 @@ async function refreshConnectBadge(tabId) {
   }
 }
 
+// «+ Проект»: выбор папки → новая вкладка. Вынесено в отдельную функцию
+// (Task 4 фазы 4) — тот же сценарий запускают и кнопка сайдбара (boot()), и
+// действие «Новый проект» в палитре команд (buildPaletteActions ниже).
+async function newProject() {
+  // Fix 5 (ревью): restoreOverlaySkip() раньше звался ДО chooseFolder() —
+  // отмена системного диалога папки гасила оверлей без единой вкладки и без
+  // возможности восстановиться. Сначала спрашиваем папку, и только при
+  // реальном выборе (folder не null) гасим restore и открываем вкладку.
+  //
+  // FIX 3 (carryover 3): оверлей restore накрывает только #main, а точки
+  // входа в это действие (кнопка сайдбара, палитра) живут вне этой области —
+  // без этого крючка можно было открыть вкладку, пока решение по
+  // восстановлению ещё не принято. Открытие вкладки = неявный отказ от
+  // restore: прогоняем ту же ветку «начать пусто», что и Esc/кнопка в оверлее.
+  const folder = await window.api.tabs.chooseFolder();
+  if (folder) {
+    if (restoreOverlaySkip) restoreOverlaySkip();
+    openTab(folder);
+  }
+}
+
+// Task 4 фазы 4 (палитра команд): полный список действий, собирается заново
+// при КАЖДОМ открытии палитры (palette.js зовёт getActions() внутри open()) —
+// состав вкладок мог измениться с прошлого раза. Действия над «активной»
+// вкладкой (restart/hooks/compact/remote-control) добавляются, только если
+// активная вкладка вообще есть — иначе им нечего делать.
+function buildPaletteActions() {
+  const actions = [];
+
+  for (const tabId of tabStore.order()) {
+    const info = tabStore.peekInfo(tabId);
+    actions.push({
+      id: `tab:${tabId}`,
+      title: `Перейти: ${info ? info.name : tabId}`,
+      hint: info ? info.cwd : '',
+      run: () => activateTab(tabId),
+    });
+  }
+
+  actions.push({
+    id: 'new-project',
+    title: 'Новый проект',
+    hint: 'Открыть папку',
+    run: () => newProject(),
+  });
+
+  const activeId = tabStore.activeId;
+  if (activeId) {
+    actions.push({
+      id: 'restart-session',
+      title: 'Перезапустить сессию',
+      hint: 'Ctrl+Shift+R',
+      run: () => window.api.term.restart(activeId),
+    });
+    actions.push({
+      id: 'connect-hooks',
+      title: 'Подключить хуки',
+      hint: '.claude/settings.json',
+      run: () => connectProject(activeId),
+    });
+    actions.push({
+      id: 'send-compact',
+      title: 'Отправить /compact',
+      hint: '/compact',
+      run: () => window.api.term.write(activeId, '/compact\r'),
+    });
+    actions.push({
+      id: 'send-remote-control',
+      title: 'Отправить /remote-control',
+      hint: '/remote-control',
+      run: () => window.api.term.write(activeId, '/remote-control\r'),
+    });
+  }
+
+  actions.push({
+    id: 'devtools',
+    title: 'Открыть DevTools',
+    hint: 'F12',
+    run: () => window.api.app.devtools(),
+  });
+
+  return actions;
+}
+
 function bindHotkeys() {
   window.addEventListener('keydown', (ev) => {
+    // Ctrl+P — палитра команд (Task 4 фазы 4). preventDefault+stopPropagation —
+    // тот же приём, что у Ctrl+Tab/Ctrl+1..9 ниже: иначе xterm получил бы
+    // печатный символ 'p'/'P' в активный терминал. Второе нажатие, пока
+    // палитра уже открыта, закрывает её (toggle) — открывать её заново тут
+    // же бессмысленно.
+    if (ev.ctrlKey && !ev.shiftKey && !ev.altKey
+        && (ev.key === 'p' || ev.key === 'P' || ev.code === 'KeyP')) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      peek?.hide();
+      if (palette.isOpen()) palette.close(); else palette.open();
+      return;
+    }
     // Ctrl+1..9 — вкладка по индексу.
     if (ev.ctrlKey && !ev.shiftKey && !ev.altKey && ev.key >= '1' && ev.key <= '9') {
       // preventDefault+stopPropagation — для ЛЮБОГО Ctrl+цифра, даже если
@@ -456,6 +562,13 @@ async function boot() {
     onOpenTab: openTabFromPeek,
   });
 
+  // Task 4 фазы 4: палитра команд (Ctrl+P) — getActions собирает свежий
+  // список при каждом открытии (buildPaletteActions выше).
+  palette = createPalette({
+    root: $('palette-root'),
+    getActions: buildPaletteActions,
+  });
+
   renderActionBar();
 
   // Глобальный диспатч событий терминалов по tabId.
@@ -497,23 +610,9 @@ async function boot() {
     if (status === 'done' || status === 'waiting') saveGhost(tabId);
   });
 
-  $('btn-new-tab').addEventListener('click', async () => {
-    // Fix 5 (ревью): restoreOverlaySkip() раньше звался ДО chooseFolder() —
-    // отмена системного диалога папки гасила оверлей без единой вкладки и
-    // без возможности восстановиться. Сначала спрашиваем папку, и только при
-    // реальном выборе (folder не null) гасим restore и открываем вкладку.
-    //
-    // FIX 3 (carryover 3): оверлей restore накрывает только #main, а эта
-    // кнопка живёт в сайдбаре — без этого крючка можно было открыть вкладку,
-    // пока решение по восстановлению ещё не принято, и ничего не писалось
-    // бы на диск до решения. Открытие вкладки = неявный отказ от restore:
-    // прогоняем ту же ветку «начать пусто», что и Esc/кнопка в оверлее.
-    const folder = await window.api.tabs.chooseFolder();
-    if (folder) {
-      if (restoreOverlaySkip) restoreOverlaySkip();
-      openTab(folder);
-    }
-  });
+  // Task 4 фазы 4: обработчик вынесен в newProject() — тот же сценарий
+  // запускает и действие «Новый проект» в палитре команд.
+  $('btn-new-tab').addEventListener('click', newProject);
 
   bindHotkeys();
 

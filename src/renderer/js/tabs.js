@@ -138,11 +138,16 @@ export function createTabStore({
   }
 
   // Peek (Task 3 фазы 4): имя проекта + полный текст вопроса по tabId —
-  // всё, что нужно createPeek().show() для отрисовки поповера.
+  // всё, что нужно createPeek().show() для отрисовки поповера. cwd (Task 4
+  // фазы 4) добавлен туда же — палитра команд (buildPaletteActions в app.js)
+  // переиспользует этот геттер для строки «Перейти: <имя>» с подсказкой-путём;
+  // peek.js этот новый филд просто игнорирует, так что ничего не ломает.
   function peekInfo(tabId) {
     const r = rows.get(tabId);
     if (!r) return null;
-    return { name: r.name, waitingText: r.waitingText };
+    return {
+      name: r.name, cwd: r.cwd, waitingText: r.waitingText,
+    };
   }
 
   function setConnectVisible(tabId, visible) {

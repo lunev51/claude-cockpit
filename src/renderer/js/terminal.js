@@ -251,13 +251,26 @@ export function initTerminal(container, config, {
       return true;
     }
 
-    // Ctrl+Shift+V — вставить из буфера обмена.
+    // Ctrl+Shift+V — вставить из буфера обмена. Task 4 фазы 4: сначала пробуем
+    // скриншот — screenshot:paste смотрит cwd этой вкладки и решает, картинка
+    // в буфере или нет (renderer напрямую этого не узнает, Clipboard API из
+    // текста картинку не отличает). Путь вставляем БЕЗ \r — пользователь сам
+    // допишет остаток строки и отправит. null (не картинка) или ошибка IPC —
+    // падаем на прежнюю текстовую вставку.
     if (ev.ctrlKey && ev.shiftKey && !ev.altKey && !ev.metaKey
         && (ev.key === 'V' || ev.key === 'v' || ev.code === 'KeyV')) {
       ev.preventDefault();
-      navigator.clipboard.readText()
-        .then((text) => { if (text) term.paste(text); })
-        .catch(() => {});
+      window.api.screenshot.paste(tabId)
+        .catch(() => null)
+        .then((res) => {
+          if (res && res.path) {
+            term.paste(res.path);
+            return;
+          }
+          navigator.clipboard.readText()
+            .then((text) => { if (text) term.paste(text); })
+            .catch(() => {});
+        });
       return false;
     }
 

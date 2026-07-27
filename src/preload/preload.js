@@ -27,6 +27,9 @@ contextBridge.exposeInMainWorld('api', {
   },
   app: {
     onNotice: (cb) => ipcRenderer.on('app:notice', (_e, n) => cb(n)),
+    // Task 4 фазы 4 (палитра команд): «Открыть DevTools» — main зовёт
+    // win.webContents.toggleDevTools() (то же самое, что F12 в main.js).
+    devtools: () => ipcRenderer.invoke('app:devtools'),
   },
   project: {
     connect: (tabId) => ipcRenderer.invoke('project:connect', tabId),
@@ -55,5 +58,10 @@ contextBridge.exposeInMainWorld('api', {
     // таскбара + заголовок окна (main/attention.js). dataUrl рисует
     // renderer (badge.js) — main про canvas ничего не знает.
     update: (count, dataUrl) => ipcRenderer.send('attention:update', { count, dataUrl }),
+  },
+  screenshot: {
+    // Task 4 фазы 4: main находит cwd вкладки и решает, картинка в буфере
+    // обмена или нет (main/screenshot.js) — возвращает {path} или null.
+    paste: (tabId) => ipcRenderer.invoke('screenshot:paste', tabId),
   },
 });

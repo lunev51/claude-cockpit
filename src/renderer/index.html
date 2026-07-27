@@ -66,6 +66,11 @@
        не обрезаясь overflow:auto сайдбара. createPeek() сама наполняет/чистит
        этот контейнер (см. src/renderer/js/peek.js). -->
   <div id="peek-root"></div>
+  <!-- Task 4 фазы 4 (палитра команд): тот же приём, что peek-root — корень
+       вне #sidebar/#main, чтобы оверлей палитры накрывал окно целиком, а не
+       обрезался overflow:auto сайдбара. createPalette() наполняет/чистит
+       этот контейнер сама (см. src/renderer/js/palette.js). -->
+  <div id="palette-root"></div>
   <script type="module" src="./js/app.js"></script>
 </body>
 </html>

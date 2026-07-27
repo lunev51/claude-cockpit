@@ -3,7 +3,7 @@
 
 const path = require('path');
 const fs = require('fs');
-const { ipcMain, shell, dialog, app } = require('electron');
+const { ipcMain, shell, dialog, app, clipboard } = require('electron');
 const { getConfig, setConfig } = require('./config');
 const { createPty } = require('./pty');
 const { createSessionManager } = require('./sessions');
@@ -11,6 +11,7 @@ const { createHookBridge } = require('./hook-bridge');
 const { connectProject, isConnected } = require('./connector');
 const { createWorkspaceStore } = require('./workspace');
 const { createWorkspaceSync } = require('./workspace-sync');
+const { saveClipboardImage } = require('./screenshot');
 const { appRoot } = require('./paths');
 
 let manager = null;
@@ -184,6 +185,12 @@ function registerIpc(win, opts = {}) {
     if (typeof url === 'string' && /^https?:\/\//i.test(url)) shell.openExternal(url);
   });
 
+  // Task 4 фазы 4 (палитра команд): «Открыть DevTools» — то же самое, что
+  // делает F12 (см. main.js/before-input-event), просто доступное и из палитры.
+  ipcMain.handle('app:devtools', () => {
+    if (!win.isDestroyed()) win.webContents.toggleDevTools();
+  });
+
   // Task 1 фазы 4: renderer шлёт агрегат «сколько вкладок ждут» + готовую
   // PNG-иконку бейджа (канвас рисует badge.js, main про canvas не знает).
   // attention — чистый модуль (attention.js), инстанс создаётся в main.js
@@ -345,6 +352,23 @@ function registerIpc(win, opts = {}) {
   ipcMain.handle('project:status', (_e, tabId) => {
     const cwd = tabCwd(tabId);
     return { connected: cwd ? isConnected(cwd) : false };
+  });
+
+  // Task 4 фазы 4 (вставка скриншотов): cwd вкладки резолвим тем же путём,
+  // что project:connect/status — tabCwd (manager.list()). saveClipboardImage —
+  // чистый модуль (screenshot.js), clipboard.readImage() инжектируется отсюда.
+  // Любая ошибка (в т.ч. пустой буфер, недоступный clipboard) → null — renderer
+  // (terminal.js) сам падает на обычную текстовую вставку в этом случае.
+  ipcMain.handle('screenshot:paste', (_e, tabId) => {
+    if (typeof tabId !== 'string') return null;
+    const cwd = tabCwd(tabId);
+    if (!cwd) return null;
+    try {
+      return saveClipboardImage({ readImage: () => clipboard.readImage(), dir: cwd, now: Date.now() });
+    } catch (err) {
+      console.warn(`[screenshot] не удалось сохранить скриншот: ${err.message}`);
+      return null;
+    }
   });
 
   ipcMain.on('term:start', (_e, payload) => {
