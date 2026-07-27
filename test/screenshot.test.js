@@ -104,6 +104,23 @@ test('две вставки с ОДИНАКОВЫМ now (разрешение ti
   assert.deepStrictEqual(fs.readFileSync(resB.path), pngB);
 });
 
+test('папка .cockpit-shots уже существует БЕЗ .gitignore (удалили, старая сборка, копия проекта) → после сохранения .gitignore появился', () => {
+  const dir = tmpDir();
+  const shotsDir = path.join(dir, '.cockpit-shots');
+  fs.mkdirSync(shotsDir, { recursive: true }); // папка есть, .gitignore — нет
+  assert.strictEqual(fs.existsSync(path.join(shotsDir, '.gitignore')), false);
+
+  const png = Buffer.from([7, 7, 7]);
+  const res = saveClipboardImage({
+    readImage: () => fakeImage(png), dir, now: new Date(2026, 6, 27, 11, 0, 0).getTime(),
+  });
+
+  assert.ok(fs.existsSync(res.path));
+  const gitignore = path.join(shotsDir, '.gitignore');
+  assert.ok(fs.existsSync(gitignore));
+  assert.strictEqual(fs.readFileSync(gitignore, 'utf8'), '*');
+});
+
 test('третья и последующие вставки в ту же секунду продолжают счётчик суффиксов (-2, -3, …)', () => {
   const dir = tmpDir();
   const now = new Date(2026, 6, 27, 10, 0, 0).getTime();

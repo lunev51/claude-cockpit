@@ -8,11 +8,16 @@ import { parseOptions } from './peek-parse.js';
 
 const MARGIN = 8; // отступ от края окна при упоре
 
-export function createPeek({ root, onSend, onOpenTab }) {
+export function createPeek({
+  root, onSend, onOpenTab, onHide,
+}) {
   let open = false;
   let currentTabId = null;
   let popoverEl = null;
   let inputEl = null;
+  let bodyEl = null;
+  let optionsEl = null;
+  let currentAnchorEl = null; // запоминаем anchorEl show() — update() может перепозиционировать
   let onDocKeydown = null;
   let onDocMousedown = null;
 
@@ -48,9 +53,11 @@ export function createPeek({ root, onSend, onOpenTab }) {
     body.className = 'peek-text';
     body.textContent = text;
     el.appendChild(body);
+    bodyEl = body;
 
-    const optionsEl = buildOptions(text);
-    if (optionsEl) el.appendChild(optionsEl);
+    const options = buildOptions(text);
+    if (options) el.appendChild(options);
+    optionsEl = options; // может быть null — update() это учитывает
 
     const input = document.createElement('input');
     input.type = 'text';
@@ -102,6 +109,15 @@ export function createPeek({ root, onSend, onOpenTab }) {
   function send(text) {
     const tabId = currentTabId;
     if (!tabId) return;
+    // Fix (ревью, критично): пустой Enter в поле — это НЕ «ничего не отправить»,
+    // а голый '\r' в pty ждущей вкладки. Для обычного текстового промпта это
+    // безобидно, но для ПРАВ-промпта Claude Code (permission prompt) голый
+    // Enter — это «согласиться с вариантом по умолчанию», причём БЕЗ единого
+    // сигнала пользователю: поповер просто молча закрывается. Рефлекторный
+    // Enter (закрыть поповер, как Esc) стал бы самым опасным из возможных
+    // отказов этой фичи — молчаливым одобрением чужого выбора за пользователя.
+    // Кнопки-варианты шлют цифру ('1'..'9') — их эта проверка не касается.
+    if (!String(text).trim()) return;
     hide();
     onSend(tabId, text);
   }
@@ -135,6 +151,7 @@ export function createPeek({ root, onSend, onOpenTab }) {
     hide(); // на случай если уже открыт другой peek — только один одновременно
 
     currentTabId = tabId;
+    currentAnchorEl = anchorEl;
     popoverEl = build({ name, text });
     root.appendChild(popoverEl);
     open = true;
@@ -163,6 +180,7 @@ export function createPeek({ root, onSend, onOpenTab }) {
     if (!open) return;
     open = false;
     currentTabId = null;
+    currentAnchorEl = null;
     if (onDocKeydown) document.removeEventListener('keydown', onDocKeydown, true);
     if (onDocMousedown) document.removeEventListener('mousedown', onDocMousedown, true);
     onDocKeydown = null;
@@ -170,11 +188,49 @@ export function createPeek({ root, onSend, onOpenTab }) {
     popoverEl?.remove();
     popoverEl = null;
     inputEl = null;
+    bodyEl = null;
+    optionsEl = null;
+    // Fix (ревью): закрытие поповера (Esc / клик вне / автозакрытие при смене
+    // статуса — все три пути идут через этот же hide()) удаляет из DOM
+    // сфокусированный <input>, и фокус браузером откатывается на <body> —
+    // дальше набор идёт в никуда, пока пользователь не кликнет в терминал
+    // руками. onHide — единая точка, куда app.js кладёт возврат фокуса
+    // терминалу активной вкладки (тот же приём, что и после отправки —
+    // views.get(tabStore.activeId)?.view.focus()), не завязывая сам peek.js
+    // на знание о вкладках/терминалах.
+    onHide?.();
+  }
+
+  // update(text): вкладка, чей поповер уже открыт, прислала ВТОРОЙ вопрос,
+  // пока пользователь ещё не ответил на первый (Fix ledger-пункт) — старый
+  // текст на экране рискует остаться неверным, если менять только .peek-text
+  // в обход этой функции. Меняем ТОЛЬКО текст вопроса и перерисовываем
+  // кнопки-варианты под него — черновик, который пользователь уже начал
+  // печатать в .peek-input, не трогаем ни на символ.
+  function update(text) {
+    if (!open || !popoverEl) return;
+    if (bodyEl) bodyEl.textContent = text;
+
+    const fresh = buildOptions(text);
+    optionsEl?.remove();
+    optionsEl = fresh;
+    if (optionsEl) {
+      // Та же позиция, что при первой сборке в build(): после .peek-text,
+      // перед .peek-input.
+      popoverEl.insertBefore(optionsEl, inputEl);
+    }
+
+    // Текст мог измениться в длине (короче/длиннее исходного) — попап мог
+    // выйти за край окна или перестать в него упираться; пересчитываем
+    // позицию тем же anchorEl, что и при открытии.
+    if (currentAnchorEl) position(currentAnchorEl);
   }
 
   function isOpen() {
     return open;
   }
 
-  return { show, hide, isOpen };
+  return {
+    show, hide, update, isOpen,
+  };
 }

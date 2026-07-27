@@ -40,19 +40,24 @@ function uniqueFile(shotsDir, now) {
 // readImage() — Electron-подобный nativeImage: isEmpty()/toPNG(). Если в
 // буфере не картинка (isEmpty() === true) — возвращаем null, ничего не пишем.
 // dir — cwd вкладки; пишем в <dir>/.cockpit-shots/<timestamp>.png (mkdir -p).
-// При ПЕРВОМ создании этой подпапки кладём рядом .gitignore с «*» — папка
-// живёт внутри чужого (пользовательского) git-репозитория проекта, и без
-// этого туда бы намусорило PNG-артефактами скриншотов.
+// Пока в этой подпапке нет .gitignore — кладём рядом файл с «*»: папка живёт
+// внутри чужого (пользовательского) git-репозитория проекта, и без этого
+// туда бы намусорило PNG-артефактами скриншотов.
 function saveClipboardImage({ readImage, dir, now }) {
   const image = readImage();
   if (!image || image.isEmpty()) return null;
 
   const shotsDir = path.join(dir, '.cockpit-shots');
-  const isNewDir = !fs.existsSync(shotsDir);
   fs.mkdirSync(shotsDir, { recursive: true });
-  if (isNewDir) {
+  // Fix (ревью): раньше решение «писать ли .gitignore» держалось на флаге
+  // «папка только что создана» — если папка уже существовала БЕЗ файла
+  // (удалили руками, старая сборка до этого фикса, скопированный проект),
+  // .gitignore никогда не появлялся, и PNG молча лезли в `git status`.
+  // Проверяем существование самого файла, а не факта создания директории.
+  const gitignorePath = path.join(shotsDir, '.gitignore');
+  if (!fs.existsSync(gitignorePath)) {
     try {
-      fs.writeFileSync(path.join(shotsDir, '.gitignore'), '*', 'utf8');
+      fs.writeFileSync(gitignorePath, '*', 'utf8');
     } catch { /* best-effort — отсутствие .gitignore не критично */ }
   }
 

@@ -264,7 +264,11 @@ export function initTerminal(container, config, {
         .catch(() => null)
         .then((res) => {
           if (res && res.path) {
-            term.paste(res.path);
+            // Fix (ревью): проект в папке с пробелом в имени («My Projects»)
+            // даёт Claude ДВА аргумента вместо одного пути — без кавычек
+            // командная строка (и сам Claude Code) режет путь по пробелу.
+            const p = res.path;
+            term.paste(/\s/.test(p) ? `"${p}"` : p);
             return;
           }
           navigator.clipboard.readText()

@@ -199,7 +199,11 @@ function registerIpc(win, opts = {}) {
   ipcMain.on('attention:update', (_e, payload) => {
     if (!attention || !payload || typeof payload !== 'object') return;
     const { count, dataUrl } = payload;
-    if (typeof count !== 'number') return;
+    // Fix (ревью): typeof count !== 'number' пропускал NaN (typeof NaN ===
+    // 'number') — NaN ломает дедупликацию в attention.js (NaN !== NaN всегда
+    // true, обновление никогда не гасится) и даёт заголовок окна вида
+    // «Cockpit — NaN ждут». count — количество вкладок, только целое ≥ 0.
+    if (!Number.isInteger(count) || count < 0) return;
     attention.update({ count, dataUrl: typeof dataUrl === 'string' ? dataUrl : null });
   });
 

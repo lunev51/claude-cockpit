@@ -202,13 +202,11 @@ function openPeek(tabId, rowEl) {
 }
 
 // onSend поповера: дописать текст (или цифру варианта) в pty вкладки, ЧЬЁ
-// имя показывал поповер — НЕ обязательно активной. Фокус терминала после
-// отправки возвращается активной вкладке (той, что реально на экране),
-// как бы peek ни закрылся сам — тем же путём, что action-bar (renderActionBar).
+// имя показывал поповер — НЕ обязательно активной. Фокус терминала возвращает
+// сам peek.hide() через onHide (см. boot()) — он уже отработал к этому
+// моменту (send() внутри peek.js зовёт hide() ДО onSend).
 function sendPeek(tabId, text) {
   window.api.term.write(tabId, `${text}\r`);
-  const activeId = tabStore.activeId;
-  if (activeId) views.get(activeId)?.view.focus();
 }
 
 // Ctrl+Enter в поповере — перейти во вкладку вместо ответа из сайдбара.
@@ -563,10 +561,19 @@ async function boot() {
   });
 
   // Task 3 фазы 4: peek — ответить Claude из сайдбара, не переключая вкладку.
+  // onHide (ревью, фикс): закрытие поповера (Esc / клик вне / автозакрытие
+  // при смене статуса вкладки — см. tab:status ниже) удаляет из DOM
+  // сфокусированный <input> peek, и браузер откатывает фокус на <body> —
+  // без этого набор шёл бы в никуда, пока пользователь не кликнет в терминал
+  // руками. Та же строка, что уже возвращала фокус после отправки ответа.
   peek = createPeek({
     root: $('peek-root'),
     onSend: sendPeek,
     onOpenTab: openTabFromPeek,
+    onHide: () => {
+      const activeId = tabStore.activeId;
+      if (activeId) views.get(activeId)?.view.focus();
+    },
   });
 
   // Task 4 фазы 4: палитра команд (Ctrl+P) — getActions собирает свежий
@@ -597,6 +604,17 @@ async function boot() {
     tabId, status, subtitle, waitingText,
   }) => {
     tabStore.setStatus(tabId, status, subtitle, waitingText);
+    // Ledger-фикс (ревью): текст в поповере — статичный снимок на момент
+    // открытия. Если Claude задаёт ВТОРОЙ вопрос той же вкладке, пока
+    // поповер всё ещё открыт (статус остаётся waiting), пользователь рискует
+    // ответить на вопрос №1, глядя на текст вопроса №1, хотя pty уже ждёт
+    // ответа на №2. peek.update() меняет только текст/кнопки-варианты, не
+    // трогая черновик пользователя в поле ввода — сверка tabId === peekedTabId
+    // (та же, что и в закрытии ниже) защищает чужой поповер от чужого статуса.
+    if (status === 'waiting' && tabId === peekedTabId) {
+      const info = tabStore.peekInfo(tabId);
+      if (info) peek?.update(info.waitingText);
+    }
     // Task 3 фазы 4 (peek): вкладка, чей поповер сейчас на экране, перестала
     // ждать (ответили из терминала напрямую, стала stuck/dead и т.п.) —
     // закрываем поповер, чтобы он не молчал про уже неактуальный вопрос.

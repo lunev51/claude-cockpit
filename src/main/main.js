@@ -119,8 +119,13 @@ function createWindow() {
   // возвращаем его точечно через before-input-event. Фильтр на keyDown
   // обязателен: событие приходит и на keyDown, и на keyUp — без фильтра
   // toggleDevTools() дёрнулся бы дважды подряд (открыл и тут же закрыл).
-  win.webContents.on('before-input-event', (_e, input) => {
+  win.webContents.on('before-input-event', (e, input) => {
     if (input.type === 'keyDown' && input.key === 'F12') {
+      // Fix (ревью): без preventDefault нажатие F12 не только открывает
+      // DevTools, но и беспрепятственно долетает до фокусной textarea xterm —
+      // ConPTY получает управляющую escape-последовательность F12 в живой pty
+      // (мусор перед курсором Claude Code), а не только открывает окно.
+      e.preventDefault();
       win.webContents.toggleDevTools();
     }
   });
@@ -134,6 +139,12 @@ function createWindow() {
 // DevTools этим не отрезаны: при необходимости открываются программно через
 // win.webContents.openDevTools().
 Menu.setApplicationMenu(null);
+
+// Fix (ревью): без явного AUMID Windows не всегда сопоставляет тосты
+// (Task 2 фазы 4, Notification) именно с этим portable-приложением —
+// доставка в центр уведомлений не гарантирована. Тот же id, что build.appId
+// в package.json. Должен быть выставлен ДО whenReady().
+app.setAppUserModelId('com.lunev.claude-cockpit');
 
 app.whenReady().then(() => {
   let rendererErrors = 0;
