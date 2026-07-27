@@ -109,3 +109,39 @@ test('smoke:true — sync никогда не пишет, даже после ma
   wsync.sync('t-1');
   assert.strictEqual(store.calls.length, 0);
 });
+
+// ---------- ARCHITECTURE Fix 13 (ревью): readyAndSync — гейт готовности,
+// вынесенный из ipc.js (обработчик 'workspace:ready'), где он раньше был
+// непокрыт тестами — в репо нет ipc-тестов вообще. ----------
+
+test('readyAndSync при пустом списке вкладок — store.set НЕ вызван сразу, но markReady сработал (последующий sync с непустым списком пишет)', () => {
+  const store = makeFakeStore();
+  let tabs = [];
+  const wsync = createWorkspaceSync({ store, listTabs: () => tabs });
+  wsync.readyAndSync(null);
+  assert.strictEqual(store.calls.length, 0);
+  // Список пополнился (открыли вкладку) — обычный sync() теперь проходит,
+  // значит markReady() внутри readyAndSync действительно взвёлся.
+  tabs = [{ tabId: 't-1', cwd: 'C:\\a', name: 'a', sessionId: null, ghostId: 'g-1' }];
+  wsync.sync('t-1');
+  assert.strictEqual(store.calls.length, 1);
+});
+
+test('readyAndSync при непустом списке вкладок — store.set вызван сразу с верным составом', () => {
+  const store = makeFakeStore();
+  const tabs = [
+    { tabId: 't-1', cwd: 'C:\\a', name: 'a', sessionId: null, ghostId: 'g-1' },
+    { tabId: 't-2', cwd: 'C:\\b', name: 'b', sessionId: 's-2', ghostId: 'g-2' },
+  ];
+  const wsync = createWorkspaceSync({ store, listTabs: () => tabs });
+  wsync.readyAndSync('t-2');
+  assert.strictEqual(store.calls.length, 1);
+  assert.deepStrictEqual(store.current, {
+    version: 1,
+    activeIndex: 1,
+    tabs: [
+      { cwd: 'C:\\a', name: 'a', sessionId: null, ghostId: 'g-1' },
+      { cwd: 'C:\\b', name: 'b', sessionId: 's-2', ghostId: 'g-2' },
+    ],
+  });
+});

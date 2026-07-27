@@ -6,6 +6,7 @@
         content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'" />
   <title>Cockpit</title>
   <link rel="stylesheet" href="../../node_modules/@xterm/xterm/css/xterm.css" />
+  <link rel="stylesheet" href="./css/fonts.css" />
   <link rel="stylesheet" href="./css/app.css" />
   <!-- xterm.js — UMD-сборки, глобали window.Terminal, window.FitAddon,
        window.WebLinksAddon, window.SearchAddon, window.Unicode11Addon, window.WebglAddon,
@@ -54,9 +55,11 @@
       </div>
     </div>
   </div>
-  <div id="status-bar">
-    <span id="status-pty">⌨ запуск…</span>
-    <span id="status-font">A —</span>
+  <div id="action-bar">
+    <div id="action-commands"></div>
+    <div id="action-right">
+      <span id="limit-5h" title="5-часовое окно"></span>
+    </div>
   </div>
   <script type="module" src="./js/app.js"></script>
 </body>

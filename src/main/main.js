@@ -3,7 +3,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { app, BrowserWindow, screen } = require('electron');
+const { app, BrowserWindow, screen, Menu } = require('electron');
 const { registerIpc, disposeSessions, getSmokeOutput, flushWorkspace } = require('./ipc');
 const { getConfig, isRootConfigCorrupt } = require('./config');
 const { setWindow, notify } = require('./notify');
@@ -55,12 +55,14 @@ function createWindow() {
     height,
     minWidth: 900,
     minHeight: 600,
-    backgroundColor: '#141413',
+    backgroundColor: '#0F0F0F',
     title: 'Cockpit',
     // Системный тайтлбар скрыт — своя drag-полоса в renderer (#titlebar),
     // кнопки окна рисует Windows поверх (overlay).
     titleBarStyle: 'hidden',
-    titleBarOverlay: { color: '#141413', symbolColor: '#A09D96', height: 36 },
+    // Fix 1 (ревью): было '#141414' — светлее, чем #titlebar (var(--bg-window)
+    // = #0F0F0F), из-за чего под кнопками окна был виден шов-прямоугольник.
+    titleBarOverlay: { color: '#0F0F0F', symbolColor: '#9E9E9E', height: 36 },
     webPreferences: {
       preload: path.join(__dirname, '../preload/preload.js'),
       contextIsolation: true,
@@ -109,6 +111,12 @@ function createWindow() {
   win.loadFile(path.join(__dirname, '../renderer/index.html'));
   return win;
 }
+
+// Housekeeping #14: без этого Ctrl+R перезагружает renderer прямо поверх
+// живых вкладок main-процесса — второй оверлей restore и дубликаты вкладок.
+// DevTools этим не отрезаны: при необходимости открываются программно через
+// win.webContents.openDevTools().
+Menu.setApplicationMenu(null);
 
 app.whenReady().then(() => {
   let rendererErrors = 0;

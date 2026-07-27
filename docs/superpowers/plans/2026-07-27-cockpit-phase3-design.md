@@ -132,7 +132,8 @@ weight 400 и 500 и соответствующими файлами.)
 
   --font-ui:    'Inter', 'Segoe UI', sans-serif;
   --font-serif: 'Inter', 'Segoe UI', sans-serif; /* серифов в v2 нет; алиас для совместимости */
-  --font-mono:  'DM Mono', 'JetBrainsMono NF', 'Cascadia Mono', Consolas, monospace;
+  /* DM Mono отменён 27.07: нет кириллицы. Берём тот же шрифт, что и терминал. */
+  --font-mono:  'JetBrainsMono NF', 'JetBrains Mono', 'Cascadia Mono', Consolas, monospace;
 }
 ```
 

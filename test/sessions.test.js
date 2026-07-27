@@ -405,16 +405,23 @@ test('restart эмитит tabs:changed — манифест пересобир�
   assert.strictEqual(afterFirstRestart, beforeFirstRestart + 1);
 
   // Проваленное резюме: спавн #2 умирает естественной смертью, SessionStart за
-  // время его жизни так и не пришёл — onExit помечает tab.overrideFailed=true.
+  // время его жизни так и не пришёл — onExit помечает tab.overrideFailed=true
+  // И (FIX 4, carryover 3) сам эмитит tabs:changed НЕМЕДЛЕННО здесь же, не
+  // дожидаясь следующего restart() — манифест узнаёт о протухшем sessionId
+  // сразу, а не спустя произвольное время до следующего restart/open/close.
   factory.spawned[1].opts.onExit(1);
+  const afterFailedExit = events.filter((e) => e.channel === 'tabs:changed').length;
+  assert.strictEqual(afterFailedExit, afterFirstRestart + 1);
 
   mgr.restart(a.tabId); // спавн #3: overrideFailed=true → голые args (без цикла на пикере)
   assert.deepStrictEqual(factory.spawned[2].opts.args, []);
   const afterSecondRestart = events.filter((e) => e.channel === 'tabs:changed').length;
   // Именно это и было целью теста: манифест пересобирается СНОВА даже на
   // рестарте, вызванном провалом резюма, — иначе следующий запуск приложения
-  // продолжал бы пытаться резюмить уже протухший session_id.
-  assert.strictEqual(afterSecondRestart, afterFirstRestart + 1);
+  // продолжал бы пытаться резюмить уже протухший session_id. Двойная
+  // подстраховка (немедленный emit из FIX 4 + explicit emit из restart())
+  // не страшна — sync в ipc.js идемпотентен относительно повторных вызовов.
+  assert.strictEqual(afterSecondRestart, afterFailedExit + 1);
 });
 
 test('restart: kill() фабрики синхронно зовёт свой onExit — гард по поколению не путает это с провалом resume/continue', () => {
@@ -539,6 +546,33 @@ test('провал restore-резюма (естественный onExit без 
   mgr.restart(a.tabId); // спавн #2: overrideFailed=true → голые (конфигурационные) args, без цикла
   assert.strictEqual(factory.spawned.length, 2);
   assert.deepStrictEqual(factory.spawned[1].opts.args, ['--model', 'sonnet']);
+});
+
+// ---------- FIX 4 (carryover 3): протухший sessionId должен долетать до манифеста немедленно ----------
+
+test('FIX 4: onExit без SessionStart (первый спавн restore, ДО какого-либо restart) эмитит tabs:changed сразу — манифест узнаёт о протухшем sessionId, не дожидаясь следующего restart/open/close', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha', sessionId: 'stale-session' });
+  mgr.start(a.tabId, 80, 24); // спавн #1: пытается резюмить stale-session
+
+  const beforeLen = events.length;
+  // Естественная смерть без единого SessionStart за время жизни процесса —
+  // resume реально не удался. До FIX 4 sessionId зануляется ТОЛЬКО в памяти
+  // тут же (onExit), а onEvent('tabs:changed', ...) не звался — syncWorkspace
+  // (который слушает исключительно 'tabs:changed') не пересобрал бы манифест
+  // до следующего restart()/open()/close(), и протухший id мог уехать на диск
+  // при выходе приложения ПРЯМО СЕЙЧАС (между этим onExit и любым restart).
+  factory.spawned[0].opts.onExit(1);
+
+  const added = events.slice(beforeLen);
+  assert.ok(
+    added.some((e) => e.channel === 'tabs:changed'),
+    'onExit должен эмитить tabs:changed синхронно с обнулением sessionId',
+  );
+  // sessionId уже null К МОМЕНТУ этого tabs:changed — гипотетический sync,
+  // подписанный на событие, увидел бы актуальное (обнулённое) состояние.
+  assert.strictEqual(mgr.list().find((t) => t.tabId === a.tabId).sessionId, null);
 });
 
 test('spawn: унаследованные CLAUDE_CODE_*/CLAUDECODE вычищены из env pty — кокпит, запущенный из-под другого Claude Code, не должен передавать вкладке чужую сессию', () => {

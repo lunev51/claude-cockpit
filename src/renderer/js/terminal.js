@@ -1,30 +1,29 @@
 // Терминал на xterm.js. UMD-сборки подключены в index.html,
 // поэтому берём глобали window.Terminal и window.FitAddon (не import).
 
-// Тёплая тёмная палитра Cockpit (спека §7): фон окна, кремовый текст,
-// терракотовый курсор. ANSI-цвета подогнаны под тёплую гамму.
+// Тема терминала v2: нейтральный чёрный + ANSI-палитра Warp default_dark (MIT).
 const THEME = {
-  background: '#141413',
-  foreground: '#E8E6E1',
+  background: '#0F0F0F',
+  foreground: '#d8d8d8',
   cursor: '#D97757',
-  cursorAccent: '#141413',
-  selectionBackground: '#3A3733',
-  black: '#1F1E1B',
-  red: '#C64545',
-  green: '#5DB872',
-  yellow: '#E8A55A',
-  blue: '#8CA8C8',
-  magenta: '#B08BBF',
-  cyan: '#5DB8A6',
-  white: '#A09D96',
-  brightBlack: '#57544E',
-  brightRed: '#D97781',
-  brightGreen: '#7BC98F',
-  brightYellow: '#EFBE7E',
-  brightBlue: '#A6BDD8',
-  brightMagenta: '#C5A3D1',
-  brightCyan: '#7FCDBD',
-  brightWhite: '#FAF9F5',
+  cursorAccent: '#0F0F0F',
+  selectionBackground: '#2A2A2A',
+  black: '#181818',
+  red: '#ab4642',
+  green: '#a1b56c',
+  yellow: '#f7ca88',
+  blue: '#7cafc2',
+  magenta: '#ba8baf',
+  cyan: '#86c1b9',
+  white: '#d8d8d8',
+  brightBlack: '#585858',
+  brightRed: '#ab4642',
+  brightGreen: '#a1b56c',
+  brightYellow: '#f7ca88',
+  brightBlue: '#7cafc2',
+  brightMagenta: '#ba8baf',
+  brightCyan: '#86c1b9',
+  brightWhite: '#f8f8f8',
 };
 
 // FIX 6 (ревью): SerializeAddon вставляет SGR-сброс (\x1b[0m — возврат к
@@ -108,6 +107,8 @@ export function initTerminal(container, config, {
   let alive = false;
 
   // --- панель поиска (создаётся динамически внутри container) ---
+  // Fix 6 (ревью): инлайн-стили были зашиты хексами мимо дизайн-токенов —
+  // cssText прекрасно принимает custom properties, заменяем на var(--...).
   const searchBar = document.createElement('div');
   searchBar.style.cssText = [
     'position:absolute',
@@ -118,11 +119,11 @@ export function initTerminal(container, config, {
     'align-items:center',
     'gap:4px',
     'padding:4px 6px',
-    'background:#1F1E1B',
-    'border:1px solid #3A3733',
+    'background:var(--bg-panel)',
+    'border:1px solid var(--border)',
     'border-radius:6px',
-    'color:#FAF9F5',
-    'font-family:sans-serif',
+    'color:var(--text)',
+    'font-family:var(--font-ui)',
     'font-size:12px',
   ].join(';');
 
@@ -134,7 +135,7 @@ export function initTerminal(container, config, {
     'border:none',
     'outline:none',
     'background:transparent',
-    'color:#FAF9F5',
+    'color:var(--text)',
     'font-size:12px',
   ].join(';');
 
@@ -144,7 +145,7 @@ export function initTerminal(container, config, {
     b.style.cssText = [
       'border:none',
       'background:transparent',
-      'color:#8F8D83',
+      'color:var(--text-dim)',
       'cursor:pointer',
       'font-size:12px',
       'padding:2px 4px',

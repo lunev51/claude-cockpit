@@ -1,0 +1,12 @@
+/* Локальные шрифты: CSP запрещает внешние источники, сети у приложения нет. */
+@font-face {
+  font-family: 'Inter';
+  src: url('../../../assets/fonts/Inter-Regular.woff2') format('woff2');
+  font-weight: 100 900;   /* вариативный: покрывает 400 и 500 + кириллица */
+  font-display: block;
+}
+
+/* DM Mono НЕ бандлится: @fontsource поставляет только подмножества (latin/latin-ext),
+   кириллицы в нём нет. Моноширинный текст использует JetBrains Mono Nerd Font,
+   установленный в системе (проверено: %WINDIR%\Fonts\JetBrainsMonoNerdFont-*.ttf).
+   Это унифицирует UI-монотекст и терминал в один шрифт. */

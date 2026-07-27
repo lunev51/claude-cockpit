@@ -11,6 +11,10 @@ html, body {
   background: var(--bg-window);
   color: var(--text);
   font-family: var(--font-ui);
+  /* Fix 2 (ревью): без этого Chromium рисует нативные элементы (скроллбары
+     сайдбара/списка восстановления, чекбоксы) светлой темой по умолчанию —
+     светлый скроллбар и белые чекбоксы с системным синим прямо на тёмной модалке. */
+  color-scheme: dark;
 }
 
 /* --- Титлбар: drag-полоса, кнопки окна рисует Windows (overlay) --- */
@@ -27,24 +31,33 @@ html, body {
 }
 #titlebar .dot {
   width: 8px; height: 8px; border-radius: 50%;
+  /* Fix 8 (ревью): терракота — только «ждёт тебя» (проект). По умолчанию
+     нейтральный дим; .alert (терракота + свечение) вешает app.js, пока
+     есть хотя бы одна вкладка в статусе waiting. */
+  background: var(--text-dim);
+}
+#titlebar .dot.alert {
   background: var(--accent);
+  box-shadow: 0 0 6px var(--accent);
 }
 #titlebar-text {
-  /* Моноширинный, как сам терминал — по просьбе пользователя (серифный не зашёл). */
-  font-family: var(--font-mono);
-  font-size: 13px;
+  /* Плотность Warp: рубленый UI-шрифт, не серифный и не моно. */
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: -0.1px;
 }
 #titlebar-sub { color: var(--text-dim); font-size: 11px; }
 
 /* --- Основная сетка --- */
 #app {
   display: flex;
-  height: calc(100% - 36px - 26px); /* минус титлбар и статус-бар */
+  height: calc(100% - 36px - 32px); /* минус титлбар и панель действий */
 }
 
 /* --- Сайдбар --- */
 #sidebar {
-  width: 240px;
+  width: 200px;
   flex: none;
   background: var(--bg-panel);
   border-right: 1px solid var(--border);
@@ -55,9 +68,10 @@ html, body {
   overflow-y: auto;
 }
 .sidebar-section {
-  font-size: 10px;
+  font-size: 9px;
+  font-weight: 500;
   text-transform: uppercase;
-  letter-spacing: 0.6px;
+  letter-spacing: 0.5px;
   color: var(--text-dim);
   padding: 6px 6px 4px;
 }
@@ -67,15 +81,26 @@ html, body {
 
 .tab-row {
   display: flex;
-  gap: 8px;
-  padding: 7px 8px;
+  gap: 7px;
+  padding: 6px 8px;
   border-radius: var(--radius-s);
   cursor: pointer;
   align-items: flex-start;
 }
 .tab-row:hover { background: var(--bg-hover); }
 .tab-row.active { background: var(--bg-card); }
-.tab-row.waiting { background: var(--bg-wait); border: 1px solid var(--border-wait); }
+.tab-row.waiting {
+  background: var(--bg-wait);
+  border-left: 2px solid var(--accent);
+  /* компенсация border-left: 6px + 2px = 8px, как у остальных строк (не «прыгает») */
+  padding-left: 6px;
+}
+/* Fix 7 (ревью): .tab-row.waiting идёт после .tab-row.active в исходнике при
+   равной специфичности — у активной ждущей вкладки терялся признак активности.
+   Отдельное правило с двойным классом побеждает оба по специфичности. */
+.tab-row.waiting.active {
+  background: color-mix(in srgb, var(--bg-wait) 70%, var(--bg-card));
+}
 
 .tab-dot {
   width: 8px; height: 8px; border-radius: 50%;
@@ -97,7 +122,7 @@ html, body {
 
 .tab-info { min-width: 0; flex: 1; }
 .tab-name {
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 500;
   display: flex;
   gap: 6px;
@@ -105,7 +130,7 @@ html, body {
 }
 .tab-name .meta { font-size: 10px; color: var(--text-dim); font-weight: 400; }
 .tab-sub {
-  font-size: 11px;
+  font-size: 10px;
   color: var(--text-muted);
   white-space: nowrap;
   overflow: hidden;
@@ -134,12 +159,12 @@ html, body {
 .sidebar-btn {
   flex: 1;
   background: var(--bg-card);
-  border: none;
+  border: 1px solid var(--border);
   border-radius: var(--radius-s);
   color: var(--text-muted);
   font-family: var(--font-ui);
   font-size: 12px;
-  padding: 7px 4px;
+  padding: 5px;
   cursor: pointer;
 }
 .sidebar-btn:hover { background: var(--bg-hover); color: var(--text); }
@@ -162,7 +187,7 @@ html, body {
 #restore-overlay {
   position: absolute;
   inset: 0;
-  background: rgba(20, 20, 19, 0.85);
+  background: color-mix(in srgb, var(--bg-window) 85%, transparent);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -180,8 +205,9 @@ html, body {
   gap: 14px;
 }
 .restore-title {
-  font-family: var(--font-serif);
-  font-size: 18px;
+  font-family: var(--font-ui);
+  font-size: 15px;
+  font-weight: 500;
   color: var(--text);
 }
 #restore-list {
@@ -200,7 +226,7 @@ html, body {
   cursor: pointer;
 }
 .restore-row:hover { background: var(--bg-hover); }
-.restore-row input[type="checkbox"] { flex: none; }
+.restore-row input[type="checkbox"] { flex: none; accent-color: var(--accent); }
 .restore-row-info { min-width: 0; flex: 1; }
 .restore-row-name { font-size: 13px; color: var(--text); }
 .restore-row-cwd {
@@ -226,16 +252,41 @@ html, body {
 /* Кнопки оверлея не должны тянуться на всю ширину, как в sidebar-footer. */
 .restore-actions .sidebar-btn { flex: none; }
 
-/* --- Статус-бар --- */
-#status-bar {
-  height: 26px;
+/* --- Панель действий (вместо отладочной статус-строки) --- */
+#action-bar {
+  height: 32px;
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 0 12px;
+  gap: 6px;
+  padding: 0 10px;
   background: var(--bg-panel);
   border-top: 1px solid var(--border);
   font-size: 11px;
   color: var(--text-muted);
   user-select: none;
+}
+#action-commands { display: flex; gap: 5px; }
+.action-btn {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+.action-btn:hover { background: var(--bg-hover); color: var(--text); }
+.action-btn:active { background: var(--accent); color: var(--bg-window); border-color: var(--accent); }
+#action-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+/* Виджет лимита пока не наполняется (дашборд — следующая фаза) — скрыт, пока пуст. */
+#limit-5h:empty { display: none; }
+
+/* Fix 9 (ревью, спека §7): «focus — 2px кольцо терракотой» вместо дефолтного
+   кольца Chromium. */
+.action-btn:focus-visible,
+.sidebar-btn:focus-visible,
+.restore-row input[type="checkbox"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }

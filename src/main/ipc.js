@@ -260,14 +260,30 @@ function registerIpc(win, opts = {}) {
     }
   });
 
-  // FIX 2 (ревью): renderer шлёт это, когда восстановление воркспейса на
+  // FIX 2 (ревью 2b): renderer шлёт это, когда восстановление воркспейса на
   // старте полностью завершено (либо решено начать пусто) — до этого момента
   // wsync.sync() молчит, так что промежуточные (неполные) составы вкладок
   // из стаггера restoreFlow никогда не попадают в манифест. См. app.js —
-  // три места вызова window.api.workspace.ready().
+  // места вызова window.api.workspace.ready().
+  //
+  // FIX 1 (carryover 3) + ARCHITECTURE Fix 13 (ревью): markReady() зовём
+  // ВСЕГДА, а немедленный sync() — ТОЛЬКО если в manager уже есть хоть одна
+  // вкладка. Раньше eager-sync звался безусловно: на ветках отказа («начать
+  // пусто» / Esc / пустой выбор чекбоксов) в этот момент manager.list() пуст,
+  // и sync писал в workspace.json валидно-пустой манифест — .bak переставал
+  // быть нужен для восстановления, а следующий запуск считал known-набор
+  // ghost-вкладок пустым и сметал уборкой сирот ВСЕ ghost-файлы. Комментарий
+  // в app.js (startEmpty) обещает «манифест НЕ трогаем» — теперь это
+  // действительно так: manager.list().length === 0 → sync не зовём, старый
+  // workspace.json (вчерашний состав) остаётся на диске нетронутым до первого
+  // РЕАЛЬНОГО изменения состава вкладок (открытия/закрытия), которое само
+  // придёт через tabs:changed → syncWorkspace().
+  //
+  // Сама логика (markReady + условный sync) вынесена в wsync.readyAndSync —
+  // это чистый (без Electron) код workspace-sync.js, покрытый test/workspace-sync.test.js;
+  // ipc.js больше не содержит непокрытой тестами ветки этого хотфикса.
   ipcMain.on('workspace:ready', () => {
-    wsync.markReady();
-    syncWorkspace();
+    wsync.readyAndSync(activeTabId);
   });
 
   ipcMain.handle('tabs:chooseFolder', async () => {

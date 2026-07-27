@@ -51,7 +51,27 @@ function createWorkspaceSync({ store, listTabs, smoke = false }) {
     store.flush();
   }
 
-  return { sync, markReady, markQuitting, flush };
+  // ARCHITECTURE Fix 13 (ревью): раньше самая ценная строка хотфикса —
+  // markReady() + немедленный условный sync() при непустом списке вкладок —
+  // жила прямо в ipc.js (обработчик 'workspace:ready'), а ipc.js без
+  // Electron-контекста не тестируется вообще (в репо нет ipc-тестов).
+  // Переносим логику сюда, в чистый (без Electron) модуль — она покрывается
+  // тем же test/workspace-sync.test.js, что и остальной гейт ready/quitting.
+  //
+  // markReady() зовём ВСЕГДА, а немедленный sync() — ТОЛЬКО если в manager
+  // уже есть хоть одна вкладка (см. подробное обоснование FIX 1 (carryover 3)
+  // выше в шапке файла и в ipc.js, обработчик 'workspace:ready'): на ветках
+  // отказа («начать пусто» / Esc / пустой выбор чекбоксов) manager.list()
+  // пуст, и eager-sync записал бы валидно-пустой манифест, теряя вчерашний
+  // состав вкладок и ghost-файлы до первого РЕАЛЬНОГО изменения состава.
+  function readyAndSync(activeTabId) {
+    markReady();
+    if (listTabs().length > 0) sync(activeTabId);
+  }
+
+  return {
+    sync, markReady, markQuitting, flush, readyAndSync,
+  };
 }
 
 module.exports = { createWorkspaceSync };
