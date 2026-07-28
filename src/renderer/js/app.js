@@ -174,6 +174,25 @@ async function refreshUsage() {
   return lastUsage;
 }
 
+// FIX 2 (ревью): дашборд открывался ИСКЛЮЧИТЕЛЬНО на lastUsage, снятом при
+// первом usage:get() в boot() — если кокпит простоял открытым несколько
+// часов, 10-минутный TTL внутри usage-ccusage.js в авто-режиме не мог
+// сработать НИКОГДА (только явный клик «Обновить» вообще бил по сети), и
+// пользователь в конце дня видел утренние цифры как актуальные, без единого
+// намёка на возраст. Вызывается из dashboard.js/open() при КАЖДОМ открытии —
+// window.api.usage.get() (НЕ usage:refresh!) сам уважает TTL: если кэш
+// свежий, реального npx не будет, это дешёвый no-op. redrawUsageViews() уже
+// умеет перерисовать дашборд, если он сейчас открыт, — а он открыт, раз это
+// вообще было вызвано.
+async function fetchUsageOnDashboardOpen() {
+  try {
+    lastUsage = await window.api.usage.get();
+  } catch (err) {
+    console.warn('[usage] usage:get при открытии дашборда не удался:', err);
+  }
+  redrawUsageViews();
+}
+
 // Task 4 фазы 5: тумблер Ctrl+D/кнопка панели действий/действие палитры —
 // второе открытие, пока дашборд уже на экране, закрывает его вместо повторного
 // открытия (тот же приём, что Ctrl+P у палитры, см. bindHotkeys). Взаимно
@@ -663,7 +682,24 @@ function showRestoreOverlay(manifest) {
     });
   }
 
+  // FIX 4 (ревью): этот обработчик и обработчики дашборда/палитры/peek все
+  // висят на document в capture-фазе, а этот зарегистрирован РАНЬШЕ (сразу в
+  // boot(), см. вызов showRestoreOverlay ниже) — значит Escape/Enter при
+  // нескольких открытых оверлеях сработал бы ЗДЕСЬ ПЕРВЫМ, даже если оверлей
+  // restore к этому моменту визуально скрыт ПОД другим оверлеем. Сценарий:
+  // старт с непустым манифестом → Ctrl+D (дашборд поверх restore) → Escape —
+  // пользователь хотел закрыть дашборд, а получал startEmpty() (решение
+  // «начать пусто» принято за спиной, весь список проектов потерян) и только
+  // ВТОРЫМ уже закрывался сам дашборд. Игнорируем оба ключа, если сверху
+  // открыт любой другой оверлей — тогда событие без preventDefault уходит
+  // тому, кто ЕГО реально должен обработать (единый стек оверлеев — задача
+  // следующей фазы, здесь достаточно точечной проверки).
+  function otherOverlayOpen() {
+    return !!(dashboard?.isOpen() || palette?.isOpen() || peek?.isOpen());
+  }
+
   function onKey(ev) {
+    if (otherOverlayOpen()) return;
     if (ev.key === 'Enter') {
       ev.preventDefault();
       startRestore();
@@ -730,6 +766,9 @@ async function boot() {
     root: $('dashboard-root'),
     getData: () => lastUsage,
     onRefresh: refreshUsage,
+    // FIX 2 (ревью): usage:get при каждом открытии — см. подробный комментарий
+    // у fetchUsageOnDashboardOpen выше и в dashboard.js/open().
+    onOpen: fetchUsageOnDashboardOpen,
     fallbackFocus: () => views.get(tabStore.activeId)?.view,
   });
 

@@ -470,6 +470,18 @@ html, body {
 }
 .dashboard-badge-stale { color: var(--warn); }
 
+/* FIX 2 (ревью): «обновлено в HH:MM» — рядом с бейджем «оценка» (внутри
+   .dashboard-spend-meta, flex-ряд — просто ещё один inline-элемент) и как
+   отдельная строка в секции лимитов (.dashboard-limits-updated — margin-top
+   вместо gap соседа по флексу). */
+.dashboard-updated-at {
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.dashboard-limits-updated {
+  margin-top: 4px;
+}
+
 .dashboard-spend-empty {
   font-size: 12px;
   color: var(--text-muted);

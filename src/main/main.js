@@ -130,29 +130,72 @@ function createWindow() {
       return;
     }
 
-    // Carryover Task 5 фазы 5 (пункт 2, phase5-carryover-notes): Menu.setApplicationMenu(null)
-    // ниже уже срубил Ctrl+R как акселератор МЕНЮ (Housekeeping #14), но F12
-    // вернул доступ к DevTools — а внутри открытых DevTools Ctrl+R/F5 всё
-    // равно перезагружают renderer НАПРЯМУЮ, как обычные клавиши страницы,
-    // мимо меню. Перезагрузка поднимает boot() заново поверх ЖИВЫХ вкладок
-    // main-процесса (сам pty/manager не перезапускается) — дубликаты вкладок
-    // и второй restore-оверлей. Гасим её здесь же, тем же приёмом, что F12.
+    // FIX 3 (ревью, phase5 final wave): ЗДЕСЬ РАНЬШЕ был гард, глушивший
+    // голый Ctrl+R и F5 через preventDefault на before-input-event — якобы
+    // против reload'а renderer'а поверх живых вкладок, когда открыт DevTools
+    // (carryover task 5 фазы 5). Гард убран целиком по итогам живой проверки
+    // ниже — он не решал заявленную проблему и ломал реальную.
     //
-    // КРИТИЧНО: гасим ТОЛЬКО чистый Ctrl+R (без Shift) и голый F5.
-    // Ctrl+Shift+R НЕ трогаем — это наш хоткей «перезапустить сессию» (см.
-    // terminal.js/attachCustomKeyEventHandler), обрабатывается в renderer.
-    // before-input-event срабатывает здесь, в main, РАНЬШЕ, чем событие
-    // вообще доходит до renderer/textarea xterm — глухой preventDefault на
-    // Ctrl+Shift+R не дал бы событию долететь до terminal.js и НАВСЕГДА
-    // сломал бы перезапуск сессии. Сознательный компромисс (зафиксирован и
-    // в отчёте task-5-report.md): reload по Ctrl+Shift+R внутри DevTools
-    // остаётся возможным — это осознанно принятая цена, а не недосмотр.
-    const isCtrlR = input.control && !input.shift && !input.alt && !input.meta
-      && (input.key === 'r' || input.key === 'R' || input.code === 'KeyR');
-    const isF5 = input.key === 'F5' || input.code === 'F5';
-    if (input.type === 'keyDown' && (isCtrlR || isF5)) {
-      e.preventDefault();
-    }
+    // Что было не так:
+    //  1. Гард висел на `win.webContents.on('before-input-event', ...)` и
+    //     проверял `win.webContents.isDevToolsOpened()` — но `before-input-
+    //     event` есть событие именно ЭТОГО webContents (страницы Cockpit), а
+    //     не webContents самой панели DevTools (Electron: `contents.
+    //     devToolsWebContents` — ОТДЕЛЬНый инстанс). preventDefault здесь
+    //     вообще не даёт renderer'у увидеть keydown (документация Electron:
+    //     «Calling event.preventDefault will prevent the page keydown/keyup
+    //     events from being emitted»), поэтому он гасил Ctrl+R/F5 для нашей
+    //     страницы — но был бессилен ровно в том случае, ради которого его
+    //     писали: когда фокус клавиатуры реально находится ВНУТРИ панели
+    //     DevTools, и клавиша рождается в её собственном webContents.
+    //  2. Изначально (до этой правки) гард вообще не проверял DevTools —
+    //     глушил Ctrl+R/F5 БЕЗУСЛОВНО. Во вкладках работает Claude Code, где
+    //     Ctrl+R — рабочий хоткей (reverse history search и т.п.), а F5
+    //     нужен любому TUI внутри pty — оба НИКОГДА не доходили ни до
+    //     renderer, ни тем более до pty активной вкладки, даже когда DevTools
+    //     вообще не был открыт. Промежуточная правка этой волны добавила
+    //     `isDevToolsOpened()` — но живая проверка ниже показала, что
+    //     условие излишне: тот путь, ради которого его писали, гард закрыть
+    //     не может (см. пункт 1), а без DevTools он и не требовался никогда.
+    //
+    // Живая проверка (CDP, --user-data-dir изолирован от прод-профиля,
+    // терминал подменён на PowerShell-эхо сырых клавиш вместо claude, гард
+    // временно отключён совсем — `if (false && ...)` — чтобы проверить факт,
+    // а не мнение):
+    //   (A) DevTools ЗАКРЫТ, Ctrl+R, БЕЗ всякого гарда → «KEY=R MOD=Control»
+    //       появилась в логе эха (клавиша дошла до pty), window.
+    //       __cockpitTestMarker пережил нажатие (страница не
+    //       перезагрузилась). Голый Ctrl+R/F5 не перезагружает окно сам по
+    //       себе — акселератора на них давно нет (Menu.setApplicationMenu(null)
+    //       ниже), так что гард здесь никогда и не требовался.
+    //   (B) DevTools ОТКРЫТ (F12), клавиша отправлена в webContents ГЛАВНОЙ
+    //       страницы (фокус не переводился вручную в панель DevTools — после
+    //       открытия DevTools фокус либо остаётся в textarea терминала, либо
+    //       уходит на случайный элемент страницы, но НЕ в DevTools), БЕЗ
+    //       гарда → та же картина: клавиша дошла до pty, маркер пережил
+    //       нажатие, reload НЕ случился. То есть открытие DevTools само по
+    //       себе никогда не приводило к перезагрузке через ЭТОТ путь —
+    //       ни разу, ни с гардом, ни без него.
+    //   (C) Ctrl+R отправлен НАПРЯМУЮ в собственный CDP-таргет DevTools
+    //       (devtools://devtools/bundled/devtools_app.html — он реально
+    //       существует как отдельный inspectable target, `Target.getTargets`
+    //       это подтвердил) — вот тут window.__cockpitTestMarker стал
+    //       undefined: страница ДЕЙСТВИТЕЛЬНО перезагрузилась. Это и есть
+    //       настоящий источник бага из carryover-заметки — reload происходит,
+    //       только когда клавиша рождается в собственном документе DevTools
+    //       (пользователь кликнул туда мышью), и `before-input-event` на
+    //       `win.webContents` этот путь принципиально не видит — ни с
+    //       гардом, ни с каким угодно другим условием внутри него.
+    //
+    // Итог: гард (в любом виде — безусловный или условный на
+    // isDevToolsOpened()) не закрывает реальный путь reload'а (C) и ломает
+    // Ctrl+R/F5 в терминале без всякой пользы. Убран целиком. Если сценарий
+    // (C) когда-нибудь станет реальной жалобой пользователя — решать его
+    // придётся на уровне `contents.on('will-navigate'|'did-start-navigation')`
+    // самого DevTools webContents (доступен как `win.webContents.
+    // devToolsWebContents` в новых Electron) или явным запретом через
+    // `win.webContents.setDevToolsWebContents`/аналог, а не через
+    // `before-input-event` окна — здесь это тупик.
   });
 
   win.loadFile(path.join(__dirname, '../renderer/index.html'));

@@ -7,7 +7,9 @@
 // как у restore-overlay, который показывается ровно один раз за старт).
 // Модуль ничего не знает о usage-oauth.js/usage-ccusage.js напрямую — только
 // про формы снапшотов {limits, spend}, которые приносит инжектированный
-// getData(); сеть/повторный запрос — исключительно через onRefresh().
+// getData(); сеть/повторный запрос — исключительно через onRefresh() (ручное
+// «Обновить», форсирует реальный npx) и onOpen() (FIX 2 ревью: тихий вызов
+// при каждом open(), уважает TTL слоя ccusage сам — см. open()).
 
 import { formatCountdown } from './countdown.js';
 import {
@@ -37,8 +39,20 @@ function limitsErrorText(error) {
 
 const SPEND_UNAVAILABLE_TEXT = 'расходы недоступны: ccusage не запустился — попробуйте «Обновить»';
 
+// FIX 2 (ревью): «обновлено в HH:MM» рядом с маркерами «оценка»/лимитов —
+// fetchedAt уже приходит в обоих снапшотах (limits/spend), лишнего IPC не
+// требует. ms<=0 — «данных ещё не было» (buildResult/zeroSnapshot кладут туда
+// 0), отдаём null, а не «01.01.1970».
+function formatTime(ms) {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return null;
+  const d = new Date(ms);
+  if (Number.isNaN(d.getTime())) return null;
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 export function createDashboard({
-  root, getData, onRefresh, fallbackFocus,
+  root, getData, onRefresh, onOpen, fallbackFocus,
 }) {
   let isOpenFlag = false;
   let overlayEl = null;
@@ -126,6 +140,20 @@ export function createDashboard({
       section.appendChild(staleEl);
     }
 
+    // FIX 2 (ревью): usage:get дёргался РОВНО ОДИН РАЗ в boot() — открытие
+    // дашборда никогда не перезапрашивало данные, поэтому 10-минутный TTL
+    // внутри usage-ccusage.js в авто-режиме не мог сработать НИКОГДА (только
+    // явный клик «Обновить»), а stale-бейдж молчал, если сам снапшот при этом
+    // формально ok:true. Единственный честный сигнал «насколько это свежо» —
+    // время получения, показываем его безусловно, если оно вообще есть.
+    const limitsTime = formatTime(limits && limits.fetchedAt);
+    if (limitsTime) {
+      const updatedEl = document.createElement('div');
+      updatedEl.className = 'dashboard-updated-at dashboard-limits-updated';
+      updatedEl.textContent = `обновлено в ${limitsTime}`;
+      section.appendChild(updatedEl);
+    }
+
     if (!ok) {
       // Пустое состояние лимитов (бриф §4): прочерки уже нарисованы полосами
       // выше (ok:false → buildLimitBar сама рисует «—»/«—»), здесь только
@@ -153,11 +181,11 @@ export function createDashboard({
     return section;
   }
 
-  // buildSpendMeta(): только маркер «оценка» — пометку «данные устарели»
-  // отсюда убрали (fix ревью, см. buildLimitsSection/render): она рисуется
-  // безусловно у секции лимитов, а не только когда блок расходов вообще
-  // успел отрисоваться.
-  function buildSpendMeta() {
+  // buildSpendMeta(spend): маркер «оценка» + FIX 2 (ревью) — «обновлено в
+  // HH:MM» из spend.fetchedAt. Пометку «данные устарели» отсюда убрали ранее
+  // (fix ревью, см. buildLimitsSection/render): она рисуется безусловно у
+  // секции лимитов, а не только когда блок расходов вообще успел отрисоваться.
+  function buildSpendMeta(spend) {
     const meta = document.createElement('div');
     meta.className = 'dashboard-spend-meta';
 
@@ -168,6 +196,14 @@ export function createDashboard({
     badge.className = 'dashboard-badge-estimate';
     badge.textContent = 'оценка';
     meta.appendChild(badge);
+
+    const time = formatTime(spend && spend.fetchedAt);
+    if (time) {
+      const updated = document.createElement('span');
+      updated.className = 'dashboard-updated-at';
+      updated.textContent = `обновлено в ${time}`;
+      meta.appendChild(updated);
+    }
 
     return meta;
   }
@@ -185,15 +221,27 @@ export function createDashboard({
     return card;
   }
 
+  // FIX 1 (ревью): spend.totals.costUsd/tokens — агрегат ccusage ЗА ВСЮ
+  // ИСТОРИЮ аккаунта (usage-ccusage.js/normalize берёт их прямо из
+  // dailyBody.totals, а НЕ пересчитывает по срезанному byDay — см. комментарий
+  // и тест там же). На реальных данных карточка «Расход» показывала $3497,
+  // пока соседние столбики графика были ~$26/день — подпись без указания
+  // периода читалась как «расход за последнее время». spend.byDay уже
+  // нарезан до последних 30 дней (normalize: byDayAll.slice(-30)) — суммируем
+  // его сами и подписываем честно. totals оставляем только для «всего»-метрик
+  // (сессии/средний чек) — ccusage не отдаёт «сессии за 30 дней» отдельно.
   function buildCardsSection(spend) {
     const wrap = document.createElement('div');
     wrap.className = 'dashboard-cards';
     const totals = spend.totals || { costUsd: 0, tokens: 0, sessions: 0 };
+    const byDay = Array.isArray(spend.byDay) ? spend.byDay : [];
+    const last30CostUsd = byDay.reduce((sum, d) => sum + (Number(d && d.costUsd) || 0), 0);
+    const last30Tokens = byDay.reduce((sum, d) => sum + (Number(d && d.tokens) || 0), 0);
     const avg = totals.sessions > 0 ? formatUsd(totals.costUsd / totals.sessions) : '—';
-    wrap.appendChild(buildCard('Расход', formatUsd(totals.costUsd)));
-    wrap.appendChild(buildCard('Токены', formatTokens(totals.tokens)));
-    wrap.appendChild(buildCard('Сессии', String(totals.sessions || 0)));
-    wrap.appendChild(buildCard('Средняя цена сессии', avg));
+    wrap.appendChild(buildCard('Расход за 30 дней', formatUsd(last30CostUsd)));
+    wrap.appendChild(buildCard('Токены за 30 дней', formatTokens(last30Tokens)));
+    wrap.appendChild(buildCard('Сессии (всего)', String(totals.sessions || 0)));
+    wrap.appendChild(buildCard('Средняя цена сессии (всего)', avg));
     return wrap;
   }
 
@@ -365,7 +413,7 @@ export function createDashboard({
       return;
     }
 
-    bodyEl.appendChild(buildSpendMeta());
+    bodyEl.appendChild(buildSpendMeta(spend));
     bodyEl.appendChild(buildCardsSection(spend));
     bodyEl.appendChild(buildTableSection(spend));
     bodyEl.appendChild(buildChartSection(spend));
@@ -403,8 +451,15 @@ export function createDashboard({
       console.warn('[dashboard] обновление не удалось:', err);
     } finally {
       refreshing = false;
-      refreshBtn.disabled = false;
-      refreshBtn.textContent = 'Обновить';
+      // FIX 5 (ревью): close() обнуляет refreshBtn (см. close()) — если
+      // пользователь закрыл дашборд, пока onRefresh() ещё летел, этот finally
+      // выполняется уже ПОСЛЕ close(), и голое refreshBtn.disabled = ... падало
+      // с TypeError на null. `refreshBtn?.disabled = ...` — не вариант: нельзя
+      // присваивать через optional chaining (SyntaxError), поэтому обычный if.
+      if (refreshBtn) {
+        refreshBtn.disabled = false;
+        refreshBtn.textContent = 'Обновить';
+      }
     }
   }
 
@@ -467,6 +522,18 @@ export function createDashboard({
 
     render(getData ? getData() : null, Date.now());
     refreshBtn?.focus();
+
+    // FIX 2 (ревью): без этого дашборд открывался ИСКЛЮЧИТЕЛЬНО на lastUsage,
+    // снятом при первом usage:get() в boot() — если кокпит простоял открытым
+    // всё утро, 10-минутный TTL внутри usage-ccusage.js никогда не успевал
+    // сработать в авто-режиме (только клик «Обновить» вообще бил по сети), и
+    // пользователь в 18:00 видел утренние цифры как актуальные. onOpen —
+    // это window.api.usage.get() (см. app.js), а НЕ usage:refresh: TTL сам
+    // решит, нужен ли реальный npx, — если кэш свежий, это дешёвый no-op.
+    // Результат сюда не возвращается специально: onOpen сам обновляет lastUsage
+    // и зовёт redrawUsageViews() (app.js), которая перерисует и кольца
+    // сайдбара, и — раз isOpenFlag уже true — этот дашборд через render().
+    if (typeof onOpen === 'function') onOpen();
   }
 
   function close() {
