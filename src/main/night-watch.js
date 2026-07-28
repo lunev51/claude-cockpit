@@ -21,10 +21,41 @@
 //   5. Потолок maxResets — считается ПО ПРОБУЖДЕНИЯМ, а не по вкладкам.
 //   6. disarm() — только вручную; снимает таймер ожидания, чистит pending,
 //      снимает блокер. Хвост уже запланированного стаггер-прохода НЕ
-//      отменяется явно (см. комментарий в disarm()) — сам себя оборвёт.
+//      отменяется явно (см. комментарий в disarm()) — сам себя оборвёт
+//      (см. generation ниже).
 //
 // Ядро НИКОГДА не бросает наружу: каждый публичный метод — try/catch,
 // сбой пишется в журнал как {type:'internal-error', detail: err.message}.
+//
+// === ПОКОЛЕНИЕ ВЗВОДА (фикс-раунд 1, Critical 1) ===
+// У onTabStop() и doWake() есть await посреди работы (refreshUsage) —
+// пока промис висит, пользователь может disarm(), а то и disarm()+arm()
+// СНОВА (armed опять true, но это уже ДРУГОЙ взвод с ДРУГИМ, только что
+// сброшенным журналом). Проверки одного только `armed` после await
+// недостаточно: если между началом await и его резолвом произошёл
+// disarm()+arm(), armed на момент проверки снова true, и стейл-результат
+// старого взвода (лимит, детектированный ДО disarm) утёк бы в журнал
+// НОВОГО взвода как будто это его собственное событие. Аналогично —
+// хвост стаггер-цепочки (тонкость 3 брифа): проверка одного `armed`
+// не отличает «просто disarm, хвост честно обрывается записью aborted»
+// от «disarm+arm, хвост принадлежит уже несуществующему, чужому журналу».
+//
+// Фикс: монотонный счётчик `generation`, инкрементируемый В arm(), disarm()
+// И dispose() — КАЖДЫЙ переход состояния бьёт по нему. Любая асинхронная
+// операция фиксирует `gen = generation` до await/до планирования колбэка и
+// сверяет `generation` с этим `gen` после. Т.к. arm()/disarm() строго
+// чередуются (arm() — no-op, если уже armed; disarm() — no-op, если уже не
+// armed), разница `generation - gen`, замеренная у ещё живой (armed на
+// момент старта) операции, однозначно говорит:
+//   0        — ничего не изменилось, работаем как обычно;
+//   1        — случился РОВНО один disarm(), arm() ещё не было — это ТОТ ЖЕ
+//              журнал (journal.reset() не звался), можно честно записать
+//              {type:'aborted'} — ровно то поведение, которого требует
+//              тонкость 3 брифа для простого disarm() посреди цепочки;
+//   >=2      — было МИНИМУМ ещё одно arm() — журнал уже ЧУЖОЙ (сброшен под
+//              новый взвод) — писать в него о судьбе старого прохода нельзя,
+//              тонем молча, не трогая НИКАКОЕ разделяемое состояние текущей
+//              (новой) сессии.
 
 const DEFAULT_CONFIG = {
   fiveHourThreshold: 95,
@@ -37,7 +68,10 @@ const DEFAULT_CONFIG = {
 
 // Статусы вкладки, при которых «продолжай» отправлять нельзя (спека,
 // раздел «Пробуждение»): ждёт ответа на диалог, мертва, либо вкладки уже
-// нет вовсе (getTabStatus вернул null).
+// нет вовсе (getTabStatus вернул null). ВАЖНО (Important 5а ревью): это
+// СПИСОК ИСКЛЮЧЕНИЙ, не вайтлист — 'done' и 'stuck' (в бою вкладка после
+// реального Stop-хука стоит именно в 'done', см. sessions.js) сюда НЕ
+// входят и обязаны продолжаться так же, как 'working'.
 const NO_RESUME_STATUSES = new Set(['waiting', 'dead']);
 
 function createNightWatch({
@@ -58,6 +92,7 @@ function createNightWatch({
   const cfg = { ...DEFAULT_CONFIG, ...(config || {}) };
 
   let armed = false;
+  let generation = 0; // см. блок комментариев выше — бьётся в arm()/disarm()/dispose()
   let resetsHandled = 0; // счётчик ПРОБУЖДЕНИЙ за текущий взвод (не вкладок) — потолок maxResets
   let pending = []; // [{ tabId, detectedAt, resetsAt }] — вкладки, встали по лимиту, ждут сброса
   const lastInputAt = new Map(); // tabId → now() последнего onUserInput (живёт дольше одного взвода — безвредно, время монотонно растёт)
@@ -126,12 +161,13 @@ function createNightWatch({
     waitTimer = setTimer(doWake, delay);
   }
 
-  // === arm/disarm — единственные два места, меняющие armed ===
+  // === arm/disarm/dispose — здесь и только здесь меняются armed/generation ===
 
   function arm() {
     try {
       if (armed) return; // повторный вызов — no-op, взвод не начинается заново поверх текущего
       armed = true;
+      generation += 1; // новый взвод обесценивает всё, что осталось от предыдущего
       resetsHandled = 0;
       pending = [];
       retries = 0;
@@ -150,15 +186,18 @@ function createNightWatch({
     try {
       if (!armed) return; // симметрично arm(): повторный вызов не плодит лишних записей в журнале
       armed = false;
+      generation += 1; // обесценивает зависшие await'ы (onTabStop/doWake) и «метит» хвост стаггера как «поколение N»
       stopWaitTimer(); // «снять таймер» — единственный таймер ожидания/ретрая
       pending = [];
       // ВАЖНО (тонкость 3 брифа): staggerTimer НЕ трогаем/не отменяем здесь.
       // Если сейчас идёт стаггер-проход резюма, его собственный колбэк сам
-      // увидит armed:false на следующем тике, запишет {type:'aborted'} и
-      // сам сбросит wakePassInFlight — если бы мы явно сняли этот таймер
-      // (clearTimer) отсюда, колбэк вообще не выстрелил бы и запись
-      // 'aborted' никогда не попала бы в журнал. dispose() — другое дело
-      // (там действительно снимаем ВСЕ таймеры, см. ниже).
+      // увидит смену generation на следующем тике и либо честно запишет
+      // {type:'aborted'} (если arm() с тех пор не звался — см. runStagger),
+      // либо, если пользователь успел ре-армить до того, как хвост
+      // выстрелил, промолчит вовсе (чужой, уже сброшенный журнал). Если бы
+      // мы явно сняли этот таймер (clearTimer) отсюда, колбэк вообще не
+      // выстрелил бы, и в простом случае (без ре-арма) запись 'aborted'
+      // никогда не попала бы в журнал. dispose() — другое дело (см. ниже).
       updateBlocker(); // armed:false → want всегда false → снимет блокер, если был включён
       appendJournal({ type: 'disarmed' });
       emitChange();
@@ -191,7 +230,9 @@ function createNightWatch({
         emitChange();
         return;
       }
-      if (pending.some((p) => p.tabId === tabId)) return; // уже ждём эту же вкладку — не плодим дубль
+      if (pending.some((p) => p.tabId === tabId)) return; // уже ждём эту же вкладку — не плодим дубль (быстрый путь, без похода в refreshUsage)
+
+      const gen = generation; // Critical 1: фиксируем поколение взвода ДО await
 
       let usage;
       let rejected = false;
@@ -201,34 +242,62 @@ function createNightWatch({
         rejected = true; // отдельно от ok:false — разные записи в журнале ниже
       }
 
-      // Тонкость 1 брифа: ПОСЛЕ await ОБЯЗАТЕЛЬНО перепроверяем armed —
-      // пользователь мог disarm-нуть, пока промис висел. Если разоружили —
-      // ничего не происходит вообще, даже журнал не трогаем.
-      if (!armed) return;
+      // Critical 1 (заменяет старую проверку одного лишь armed): поколение
+      // сменилось, пока ждали (disarm, или disarm+arm, или dispose) — эта
+      // работа СТАРОГО взвода больше не в счёт. Молчим безусловно: даже
+      // «просто disarm без rearm» здесь не пишет ничего — так же, как и
+      // раньше (тест «disarm во время await → после резолва ничего не
+      // происходит» не ждёт никакой записи, в отличие от стаггер-хвоста,
+      // у которого есть явное 'aborted' — см. runStagger).
+      if (generation !== gen) return;
 
       if (rejected) {
         appendJournal({ type: 'usage-error', tabId });
         emitChange();
         return;
       }
-      if (!usage || !usage.ok) {
+      // Critical 2: битые/протухшие данные (!ok) И устаревший кэш поллера
+      // (stale:true — реальный процент мог уже быть совсем другим, пока
+      // токен обновлялся) трактуем ОДИНАКОВО консервативно — ложное
+      // «продолжай» хуже пропущенного детекта.
+      if (!usage || !usage.ok || usage.stale) {
         appendJournal({ type: 'no-usage-data', tabId });
         emitChange();
         return;
       }
+      if (!usage.fiveHour || usage.fiveHour.percent < cfg.fiveHourThreshold) {
+        return; // обычное завершение задачи — тишина, никакой записи (Minor 1: и никакой проверки недельного лимита тоже)
+      }
+      // Minor 1: недельный лимит проверяем ТОЛЬКО внутри ветки «пятичасовой
+      // тоже упёрся в порог» (было — независимо от fiveHour, засоряя журнал
+      // на КАЖДОМ обычном завершении задачи при sevenDay>=99).
       if (usage.sevenDay && usage.sevenDay.percent >= 99) {
         appendJournal({ type: 'weekly-limit', tabId });
         emitChange();
         return;
-      }
-      if (!usage.fiveHour || usage.fiveHour.percent < cfg.fiveHourThreshold) {
-        return; // обычное завершение задачи — тишина, никакой записи
       }
       if (usage.fiveHour.resetsAt == null) {
         appendJournal({ type: 'no-resets-at', tabId });
         emitChange();
         return;
       }
+      // Critical 2, доп. санити-гард: resetsAt из уже устаревших (но
+      // формально ok:true, stale:false — например, часы разошлись) данных
+      // может оказаться в прошлом. Планировать пробуждение «в прошлое»
+      // означало бы, что scheduleWaitAt тут же выстрелит немедленно —
+      // честнее сразу отказаться от детекта, как от «нечем планировать».
+      if (usage.fiveHour.resetsAt <= now()) {
+        appendJournal({ type: 'no-resets-at', tabId, detail: 'resets-at-in-past' });
+        emitChange();
+        return;
+      }
+      // Important 1: гонка двух конкурентных Stop одной и той же вкладки —
+      // оба могли пройти самый первый (синхронный) дубль-гард выше ДО того,
+      // как хоть один из них допишет в pending (оба ещё видели pending
+      // пустым/без этого tabId на момент своего входа). Перепроверяем
+      // ПРЯМО ПЕРЕД мутацией pending — единственное место, где дубль
+      // реально мог бы возникнуть.
+      if (pending.some((p) => p.tabId === tabId)) return;
 
       // Это остановка по лимиту. Если pending был пуст — начинается новый
       // цикл ожидания, старые ретраи прошлого (уже завершившегося) цикла в
@@ -285,21 +354,34 @@ function createNightWatch({
 
   // Стаггер-цепочка (тонкость 3 брифа): первая вкладка — сразу (синхронно
   // внутри этого же вызова), следующие — через setTimer(staggerMs), одна за
-  // другой. На КАЖДОМ шаге (включая самый первый) проверяем armed заново —
-  // если режим успели выключить посреди цепочки, хвост не стреляет вовсе:
-  // записываем {type:'aborted'} и обрываемся. Статус вкладки читаем именно
-  // тут, в момент выстрела — не при планировании.
+  // другой. `gen` — поколение взвода НА МОМЕНТ, когда стартовал ЭТОТ
+  // стаггер-проход (передано из doWake, где сброс был подтверждён) —
+  // прокидывается по всей цепочке рекурсивных вызовов НЕИЗМЕННЫМ (не
+  // перечитывается из текущего generation), чтобы отличить «работаем как
+  // обычно» от «поколение сменилось, пока цепочка спала между тиками» на
+  // КАЖДОМ шаге, включая самый первый. Статус вкладки читаем именно тут, в
+  // момент выстрела — не при планировании.
   //
   // Обёрнута в try/catch целиком: вызывается не только синхронно из doWake
   // (там уже есть свой try/catch), но и позже — как самостоятельный колбэк
   // таймера — где чужого try/catch над ней уже нет.
-  function runStagger(list, index, total, resumedCount) {
+  function runStagger(list, index, total, resumedCount, gen) {
     try {
-      if (!armed) {
-        appendJournal({ type: 'aborted' });
-        wakePassInFlight = false;
-        updateBlocker();
-        emitChange();
+      const delta = generation - gen; // Critical 1 — см. блок комментариев в шапке файла
+      if (delta !== 0) {
+        if (delta === 1) {
+          // Ровно один disarm() с тех пор — journal.reset() не звался
+          // (arm() ещё не было), это ТОТ ЖЕ журнал — честно фиксируем обрыв.
+          appendJournal({ type: 'aborted' });
+          wakePassInFlight = false;
+          updateBlocker();
+          emitChange();
+        }
+        // delta >= 2: было минимум ещё одно arm() — журнал уже ЧУЖОЙ
+        // (принадлежит следующему взводу). Молчим безусловно и НЕ трогаем
+        // pending/wakePassInFlight/блокер — это уже состояние НОВОЙ сессии,
+        // которое ей не принадлежит менять постороннему, давно неактуальному
+        // колбэку.
         return;
       }
       if (total === 0) {
@@ -317,7 +399,7 @@ function createNightWatch({
       if (index + 1 < total) {
         staggerTimer = setTimer(() => {
           staggerTimer = null;
-          runStagger(list, index + 1, total, newCount);
+          runStagger(list, index + 1, total, newCount, gen);
         }, cfg.staggerMs);
       } else {
         wakePassInFlight = false;
@@ -326,7 +408,13 @@ function createNightWatch({
         emitChange();
       }
     } catch (err) {
+      // Important 2: исключение (например, writeToTab бросил — мёртвый pty)
+      // не должно залипать power-blocker навсегда — явно гасим
+      // wakePassInFlight и пересчитываем блокер ДО записи/emit, а не только
+      // логируем ошибку.
       appendJournal({ type: 'internal-error', detail: err && err.message });
+      wakePassInFlight = false;
+      updateBlocker();
       emitChange();
     }
   }
@@ -337,6 +425,7 @@ function createNightWatch({
   async function doWake() {
     waitTimer = null;
     wakeAt = null;
+    const gen = generation; // Critical 1: поколение на момент старта ЭТОГО пробуждения
     try {
       let usage;
       try {
@@ -345,10 +434,16 @@ function createNightWatch({
         usage = null;
       }
 
-      // Тонкость 1 брифа применима и здесь: перепроверяем armed сразу после await.
-      if (!armed) return;
+      // Critical 1: поколение сменилось за время await — молчим (та же
+      // логика, что в onTabStop; конкретно про хвост стаггера заботится
+      // runStagger, которому gen передаётся ниже).
+      if (generation !== gen) return;
 
-      const windowReset = !!(usage && usage.ok && usage.fiveHour && usage.fiveHour.percent < cfg.fiveHourThreshold);
+      // Critical 2: stale:true НЕ считаем подтверждённым сбросом окна, даже
+      // если процент в кэше уже ниже порога — это цифры из прошлого,
+      // токен/сеть могли всё ещё не восстановиться. Уходим в обычный ретрай.
+      const windowReset = !!(usage && usage.ok && !usage.stale
+        && usage.fiveHour && usage.fiveHour.percent < cfg.fiveHourThreshold);
 
       if (windowReset) {
         resetsHandled += 1; // потолок считается по пробуждениям, не по вкладкам (тонкость 5 брифа)
@@ -358,15 +453,19 @@ function createNightWatch({
         pending = [];
         updateBlocker();
         emitChange();
-        runStagger(list, 0, list.length, 0);
+        runStagger(list, 0, list.length, 0, gen);
       } else {
         retries += 1;
+        // Minor 2: перечисляем tabId зависших вкладок в detail — утренний
+        // отчёт должен показывать, КАКИЕ вкладки всё ещё ждут, а не только
+        // порядковый номер попытки.
+        const tabIds = pending.map((p) => p.tabId).join(', ');
         if (retries <= cfg.maxRetries) {
-          appendJournal({ type: 'retry', detail: String(retries) });
+          appendJournal({ type: 'retry', detail: `${retries} (${tabIds})` });
           scheduleWaitAt(now() + cfg.retryMs);
           emitChange();
         } else {
-          appendJournal({ type: 'gave-up' });
+          appendJournal({ type: 'gave-up', detail: tabIds });
           pending = [];
           updateBlocker();
           emitChange();
@@ -421,6 +520,14 @@ function createNightWatch({
       }
       powerBlocker.stop();
       blockerOn = false;
+      // Important 3: синхронное состояние тоже гасим — до этого фикса
+      // armed/pending переживали dispose(), и isArmed()/snapshot() продолжали
+      // врать «всё ещё взведено» после закрытия приложения; а любой
+      // повисший на await onTabStop, резолвнувшись уже ПОСЛЕ dispose(),
+      // заново поднимал таймер и powerSaveBlocker на выходе из процесса.
+      armed = false;
+      pending = [];
+      generation += 1; // обесценивает любую операцию (onTabStop/doWake), запущенную ДО dispose() и ещё не резолвнувшуюся
     } catch (err) {
       appendJournal({ type: 'internal-error', detail: err && err.message });
       emitChange();
