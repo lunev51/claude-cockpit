@@ -46,7 +46,15 @@
       </div>
     </div>
     <div id="main">
-      <div id="terminal-host"></div>
+      <!-- Task 2 фазы 6 (панель диффа): строка терминал+панель, НЕ оверлей —
+           #diff-panel (380px, flex:none) живёт рядом с #terminal-host в общем
+           flex-ряду, #action-bar остаётся ПОД этой строкой на всю ширину
+           #main (см. app.css/#main-row). Контент строит diffpanel.js
+           программно один раз при boot() (см. app.js). -->
+      <div id="main-row">
+        <div id="terminal-host"></div>
+        <div id="diff-panel" class="hidden"></div>
+      </div>
       <div id="action-bar">
         <div id="action-commands"></div>
         <div id="action-right">

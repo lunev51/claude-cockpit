@@ -8,6 +8,7 @@ import { createPeek } from './peek.js';
 import { createPalette } from './palette.js';
 import { createDashboard } from './dashboard.js';
 import { renderRings } from './rings.js';
+import { createDiffPanel } from './diffpanel.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -22,6 +23,9 @@ let palette = null;
 // своим DOM (см. dashboard.js), здесь только держим ссылку для bindHotkeys/
 // панели действий/палитры и для проброса свежих usage-снапшотов, пока открыт.
 let dashboard = null;
+// Task 2 фазы 6: панель диффа — НЕ оверлей (см. diffpanel.js), createDiffPanel
+// сама владеет своим DOM внутри #diff-panel (строится один раз при boot()).
+let diffPanel = null;
 // Task 3 фазы 4 (peek): tabId, для которого сейчас открыт поповер (или null).
 // Нужен, чтобы обработчик tab:status закрывал peek ТОЛЬКО когда статус меняет
 // именно ту вкладку, что сейчас показана в поповере — peek.hide() идемпотентна,
@@ -86,6 +90,19 @@ function renderActionBar() {
   dashBtn.addEventListener('mousedown', (e) => e.preventDefault());
   dashBtn.addEventListener('click', () => toggleDashboard());
   host.appendChild(dashBtn);
+  // Task 2 фазы 6: кнопка «±» — тумблер панели диффа (та же логика, что
+  // Ctrl+G, см. bindHotkeys). Тоже пересобирается на каждый renderActionBar()
+  // (вызывается один раз за boot()), а не лежит статикой в index.html — тот
+  // же приём, что и dashBtn выше.
+  const diffBtn = document.createElement('button');
+  diffBtn.type = 'button';
+  diffBtn.id = 'btn-diffpanel';
+  diffBtn.className = 'action-btn';
+  diffBtn.textContent = '±';
+  diffBtn.title = 'Панель диффа (Ctrl+G)';
+  diffBtn.addEventListener('mousedown', (e) => e.preventDefault());
+  diffBtn.addEventListener('click', () => toggleDiffPanel());
+  host.appendChild(diffBtn);
   // deepMerge (config.js) при частичном оверрайде массива объектом даёт
   // {0:…,1:…} вместо массива — Array.isArray отсекает такой и любой другой
   // некорректный actionBar.commands, чтобы не уронить boot() на итерации.
@@ -204,6 +221,16 @@ function toggleDashboard() {
   else dashboard.open();
 }
 
+// Task 2 фазы 6: тумблер панели диффа (Ctrl+G/кнопка «±» панели действий) —
+// НЕ оверлей (см. diffpanel.js), так что, в отличие от toggleDashboard() выше,
+// не нужно закрывать peek/palette/dashboard — панель просто раздвигает layout
+// рядом с терминалом, а не накрывает его. Состояние переживает перезапуск —
+// пишем в config.ui.diffPanelOpen сразу после toggle().
+function toggleDiffPanel() {
+  diffPanel?.toggle();
+  window.api.config.set({ ui: { diffPanelOpen: !!diffPanel?.isOpen() } });
+}
+
 // Создать вкладку: контейнер + xterm + запись в стор. activate — переключиться сразу.
 // command/args — явный оверрайд конкретного спавна (не используется восстановлением
 // воркспейса — см. sessionId ниже, FIX 3 ревью).
@@ -273,6 +300,10 @@ function activateTab(tabId) {
   for (const [id, v] of views) v.container.classList.toggle('hidden', id !== tabId);
   tabStore.setActive(tabId);
   window.api.workspace.setActive(tabId); // main пересчитает activeIndex манифеста
+  // Task 2 фазы 6: переключение вкладки — один из триггеров обновления
+  // панели диффа (бриф); setActiveTab сама не делает IPC, если панель сейчас
+  // закрыта (см. diffpanel.js).
+  diffPanel?.setActiveTab(tabId);
   // fit после показа: скрытый контейнер имеет нулевые размеры (рефит запускает
   // ResizeObserver в terminal.js сам, когда контейнер становится видимым).
   requestAnimationFrame(() => {
@@ -315,7 +346,12 @@ async function closeTab(tabId) {
   // Переключаемся на соседнюю вкладку, только если закрыли активную —
   // закрытие фоновой вкладки не должно перебивать фокус пользователя.
   if (!wasActive) return;
-  if (fallback) activateTab(fallback);
+  if (fallback) {
+    activateTab(fallback); // activateTab сама зовёт diffPanel?.setActiveTab(fallback)
+    return;
+  }
+  // Закрыли последнюю вкладку — панели диффа больше нечего показывать.
+  diffPanel?.setActiveTab(null);
 }
 
 // Task 3 фазы 4 (peek): клик (или Space) по строке waiting — открыть поповер
@@ -494,6 +530,16 @@ function bindHotkeys() {
       ev.preventDefault();
       ev.stopPropagation();
       toggleDashboard();
+      return;
+    }
+    // Ctrl+G — панель диффа (Task 2 фазы 6), тот же паттерн preventDefault/
+    // stopPropagation, что Ctrl+P/Ctrl+D выше: иначе xterm получил бы 'g'/'G'
+    // в активный терминал.
+    if (ev.ctrlKey && !ev.shiftKey && !ev.altKey
+        && (ev.key === 'g' || ev.key === 'G' || ev.code === 'KeyG')) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      toggleDiffPanel();
       return;
     }
     // Ctrl+1..9 — вкладка по индексу.
@@ -772,6 +818,14 @@ async function boot() {
     fallbackFocus: () => views.get(tabStore.activeId)?.view,
   });
 
+  // Task 2 фазы 6 (панель диффа): состояние открыта/закрыта переживает
+  // перезапуск (config.ui.diffPanelOpen, см. toggleDiffPanel). open() внутри
+  // безопасен даже без единой открытой вкладки — setActiveTab(tabId) позже
+  // (при первом activateTab внутри openTab/restoreFlow) сама подхватит и
+  // обновит содержимое, раз панель уже открыта.
+  diffPanel = createDiffPanel({ root: $('diff-panel'), api: window.api });
+  if (config.ui?.diffPanelOpen) diffPanel.open();
+
   renderActionBar();
 
   // Task 3 фазы 5 (кольца лимитов): первичный usage:get — НЕ await, чтобы
@@ -820,6 +874,11 @@ async function boot() {
   window.api.term.onExit((p) => {
     views.get(p.tabId)?.view.handlers.onExit(p);
   });
+  // Task 2 фазы 6 (панель диффа): PostToolUse (main/sessions.js) → git:changed.
+  // diffPanel сама решает, актуально ли событие (открыта ли панель, та ли это
+  // вкладка) и держит дебаунс 1500мс — здесь только проводка канала.
+  window.api.git.onChanged(({ tabId }) => diffPanel?.handleGitChanged(tabId));
+
   // Task 2 фазы 4: клик по Windows-тосту — main прислал {tabId}. activateTab
   // сама тихо игнорирует неизвестный/уже закрытый tabId (views.get → undefined
   // → return), так что здесь ничего дополнительно проверять не нужно.

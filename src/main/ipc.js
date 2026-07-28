@@ -18,6 +18,7 @@ const { saveClipboardImage } = require('./screenshot');
 const { appRoot } = require('./paths');
 const { createUsagePoller } = require('./usage-oauth');
 const { createCcusage } = require('./usage-ccusage');
+const { createGitInfo } = require('./git-info');
 
 let manager = null;
 let smokeOutput = '';
@@ -28,6 +29,7 @@ let wsync = null;        // гейт синхронизации манифест
 let activeTabId = null;  // последний tabId, о котором сообщил renderer через workspace:setActive
 let usagePoller = null;  // поллер официальных лимитов (usage-oauth.js) — слой A
 let ccusage = null;      // слой расходов ccusage (usage-ccusage.js) — слой B
+let gitInfo = null;      // Task 2 фазы 6 (панель диффа): git-info.js, чистое ядро + реальный run()
 let usageMonitorTimer = null; // лёгкий сторож (только snapshot(), без сети) — рассылает usage:update
 let lastBroadcastKey = null;    // `fetchedAt|stale|error` последнего разосланного usage:update — см. usageBroadcastKey()
 let lastCcusageResult = null;   // последний известный ответ ccusage.get() — уходит и в usage:get/usage:refresh, и в usage:update
@@ -185,6 +187,34 @@ function runCcusage(args) {
   });
 }
 
+// run(args, cwd) для git-info.js (Task 2 фазы 6, панель диффа): контракт
+// модуля — resolve({code, stdout, stderr}) на ЛЮБОЙ обычный запуск (в т.ч.
+// code!=0 — например "not a git repository", это git-info.js сам разбирает
+// по stderr), и REJECT только когда бинарника нет вовсе (ENOENT), чтобы
+// isGitMissingError() в git-info.js отличил «git не установлен» от «git
+// сказал code!=0». maxBuffer 10 МБ (а не дефолтный 1 МБ execFile) — диффы
+// больших коммитов легко превышают мегабайт. timeout 15с — тот же порядок,
+// что usageHttpGet (20с), git локальный и обычно быстрее сети.
+function gitRun(args, cwd) {
+  return new Promise((resolve, reject) => {
+    execFile('git', args, {
+      cwd, windowsHide: true, timeout: 15000, maxBuffer: 10 * 1024 * 1024,
+    }, (err, stdout, stderr) => {
+      if (err && err.code === 'ENOENT') {
+        reject(err);
+        return;
+      }
+      // err.code здесь — код завершения процесса (число) при code!=0, ЛИБО
+      // строка вроде 'ETIMEDOUT'/сигнал при убийстве по timeout — в обоих
+      // случаях, кроме ENOENT (отсечён выше), это НЕ git-missing: коду 1
+      // хватает, чтобы git-info.js посчитал это либо "not-a-repo" (по
+      // тексту stderr), либо общим 'failed'.
+      const code = err ? (typeof err.code === 'number' ? err.code : 1) : 0;
+      resolve({ code, stdout: stdout || '', stderr: stderr || '' });
+    });
+  });
+}
+
 // FINDING 1 (ревью, fix round 1): usage-oauth.js/applyError() при сбое
 // оставляет fetchedAt ПРЕЖНИМ (берёт из lastGood) — сторож, сравнивавший
 // только fetchedAt, никогда не замечал переход в stale (истёк токен → 15-мин
@@ -212,6 +242,11 @@ function registerIpc(win, opts = {}) {
     run: runCcusage,
     cache: createJsonFileCache(usageCcusageCacheFile()),
   });
+  // Task 2 фазы 6 (панель диффа): gitInfo — чистое ядро (git-info.js) +
+  // реальный run() (execFile выше). Конструктор не делает I/O сам по себе —
+  // безопасно создавать безусловно, даже в smoke (сам IPC-хендлер ниже
+  // просто не зовёт .get() в smoke — см. 'git:get').
+  gitInfo = createGitInfo({ run: gitRun });
   lastBroadcastKey = null;
   lastCcusageResult = null;
   manualRefreshInFlight = null;
@@ -584,6 +619,20 @@ function registerIpc(win, opts = {}) {
   ipcMain.handle('project:status', (_e, tabId) => {
     const cwd = tabCwd(tabId);
     return { connected: cwd ? isConnected(cwd) : false };
+  });
+
+  // Task 2 фазы 6 (панель диффа): cwd вкладки — тот же tabCwd(), что и
+  // project:connect/status выше. smoke: НЕ дёргаем git вообще — headless-
+  // прогон не должен спавнить внешние процессы сверх PTY_OK-смоука (см.
+  // task-2-brief.md, шаг 3: «в smoke НЕ вызывать»). force — явный ручной
+  // повтор (кнопка «Обновить» панели), опрокидывает TTL-кэш gitInfo.
+  ipcMain.handle('git:get', async (_e, tabId, opts) => {
+    if (smoke) return null;
+    if (typeof tabId !== 'string') return null;
+    const cwd = tabCwd(tabId);
+    if (!cwd) return null;
+    const force = !!(opts && opts.force);
+    return gitInfo.get(cwd, { force });
   });
 
   // Task 4 фазы 4 (вставка скриншотов): cwd вкладки резолвим тем же путём,

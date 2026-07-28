@@ -35,6 +35,16 @@ contextBridge.exposeInMainWorld('api', {
     connect: (tabId) => ipcRenderer.invoke('project:connect', tabId),
     status: (tabId) => ipcRenderer.invoke('project:status', tabId),
   },
+  git: {
+    // Task 2 фазы 6 (панель диффа): {tabId, {force}} → main резолвит cwd
+    // вкладки и зовёт gitInfo.get() (git-info.js, TTL-кэш внутри).
+    get: (tabId, opts) => ipcRenderer.invoke('git:get', tabId, opts),
+    // git:changed шлёт sessions.js на КАЖДЫЙ PostToolUse (см. main/sessions.js) —
+    // тот же generic-мост onEvent→win.webContents.send, что и остальные
+    // каналы (tab:status, term:data и т.п.), отдельной проводки в ipc.js не
+    // требует.
+    onChanged: (cb) => ipcRenderer.on('git:changed', (_e, p) => cb(p)),
+  },
   tab: {
     onStatus: (cb) => ipcRenderer.on('tab:status', (_e, p) => cb(p)),
     // Task 2 фазы 4: клик по Windows-тосту — main поднимает окно и шлёт сюда

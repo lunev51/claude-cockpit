@@ -372,6 +372,14 @@ function createSessionManager({
       case 'Stop':
         setStatus(tab, 'done', '');
         break;
+      case 'PostToolUse':
+        // Task 2 фазы 6 (панель диффа): PostToolUse — не сигнал ожидания и не
+        // «работает» (это уже сказал PreToolUse чуть раньше), а факт «файлы
+        // проекта могли измениться». Статус НЕ трогаем, только даём renderer'у
+        // знать, что панели диффа стоит обновиться (см. diffpanel.js — дебаунс
+        // 1500мс живёт уже там, не здесь).
+        onEvent('git:changed', { tabId });
+        break;
       default:
         break; // незнакомые события молча игнорируем — контракт CLI может расти
     }

@@ -249,12 +249,132 @@ html, body {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  position: relative; /* якорь для #restore-overlay */
+  position: relative; /* якорь для #restore-overlay/#dashboard-root — накрывают ВЕСЬ #main, включая диафф-панель */
 }
-#terminal-host { flex: 1; min-height: 0; position: relative; }
+/* Task 2 фазы 6 (панель диффа): строка терминал+панель — #action-bar остаётся
+   ПОД ней, на всю ширину #main (см. index.html). НЕ оверлей: оверлеев уже
+   четыре (restore/dashboard/palette/peek) и они дерутся за Escape — панель
+   диффа просто раздвигает/сдвигает layout, как обычный flex-сосед. */
+#main-row {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+}
+#terminal-host { flex: 1; min-height: 0; min-width: 0; position: relative; }
 /* Контейнеры терминалов вкладок (Task 4 создаёт .term-view на вкладку) */
 .term-view { position: absolute; inset: 0; padding: 4px 0 0 8px; }
 .term-view.hidden { display: none; }
+
+/* --- Панель диффа (Task 2 фазы 6): 380px справа от терминала, flex:none —
+   сворачивается/разворачивается по Ctrl+G и кнопке «±» в панели действий
+   (см. app.js/diffpanel.js). .hidden убирает её из #main-row целиком —
+   #terminal-host (flex:1) тут же занимает освободившееся место. --- */
+#diff-panel {
+  width: 380px;
+  flex: none;
+  min-width: 0;
+  border-left: 1px solid var(--border);
+  background: var(--bg-panel);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+#diff-panel.hidden { display: none; }
+.diff-panel-header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.diff-panel-summary {
+  font-size: 11px;
+  color: var(--text-muted);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.diff-panel-refresh { flex: none; }
+.diff-panel-empty {
+  padding: 16px 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+  text-align: center;
+}
+.diff-panel-files {
+  flex: none;
+  max-height: 40%;
+  overflow-y: auto;
+  border-bottom: 1px solid var(--border);
+}
+.diff-panel-files:empty { border-bottom: none; }
+.diff-file-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  cursor: pointer;
+  font-size: 11px;
+}
+.diff-file-row:hover { background: var(--bg-hover); }
+.diff-file-status {
+  flex: none;
+  width: 14px;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--text-muted);
+}
+.diff-file-status.diff-status-add { color: var(--ok); }
+.diff-file-status.diff-status-del { color: var(--err); }
+.diff-file-status.diff-status-conflict { color: var(--warn); }
+.diff-file-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+.diff-file-counts {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-dim);
+}
+/* Уведомления «показано N из M» — файлы и строки диффа НЕЗАВИСИМЫ (ревью
+   Task 1: разные лимиты могут обрезать не синхронно), поэтому это ДВЕ
+   отдельные строки, каждая появляется только когда её собственный лимит
+   реально сработал. */
+.diff-panel-truncated {
+  flex: none;
+  padding: 4px 10px;
+  font-size: 10px;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border);
+}
+.diff-panel-truncated.hidden { display: none; }
+.diff-panel-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+.diff-panel-text {
+  margin: 0;
+  padding: 8px 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.diff-line { white-space: pre; }
+.diff-line-add { color: var(--ok); }
+.diff-line-del { color: var(--err); }
+.diff-line-hunk { color: var(--text-dim); }
+.diff-line-context { color: var(--text-muted); }
 
 /* --- Оверлей восстановления воркспейса (Task 4): показывается на boot,
    если манифест воркспейса непуст — накрывает всю главную область. --- */
@@ -646,7 +766,8 @@ html, body {
 .tab-row:focus-visible,
 #limits:focus-visible,
 .restore-row input[type="checkbox"]:focus-visible,
-.chart-preset:focus-visible {
+.chart-preset:focus-visible,
+.diff-file-row:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
