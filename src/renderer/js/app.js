@@ -6,6 +6,7 @@ import { createTabStore } from './tabs.js';
 import { renderBadge } from './badge.js';
 import { createPeek } from './peek.js';
 import { createPalette } from './palette.js';
+import { createDashboard } from './dashboard.js';
 import { renderRings } from './rings.js';
 
 const $ = (id) => document.getElementById(id);
@@ -17,6 +18,10 @@ let peek = null;
 // Task 4 фазы 4: палитра команд (Ctrl+P) — createPalette сама владеет своим
 // DOM-оверлеем (см. palette.js), здесь только держим ссылку для bindHotkeys.
 let palette = null;
+// Task 4 фазы 5: дашборд лимитов и расходов — createDashboard сама владеет
+// своим DOM (см. dashboard.js), здесь только держим ссылку для bindHotkeys/
+// панели действий/палитры и для проброса свежих usage-снапшотов, пока открыт.
+let dashboard = null;
 // Task 3 фазы 4 (peek): tabId, для которого сейчас открыт поповер (или null).
 // Нужен, чтобы обработчик tab:status закрывал peek ТОЛЬКО когда статус меняет
 // именно ту вкладку, что сейчас показана в поповере — peek.hide() идемпотентна,
@@ -61,6 +66,20 @@ function pushAttention() {
 function renderActionBar() {
   const host = $('action-commands');
   host.textContent = '';
+  // Task 4 фазы 5 (дашборд): кнопка 📊 — ПЕРВАЯ в #action-commands, отдельно
+  // от списка слэш-команд из config.actionBar.commands ниже. host.textContent
+  // выше стирает ВСЁ на каждый вызов renderActionBar() (вызывается один раз
+  // за boot(), но пересобираем кнопку тут же, а не полагаемся на статичную
+  // разметку в index.html — та была бы снесена этой же строкой).
+  const dashBtn = document.createElement('button');
+  dashBtn.type = 'button';
+  dashBtn.id = 'btn-dashboard';
+  dashBtn.className = 'action-btn';
+  dashBtn.textContent = '📊';
+  dashBtn.title = 'Дашборд лимитов и расходов (Ctrl+D)';
+  dashBtn.addEventListener('mousedown', (e) => e.preventDefault());
+  dashBtn.addEventListener('click', () => toggleDashboard());
+  host.appendChild(dashBtn);
   // deepMerge (config.js) при частичном оверрайде массива объектом даёт
   // {0:…,1:…} вместо массива — Array.isArray отсекает такой и любой другой
   // некорректный actionBar.commands, чтобы не уронить boot() на итерации.
@@ -107,16 +126,33 @@ function redrawLimits(now = Date.now()) {
   renderRings(host, lastUsage ? lastUsage.limits : null, now);
 }
 
-// Клик/Enter/Space по #limits — форс-обновление обоих слоёв usage. Дашборд
-// (Task 4) станет вторым эффектом того же клика — пока только обновляем кольца.
+// Task 4 фазы 5 (дашборд): единая точка «перерисовать все view usage-снапшота
+// разом» — кольца сайдбара ВСЕГДА, дашборд — только если сейчас открыт
+// (dashboard.render() сама не рисует ничего, если её DOM разобран, но зачем
+// звать её вообще, если оверлея нет). Используется вместо голого redrawLimits()
+// во всех трёх местах, где мог обновиться lastUsage: первичный usage:get в
+// boot(), usage:update от main, локальный таймер 30с (см. ниже).
+function redrawUsageViews(now = Date.now()) {
+  redrawLimits(now);
+  if (dashboard?.isOpen()) dashboard.render(lastUsage, now);
+}
+
+// Клик/Enter/Space по #limits — форс-обновление обоих слоёв usage. Кнопка
+// «Обновить» дашборда (Task 4 фазы 5) переиспользует ЭТУ ЖЕ функцию как
+// onRefresh — тот же single-flight/троттлинг guard, что и у колец, не
+// дублируется в dashboard.js.
 //
 // FINDING 2 (ревью, fix round 1): guard usageRefreshing — повторный вызов,
 // пока предыдущий IPC-round-trip ещё не разрешился, попросту НЕ отправляется
 // (main всё равно бы отбил его single-flight'ом/троттлингом, см. ipc.js, но
 // незачем даже слать лишний usage:refresh). .busy — визуальная обратная связь
 // (opacity + cursor:progress, app.css), пока запрос летит.
+//
+// Возвращает lastUsage — и на раннем guard-выходе, и в конце: дашборд зовёт
+// refreshUsage() как onRefresh() и рендерит то, что она вернёт; undefined
+// заставил бы его молча пропустить перерисовку кнопки «Обновить».
 async function refreshUsage() {
-  if (usageRefreshing) return;
+  if (usageRefreshing) return lastUsage;
   usageRefreshing = true;
   const host = $('limits');
   host?.classList.add('busy');
@@ -127,8 +163,20 @@ async function refreshUsage() {
   } finally {
     usageRefreshing = false;
     host?.classList.remove('busy');
-    redrawLimits();
+    redrawUsageViews();
   }
+  return lastUsage;
+}
+
+// Task 4 фазы 5: тумблер Ctrl+D/кнопка панели действий/действие палитры —
+// второе открытие, пока дашборд уже на экране, закрывает его вместо повторного
+// открытия (тот же приём, что Ctrl+P у палитры, см. bindHotkeys). Взаимно
+// исключаем с палитрой и peek — оба оверлея не должны показываться одновременно.
+function toggleDashboard() {
+  peek?.hide();
+  if (palette.isOpen()) palette.close();
+  if (dashboard.isOpen()) dashboard.close();
+  else dashboard.open();
 }
 
 // Создать вкладку: контейнер + xterm + запись в стор. activate — переключиться сразу.
@@ -188,6 +236,9 @@ function activateTab(tabId) {
   // себя сама, см. palette.js/runAt) не должно оставлять палитру открытой
   // «за спиной». close() идемпотентна — безвредно, если она уже закрыта.
   palette?.close();
+  // Task 4 фазы 5: та же логика — дашборд накрывает терминальную область
+  // целиком, переключение вкладки под ним не должно оставлять его висеть.
+  dashboard?.close();
   for (const [id, v] of views) v.container.classList.toggle('hidden', id !== tabId);
   tabStore.setActive(tabId);
   window.api.workspace.setActive(tabId); // main пересчитает activeIndex манифеста
@@ -327,6 +378,15 @@ function buildPaletteActions() {
     run: () => newProject(),
   });
 
+  // Task 4 фазы 5: действие «Дашборд» — не привязано к активной вкладке
+  // (как «Новый проект» выше), доступно всегда.
+  actions.push({
+    id: 'dashboard',
+    title: 'Дашборд',
+    hint: 'Ctrl+D',
+    run: () => toggleDashboard(),
+  });
+
   const activeId = tabStore.activeId;
   if (activeId) {
     actions.push({
@@ -377,6 +437,9 @@ function bindHotkeys() {
       ev.preventDefault();
       ev.stopPropagation();
       peek?.hide();
+      // Task 4 фазы 5: взаимное исключение оверлеев — дашборд не должен
+      // остаться висеть «за спиной» открывшейся палитры.
+      dashboard?.close();
       // Fix round 1 (ревью): peek?.hide() выше уже мог схлопнуть
       // document.activeElement на <body> (см. подробный разбор в palette.js/
       // open) — передаём терминал активной вкладки как fallback НА СЛУЧАЙ
@@ -385,6 +448,20 @@ function bindHotkeys() {
       // валиден.
       if (palette.isOpen()) palette.close();
       else palette.open(views.get(tabStore.activeId)?.view);
+      return;
+    }
+    // Ctrl+D — дашборд лимитов и расходов (Task 4 фазы 5), тот же паттерн, что
+    // Ctrl+P выше (toggle + preventDefault/stopPropagation). ВНИМАНИЕ: это
+    // перехватывает Ctrl+D раньше, чем событие дошло бы до textarea xterm —
+    // родное значение Ctrl+D в терминале (EOF/выход из шелла) больше не
+    // доходит до pty активной вкладки, пока это приложение в фокусе. То же
+    // сознательное решение уже принято для Ctrl+P (перехватывает печатный
+    // символ) — здесь оно явно предписано брифом задачи.
+    if (ev.ctrlKey && !ev.shiftKey && !ev.altKey
+        && (ev.key === 'd' || ev.key === 'D' || ev.code === 'KeyD')) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      toggleDashboard();
       return;
     }
     // Ctrl+1..9 — вкладка по индексу.
@@ -629,6 +706,20 @@ async function boot() {
     getActions: buildPaletteActions,
   });
 
+  // Task 4 фазы 5: дашборд лимитов и расходов (Ctrl+D). getData читает тот же
+  // lastUsage, что и кольца сайдбара — отдельного usage:get дашборд не делает.
+  // onRefresh переиспользует refreshUsage() (тот же single-flight/троттлинг
+  // guard, что и клик по кольцам, см. выше). fallbackFocus — геттер, а не
+  // статическое значение: активная вкладка на момент КАЖДОГО открытия
+  // резолвится заново (та же проблема со «застывшим» значением, что решена в
+  // palette.js/open(fallbackFocus)).
+  dashboard = createDashboard({
+    root: $('dashboard-root'),
+    getData: () => lastUsage,
+    onRefresh: refreshUsage,
+    fallbackFocus: () => views.get(tabStore.activeId)?.view,
+  });
+
   renderActionBar();
 
   // Task 3 фазы 5 (кольца лимитов): первичный usage:get — НЕ await, чтобы
@@ -638,19 +729,22 @@ async function boot() {
   // прочерки (ok:false — snapshot ещё не пришёл), пока промис не разрешится.
   window.api.usage.get().then((payload) => {
     lastUsage = payload;
-    redrawLimits();
+    redrawUsageViews();
   }).catch((err) => console.warn('[usage] usage:get не удался:', err));
 
   // main шлёт это после каждого успешно обнаруженного refresh поллера (см.
   // usageMonitorTimer в main/ipc.js) — payload той же формы {limits, spend}.
+  // redrawUsageViews (Task 4 фазы 5) — заодно перерисовывает дашборд, если он
+  // сейчас открыт (фоновый refresh не должен молчать под открытым оверлеем).
   window.api.usage.onUpdate((payload) => {
     lastUsage = payload;
-    redrawLimits();
+    redrawUsageViews();
   });
 
-  // Клик по кольцам — форс-обновление (дашборд появится в Task 4, пока просто
-  // usage:refresh). Enter/Space — та же клавиатурная доступность, что и
-  // остальные интерактивные элементы сайдбара (tabindex=0 в index.html).
+  // Клик по кольцам — форс-обновление обоих слоёв usage (та же refreshUsage,
+  // что зовёт кнопка «Обновить» дашборда). Enter/Space — та же клавиатурная
+  // доступность, что и остальные интерактивные элементы сайдбара (tabindex=0
+  // в index.html).
   const limitsEl = $('limits');
   limitsEl?.addEventListener('click', refreshUsage);
   limitsEl?.addEventListener('keydown', (ev) => {
@@ -661,9 +755,10 @@ async function boot() {
   });
 
   // Локальный таймер 30с — ТОЛЬКО обновление обратного отсчёта («сброс через
-  // …»), без единого сетевого запроса: redrawLimits() просто перечитывает уже
-  // известный lastUsage.limits с новым Date.now().
-  setInterval(() => redrawLimits(), 30000);
+  // …»), без единого сетевого запроса: redrawUsageViews() просто перечитывает
+  // уже известный lastUsage с новым Date.now() (и в кольцах, и в дашборде,
+  // если он открыт).
+  setInterval(() => redrawUsageViews(), 30000);
 
   // Глобальный диспатч событий терминалов по tabId.
   window.api.term.onData(({ tabId, data }) => views.get(tabId)?.view.handlers.onData(data));

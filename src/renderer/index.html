@@ -63,6 +63,13 @@
           </div>
         </div>
       </div>
+      <!-- Task 4 фазы 5 (дашборд лимитов и расходов): корень оверлея — внутри
+           #main (position:relative), как #restore-overlay, а не прямой ребёнок
+           <body> (в отличие от peek-root/palette-root) — дашборд накрывает
+           именно терминальную область, а не окно целиком. Пустой div сам по
+           себе ничего не занимает — createDashboard() наполняет/чистит его
+           только на время открытия (см. src/renderer/js/dashboard.js). -->
+      <div id="dashboard-root"></div>
     </div>
   </div>
   <!-- Task 3 фазы 4 (peek): корень поповера — вне #sidebar/#main нарочно,
