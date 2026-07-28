@@ -43,6 +43,13 @@ let restoreOverlaySkip = null;
 // usage.get() (см. boot()); redrawLimits() сама терпит null (rings.js рисует
 // прочерки, не ломая вёрстку).
 let lastUsage = null;
+// Task 4 фазы 6 (раздел GitHub дашборда): последний ответ gh:global —
+// {ok, error, prs, issues, notifications, fetchedAt} или null ДО первого
+// открытия дашборда (лениво, тот же приём, что и ccusage — см.
+// fetchUsageOnDashboardOpen). Отдельно от lastUsage, потому что источник другой
+// (gh-info.js, не usage-oauth/ccusage), но передаётся в dashboard.render()
+// вместе с ним как поле .gh (см. redrawUsageViews/getData ниже).
+let lastGh = null;
 // FINDING 2 (ревью, fix round 1): пока предыдущий usage:refresh не разрешился,
 // повторный клик/автоповтор Enter-Space по #limits не должен запускать
 // параллельный ещё один — main и сам защищён (single-flight + троттлинг, см.
@@ -70,6 +77,37 @@ function updateTitlebarAlert() {
 function pushAttention() {
   const n = tabStore.waitingCount();
   window.api.attention.update(n, renderBadge(n));
+}
+
+// Task 4 фазы 6 (бейдж PR): «вид ошибки» уже залогирован — не спамим консоль
+// на каждый тик 3-минутного таймера/активацию вкладки (папка без remote,
+// отсутствующий gh и т.п. не меняются от вызова к вызову).
+const loggedGhErrors = new Set();
+function logGhErrorOnce(kind, detail) {
+  if (loggedGhErrors.has(kind)) return;
+  loggedGhErrors.add(kind);
+  console.warn(`[gh] ${kind}${detail ? `: ${detail}` : ''}`);
+}
+
+// gh.repo(tabId) → бейдж PR строки сайдбара. ok:true+pr — рисуем бейдж; любой
+// другой исход (нет PR на ветке, no-remote/no-gh/auth/failed, сбой самого IPC)
+// молча гасит бейдж — setPr(tabId, null) уже умеет прятать его (см. tabs.js).
+// gh-info.js кэширует по cwd (TTL 3 мин, дольше для 'no-gh') — повторные вызовы
+// отсюда (активация вкладки/таймер ниже) не спавнят gh чаще, чем реально нужно.
+async function refreshTabPr(tabId) {
+  try {
+    const res = await window.api.gh.repo(tabId);
+    if (res && res.ok && res.pr) {
+      tabStore.setPr(tabId, res.pr);
+      return;
+    }
+    if (res && !res.ok) logGhErrorOnce(res.error || 'failed');
+    else if (res && res.error === 'no-remote') logGhErrorOnce('no-remote');
+    tabStore.setPr(tabId, null);
+  } catch (err) {
+    logGhErrorOnce('ipc-failed', err && err.message);
+    tabStore.setPr(tabId, null);
+  }
 }
 
 // Панель действий: кнопки шлют слэш-команду в pty активной вкладки (фича 23/26).
@@ -155,9 +193,17 @@ function redrawLimits(now = Date.now()) {
 // звать её вообще, если оверлея нет). Используется вместо голого redrawLimits()
 // во всех трёх местах, где мог обновиться lastUsage: первичный usage:get в
 // boot(), usage:update от main, локальный таймер 30с (см. ниже).
+// Task 4 фазы 6: снапшот, который видит дашборд — {limits, spend} из lastUsage
+// плюс отдельно подтянутое поле .gh (lastGh, null до первого открытия
+// дашборда) — см. fetchUsageOnDashboardOpen. dashboard.js/render() и getData()
+// (см. createDashboard ниже) используют ровно эту же форму.
+function dashboardSnapshot() {
+  return { ...(lastUsage || {}), gh: lastGh };
+}
+
 function redrawUsageViews(now = Date.now()) {
   redrawLimits(now);
-  if (dashboard?.isOpen()) dashboard.render(lastUsage, now);
+  if (dashboard?.isOpen()) dashboard.render(dashboardSnapshot(), now);
 }
 
 // Клик/Enter/Space по #limits — форс-обновление обоих слоёв usage. Кнопка
@@ -201,13 +247,26 @@ async function refreshUsage() {
 // свежий, реального npx не будет, это дешёвый no-op. redrawUsageViews() уже
 // умеет перерисовать дашборд, если он сейчас открыт, — а он открыт, раз это
 // вообще было вызвано.
-async function fetchUsageOnDashboardOpen() {
-  try {
-    lastUsage = await window.api.usage.get();
-  } catch (err) {
-    console.warn('[usage] usage:get при открытии дашборда не удался:', err);
-  }
-  redrawUsageViews();
+// Task 4 фазы 6: тем же обработчиком (тот же принцип «лениво, при каждом
+// открытии») тянем сводку GitHub (gh:global). ВАЖНО: usage.get() и gh.global()
+// запускаются НЕЗАВИСИМО (каждый — свой .then/.catch, тот же fire-and-forget
+// приём, что и первичный usage.get() в boot()), а НЕ через один общий await —
+// первый вызов usage.get() (ленивый ccusage.get() внутри может спавнить npx,
+// до 60с по таймауту) не должен задерживать отрисовку раздела GitHub, если тот
+// уже готов раньше. Каждый источник сам зовёт redrawUsageViews() по своему
+// разрешению — раздел «загружаю…» (dashboard.js/buildGithubSection) сменится
+// на реальные данные ровно тогда, когда придёт ИМЕННО его ответ, а не когда
+// придут оба разом.
+function fetchUsageOnDashboardOpen() {
+  window.api.usage.get().then((v) => {
+    lastUsage = v;
+    redrawUsageViews();
+  }).catch((err) => console.warn('[usage] usage:get при открытии дашборда не удался:', err));
+
+  window.api.gh.global().then((v) => {
+    lastGh = v;
+    redrawUsageViews();
+  }).catch((err) => console.warn('[gh] gh:global при открытии дашборда не удался:', err));
 }
 
 // Task 4 фазы 5: тумблер Ctrl+D/кнопка панели действий/действие палитры —
@@ -304,6 +363,11 @@ function activateTab(tabId) {
   // панели диффа (бриф); setActiveTab сама не делает IPC, если панель сейчас
   // закрыта (см. diffpanel.js).
   diffPanel?.setActiveTab(tabId);
+  // Task 4 фазы 6 (бейдж PR): активация вкладки — один из двух триггеров
+  // обновления бейджа (второй — периодический таймер, см. boot()). Fire-and-
+  // forget — сама функция никогда не бросает и обновляет tabStore асинхронно,
+  // когда IPC разрешится.
+  refreshTabPr(tabId);
   // fit после показа: скрытый контейнер имеет нулевые размеры (рефит запускает
   // ResizeObserver в terminal.js сам, когда контейнер становится видимым).
   requestAnimationFrame(() => {
@@ -776,6 +840,10 @@ async function boot() {
     onClose: closeTab,
     onConnect: connectProject,
     onPeek: openPeek,
+    // Task 4 фазы 6 (бейдж PR): api — тот же приём, что diffPanel ниже
+    // (createDiffPanel({..., api})) — клик по бейджу зовёт
+    // api.shell.openExternal() напрямую, без отдельного колбэка на каждое действие.
+    api: window.api,
   });
 
   // Task 3 фазы 4: peek — ответить Claude из сайдбара, не переключая вкладку.
@@ -810,12 +878,16 @@ async function boot() {
   // palette.js/open(fallbackFocus)).
   dashboard = createDashboard({
     root: $('dashboard-root'),
-    getData: () => lastUsage,
+    getData: dashboardSnapshot,
     onRefresh: refreshUsage,
     // FIX 2 (ревью): usage:get при каждом открытии — см. подробный комментарий
     // у fetchUsageOnDashboardOpen выше и в dashboard.js/open().
     onOpen: fetchUsageOnDashboardOpen,
     fallbackFocus: () => views.get(tabStore.activeId)?.view,
+    // Task 4 фазы 6: клик по строке раздела GitHub открывает URL в браузере —
+    // тот же приём, что и api в createTabStore выше (diffpanel.js тоже так
+    // получает api целиком, а не по колбэку на каждое действие).
+    api: window.api,
   });
 
   // Task 2 фазы 6 (панель диффа): состояние открыта/закрыта переживает
@@ -936,6 +1008,15 @@ async function boot() {
   setInterval(() => {
     if (tabStore.activeId) saveGhost(tabStore.activeId);
   }, 30000);
+
+  // Task 4 фазы 6 (бейдж PR): раз в 3 мин обновляем бейдж для ВСЕХ открытых
+  // вкладок (бриф) — gh-info.js сам кэширует ответ по cwd (TTL 3 мин, дольше
+  // при отсутствующем gh), так что реальный спавн gh произойдёт только там,
+  // где кэш и правда успел устареть. Закрытые вкладки просто выпадают из
+  // tabStore.order() — отдельная чистка таймера при закрытии не нужна (бриф).
+  setInterval(() => {
+    for (const tabId of tabStore.order()) refreshTabPr(tabId);
+  }, 180000);
 
   // Манифест воркспейса (Task 3): пуст/отсутствует — старое поведение
   // (стартовая вкладка из конфига). Непуст — оверлей restore (Task 4).

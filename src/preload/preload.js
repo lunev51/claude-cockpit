@@ -45,6 +45,15 @@ contextBridge.exposeInMainWorld('api', {
     // требует.
     onChanged: (cb) => ipcRenderer.on('git:changed', (_e, p) => cb(p)),
   },
+  gh: {
+    // Task 4 фазы 6 (бейдж PR + дашборд GitHub): {tabId, {force}} → main
+    // резолвит cwd вкладки и зовёт ghInfo.getRepo() (gh-info.js, TTL-кэш
+    // внутри) — тот же приём, что git.get выше.
+    repo: (tabId, opts) => ipcRenderer.invoke('gh:repo', tabId, opts),
+    // Сводка по всем открытым PR/issues пользователя + уведомления — без
+    // привязки к вкладке (раздел «GitHub» дашборда).
+    global: (opts) => ipcRenderer.invoke('gh:global', opts),
+  },
   tab: {
     onStatus: (cb) => ipcRenderer.on('tab:status', (_e, p) => cb(p)),
     // Task 2 фазы 4: клик по Windows-тосту — main поднимает окно и шлёт сюда

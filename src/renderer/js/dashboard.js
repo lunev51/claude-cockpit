@@ -5,11 +5,16 @@
 // строится в open() и разбирается в close() (тот же приём, что палитра —
 // palette.js/build()+close() — а не статическая разметка + toggle .hidden,
 // как у restore-overlay, который показывается ровно один раз за старт).
-// Модуль ничего не знает о usage-oauth.js/usage-ccusage.js напрямую — только
-// про формы снапшотов {limits, spend}, которые приносит инжектированный
+// Модуль ничего не знает о usage-oauth.js/usage-ccusage.js/gh-info.js напрямую —
+// только про формы снапшотов {limits, spend, gh}, которые приносит инжектированный
 // getData(); сеть/повторный запрос — исключительно через onRefresh() (ручное
-// «Обновить», форсирует реальный npx) и onOpen() (FIX 2 ревью: тихий вызов
-// при каждом open(), уважает TTL слоя ccusage сам — см. open()).
+// «Обновить», форсирует реальный npx для usage; раздел GitHub эта кнопка не
+// трогает — см. app.js/refreshUsage) и onOpen() (FIX 2 ревью: тихий вызов
+// при каждом open(), уважает TTL слоя ccusage сам; Task 4 фазы 6 — тем же
+// вызовом лениво тянет и gh:global, см. app.js/fetchUsageOnDashboardOpen).
+// api (Task 4 фазы 6) — инжектированный window.api целиком (тот же приём, что
+// diffpanel.js) — используется только для api.shell.openExternal() при клике
+// по строке раздела GitHub.
 
 import { formatCountdown } from './countdown.js';
 import {
@@ -51,8 +56,19 @@ function formatTime(ms) {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
+// Коды ошибок ghInfo.getRepo/getGlobal ('no-gh'|'auth'|'failed') → человеко-
+// читаемая причина для пустых состояний раздела GitHub (бриф §Task 4 фазы 6).
+const GH_ERROR_TEXT = {
+  'no-gh': 'gh не установлен',
+  auth: 'gh не авторизован',
+};
+
+function ghErrorText(error) {
+  return GH_ERROR_TEXT[error] || 'GitHub недоступен';
+}
+
 export function createDashboard({
-  root, getData, onRefresh, onOpen, fallbackFocus,
+  root, getData, onRefresh, onOpen, fallbackFocus, api,
 }) {
   let isOpenFlag = false;
   let overlayEl = null;
@@ -378,6 +394,114 @@ export function createDashboard({
     return section;
   }
 
+  // Task 4 фазы 6 (раздел GitHub): одна кликабельная строка — repo #num +
+  // заголовок (+ цветная точка статуса проверок, если передан checksClass).
+  // Клик открывает url в браузере через api.shell.openExternal — тот же
+  // приём, что и бейдж PR в сайдбаре (tabs.js), только api инжектирован сюда
+  // конструктором (см. createDashboard), а не глобальным window.api.
+  function buildGithubRow({
+    left, title, checksClass, url,
+  }) {
+    const row = document.createElement('div');
+    row.className = 'dashboard-github-row';
+    if (url) {
+      row.classList.add('clickable');
+      row.addEventListener('click', () => api.shell.openExternal(url));
+    }
+
+    if (checksClass) {
+      const dot = document.createElement('span');
+      dot.className = `dashboard-github-dot ${checksClass}`;
+      row.appendChild(dot);
+    }
+
+    const leftEl = document.createElement('span');
+    leftEl.className = 'dashboard-github-repo';
+    leftEl.textContent = left;
+    row.appendChild(leftEl);
+
+    const titleEl = document.createElement('span');
+    titleEl.className = 'dashboard-github-row-title';
+    titleEl.textContent = title || '';
+    if (title) titleEl.title = title;
+    row.appendChild(titleEl);
+
+    return row;
+  }
+
+  function buildGithubGroup(label, items, emptyText, withChecks) {
+    const wrap = document.createElement('div');
+    wrap.className = 'dashboard-github-group';
+
+    const title = document.createElement('div');
+    title.className = 'dashboard-github-group-title';
+    title.textContent = label;
+    wrap.appendChild(title);
+
+    if (!items.length) {
+      const empty = document.createElement('div');
+      empty.className = 'dashboard-github-empty';
+      empty.textContent = emptyText;
+      wrap.appendChild(empty);
+      return wrap;
+    }
+
+    for (const item of items) {
+      wrap.appendChild(buildGithubRow({
+        left: `${item.repo || '?'} #${item.number}`,
+        title: item.title,
+        checksClass: withChecks ? (item.checks || 'none') : null,
+        url: item.url,
+      }));
+    }
+    return wrap;
+  }
+
+  // buildGithubSection(gh): gh — снапшот gh:global ({ok, error, prs, issues,
+  // notifications, fetchedAt}) или null. null означает «ещё не запрошено в
+  // ЭТОМ открытии дашборда» (запрос летит лениво, см. app.js/
+  // fetchUsageOnDashboardOpen) — рисуем «загружаю…», а не пустые списки,
+  // чтобы не соврать пользователю, что открытых PR и правда нет.
+  function buildGithubSection(gh) {
+    const section = document.createElement('div');
+    section.className = 'dashboard-section dashboard-github';
+
+    const title = document.createElement('div');
+    title.className = 'dashboard-section-title';
+    title.textContent = 'GitHub';
+    section.appendChild(title);
+
+    if (!gh) {
+      const loading = document.createElement('div');
+      loading.className = 'dashboard-github-loading';
+      loading.textContent = 'загружаю…';
+      section.appendChild(loading);
+      return section;
+    }
+
+    if (!gh.ok) {
+      const err = document.createElement('div');
+      err.className = 'dashboard-github-error';
+      err.textContent = ghErrorText(gh.error);
+      section.appendChild(err);
+      return section;
+    }
+
+    const prs = Array.isArray(gh.prs) ? gh.prs : [];
+    const issues = Array.isArray(gh.issues) ? gh.issues : [];
+    section.appendChild(buildGithubGroup('Мои открытые PR', prs, 'нет открытых PR', true));
+    section.appendChild(buildGithubGroup('Назначенные issues', issues, 'нет назначенных issues', false));
+
+    const notifRow = document.createElement('div');
+    notifRow.className = 'dashboard-github-notif';
+    const notifCount = Number(gh.notifications) || 0;
+    notifRow.textContent = `Уведомлений: ${notifCount}`;
+    notifRow.addEventListener('click', () => api.shell.openExternal('https://github.com/notifications'));
+    section.appendChild(notifRow);
+
+    return section;
+  }
+
   // render(data, now): data — {limits, spend} (форма usage:get/usage:refresh/
   // usage:update). Идемпотентная полная перерисовка bodyEl — вызывается и из
   // open(), и повторно извне (см. app.js) при каждом usage:update/локальном
@@ -388,6 +512,7 @@ export function createDashboard({
     lastData = data;
     const limits = data && data.limits;
     const spend = data && data.spend;
+    const gh = data && data.gh;
 
     // Fix ревью (баг): вычисляем «данные устарели» ОДИН РАЗ здесь, а не
     // только внутри buildSpendMeta() — реалистичное сочетание: слой лимитов
@@ -410,13 +535,18 @@ export function createDashboard({
       empty.className = 'dashboard-spend-empty';
       empty.textContent = SPEND_UNAVAILABLE_TEXT;
       bodyEl.appendChild(empty);
-      return;
+    } else {
+      bodyEl.appendChild(buildSpendMeta(spend));
+      bodyEl.appendChild(buildCardsSection(spend));
+      bodyEl.appendChild(buildTableSection(spend));
+      bodyEl.appendChild(buildChartSection(spend));
     }
 
-    bodyEl.appendChild(buildSpendMeta(spend));
-    bodyEl.appendChild(buildCardsSection(spend));
-    bodyEl.appendChild(buildTableSection(spend));
-    bodyEl.appendChild(buildChartSection(spend));
+    // Task 4 фазы 6: раздел GitHub — ПОСЛЕ блока расходов (бриф), рисуется
+    // безусловно, независимо от доступности слоёв лимитов/расходов выше (та же
+    // логика, что и у buildLimitsSection — ошибка одного источника данных не
+    // должна прятать другой).
+    bodyEl.appendChild(buildGithubSection(gh));
   }
 
   // --- Оверлей: открытие/закрытие (тот же паттерн, что palette.js) ---

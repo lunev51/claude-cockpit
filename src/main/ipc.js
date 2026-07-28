@@ -19,6 +19,7 @@ const { appRoot } = require('./paths');
 const { createUsagePoller } = require('./usage-oauth');
 const { createCcusage } = require('./usage-ccusage');
 const { createGitInfo } = require('./git-info');
+const { createGhInfo } = require('./gh-info');
 
 let manager = null;
 let smokeOutput = '';
@@ -30,6 +31,7 @@ let activeTabId = null;  // последний tabId, о котором сооб
 let usagePoller = null;  // поллер официальных лимитов (usage-oauth.js) — слой A
 let ccusage = null;      // слой расходов ccusage (usage-ccusage.js) — слой B
 let gitInfo = null;      // Task 2 фазы 6 (панель диффа): git-info.js, чистое ядро + реальный run()
+let ghInfo = null;       // Task 4 фазы 6 (панель GitHub): gh-info.js, чистое ядро + реальный run()
 let usageMonitorTimer = null; // лёгкий сторож (только snapshot(), без сети) — рассылает usage:update
 let lastBroadcastKey = null;    // `fetchedAt|stale|error` последнего разосланного usage:update — см. usageBroadcastKey()
 let lastCcusageResult = null;   // последний известный ответ ccusage.get() — уходит и в usage:get/usage:refresh, и в usage:update
@@ -215,6 +217,34 @@ function gitRun(args, cwd) {
   });
 }
 
+// run(args, cwd) для gh-info.js (Task 4 фазы 6, панель GitHub): тот же контракт,
+// что и gitRun выше — resolve({code, stdout, stderr}) на любой обычный запуск
+// (gh-info.js сам разбирает 'auth'/'no-remote' по stderr), reject ТОЛЬКО когда
+// бинарника нет вовсе (ENOENT), чтобы isGhMissingError() в gh-info.js отличил
+// «gh не установлен» от «gh сказал code!=0». shell:true ОБЯЗАТЕЛЕН на Windows —
+// без него execFile('gh', ...) падает с ENOENT, если gh.exe обёрнут батником/
+// шимом (тот же приём, что и для npx в runCcusage выше — тот же класс проблемы
+// на этой платформе). cwd — не всегда нужен вызывающему коду (getGlobal() зовёт
+// execGh без cwd вовсе, см. gh-info.js) — execFile с cwd:undefined просто
+// использует cwd текущего процесса, это безопасно для команд типа `gh search`/
+// `gh api`, которые не привязаны к конкретному репозиторию. timeout 30с —
+// дольше, чем у gitRun (15с): search/api — сетевые вызовы, а не локальный git.
+// maxBuffer 5 МБ — с запасом под JSON-ответы gh (бриф).
+function ghRun(args, cwd) {
+  return new Promise((resolve, reject) => {
+    execFile('gh', args, {
+      cwd, windowsHide: true, timeout: 30000, maxBuffer: 5 * 1024 * 1024, shell: true,
+    }, (err, stdout, stderr) => {
+      if (err && err.code === 'ENOENT') {
+        reject(err);
+        return;
+      }
+      const code = err ? (typeof err.code === 'number' ? err.code : 1) : 0;
+      resolve({ code, stdout: stdout || '', stderr: stderr || '' });
+    });
+  });
+}
+
 // FINDING 1 (ревью, fix round 1): usage-oauth.js/applyError() при сбое
 // оставляет fetchedAt ПРЕЖНИМ (берёт из lastGood) — сторож, сравнивавший
 // только fetchedAt, никогда не замечал переход в stale (истёк токен → 15-мин
@@ -247,6 +277,11 @@ function registerIpc(win, opts = {}) {
   // безопасно создавать безусловно, даже в smoke (сам IPC-хендлер ниже
   // просто не зовёт .get() в smoke — см. 'git:get').
   gitInfo = createGitInfo({ run: gitRun });
+  // Task 4 фазы 6 (панель GitHub): ghInfo — чистое ядро (gh-info.js) + реальный
+  // run() (ghRun выше). Тот же приём, что gitInfo прямо над этим — конструктор
+  // не делает I/O сам по себе, безопасно создавать безусловно даже в smoke (сам
+  // IPC-хендлер ниже просто не зовёт .getRepo()/.getGlobal() в smoke).
+  ghInfo = createGhInfo({ run: ghRun });
   lastBroadcastKey = null;
   lastCcusageResult = null;
   manualRefreshInFlight = null;
@@ -633,6 +668,28 @@ function registerIpc(win, opts = {}) {
     if (!cwd) return null;
     const force = !!(opts && opts.force);
     return gitInfo.get(cwd, { force });
+  });
+
+  // Task 4 фазы 6 (панель GitHub): cwd вкладки — тот же tabCwd(), что и git:get
+  // выше. smoke: НЕ дёргаем gh вообще — headless-прогон не должен спавнить
+  // внешние процессы сверх PTY_OK-смоука. force — ручной повтор, опрокидывает
+  // TTL-кэш ghInfo.
+  ipcMain.handle('gh:repo', async (_e, tabId, opts) => {
+    if (smoke) return null;
+    if (typeof tabId !== 'string') return null;
+    const cwd = tabCwd(tabId);
+    if (!cwd) return null;
+    const force = !!(opts && opts.force);
+    return ghInfo.getRepo(cwd, { force });
+  });
+
+  // gh:global — сводка по ВСЕМ открытым PR/issues пользователя + число
+  // непрочитанных уведомлений, без привязки к конкретной вкладке (дашборд,
+  // Task 4 фазы 6). smoke — тот же гейт, что и gh:repo выше.
+  ipcMain.handle('gh:global', async (_e, opts) => {
+    if (smoke) return null;
+    const force = !!(opts && opts.force);
+    return ghInfo.getGlobal({ force });
   });
 
   // Task 4 фазы 4 (вставка скриншотов): cwd вкладки резолвим тем же путём,
