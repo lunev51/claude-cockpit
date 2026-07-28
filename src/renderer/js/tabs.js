@@ -197,6 +197,19 @@ export function createTabStore({
     };
   }
 
+  // C1 (ревью финальной волны фазы 7): текущий статус вкладки по tabId — или
+  // null, если вкладка неизвестна/уже закрыта. app.js использует это перед
+  // ЛЮБОЙ записью команды+'\r' в pty АКТИВНОЙ вкладки (рецепт/панель действий/
+  // палитровые «/compact»,«/remote-control») — если вкладка сейчас 'waiting'
+  // (ждёт ответа на диалог разрешения Claude Code), завершающий '\r' молча
+  // подтвердил бы подсвеченный вариант диалога, а сам текст команды был бы
+  // потерян. Тот же r.status, что уже использует placeRow()/trigger() выше —
+  // не отдельный источник правды.
+  function statusOf(tabId) {
+    const r = rows.get(tabId);
+    return r ? r.status : null;
+  }
+
   function setConnectVisible(tabId, visible) {
     const r = rows.get(tabId);
     if (r) r.connectBtn.classList.toggle('hidden', !visible);
@@ -252,6 +265,7 @@ export function createTabStore({
     remove,
     setActive,
     setStatus,
+    statusOf,
     setConnectVisible,
     setPr,
     neighborOf,

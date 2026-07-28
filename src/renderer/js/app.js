@@ -210,7 +210,8 @@ function renderActionBar() {
     btn.addEventListener('click', () => {
       const id = tabStore.activeId;
       if (id) {
-        window.api.term.write(id, `${command}\r`);
+        // C1 (ревью финальной волны): гард статуса — см. writeCommandToTab.
+        writeCommandToTab(id, command);
         // Возвращаем фокус терминалу активной вкладки на случай, если он
         // всё же ушёл на кнопку (например, при активации с клавиатуры).
         views.get(id)?.view.focus();
@@ -648,6 +649,32 @@ function showToast(text, level = 'info') {
   setTimeout(() => el.remove(), TOAST_TTL_MS);
 }
 
+// C1 (ревью финальной волны фазы 7, критично): единый гард перед записью
+// команды/текста + '\r' в pty вкладки — если целевая вкладка сейчас 'waiting'
+// (ждёт ответа на диалог разрешения Claude Code), завершающий '\r' молча
+// подтвердил бы подсвеченный вариант диалога, а сам текст команды/рецепта
+// был бы потерян. Сценарий из ревью: Claude спрашивает «Bash: rm -rf build —
+// 1. Yes / 2. No» → статус waiting → Ctrl+P → «Рецепт: Отревьюй мои
+// изменения» → Enter → голый '\r' выбирает вариант №1, инструмент выполняется
+// без ревью. Используется ВЕЗДЕ, где renderer пишет команду в pty НЕ как
+// осознанный ответ на конкретный диалог: рецепты (runRecipe), кнопки панели
+// действий (renderActionBar), палитровые «Отправить /compact»/
+// «/remote-control» (buildPaletteActions). НЕ используется в sendPeek() —
+// peek.js СПЕЦИАЛЬНО предназначен для ответа НА ЭТОТ waiting-диалог, у него
+// СВОЙ гард другой смысловой природы (непустой текст, см. peek.js/send() —
+// не даёт голому Enter молча подтвердить дефолт диалога; статус вкладки его
+// не касается, потому что peek и есть штатный способ ответить, пока статус
+// waiting).
+function writeCommandToTab(tabId, command) {
+  if (!tabId) return false;
+  if (tabStore.statusOf(tabId) === 'waiting') {
+    showToast('Вкладка ждёт ответа на диалог — команда не отправлена', 'warn');
+    return false;
+  }
+  window.api.term.write(tabId, `${command}\r`);
+  return true;
+}
+
 // Клик по ⚡: прописать хуки Cockpit в .claude/settings.json проекта вкладки.
 async function connectProject(tabId) {
   try {
@@ -741,7 +768,11 @@ async function runRecipe(recipe) {
   // (для диалога разрешения Claude Code это молчаливое согласие с вариантом
   // по умолчанию) — тот же guard, что peek.js/send().
   if (!text || !text.trim()) return;
-  window.api.term.write(tabId, `${text}\r`);
+  // C1 (ревью финальной волны, критично): гард статуса — см. writeCommandToTab.
+  // Рецепт — НЕ ответ на конкретный диалог waiting; в отличие от peek.js,
+  // здесь нет иного пути узнать, что пользователь на самом деле хотел ответить
+  // именно на подсвеченный вариант, а не отправить рецепт позже.
+  writeCommandToTab(tabId, text);
   views.get(tabId)?.view.focus();
 }
 
@@ -832,11 +863,23 @@ async function openWorkspace(ws) {
   //
   // N1 (ре-ревью раунда 1): вызов стоит ПОСЛЕ отменяемого диалога — раньше
   // он был первой строкой функции, и Esc в диалоге оставлял пользователя с
-  // уже похороненным списком восстановления. Инвариант «пока restoreOverlaySkip
-  // не null, tabStore пуст» НЕ выполняется: результат поиска по истории
-  // (Ctrl+Shift+H) открывает вкладку мимо оверлея, так что диалог выше вполне
-  // может показаться при живом оверлее — и его отмена обязана не иметь
-  // последствий.
+  // уже похороненным списком восстановления.
+  //
+  // [Приведено в соответствие после I2, ревью финальной волны фазы 7]: до
+  // фикса I2 инвариант «пока restoreOverlaySkip не null, tabStore пуст» здесь
+  // был ошибочно назван невыполнимым — результат поиска по истории
+  // (Ctrl+Shift+H, historySearch/onOpenResult) действительно открывал вкладку
+  // мимо оверлея restore, ЭТО и было находкой I2, теперь исправленной там же.
+  // После фикса каждый ИЗВЕСТНЫЙ путь, поднимающий вкладку (newProject,
+  // openWorkspace здесь же, historySearch.onOpenResult), сам гасит
+  // restoreOverlaySkip ДО открытия — так что к моменту, когда мы доходим
+  // ДО ЭТОЙ строки, tabStore пуст, если только restore ещё не решён. Вызов
+  // здесь остаётся НУЖНЫМ по ДРУГОЙ причине: «Открыть воркспейс: <name>» —
+  // действие палитры, а палитра (z-index выше restore) доступна ЛЮБОМУ
+  // пользователю в ЛЮБОЙ момент, в т.ч. пока restore ещё висит на экране И
+  // tabStore ещё пуст (currentCount===0 → диалог подтверждения выше
+  // пропускается вовсе) — restoreOverlaySkip() здесь гасит именно ЭТОТ,
+  // палитровый путь, независимый от historySearch.
   if (restoreOverlaySkip) restoreOverlaySkip();
 
   workspaceOpenInFlight = true;
@@ -1002,13 +1045,14 @@ function buildPaletteActions() {
       id: 'send-compact',
       title: 'Отправить /compact',
       hint: '/compact',
-      run: () => window.api.term.write(activeId, '/compact\r'),
+      // C1 (ревью финальной волны): гард статуса — см. writeCommandToTab.
+      run: () => writeCommandToTab(activeId, '/compact'),
     });
     actions.push({
       id: 'send-remote-control',
       title: 'Отправить /remote-control',
       hint: '/remote-control',
-      run: () => window.api.term.write(activeId, '/remote-control\r'),
+      run: () => writeCommandToTab(activeId, '/remote-control'),
     });
   }
 
@@ -1020,6 +1064,44 @@ function buildPaletteActions() {
   });
 
   return actions;
+}
+
+// I1 (ревью финальной волны фазы 7): единый реестр «что из оверлееподобного
+// сейчас открыто» — раньше это было ПЯТЬ РАЗНЫХ инлайн-списков (гард Ctrl+G,
+// гард Ctrl+Q, локальный otherOverlayOpen() внутри showRestoreOverlay, …),
+// каждый со своим НЕПОЛНЫМ набором проверяемых сущностей: restore не знал
+// про queueInputOpen, а Ctrl+Q — про открытый оверлей restore (сценарий
+// ревью: непустой манифест на старте → оверлей restore → Ctrl+Q разворачивает
+// #queue-input-row — он БЕЗ z-index, обычный элемент потока внутри #main, —
+// ПОД restore (z-index 30), невидимо, и забирает фокус → Esc → capture-
+// обработчик restore видит Escape ПЕРВЫМ (его otherOverlayOpen() не знал про
+// открытую очередь) → startEmpty(): решение «начать пусто» принято ЗА
+// пользователя, список проектов на восстановление потерян безвозвратно).
+// Единственный источник правды — обход ЭТОГО объекта, а не N ручных копий
+// одного и того же списка, которые легко развести при следующем изменении
+// (что и произошло: #diff-panel по Ctrl+G — обычный flex-сосед внутри того
+// же #main, что и restore, и без проверки restore имел бы ТОЧНО ТАКОЙ ЖЕ
+// «открывается невидимо под оверлеем» баг, просто без явного отчёта о нём).
+function overlayFlags() {
+  return {
+    dashboard: !!dashboard?.isOpen(),
+    palette: !!palette?.isOpen(),
+    peek: !!peek?.isOpen(),
+    historySearch: !!historySearch?.isOpen(),
+    recipeForm: !!recipeForm?.isOpen(),
+    queue: queueInputOpen,
+    // restoreOverlaySkip не null ровно пока оверлей restore на экране и
+    // решение по восстановлению ещё не принято (см. showRestoreOverlay).
+    restore: !!restoreOverlaySkip,
+  };
+}
+
+// «Есть ли какой-то ДРУГОЙ модальный элемент открыт прямо сейчас» — exclude
+// (необязателен) исключает из проверки сам элемент, который спрашивает: ему
+// закономерно можно быть уже открытым, это не мешает его собственному
+// действию (закрытию/повторному тумблеру).
+function otherOverlayOpen(exclude) {
+  return Object.entries(overlayFlags()).some(([key, val]) => val && key !== exclude);
 }
 
 function bindHotkeys() {
@@ -1082,21 +1164,33 @@ function bindHotkeys() {
       // оверлей. Без гарда пользователь переключал (и сохранял в конфиг)
       // панель, невидимую под оверлеем — интерфейс молча менял состояние,
       // не показывая результат.
-      if (dashboard?.isOpen() || palette?.isOpen() || historySearch?.isOpen() || recipeForm?.isOpen()) return;
+      // I1 (ревью финальной волны): otherOverlayOpen() — единый реестр (см.
+      // определение выше), теперь включает и restore — #diff-panel лежит
+      // ВНУТРИ #main, ровно там же, где restore-overlay (z-index 30,
+      // position:absolute inset:0), и без этой строки Ctrl+G точно так же
+      // разворачивал бы панель НЕВИДИМО под ним, как Ctrl+Q разворачивал
+      // #queue-input-row (тот же класс дыры, просто без отдельного отчёта).
+      if (otherOverlayOpen()) return;
       toggleDiffPanel();
       return;
     }
     // Ctrl+Q — поле ввода очереди промптов (Task 1 фазы 7), тот же паттерн
     // preventDefault/stopPropagation/toggle, что Ctrl+P/Ctrl+D/Ctrl+G выше:
-    // иначе xterm получил бы 'q'/'Q' в активный терминал. Гард по dashboard/
-    // palette — тот же приём, что Ctrl+G («Находка 14» выше): не открывать
-    // поле НЕВИДИМО под другим оверлеем, который перехватывает терминальную
-    // область целиком.
+    // иначе xterm получил бы 'q'/'Q' в активный терминал. Гард — тот же
+    // единый otherOverlayOpen(), что и у Ctrl+G выше (I1, ревью финальной
+    // волны): не открывать поле НЕВИДИМО под другим оверлеем, который
+    // перехватывает терминальную область целиком, — ВКЛЮЧАЯ restore (раньше
+    // Ctrl+Q ничего не знал про открытый оверлей restore: непустой манифест
+    // на старте → restore на экране → Ctrl+Q разворачивал #queue-input-row
+    // ПОД ним, невидимо, забирая фокус — следующий Esc доставался capture-
+    // обработчику restore, а не полю ввода, и «начать пусто» срабатывало за
+    // спиной пользователя). exclude:'queue' — собственное состояние очереди
+    // не должно мешать сама себе переключиться.
     if (ev.ctrlKey && !ev.shiftKey && !ev.altKey
         && (ev.key === 'q' || ev.key === 'Q' || ev.code === 'KeyQ')) {
       ev.preventDefault();
       ev.stopPropagation();
-      if (dashboard?.isOpen() || palette?.isOpen() || historySearch?.isOpen() || recipeForm?.isOpen()) return;
+      if (otherOverlayOpen('queue')) return;
       if (queueInputOpen) closeQueueInput();
       else openQueueInput();
       return;
@@ -1312,15 +1406,19 @@ function showRestoreOverlay(manifest) {
   // «начать пусто» принято за спиной, весь список проектов потерян) и только
   // ВТОРЫМ уже закрывался сам дашборд. Игнорируем оба ключа, если сверху
   // открыт любой другой оверлей — тогда событие без preventDefault уходит
-  // тому, кто ЕГО реально должен обработать (единый стек оверлеев — задача
-  // следующей фазы, здесь достаточно точечной проверки).
-  function otherOverlayOpen() {
-    return !!(dashboard?.isOpen() || palette?.isOpen() || peek?.isOpen() || historySearch?.isOpen()
-      || recipeForm?.isOpen());
-  }
-
+  // тому, кто ЕГО реально должен обработать.
+  //
+  // I1 (ревью финальной волны): локальная копия этого списка ЗАМЕНЕНА на
+  // общий otherOverlayOpen(exclude) (см. определение выше по файлу, рядом с
+  // bindHotkeys) — раньше у ЭТОЙ копии не было queueInputOpen в списке:
+  // Ctrl+Q успевал развернуть #queue-input-row ПОД restore ДО того, как
+  // Ctrl+Q сам научился отказывать (см. фикс гарда Ctrl+Q выше) — тогда
+  // Escape долетал бы именно сюда первым (эта копия про очередь не знала) и
+  // startEmpty() срабатывал бы за спиной пользователя. Теперь оба места
+  // читают ОДИН и тот же реестр — пропустить будущий новый оверлей в одном
+  // из них, забыв про другое, структурно невозможно.
   function onKey(ev) {
-    if (otherOverlayOpen()) return;
+    if (otherOverlayOpen('restore')) return;
     if (ev.key === 'Enter') {
       ev.preventDefault();
       startRestore();
@@ -1414,10 +1512,26 @@ async function boot() {
   // тот же openTab(cwd, {sessionId}), которым восстановление воркспейса
   // (restoreFlow выше) резюмит сессии — sessions.js сам достраивает
   // `--resume <sessionId>` поверх конфигурационных args (FIX 3, ревью).
+  //
+  // I2 (ревью финальной волны фазы 7): restoreOverlaySkip() — ТОТ ЖЕ приём,
+  // что уже есть в newProject() и openWorkspace(), раньше пропущенный именно
+  // здесь. Сценарий А: старт с манифестом на 5 проектов → Ctrl+Shift+H →
+  // Enter на результате → вкладка открыта ЗА оверлеем restore (палитра/поиск
+  // рисуются ПОВЕРХ restore по z-index, см. Important 1 в openWorkspace() —
+  // но решение по restore ЕЩЁ не принято) → Esc на оверлее → startEmpty() →
+  // readyAndSync видит уже НЕПУСТОЙ tabStore (условие «пусто» не
+  // выполняется) → манифест перезаписан ОДНОЙ вкладкой, вчерашний состав
+  // потерян безвозвратно. Сценарий Б: вместо Esc — «Восстановить всё» →
+  // дубли вкладок И дубли живых сессий Claude. Открытие результата поиска =
+  // неявный отказ от restore, тот же принцип, что и у остальных действий,
+  // способных поднять вкладку мимо оверлея.
   historySearch = createSearch({
     root: $('search-root'),
     api: window.api,
-    onOpenResult: (cwd, sessionId) => openTab(cwd, { sessionId }),
+    onOpenResult: (cwd, sessionId) => {
+      if (restoreOverlaySkip) restoreOverlaySkip();
+      return openTab(cwd, { sessionId });
+    },
   });
 
   // Task 4 фазы 7 (рецепты промптов + именованные воркспейсы): мини-форма
