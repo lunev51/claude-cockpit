@@ -220,6 +220,26 @@ function createInMemoryNightJournal() {
   };
 }
 
+// Important 2 (ревью фикс-раунд 1, Task 2 фазы 8): term:write несёт не
+// только реальные клавиши пользователя, но и АВТООТВЕТЫ эмулятора xterm.js —
+// focus in/out (\x1b[I / \x1b[O — режим 1004 у нас реально включён, виден в
+// smoke-выводе), ответ на DSR (\x1b[24;80R), ответ на DA (\x1b[?1;2c). Без
+// фильтра простое перемещение окна кокпита (focus out/in) или ответ
+// терминала на запрос самого приложения внутри pty засчитывались бы как
+// «пользователь перехватил вкладку» — nightWatch.onUserInput() отменил бы
+// продолжение ночной смены МОЛЧА, и в журнале запись 'skipped user-took-over'
+// выглядела бы совершенно легитимно, хотя пользователь вкладку не трогал.
+// Вынесена в отдельную чистую функцию ради тестируемости (ipc.js целиком не
+// тестируется под node --test, require('electron') вне настоящего рантайма
+// не даёт объект). Стрелки (\x1b[A..D), голый Esc (\x1b без хвоста), Enter
+// (\r) — НАСТОЯЩИЙ пользовательский ввод, под регэксп не попадают (regex
+// требует \x1b[ + I/O/цифры;цифрыR/?цифры;c — одиночная буква A-D после
+// \x1b[ ни под одну из веток не подходит).
+function hasRealUserInput(data) {
+  const withoutReports = data.replace(/\x1b\[(?:I|O|\d+;\d+R|\?[\d;]+c)/g, '');
+  return withoutReports.length > 0;
+}
+
 // HH:MM из ms-таймстампа (локальное время) — брифом заказан именно этот
 // формат для тоста «Лимит: продолжу в HH:MM». Нечисловой/некорректный вход
 // (защита от неожиданной формы entry.detail) → '?', тост всё равно не падает.
@@ -240,7 +260,20 @@ function formatHHMM(ms) {
 // текстом. journal.append(entry) вызывается ВСЕГДА, независимо от исхода
 // тоста — запись в журнал первична, тост — побочный эффект поверх неё,
 // обёрнутый в try/catch, чтобы сбой форматирования не проглотил саму запись.
-function withNightToasts(journal) {
+//
+// wakeMarginMs — Minor 3 (ревью фикс-раунд 1): тост «продолжу в HH:MM» обязан
+// показывать момент РЕАЛЬНОГО продолжения (resetsAt + wakeMarginMs — см.
+// scheduleWaitAt() в night-watch.js), а не сам resetsAt (окно сброса), иначе
+// он систематически врёт на wakeMarginMs раньше настоящего момента вброса.
+//
+// Обращение к `nightWatch` (Minor 2 ниже) — ссылка на МОДУЛЬНУЮ let-переменную
+// (объявлена в начале файла, присваивается чуть позже, в registerIpc(), сразу
+// после createNightWatch()) — сама функция append() выполняется только
+// АСИНХРОННО, много позже полного создания nightWatch (по-настоящему первый
+// append произойдёт не раньше первого реального onTabStop/arm() из IPC), так
+// что к моменту вызова nightWatch уже гарантированно присвоен; отдельная
+// «ref-переменная» не нужна — closure и так видит актуальное значение.
+function withNightToasts(journal, wakeMarginMs) {
   return {
     ...journal,
     append(entry) {
@@ -248,14 +281,29 @@ function withNightToasts(journal) {
       try {
         if (!entry) return;
         switch (entry.type) {
-          case 'limit-stop':
-            notify(`Лимит: продолжу в ${formatHHMM(entry.detail)}`, 'info');
+          case 'limit-stop': {
+            // Minor 2 (ревью фикс-раунд 1): тостим ТОЛЬКО первый лимит-стоп
+            // цикла ожидания — при мульти-детекте (несколько вкладок встают
+            // по лимиту одна за другой, окно общее на аккаунт) N одинаковых
+            // тостов подряд не несут новой информации. pendingCount===1 в
+            // МОМЕНТ этой записи означает, что именно ОНА впервые открыла
+            // цикл (night-watch.js/onTabStop делает pending.push() ДО
+            // appendJournal({type:'limit-stop'}) — снапшот, снятый прямо
+            // здесь, синхронно внутри той же цепочки вызовов, уже видит
+            // свежий pending).
+            if (!nightWatch || nightWatch.snapshot().pendingCount !== 1) break;
+            notify(`Лимит: продолжу в ${formatHHMM(Number(entry.detail) + wakeMarginMs)}`, 'info');
             break;
+          }
           case 'wake-complete': {
             // detail — вида "N of M" (см. night-watch.js/runStagger) — тосту
             // нужно только N (сколько РЕАЛЬНО продолжили).
             const m = /^(\d+)/.exec(String(entry.detail || ''));
-            notify(`Ночная смена: продолжил ${m ? m[1] : '0'} вкладок`, 'info');
+            const n = m ? Number(m[1]) : 0;
+            // Minor 4 (ревью фикс-раунд 1): «продолжил 0 вкладок» (случай
+            // '0 of 0' — будильник выстрелил, продолжать было некого) — шум,
+            // не несёт пользы; запись в журнале остаётся, тоста не будет.
+            if (n > 0) notify(`Ночная смена: продолжил ${n} вкладок`, 'info');
             break;
           }
           case 'weekly-limit':
@@ -753,8 +801,27 @@ function registerIpc(win, opts = {}) {
       if (channel === 'tab:status') {
         const prev = lastStatusByTab.get(payload.tabId);
         lastStatusByTab.set(payload.tabId, payload.status);
-        if (nightWatch && payload.status === 'done' && prev === 'working') {
-          nightWatch.onTabStop(payload.tabId, prev);
+        // Minor 1 (ревью фикс-раунд 1): ядро (night-watch.js/processResumeTab,
+        // NO_RESUME_STATUSES) считает 'stuck' ПОЛНОСТЬЮ резюмируемым статусом
+        // на пробуждении — детект должен быть симметричен: вкладку могло
+        // пометить checkStuck() (>5 мин без вывода — типичная картина, пока
+        // Claude висит на исчерпанном лимите) НЕПОСРЕДСТВЕННО перед самим
+        // Stop-хуком, она всё ещё реально «работала». night-watch.js/onTabStop
+        // (уже отревьюженное ядро Task 1) требует ЛИТЕРАЛЬНО prevStatus==='working'
+        // (спека) — не трогаем ядро, нормализуем здесь, в обвязке, которая и
+        // владеет знанием о пятистатусной модели статусов sessions.js.
+        const wasWorking = prev === 'working' || prev === 'stuck';
+        // Important 1 (ревью фикс-раунд 1): детект теперь ТАКЖЕ требует
+        // ДОКАЗАННОГО поколения (payload.genProven, см. sessions.js/applyHookEvent,
+        // ветка 'Stop') — без этого гарда сторонний процесс ТОЙ ЖЕ сессии вне
+        // кокпита (маршрутизация по session_id, gen:null — заявленная фича
+        // port-file, см. I4 фазы 7) мог бы завершить СВОЮ задачу и подложить
+        // working→done вкладке кокпита, которая в это время реально работала
+        // над своей — ночная смена восприняла бы это как остановку по лимиту
+        // и позже вбросила бы «продолжай» в живой ввод чужой (в смысле не
+        // связанной с этим событием) сессии.
+        if (nightWatch && payload.status === 'done' && wasWorking && payload.genProven === true) {
+          nightWatch.onTabStop(payload.tabId, 'working');
         }
       }
       // Task 2 фазы 4: тот же поток, что шлёт tab:status в renderer, — тостер
@@ -783,6 +850,19 @@ function registerIpc(win, opts = {}) {
   // безвреден и в smoke (арминг там всё равно недостижим — см. nightToggleHandler
   // с гейтом `if (smoke) return null;` до обращения к nightWatch вообще).
   lastStatusByTab = new Map();
+  const nightCfg = getConfig().nightWatch;
+  // Minor 5 (ревью фикс-раунд 1): пачка Stop'ов в разных вкладках (окно
+  // общее на аккаунт — вполне реалистично, если несколько сессий упёрлись в
+  // лимит примерно одновременно) звала бы usagePoller.refresh() параллельно,
+  // мимо уже существующей single-flight защиты manualRefreshInFlight (та
+  // покрывает только IPC-путь 'usage:refresh') — риск словить 429 от
+  // Anthropic и уйти в 10-минутный stale-бэкофф поллера, из-за которого
+  // СЛЕДУЮЩИЙ настоящий лимит-стоп получил бы no-usage-data и не продолжился
+  // бы ночью вовсе. Конкурентные детекты теперь делят ОДИН сетевой запрос.
+  let usageRefreshInFlight = null;
+  const refreshUsage = () => usageRefreshInFlight
+    || (usageRefreshInFlight = Promise.resolve(usagePoller.refresh())
+      .finally(() => { usageRefreshInFlight = null; }));
   nightWatch = createNightWatch({
     now: Date.now,
     // unref — так же, как stuckTimer/usageMonitorTimer ниже: таймеры ночной
@@ -794,7 +874,7 @@ function registerIpc(win, opts = {}) {
       return id;
     },
     clearTimer: (id) => clearTimeout(id),
-    refreshUsage: () => usagePoller.refresh(),
+    refreshUsage,
     getTabStatus: (tabId) => {
       const tab = manager.list().find((t) => t.tabId === tabId);
       return tab ? tab.status : null;
@@ -812,8 +892,9 @@ function registerIpc(win, opts = {}) {
     powerBlocker: smoke ? createNoopPowerBlocker() : createRealPowerBlocker(),
     journal: withNightToasts(
       smoke ? createInMemoryNightJournal() : createNightJournal({ file: nightJournalFile() }),
+      nightCfg.wakeMarginMs,
     ),
-    config: getConfig().nightWatch,
+    config: nightCfg,
   });
 
   // Мост создаётся ПОСЛЕ manager — маршрутизация по tabId из env pty,
@@ -1256,12 +1337,16 @@ function registerIpc(win, opts = {}) {
     const { tabId, data } = payload;
     if (typeof tabId !== 'string' || typeof data !== 'string') return;
     manager.write(tabId, data);
-    // Task 2 фазы 8 («Ночная смена»): единственный путь клавиатуры пользователя
-    // в pty (спека, раздел «Точки интеграции») — если пользователь сам
-    // перехватил вкладку после остановки по лимиту, ядро не должно позже
-    // вбросить туда «продолжай» поверх его ручного ввода (processResumeTab в
-    // night-watch.js сверяет lastInputAt с моментом детекта).
-    if (nightWatch) nightWatch.onUserInput(tabId);
+    // Task 2 фазы 8 («Ночная смена»): term:write — основной путь клавиатуры
+    // пользователя в pty (спека, раздел «Точки интеграции»), но не ЕДИНСТВЕННЫЙ
+    // по содержимому — вперемешку с реальными клавишами сюда же прилетают
+    // автоответы эмулятора xterm.js (см. hasRealUserInput() выше, Important 2
+    // ревью фикс-раунда 1). Если пользователь сам перехватил вкладку после
+    // остановки по лимиту, ядро не должно позже вбросить туда «продолжай»
+    // поверх его ручного ввода (processResumeTab в night-watch.js сверяет
+    // lastInputAt с моментом детекта) — но голый автоответ терминала не
+    // должен считаться таким перехватом.
+    if (nightWatch && hasRealUserInput(data)) nightWatch.onUserInput(tabId);
   });
 
   ipcMain.on('term:resize', (_e, payload) => {
@@ -1366,4 +1451,8 @@ module.exports = {
   // Task 2 фазы 8 («Ночная смена»): та же причина — см. комментарий у их
   // определения выше.
   nightToggleHandler, nightGetHandler,
+  // Important 2 (ревью фикс-раунд 1, Task 2 фазы 8): чистая функция без
+  // Electron — экспортирована ради собственного юнит-теста (см. комментарий
+  // у определения выше).
+  hasRealUserInput,
 };

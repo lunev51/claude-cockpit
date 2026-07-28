@@ -122,12 +122,19 @@ function createSessionManager({
     return { tabId, cwd, name };
   }
 
-  function setStatus(tab, status, subtitle) {
+  // extra (Important 1, ревью Task 2 фазы 8) — необязательный объект,
+  // домешиваемый в payload 'tab:status' ПОВЕРХ обычных полей. Единственный
+  // вызывающий, который его передаёт, — ветка 'Stop' в applyHookEvent ниже
+  // (поле genProven — см. подробный комментарий там). Остальные вызовы
+  // setStatus() не передают extra вовсе, так что их payload не меняется НИ
+  // НА БАЙТ — `...(extra || {})` от undefined добавляет пустой объект.
+  function setStatus(tab, status, subtitle, extra) {
     tab.status = status;
     if (typeof subtitle === 'string') tab.subtitle = subtitle;
     if (status !== 'waiting') tab.waitingText = '';
     onEvent('tab:status', {
       tabId: tab.tabId, status, subtitle: tab.subtitle, waitingText: tab.waitingText,
+      ...(extra || {}),
     });
   }
 
@@ -551,7 +558,22 @@ function createSessionManager({
         });
         break;
       case 'Stop':
-        setStatus(tab, 'done', '');
+        // Important 1 (ревью Task 2 фазы 8, «Ночная смена»): night-watch.js
+        // детектит остановку по лимиту через working→done на 'tab:status', а
+        // не через собственный гард поколения — до этого фикса он доверял
+        // ЛЮБОМУ working→done, включая пришедший от СТОРОННЕГО процесса той
+        // же сессии (маршрутизация по session_id, gen:null — заявленная
+        // фича port-file, см. I4 выше). Сценарий отказа: сессия S открыта во
+        // вкладке B кокпита И в обычном терминале снаружи; внешний процесс
+        // завершает СВОЮ задачу и шлёт Stop без COCKPIT_TAB_GEN → статус B
+        // уезжает в 'done', хотя B всё это время реально работала над своей —
+        // ночная смена посчитала бы это остановкой по лимиту и позже вбросила
+        // бы «продолжай» в живой ввод B. genProven здесь — ТОТ ЖЕ флаг, что
+        // уже гейтит injectQueuedOnStop чуть ниже (см. его определение выше
+        // по функции) — прокидываем его же в payload 'tab:status', чтобы
+        // обвязка ipc.js могла потребовать ДОКАЗАННОЕ поколение и для детекта
+        // ночной смены, тем же приёмом, что уже защищает вброс очереди.
+        setStatus(tab, 'done', '', { genProven });
         // Task 1 фазы 7 (очередь промптов): вбрасываем СТРОГО один элемент
         // очереди на этот Stop — не всю очередь разом. Гарды (pty жив,
         // очередь непуста) — внутри injectQueuedOnStop(). I4 (ревью финальной

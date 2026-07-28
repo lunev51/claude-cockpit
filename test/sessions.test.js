@@ -1131,6 +1131,64 @@ test('applyHookEvent: gen не передан (I4 — сторонняя сес�
   assert.deepStrictEqual(changed[changed.length - 1].queue, ['текст']);
 });
 
+// ---------- Important 1 (ревью Task 2 фазы 8, «Ночная смена»): genProven в payload 'tab:status' ----------
+// Ночная смена (main/ipc.js) детектит остановку по лимиту на переходе
+// working→done, беря сигнал из 'tab:status' — она НЕ имеет доступа к
+// gen/tab.gen напрямую (это внутреннее состояние sessions.js). Без genProven
+// в payload обвязка не могла бы отличить «наша собственная вкладка
+// действительно встала» от «сторонний процесс той же сессии просто закончил
+// СВОЮ задачу» (I4 — маршрутизация по session_id без COCKPIT_TAB_GEN,
+// заявленная фича port-file). genProven — тот же флаг, что уже гейтит
+// injectQueuedOnStop, теперь виден и снаружи функции.
+
+test('Stop с ДОКАЗАННЫМ (текущим) поколением → tab:status несёт genProven:true', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  const gen = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  mgr.applyHookEvent(a.tabId, 'Stop', {}, gen);
+  const st = statusOf(events, a.tabId);
+  assert.strictEqual(st.status, 'done');
+  assert.strictEqual(st.genProven, true);
+});
+
+test('Stop от session_id-маршрута БЕЗ доказанного поколения (I4 — сторонний процесс) → статус двигается, но genProven:false', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'Stop', {}); // gen не передан вовсе — недоказанное поколение
+  const st = statusOf(events, a.tabId);
+  assert.strictEqual(st.status, 'done', 'статус ДОЛЖЕН двигаться — заявленная фича port-file');
+  assert.strictEqual(st.genProven, false, 'но флаг доказанности обязан быть ложным — ночная смена не должна детектить это как «свою» остановку');
+});
+
+test('Stop с УСТАРЕВШИМ (не текущим) поколением → событие отбрасывается ЦЕЛИКОМ, genProven не при чём (событие не приходит вовсе)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  const staleGen = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  mgr.restart(a.tabId);
+  const before = statusOf(events, a.tabId);
+  mgr.applyHookEvent(a.tabId, 'Stop', {}, staleGen); // чужое (устаревшее) поколение — гард отсекает ВСЁ событие
+  assert.deepStrictEqual(statusOf(events, a.tabId), before, 'устаревшее поколение не должно было произвести вообще никакого tab:status');
+});
+
+test('остальные ветки applyHookEvent (SessionStart/PreToolUse/UserPromptSubmit) НЕ получают genProven в payload — форма события не изменилась', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'sess-1' });
+  assert.ok(!Object.prototype.hasOwnProperty.call(statusOf(events, a.tabId), 'genProven'));
+  mgr.applyHookEvent(a.tabId, 'PreToolUse', { tool_name: 'Bash' });
+  assert.ok(!Object.prototype.hasOwnProperty.call(statusOf(events, a.tabId), 'genProven'));
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', {});
+  assert.ok(!Object.prototype.hasOwnProperty.call(statusOf(events, a.tabId), 'genProven'));
+});
+
 // ---------- Important 1 (ревью раунд 1, обязательная правка): gen должен быть глобальным, а не по вкладке ----------
 
 test('genSeq глобален: первые спавны РАЗНЫХ вкладок получают РАЗНЫЕ поколения, а не одинаковый gen:1 у каждой', () => {

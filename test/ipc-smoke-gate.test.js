@@ -18,7 +18,7 @@ const {
   historySearchHandler, historyRefreshHandler, createHistoryIndexState, HISTORY_INDEX_TTL_MS,
   recipesListHandler, recipesSavePromptHandler, recipesDeletePromptHandler,
   recipesListWorkspacesHandler, recipesSaveWorkspaceHandler, recipesDeleteWorkspaceHandler,
-  nightToggleHandler, nightGetHandler,
+  nightToggleHandler, nightGetHandler, hasRealUserInput,
 } = require('../src/main/ipc');
 
 // gitInfo/ghInfo-заглушки, которые ПАДАЮТ, если их дёрнули: смоук-гейт по
@@ -397,4 +397,56 @@ test('nightGetHandler: smoke:false → отдаёт nightWatch.snapshot() как
   const nightWatch = { snapshot: () => ({ armed: true, pendingCount: 2 }) };
   const res = nightGetHandler({ smoke: false, nightWatch });
   assert.deepStrictEqual(res, { armed: true, pendingCount: 2 });
+});
+
+// ------------------------------------------------------------ hasRealUserInput --
+// Important 2 (ревью фикс-раунд 1, Task 2 фазы 8): term:write несёт не
+// только клавиши пользователя, но и автоответы эмулятора xterm.js (focus
+// 1004 in/out, ответ на DSR, ответ на DA) — без фильтра они засчитывались бы
+// как «пользователь перехватил вкладку» и молча гасили продолжение ночной
+// смены. Стрелки/Esc/Enter обязаны ПРОЙТИ фильтр как настоящий ввод.
+
+test('hasRealUserInput: обычный текст/буквы → true', () => {
+  assert.strictEqual(hasRealUserInput('привет'), true);
+  assert.strictEqual(hasRealUserInput('a'), true);
+});
+
+test('hasRealUserInput: Enter (\\r) → true', () => {
+  assert.strictEqual(hasRealUserInput('\r'), true);
+});
+
+test('hasRealUserInput: голый Esc (без хвоста) → true', () => {
+  assert.strictEqual(hasRealUserInput('\x1b'), true);
+});
+
+test('hasRealUserInput: стрелки (\\x1b[A..D) → true, НЕ вырезаются регэкспом', () => {
+  assert.strictEqual(hasRealUserInput('\x1b[A'), true); // вверх
+  assert.strictEqual(hasRealUserInput('\x1b[B'), true); // вниз
+  assert.strictEqual(hasRealUserInput('\x1b[C'), true); // вправо
+  assert.strictEqual(hasRealUserInput('\x1b[D'), true); // влево
+});
+
+test('hasRealUserInput: чистый focus-репорт (\\x1b[I / \\x1b[O, режим 1004) → false', () => {
+  assert.strictEqual(hasRealUserInput('\x1b[I'), false);
+  assert.strictEqual(hasRealUserInput('\x1b[O'), false);
+});
+
+test('hasRealUserInput: чистый ответ на DSR (\\x1b[24;80R) → false', () => {
+  assert.strictEqual(hasRealUserInput('\x1b[24;80R'), false);
+});
+
+test('hasRealUserInput: чистый ответ на DA (\\x1b[?1;2c) → false', () => {
+  assert.strictEqual(hasRealUserInput('\x1b[?1;2c'), false);
+});
+
+test('hasRealUserInput: несколько автоответов подряд, ничего кроме них → false', () => {
+  assert.strictEqual(hasRealUserInput('\x1b[I\x1b[24;80R\x1b[O'), false);
+});
+
+test('hasRealUserInput: автоответ + реальная клавиша в одном батче → true (реальный ввод остаётся после вырезания репорта)', () => {
+  assert.strictEqual(hasRealUserInput('\x1b[Ia'), true);
+});
+
+test('hasRealUserInput: пустая строка → false', () => {
+  assert.strictEqual(hasRealUserInput(''), false);
 });
