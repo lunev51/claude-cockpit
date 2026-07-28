@@ -8,3 +8,7 @@ vendorwhisper-cuda/
 .superpowers/
 .cockpit-shots/
 smoke-err.txt
+# Гигиена (ревью финальной волны фазы 7): .claude/ — локальные настройки
+# Claude Code этого чекаута (permissions/hooks сессии разработки), не артефакт
+# сборки и не часть продукта — не должен уехать в PR первым же `git add -A`.
+.claude/

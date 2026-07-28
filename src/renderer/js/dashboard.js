@@ -62,9 +62,14 @@ function formatTime(ms) {
 
 // Коды ошибок ghInfo.getRepo/getGlobal ('no-gh'|'auth'|'failed') → человеко-
 // читаемая причина для пустых состояний раздела GitHub (бриф §Task 4 фазы 6).
+// Находка 4 (carryover ревью фазы 6, задача 5 фазы 7): без ключа 'failed'
+// фолбэк ниже (ghErrorText) отдавал общий текст «GitHub недоступен» — тот же
+// класс находки, что уже чинили у LIMITS_ERROR_TEXT выше, только для другой
+// карты (gh-info.js, а не usage-oauth.js).
 const GH_ERROR_TEXT = {
   'no-gh': 'gh не установлен',
   auth: 'gh не авторизован',
+  failed: 'не удалось получить данные — попробуйте «Обновить»',
 };
 
 function ghErrorText(error) {
@@ -326,7 +331,15 @@ export function createDashboard({
     return section;
   }
 
-  function renderChartBars(barsHost, byDay) {
+  // hintEl — строка в заголовке секции: по умолчанию показывает единицы
+  // измерения, при наведении на колонку — точные цифры её дня (живая приёмка
+  // фазы 7: системный title не работал — у столбика в 2-3px некуда попасть
+  // курсором, плюс секундная задержка нативной подсказки; поэтому зона
+  // наведения — ВСЯ колонка на высоту графика, а вывод мгновенный и в
+  // фиксированном месте).
+  const CHART_HINT_DEFAULT = '$ за день · наведи на столбик';
+
+  function renderChartBars(barsHost, byDay, hintEl) {
     barsHost.textContent = '';
     const slice = byDay.slice(-chartPreset);
     if (!slice.length) {
@@ -337,14 +350,31 @@ export function createDashboard({
       return;
     }
     const maxCost = slice.reduce((m, d) => Math.max(m, d.costUsd), 0);
+    // Живая приёмка фазы 7: высота столбиков ничего не говорила — ни единиц,
+    // ни масштаба. Подписываем ЗНАЧЕНИЕ над столбиком-максимумом (он задаёт
+    // масштаб всей сетки: остальные — доли от него); каждое из 30 значений
+    // не подписать — 10px-цифры слипнутся, для точечных цифр есть наведение.
+    // При нескольких равных максимумах подписываем первый — остальные видны
+    // по одинаковой высоте.
+    const maxIdx = slice.findIndex((d) => d.costUsd === maxCost);
     slice.forEach((d, i) => {
+      // Колонка на полную высоту графика — hover-мишень; заливка-столбик
+      // прижата к её низу.
+      const col = document.createElement('div');
+      col.className = 'chart-col';
+
       const bar = document.createElement('div');
       bar.className = 'chart-bar';
       // Минимум 2% высоты — нулевой/почти нулевой день остаётся видимым
       // штрихом, а не пропадает из сетки полностью.
       const h = maxCost > 0 ? Math.max(2, Math.round((d.costUsd / maxCost) * 100)) : 2;
       bar.style.height = `${h}%`;
-      bar.title = `${formatShortDate(d.date)}: ${formatUsd(d.costUsd)}, ${formatTokens(d.tokens)} токенов`;
+      if (i === maxIdx && maxCost > 0) {
+        const value = document.createElement('span');
+        value.className = 'chart-bar-value';
+        value.textContent = formatUsd(d.costUsd);
+        bar.appendChild(value);
+      }
       // Подпись даты под каждым 5-м баром (бриф), считая от начала видимого среза.
       if (i % 5 === 0) {
         const label = document.createElement('span');
@@ -352,7 +382,23 @@ export function createDashboard({
         label.textContent = formatShortDate(d.date);
         bar.appendChild(label);
       }
-      barsHost.appendChild(bar);
+      col.appendChild(bar);
+
+      if (hintEl) {
+        col.addEventListener('mouseenter', () => {
+          // «(вкл. кэш)» — живая приёмка фазы 7: 97% дневных токенов обычно
+          // кэш-чтения (перечитывание контекста на каждый запрос), они в
+          // ~10 раз дешевле обычного ввода — поэтому токены и высота
+          // столбика ($) друг другу не пропорциональны, и это не баг.
+          hintEl.textContent = `${formatShortDate(d.date)} · ${formatUsd(d.costUsd)} · ${formatTokens(d.tokens)} токенов (вкл. кэш)`;
+          hintEl.classList.add('active');
+        });
+        col.addEventListener('mouseleave', () => {
+          hintEl.textContent = CHART_HINT_DEFAULT;
+          hintEl.classList.remove('active');
+        });
+      }
+      barsHost.appendChild(col);
     });
   }
 
@@ -366,6 +412,14 @@ export function createDashboard({
     title.className = 'dashboard-section-title';
     title.textContent = 'Расход по дням';
     header.appendChild(title);
+    // Живая приёмка фазы 7: без пояснения единиц было «непонятно, что
+    // конкретно показывают столбики». $ — данные ccusage (те же, что карточка
+    // «Расход» выше); при наведении на колонку сюда выводятся точные цифры
+    // её дня (см. renderChartBars).
+    const hint = document.createElement('span');
+    hint.className = 'dashboard-chart-hint';
+    hint.textContent = CHART_HINT_DEFAULT;
+    header.appendChild(hint);
 
     const presets = document.createElement('div');
     presets.className = 'dashboard-chart-presets';
@@ -392,7 +446,7 @@ export function createDashboard({
 
     const bars = document.createElement('div');
     bars.className = 'dashboard-chart-bars';
-    renderChartBars(bars, Array.isArray(spend.byDay) ? spend.byDay : []);
+    renderChartBars(bars, Array.isArray(spend.byDay) ? spend.byDay : [], hint);
     section.appendChild(bars);
 
     return section;

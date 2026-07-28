@@ -14,8 +14,11 @@ const GROUP_OF = {
 
 // Task 4 фазы 6 (бейдж PR): классификация checks ('passing'|'failing'|'pending'|
 // 'none') → CSS-модификатор .tab-pr-badge. Черновик (isDraft) визуально
-// приглушаем так же, как 'none' (нет проверок) — бриф явно требует --text-dim
-// для «нет проверок/черновик», не выделяя эти два случая цветом отдельно.
+// приглушаем так же, как 'none' (нет проверок) — бриф требует единого
+// приглушённого стиля для «нет проверок/черновик» (app.css/.tab-pr-badge.none,
+// --text-muted + заливка color-mix от --text-muted после carryover фазы 6:
+// --bg-card сливался с фоном активной строки), не выделяя эти два случая
+// цветом отдельно.
 function prBadgeClass(pr) {
   if (pr.isDraft) return 'none';
   return pr.checks === 'passing' || pr.checks === 'failing' || pr.checks === 'pending'
@@ -194,6 +197,19 @@ export function createTabStore({
     };
   }
 
+  // C1 (ревью финальной волны фазы 7): текущий статус вкладки по tabId — или
+  // null, если вкладка неизвестна/уже закрыта. app.js использует это перед
+  // ЛЮБОЙ записью команды+'\r' в pty АКТИВНОЙ вкладки (рецепт/панель действий/
+  // палитровые «/compact»,«/remote-control») — если вкладка сейчас 'waiting'
+  // (ждёт ответа на диалог разрешения Claude Code), завершающий '\r' молча
+  // подтвердил бы подсвеченный вариант диалога, а сам текст команды был бы
+  // потерян. Тот же r.status, что уже использует placeRow()/trigger() выше —
+  // не отдельный источник правды.
+  function statusOf(tabId) {
+    const r = rows.get(tabId);
+    return r ? r.status : null;
+  }
+
   function setConnectVisible(tabId, visible) {
     const r = rows.get(tabId);
     if (r) r.connectBtn.classList.toggle('hidden', !visible);
@@ -249,6 +265,7 @@ export function createTabStore({
     remove,
     setActive,
     setStatus,
+    statusOf,
     setConnectVisible,
     setPr,
     neighborOf,

@@ -48,7 +48,21 @@ function main() {
     // его вкладки. У СТОРОННИХ claude-сессий той же папки (запущенных вручную,
     // не из кокпита) такой переменной нет — им достанется tabId: null, и мост
     // не сможет спутать их с чужой вкладкой по одному лишь cwd/session_id.
-    const payload = JSON.stringify({ event, data, tabId: process.env.COCKPIT_TAB_ID || null });
+    //
+    // gen (доп. находка ревью Task 1 фазы 7, задача 5): COCKPIT_TAB_GEN —
+    // поколение pty-процесса на момент ЕГО спавна (sessions.js/spawn()), тоже
+    // наследуется только потомками вкладки кокпита. Мост сверяет его с
+    // ТЕКУЩИМ поколением вкладки — если к моменту, когда этот хук долетел,
+    // вкладка уже успела перезапуститься/закрыться (новое поколение), событие
+    // отбрасывается целиком: оно принадлежит уже мёртвому процессу и не
+    // должно ничего менять в новой сессии (в т.ч. вбрасывать очередь
+    // промптов на Stop). Нет переменной (сторонняя сессия, гипотетический
+    // старый мост) — gen: null, мост тогда не гардит поколение вовсе.
+    const rawGen = Number(process.env.COCKPIT_TAB_GEN);
+    const gen = Number.isInteger(rawGen) && rawGen > 0 ? rawGen : null;
+    const payload = JSON.stringify({
+      event, data, tabId: process.env.COCKPIT_TAB_ID || null, gen,
+    });
     try {
       const req = http.request({
         host: '127.0.0.1',

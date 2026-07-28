@@ -5,6 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const https = require('https');
+const readline = require('readline');
 const { execFile } = require('child_process');
 const { ipcMain, shell, dialog, app, clipboard } = require('electron');
 const { getConfig, setConfig } = require('./config');
@@ -21,6 +22,11 @@ const { createUsagePoller } = require('./usage-oauth');
 const { createCcusage } = require('./usage-ccusage');
 const { createGitInfo } = require('./git-info');
 const { createGhInfo } = require('./gh-info');
+const { createRunners } = require('./runners');
+const { createHistoryIndex } = require('./history-index');
+const {
+  createRecipeStore, extractPlaceholders, fillPrompt, normalizeForPty,
+} = require('./recipes');
 
 let manager = null;
 let smokeOutput = '';
@@ -33,6 +39,18 @@ let usagePoller = null;  // поллер официальных лимитов (
 let ccusage = null;      // слой расходов ccusage (usage-ccusage.js) — слой B
 let gitInfo = null;      // Task 2 фазы 6 (панель диффа): git-info.js, чистое ядро + реальный run()
 let ghInfo = null;       // Task 4 фазы 6 (панель GitHub): gh-info.js, чистое ядро + реальный run()
+let runners = null;      // Task 5 carryover фазы 6 (задача 5 фазы 7): runners.js, реестр процессов + раннеры npx/git/gh
+let recipeStore = null;       // Task 4 фазы 7 (рецепты + именованные воркспейсы): recipes.js, чистое ядро + реальные пути в userData
+let historyIndex = null;      // Task 3 фазы 7 (поиск истории): history-index.js, чистое ядро + реальные зависимости
+// I5 (ревью финальной волны фазы 7): состояние ленивого индекса истории —
+// единый мутируемый объект (createHistoryIndexState(), см. ниже) вместо
+// россыпи независимых let-переменных. builtAt (было historyIndexBuilt —
+// boolean, взводимый РОВНО ОДИН РАЗ за жизнь окна) заменён на timestamp: 0 —
+// «индекс ещё ни разу не строился», иначе — момент последнего успешного
+// refresh(). Кокпит держат открытым сутками (обычный день, не край) — сессии,
+// созданные ПОСЛЕ первого поиска, не искались до перезапуска кокпита вовсе.
+// Подробности TTL — у HISTORY_INDEX_TTL_MS/historySearchHandler() ниже.
+let historyIndexState = null;
 let usageMonitorTimer = null; // лёгкий сторож (только snapshot(), без сети) — рассылает usage:update
 let lastBroadcastKey = null;    // `fetchedAt|stale|error` последнего разосланного usage:update — см. usageBroadcastKey()
 let lastCcusageResult = null;   // последний известный ответ ccusage.get() — уходит и в usage:get/usage:refresh, и в usage:update
@@ -110,6 +128,26 @@ function usageCcusageCacheFile() {
   return path.join(app.getPath('userData'), 'usage-ccusage.json');
 }
 
+// Task 3 фазы 7 (поиск истории): тот же файл-кэш, что и у слоёв usage выше —
+// createJsonFileCache ниже используется третий раз, каждый со своим путём.
+function historyIndexCacheFile() {
+  return path.join(app.getPath('userData'), 'history-index.json');
+}
+
+// Task 4 фазы 7 (рецепты + именованные воркспейсы): два независимых файла в
+// userData — recipes.js сам про app.getPath() ничего не знает (чистое ядро),
+// пути резолвит только этот файл, тот же приём, что historyIndexCacheFile выше.
+function promptsFile() {
+  return path.join(app.getPath('userData'), 'prompts.json');
+}
+
+function workspacesLibraryFile() {
+  // Имя НЕ workspace.json — тот файл уже занят манифестом текущего состава
+  // вкладок (workspace.js/createWorkspaceStore, переменная store выше); это
+  // отдельная библиотека ИМЕНОВАННЫХ, явно сохранённых пользователем профилей.
+  return path.join(app.getPath('userData'), 'workspaces-library.json');
+}
+
 // JSON-файл кэша: read/write в try/catch (битый/отсутствующий файл → null,
 // ошибка записи — не критична, просто предупреждение). Оба слоя используют
 // эту же фабрику, каждый со своим путём.
@@ -168,224 +206,86 @@ function usageHttpGet(url, headers) {
   });
 }
 
-// Задача 5 фазы 6 (carryover): реестр живых дочерних процессов всех трёх
-// раннеров ниже (runCcusage/gitRun/ghRun) — pid → ChildProcess, который
-// вернул сам execFile(). Нужен по двум причинам:
-//   (а) execFile(..., {shell:true, timeout}) на Windows спавнит cmd.exe,
-//       который сам спавнит РЕАЛЬНЫЙ процесс (node.exe при npx, gh.exe и
-//       т.п.) — это ВНУК, а не прямой child_process. Штатный timeout/kill()
-//       у execFile убивает только cmd.exe; внук остаётся жить осиротевшим
-//       (например, npx продолжает молотить сеть уже после того, как main
-//       решил, что вызов провалился по таймауту).
-//   (б) disposeSessions() (закрытие приложения) раньше вообще не трогал эти
-//       execFile — если git/gh/npx ещё выполнялись в момент выхода, они
-//       переживали родительский процесс Electron целиком.
-// Убираем запись из реестра сами по событию 'exit' — так disposeSessions()
-// всегда видит актуальный набор РЕАЛЬНО ещё живых процессов, а не тех, что
-// уже успели завершиться штатно.
-const liveChildren = new Map();
+// Раннеры внешних CLI (npx/git/gh) + реестр процессов + watchdog принудительной
+// уборки дерева (runCcusage/gitRun/ghRun/killProcessTree/armKillWatchdog) —
+// вынесены в runners.js (Task 5 carryover фазы 6, задача 5 фазы 7): execFile
+// там инжектируется, что впервые даёт покрыть реестр/killProcessTree/
+// armKillWatchdog тестами (test/runners.test.js) — раньше эта логика жила
+// прямо здесь вперемешку с require('electron'), а ipc.js целиком не
+// тестируется. Инстанс создаётся ниже, в registerIpc() (runners = createRunners({execFile})),
+// тем же приёмом, что gitInfo/ghInfo — конструктор безопасно создавать
+// безусловно, I/O он сам по себе не делает.
 
-function trackChild(child) {
-  if (child && typeof child.pid === 'number') {
-    liveChildren.set(child.pid, child);
-    child.once('exit', () => liveChildren.delete(child.pid));
+// --- Task 3 фазы 7 (глобальный поиск истории): реальные зависимости для
+// createHistoryIndex (history-index.js, Task 2, чистое ядро — listProjects/
+// readFileLines/stat/cache только инжектируются, сам модуль ни fs, ни path,
+// ни electron не видит).
+
+function historyProjectsRoot() {
+  return path.join(os.homedir(), '.claude', 'projects');
+}
+
+// listProjects() → массив {projectDir, sessionId, filePath} — ТОЛЬКО файлы
+// ПЕРВОГО уровня <project>/<sessionId>.jsonl, БЕЗ рекурсии. ВАЖНО (ревью
+// задачи 2): вложенные транскрипты субагентов живут в
+// <project>/<sessionId>/subagents/agent-*.jsonl — рекурсивный обход захватил
+// бы их как «сессии» и замусорил индекс тем, что вне контракта history-index.js.
+// withFileTypes+isFile() — тот же фильтр, что временная живая проверка задачи 2
+// (task-2-report.md) уже подтвердила на реальных данных этой машины (47
+// сессий, ровно столько же, сколько верхнеуровневых .jsonl файлов).
+async function listHistoryProjects() {
+  const base = historyProjectsRoot();
+  let projectDirs;
+  try {
+    projectDirs = await fs.promises.readdir(base, { withFileTypes: true });
+  } catch {
+    return []; // ~/.claude/projects ещё нет (свежая машина/чистый профиль) — истории нет
   }
-  return child;
+  const out = [];
+  for (const pd of projectDirs) {
+    if (!pd.isDirectory()) continue;
+    const projectDir = path.join(base, pd.name);
+    let files;
+    try {
+      files = await fs.promises.readdir(projectDir, { withFileTypes: true });
+    } catch {
+      continue; // папка проекта исчезла между двумя readdir — пропустить
+    }
+    for (const f of files) {
+      if (!f.isFile() || !f.name.toLowerCase().endsWith('.jsonl')) continue;
+      out.push({
+        projectDir,
+        sessionId: f.name.slice(0, -'.jsonl'.length),
+        filePath: path.join(projectDir, f.name),
+      });
+    }
+  }
+  return out;
 }
 
-// Убивает дерево процессов по pid: taskkill /PID <pid> /T /F.
-//
-// УТОЧНЁННОЕ ПРАВИЛО ПРОЕКТА (после живой проверки задачи 5): запрет на
-// `taskkill /F` касается ЗАВЕРШЕНИЯ САМОГО ПРИЛОЖЕНИЯ КОКПИТА в тестах и
-// живых проверках — жёсткое убийство электрона мимо его обработчиков выхода
-// прячет баги (так один раз проглядели обнуление манифеста воркспейса).
-// К ЭТИМ процессам (headless-помощники runCcusage/gitRun/ghRun — npx/gh/git)
-// это соображение не относится: у них нет состояния, которое нужно сохранить
-// корректным выходом, они headless (нет окна/UI, которые могли бы потерять
-// несохранённое), и killProcessTree() зовётся ТОЛЬКО когда они уже либо
-// просрочили свой собственный таймаут (killTreeOnTimeout), либо приложение
-// закрывается, а они всё ещё висят (disposeSessions()) — то есть их штатное
-// время уже вышло. Здесь `/F` — не обход правила, а его точное применение:
-// для завершения ПОМОЩНИКОВ (не самого кокпита) он разрешён и необходим.
-//
-// Почему обязателен именно `/F`: эмпирически проверено (см. отчёт задачи 5) —
-// `taskkill /PID <pid> /T` БЕЗ `/F` на Windows структурно не может закрыть
-// headless-дерево (node.exe/gh.exe/git.exe без своего окна): ОС отвечает
-// «этот процесс можно завершить только принудительно», причём даже когда
-// цель ещё жива на момент вызова. То есть без `/F` вызов — чистая
-// косметика: создаёт ложное ощущение, что уборка сработала, а внук остаётся
-// висеть точно так же, как и без всякого фикса. `/T` — рекурсивно по всему
-// дереву потомков (лечит проблему (а) в комментарии реестра выше — убивает
-// не только cmd.exe, но и его внука node/gh).
-//
-// Колбэк-заглушка ниже — код возврата/ошибку taskkill сознательно
-// проглатываем: она падает, если процесс уже успел завершиться сам между
-// таймаутом/dispose и этим вызовом (гонка, не баг), и в любом случае это
-// best-effort уборка ПОСЛЕ факта — её неуспех не должен прерывать
-// (ни синхронно бросить, ни залогировать шумно) выход самого приложения.
-function killProcessTree(pid) {
-  if (typeof pid !== 'number') return;
-  execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, () => {});
+// stat(filePath) → {mtimeMs, size} — совпадает по именам полей с fs.Stats.
+async function statHistoryFile(filePath) {
+  const st = await fs.promises.stat(filePath);
+  return { mtimeMs: st.mtimeMs, size: st.size };
 }
 
-// Убивает дерево ПО ТАЙМАУТУ (err.killed — execFile сам взвёл SIGTERM/kill,
-// потому что процесс не уложился в options.timeout): по обычному коду
-// завершения (в т.ч. code!=0) дерево трогать не нужно — процесс и так уже
-// закончился сам, taskkill там был бы просто лишним no-op вызовом.
-// ВАЖНО (найдено живой проверкой задачи 5, после перехода на /F): это
-// ВТОРИЧНЫЙ, подстраховочный вызов — к моменту, когда колбэк execFile вообще
-// срабатывает с err.killed:true, Node УЖЕ дождался смерти child (это и есть
-// смысл колбэка — «процесс завершился»), то есть child.pid к этому моменту
-// как правило МЁРТВ, и taskkill /PID <мёртвый pid> /T /F не находит его,
-// чтобы пройтись по /T («не удалось найти этот процесс» — воспроизведено
-// эмпирически). Основную работу по факту делает armKillWatchdog() ниже —
-// он бьёт по дереву, ПОКА родитель ещё жив, ДО того как это увидит Node.
-function killTreeOnTimeout(err, child) {
-  if (err && err.killed) killProcessTree(child.pid);
-}
-
-// Запас времени, на который наш собственный вотчдог должен сработать РАНЬШЕ,
-// чем options.timeout самого execFile.
-const KILL_WATCHDOG_GUARD_MS = 500;
-
-// Проактивный вотчдог: форсит ДЕРЕВО по child.pid чуть РАНЬШЕ, чем истечёт
-// options.timeout execFile. Причина существования этой функции — тот же
-// вывод живой проверки, что и в комментарии killTreeOnTimeout выше: если
-// положиться ИСКЛЮЧИТЕЛЬНО на err.killed постфактум (внутри колбэка), к
-// этому моменту Node уже сам дождался смерти child и вызвал колбэк — то
-// есть pid уже мёртв, и taskkill (что с /F, что без) физически не может его
-// найти, чтобы пройтись по /T, а обречённый внук (node/gh) остаётся жить.
-// Вотчдог с ЧУТЬ меньшей задержкой (`timeoutMs - KILL_WATCHDOG_GUARD_MS`)
-// форсит дерево, ПОКА и cmd.exe/git/gh, и его потомки ЕЩЁ живы — это и есть
-// сценарий, который живая проверка подтвердила рабочим (taskkill /T /F
-// реально убивает всё дерево целиком, если процесс ещё существует на
-// момент вызова). Сам options.timeout execFile остаётся как страховочный
-// бэкстоп на случай, если наш вотчдог почему-то не сработал вовремя —
-// двойной защиты не бывает лишней, а повторный/поздний killProcessTree на
-// уже мёртвый pid безвреден (см. killProcessTree — ошибку глотаем).
-// .unref() — вотчдог не должен сам по себе держать процесс живым, если всё
-// остальное уже завершилось (симметрично stuckTimer/usageMonitorTimer ниже
-// по файлу).
-function armKillWatchdog(child, timeoutMs) {
-  const delay = Math.max(0, timeoutMs - KILL_WATCHDOG_GUARD_MS);
-  const timer = setTimeout(() => killProcessTree(child.pid), delay);
-  timer.unref?.();
-  return timer;
-}
-
-// Версия ccusage запинена сознательно (не @latest): скорость (npx не лезет
-// в реестр проверять свежую версию при КАЖДОМ вызове — a это на счету у
-// каждого usage:get/usage:refresh), предсказуемость (один и тот же формат
-// JSON-вывода тут и у клиента, а не «что там лежит в реестре сегодня») и
-// меньше supply-chain-поверхности (обновление версии — осознанный шаг в
-// коде, а не молчаливая подмена пакета выше по цепочке между двумя запусками).
-// Как обновлять: проверить changelog ccusage на breaking changes в формате
-// вывода `claude daily/session --json` (см. test/usage-ccusage.test.js —
-// normalize() читает конкретные поля), прогнать тесты на реальном выводе
-// новой версии, и только потом поднять номер здесь одной строкой.
-const CCUSAGE_PACKAGE = 'ccusage@20.0.19';
-
-// run(args) для ccusage: execFile('npx', ...) БЕЗ shell:true падает на Windows
-// с ENOENT (npx — это .cmd-шим, не бинарник); execFile('npx.cmd', ...) БЕЗ
-// shell:true падает с ENOENT/EINVAL — известная особенность обработки .cmd в
-// child_process на Windows (проверено фактически на этой машине: npx.cmd без
-// shell → 'spawn EINVAL'). Рабочий вариант — execFile('npx', args, {shell:true})
-// (проверено: реальный вызов `ccusage claude daily --json` вернулся за ~1.5с
-// с валидным JSON). args — фиксированные литералы вида ['claude','daily','--json'],
-// без пользовательского ввода — риск инъекции через DEP0190 (аргументы не
-// экранируются под shell:true) отсутствует.
-function runCcusage(args) {
-  return new Promise((resolve) => {
-    const TIMEOUT_MS = 60000;
-    const child = execFile('npx', ['--yes', CCUSAGE_PACKAGE, ...args], {
-      timeout: TIMEOUT_MS,
-      windowsHide: true,
-      shell: true,
-      maxBuffer: 16 * 1024 * 1024,
-    }, (err, stdout, stderr) => {
-      clearTimeout(watchdog);
-      killTreeOnTimeout(err, child);
-      resolve({ code: err ? (err.code || 1) : 0, stdout: stdout || '', stderr: stderr || '' });
-    });
-    trackChild(child);
-    const watchdog = armKillWatchdog(child, TIMEOUT_MS);
-  });
-}
-
-// run(args, cwd) для git-info.js (Task 2 фазы 6, панель диффа): контракт
-// модуля — resolve({code, stdout, stderr}) на ЛЮБОЙ обычный запуск (в т.ч.
-// code!=0 — например "not a git repository", это git-info.js сам разбирает
-// по stderr), и REJECT только когда бинарника нет вовсе (ENOENT), чтобы
-// isGitMissingError() в git-info.js отличил «git не установлен» от «git
-// сказал code!=0». maxBuffer 10 МБ (а не дефолтный 1 МБ execFile) — диффы
-// больших коммитов легко превышают мегабайт. timeout 15с — тот же порядок,
-// что usageHttpGet (20с), git локальный и обычно быстрее сети.
-function gitRun(args, cwd) {
-  return new Promise((resolve, reject) => {
-    const TIMEOUT_MS = 15000;
-    const child = execFile('git', args, {
-      cwd, windowsHide: true, timeout: TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024,
-    }, (err, stdout, stderr) => {
-      // Задача 5 фазы 6: та же осторожность по таймауту, что и у runCcusage
-      // выше (реестр/killProcessTree/armKillWatchdog в начале этого файла) —
-      // здесь без shell:true child и есть сам git.exe (не обёрнут в cmd.exe),
-      // но унификация раннеров важнее: killProcessTree(pid, /T /F) безвредна
-      // и для «бездетного» процесса, а если git когда-нибудь всё же породит
-      // потомка (hook, pager), дерево уберётся тоже.
-      clearTimeout(watchdog);
-      killTreeOnTimeout(err, child);
-      if (err && err.code === 'ENOENT') {
-        reject(err);
-        return;
-      }
-      // err.code здесь — код завершения процесса (число) при code!=0, ЛИБО
-      // строка вроде 'ETIMEDOUT'/сигнал при убийстве по timeout — в обоих
-      // случаях, кроме ENOENT (отсечён выше), это НЕ git-missing: коду 1
-      // хватает, чтобы git-info.js посчитал это либо "not-a-repo" (по
-      // тексту stderr), либо общим 'failed'.
-      const code = err ? (typeof err.code === 'number' ? err.code : 1) : 0;
-      resolve({ code, stdout: stdout || '', stderr: stderr || '' });
-    });
-    trackChild(child);
-    const watchdog = armKillWatchdog(child, TIMEOUT_MS);
-  });
-}
-
-// run(args, cwd) для gh-info.js (Task 4 фазы 6, панель GitHub): тот же контракт,
-// что и gitRun выше — resolve({code, stdout, stderr}) на любой обычный запуск
-// (gh-info.js сам разбирает 'auth'/'no-remote' по stderr), reject ТОЛЬКО когда
-// бинарника нет вовсе (ENOENT), чтобы isGhMissingError() в gh-info.js отличил
-// «gh не установлен» от «gh сказал code!=0». shell:true ОБЯЗАТЕЛЕН на Windows —
-// без него execFile('gh', ...) падает с ENOENT, если gh.exe обёрнут батником/
-// шимом (тот же приём, что и для npx в runCcusage выше — тот же класс проблемы
-// на этой платформе). cwd — не всегда нужен вызывающему коду (getGlobal() зовёт
-// execGh без cwd вовсе, см. gh-info.js) — execFile с cwd:undefined просто
-// использует cwd текущего процесса, это безопасно для команд типа `gh search`/
-// `gh api`, которые не привязаны к конкретному репозиторию. timeout 30с —
-// дольше, чем у gitRun (15с): search/api — сетевые вызовы, а не локальный git.
-// maxBuffer 5 МБ — с запасом под JSON-ответы gh (бриф).
-function ghRun(args, cwd) {
-  return new Promise((resolve, reject) => {
-    const TIMEOUT_MS = 30000;
-    const child = execFile('gh', args, {
-      cwd, windowsHide: true, timeout: TIMEOUT_MS, maxBuffer: 5 * 1024 * 1024, shell: true,
-    }, (err, stdout, stderr) => {
-      // Задача 5 фазы 6: shell:true здесь — тот же класс проблемы, что и у
-      // runCcusage (реестр/killProcessTree/armKillWatchdog выше) — child при
-      // таймауте нужно добивать деревом ПРОАКТИВНО (см. armKillWatchdog),
-      // а не просто оставлять cmd.exe/gh.exe висеть.
-      clearTimeout(watchdog);
-      killTreeOnTimeout(err, child);
-      if (err && err.code === 'ENOENT') {
-        reject(err);
-        return;
-      }
-      const code = err ? (typeof err.code === 'number' ? err.code : 1) : 0;
-      resolve({ code, stdout: stdout || '', stderr: stderr || '' });
-    });
-    trackChild(child);
-    const watchdog = armKillWatchdog(child, TIMEOUT_MS);
-  });
+// readFileLines(filePath) → асинхронный генератор строк — потоково, ЧЕРЕЗ
+// fs.createReadStream+readline, файл НИКОГДА не читается целиком (транскрипты
+// бывают десятками МБ). Ошибка потока (файл исчез между stat() и этим вызовом)
+// доходит до history-index.js как reject внутри `for await` — readline
+// пробрасывает 'error' входного стрима в асинхронный итератор (проверено
+// живьём: ENOENT на несуществующем файле ловится именно так, не проглатывается).
+async function* readHistoryJsonlLines(filePath) {
+  const stream = fs.createReadStream(filePath, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  try {
+    for await (const line of rl) {
+      yield line;
+    }
+  } finally {
+    rl.close();
+    stream.destroy();
+  }
 }
 
 // FINDING 1 (ревью, fix round 1): usage-oauth.js/applyError() при сбое
@@ -397,6 +297,178 @@ function ghRun(args, cwd) {
 // «состояние изменилось» и рассылается.
 function usageBroadcastKey(snap) {
   return `${snap.fetchedAt}|${snap.stale}|${snap.error}`;
+}
+
+// Task 5 carryover фазы 6 (задача 5 фазы 7, п.4 брифа): смоук-гейт git:get/
+// gh:repo/gh:global вынесен в отдельные функции с явными зависимостями.
+// ПРИЧИНА: ipc.js целиком не тестируется — модуль на верхнем уровне зовёт
+// require('electron'), который вне настоящего Electron-рантайма отдаёт не
+// объект, а строку пути к бинарнику (ipcMain/app/dialog там undefined), так
+// что registerIpc() нельзя вызвать под node --test. Раньше это означало, что
+// удаление `if (smoke) return null;` внутри ipcMain.handle прошло бы зелёным —
+// ни один тест бы не заметил (находка 3, ревью carryover фазы 6). Экспортируем
+// эти три функции (см. module.exports внизу файла) — test/ipc-smoke-gate.test.js
+// зовёт их напрямую с фейковым gitInfo/ghInfo, минуя Electron целиком; это
+// ТА ЖЕ логика, что реально исполняется в проде (registerIpc() ниже просто
+// прокидывает сюда своё замыкание), а не отдельная параллельная реализация.
+function gitGetHandler({
+  smoke, tabId, opts, tabCwd, gitInfo,
+}) {
+  if (smoke) return null;
+  if (typeof tabId !== 'string') return null;
+  const cwd = tabCwd(tabId);
+  if (!cwd) return null;
+  const force = !!(opts && opts.force);
+  return gitInfo.get(cwd, { force });
+}
+
+function ghRepoHandler({
+  smoke, tabId, opts, tabCwd, ghInfo,
+}) {
+  if (smoke) return null;
+  if (typeof tabId !== 'string') return null;
+  const cwd = tabCwd(tabId);
+  if (!cwd) return null;
+  const force = !!(opts && opts.force);
+  return ghInfo.getRepo(cwd, { force });
+}
+
+function ghGlobalHandler({ smoke, opts, ghInfo }) {
+  if (smoke) return null;
+  const force = !!(opts && opts.force);
+  return ghInfo.getGlobal({ force });
+}
+
+// I5 (ревью финальной волны фазы 7): раньше индекс истории собирался лениво
+// РОВНО ОДИН РАЗ за жизнь окна (historyIndexBuilt — boolean, взводился и
+// больше никогда не сбрасывался) — сессии, созданные ПОСЛЕ первого поиска,
+// не попадали в индекс до перезапуска кокпита вообще. Кокпит держат открытым
+// сутками — это обычный рабочий день, не крайний случай (сценарий ревью:
+// кокпит открыт с 9:00, новая вкладка в 11:00, первый поиск в 12:00, повторный
+// поиск в 17:00 — «ничего не найдено», хотя строка есть в транскрипте).
+//
+// Фикс — TTL, а не «refresh при каждом открытии оверлея поиска» (тоже
+// предлагался): поиск — редкое, ручное действие (Ctrl+Shift+H от случая к
+// случаю), а historyIndex.refresh() БЕЗ force уже сам инкрементален
+// (history-index.js перечитывает содержимое ТОЛЬКО файлов, чьи mtime/size
+// изменились) — но даже так стоит заметное время (1.5-2.2с на 47 сессиях этой
+// машины, задача 2 фазы 7): перечисление ~/.claude/projects целиком и
+// stat() КАЖДОГО файла — не бесплатны сами по себе, даже без единого чтения
+// содержимого. search.js дебаунсит ввод на 350мс, но пользователь может
+// уточнять запрос НЕСКОЛЬКО раз подряд, продолжая печатать, — TTL короче,
+// чем «кокпит открыт весь рабочий день» (часы), но заметно ДОЛЬШЕ типичной
+// паузы между такими уточнениями (секунды-десятки секунд), чтобы каждое
+// уточнение одного запроса не било повторным refresh(). 5 минут:
+// гарантированно ловит сценарий ревью (любой разрыв между поисками дольше
+// пяти минут — а час между 11:00 и 12:00 кратно больше — форсирует
+// пересбор), и с большим запасом переживает типичную серию правок одного
+// запроса в открытом оверлее.
+const HISTORY_INDEX_TTL_MS = 5 * 60 * 1000;
+
+// builtAt: 0 — индекс ещё ни разу не строился, иначе — now() на момент
+// последнего успешного refresh(). buildInFlight — Promise текущей сборки,
+// если уже выполняется (single-flight, см. historySearchHandler ниже).
+function createHistoryIndexState() {
+  return { builtAt: 0, size: 0, buildInFlight: null };
+}
+
+// Task 3 фазы 7 (глобальный поиск истории): смотри search.js (renderer) —
+// оверлей с дебаунсом/отменой устаревших запросов, эта функция — только
+// проводка + ленивая сборка индекса. Вынесена в отдельную функцию с явными
+// зависимостями по ТОЙ ЖЕ причине, что gitGetHandler/ghRepoHandler/
+// ghGlobalHandler выше (см. комментарий там) — ipc.js целиком не
+// тестируется, а history:search добавлен в ЭТОЙ ЖЕ ветке фазы 7 с тем же
+// классом гейта, но без единого теста на него (находка «дыра тестов №1»,
+// ревью финальной волны).
+//
+// state — createHistoryIndexState() (mutable, по ссылке — см. регистрацию в
+// registerIpc()); historyIndex — createHistoryIndex() (history-index.js);
+// now — инжектируемый клок, тестам нужен управляемый (TTL иначе нельзя было
+// бы проверить без реального ожидания 5 минут).
+//
+// FINDING (ревью Task 3, Important, всё ещё в силе): ipcMain.handle НЕ
+// сериализует параллельные invoke одного канала, а дебаунс в renderer
+// (search.js) отменяет только ЕЩЁ НЕ ОТПРАВЛЕННЫЙ таймер — уже улетевший
+// запрос летит независимо от следующего. Single-flight по тому же образцу,
+// что manualRefreshInFlight у usage:refresh: пока сборка не разрешилась, все
+// параллельные вызовы ждут ОДИН и тот же промис, второго refresh() не
+// запускается вовсе — TTL (I5) лишь РАСШИРЯЕТ множество случаев, когда мы
+// решаем «пересбор нужен», сам механизм single-flight не тронут ни строкой.
+async function historySearchHandler({
+  smoke, query, opts, state, historyIndex, now = Date.now,
+}) {
+  if (smoke) return null;
+  const stale = state.builtAt === 0 || (now() - state.builtAt) > HISTORY_INDEX_TTL_MS;
+  if (stale) {
+    if (!state.buildInFlight) {
+      state.buildInFlight = (async () => {
+        const entries = await historyIndex.refresh({});
+        state.builtAt = now();
+        state.size = entries.length;
+      })();
+    }
+    try {
+      await state.buildInFlight;
+    } finally {
+      state.buildInFlight = null;
+    }
+  }
+  const o = opts && typeof opts === 'object' ? opts : {};
+  const results = await historyIndex.search(query, o);
+  return { results, indexSize: state.size };
+}
+
+// Явный пересбор индекса ({force:true} игнорирует mtime/size-эвристику
+// history-index.js целиком). Канал существует по брифу задачи 3 — текущий
+// UI (search.js) им не пользуется напрямую (полагается на встроенный
+// ленивый пересбор внутри historySearchHandler выше), задел на будущую
+// кнопку «Обновить индекс». Вынесена по той же причине, что historySearchHandler.
+async function historyRefreshHandler({
+  smoke, opts, state, historyIndex, now = Date.now,
+}) {
+  if (smoke) return null;
+  const force = !!(opts && opts.force);
+  const entries = await historyIndex.refresh({ force });
+  state.builtAt = now();
+  state.size = entries.length;
+  return entries;
+}
+
+// Дыра тестов №1 (ревью финальной волны фазы 7): recipes:* добавлены в ЭТОЙ
+// ЖЕ ветке (Task 4 фазы 7) с тем же классом смоук-гейта, что git:get/gh:repo/
+// gh:global, но остались без единого теста на него. Вынесены по тому же
+// приёму — явные зависимости, экспорт только ради теста (см. module.exports
+// внизу файла), registerIpc() ниже просто прокидывает реальные замыкания.
+function recipesListHandler({ smoke, recipeStore }) {
+  if (smoke) return [];
+  return recipeStore.listPrompts().map((p) => ({ ...p, placeholders: extractPlaceholders(p.text) }));
+}
+
+function recipesSavePromptHandler({ smoke, recipe, recipeStore }) {
+  if (smoke) return null;
+  return recipeStore.savePrompt(recipe);
+}
+
+function recipesDeletePromptHandler({ smoke, id, recipeStore }) {
+  if (smoke) return;
+  if (typeof id === 'string') recipeStore.deletePrompt(id);
+}
+
+function recipesListWorkspacesHandler({ smoke, recipeStore }) {
+  if (smoke) return [];
+  return recipeStore.listWorkspaces();
+}
+
+function recipesSaveWorkspaceHandler({
+  smoke, name, tabs, recipeStore,
+}) {
+  if (smoke) return null;
+  return recipeStore.saveWorkspace(name, tabs);
+}
+
+function recipesDeleteWorkspaceHandler({ smoke, id, recipeStore }) {
+  if (smoke) return;
+  if (typeof id === 'string') recipeStore.deleteWorkspace(id);
 }
 
 function registerIpc(win, opts = {}) {
@@ -411,24 +483,56 @@ function registerIpc(win, opts = {}) {
     cache: createJsonFileCache(usageOauthCacheFile()),
     log: (msg) => console.warn(msg),
   });
+  // Task 5 carryover фазы 6 (задача 5 фазы 7): runners.js — реестр процессов
+  // + раннеры npx/git/gh, execFile — реальный child_process.execFile (см.
+  // require в шапке файла). Конструктор не делает I/O сам по себе — безопасно
+  // создавать безусловно, даже в smoke (сами runCcusage/gitRun/ghRun ничего
+  // не запускают, пока их не позовут IPC-хендлеры ниже, а те в smoke этого не делают).
+  runners = createRunners({ execFile });
   ccusage = createCcusage({
-    run: runCcusage,
+    run: runners.runCcusage,
     cache: createJsonFileCache(usageCcusageCacheFile()),
   });
   // Task 2 фазы 6 (панель диффа): gitInfo — чистое ядро (git-info.js) +
-  // реальный run() (execFile выше). Конструктор не делает I/O сам по себе —
+  // реальный run() (runners.gitRun). Конструктор не делает I/O сам по себе —
   // безопасно создавать безусловно, даже в smoke (сам IPC-хендлер ниже
   // просто не зовёт .get() в smoke — см. 'git:get').
-  gitInfo = createGitInfo({ run: gitRun });
+  gitInfo = createGitInfo({ run: runners.gitRun });
   // Task 4 фазы 6 (панель GitHub): ghInfo — чистое ядро (gh-info.js) + реальный
-  // run() (ghRun выше). Тот же приём, что gitInfo прямо над этим — конструктор
+  // run() (runners.ghRun). Тот же приём, что gitInfo прямо над этим — конструктор
   // не делает I/O сам по себе, безопасно создавать безусловно даже в smoke (сам
   // IPC-хендлер ниже просто не зовёт .getRepo()/.getGlobal() в smoke).
-  ghInfo = createGhInfo({ run: ghRun });
+  ghInfo = createGhInfo({ run: runners.ghRun });
+  // Task 3 фазы 7 (глобальный поиск истории): historyIndex — чистое ядро
+  // (history-index.js) + реальные зависимости выше (обход ~/.claude/projects,
+  // потоковое чтение JSONL, fs.stat, JSON-кэш в userData). Конструктор не
+  // делает I/O сам по себе — безопасно создавать всегда, даже в smoke (сам
+  // IPC-хендлер 'history:search'/'history:refresh' ниже просто не зовёт
+  // .refresh()/.search() в smoke). Сборка индекса — ЛЕНИВАЯ, при первом
+  // РЕАЛЬНОМ history:search (см. хендлер ниже), не здесь и не на старте.
+  historyIndex = createHistoryIndex({
+    listProjects: listHistoryProjects,
+    readFileLines: readHistoryJsonlLines,
+    stat: statHistoryFile,
+    cache: createJsonFileCache(historyIndexCacheFile()),
+  });
+  historyIndexState = createHistoryIndexState();
   lastBroadcastKey = null;
   lastCcusageResult = null;
   manualRefreshInFlight = null;
   lastManualRefreshAt = 0;
+
+  // Task 4 фазы 7 (рецепты + именованные воркспейсы): recipeStore — чистое
+  // ядро (recipes.js) + реальные пути в userData выше. Конструктор не делает
+  // I/O сам по себе (тот же приём, что historyIndex/gitInfo/ghInfo выше) —
+  // безопасно создавать всегда, даже в smoke. Дефолтные рецепты первого
+  // запуска (бриф) сеются здесь, но ТОЛЬКО не в smoke — headless-прогон не
+  // должен писать в userData ничего нового при каждом запуске.
+  recipeStore = createRecipeStore({
+    promptsFile: promptsFile(),
+    workspacesFile: workspacesLibraryFile(),
+  });
+  if (!smoke) recipeStore.ensureDefaultPrompts();
 
   // Стор манифеста создаётся один раз на регистрацию — независимо от smoke,
   // чтобы workspace:get всегда мог отдать хоть что-то (в smoke он просто
@@ -815,36 +919,91 @@ function registerIpc(win, opts = {}) {
   // прогон не должен спавнить внешние процессы сверх PTY_OK-смоука (см.
   // task-2-brief.md, шаг 3: «в smoke НЕ вызывать»). force — явный ручной
   // повтор (кнопка «Обновить» панели), опрокидывает TTL-кэш gitInfo.
-  ipcMain.handle('git:get', async (_e, tabId, opts) => {
-    if (smoke) return null;
-    if (typeof tabId !== 'string') return null;
-    const cwd = tabCwd(tabId);
-    if (!cwd) return null;
-    const force = !!(opts && opts.force);
-    return gitInfo.get(cwd, { force });
-  });
+  // Сама логика — в gitGetHandler() (см. выше по файлу, п.4 брифа задачи 5
+  // фазы 7): вынесена, чтобы смоук-гейт был протестирован без Electron.
+  ipcMain.handle('git:get', async (_e, tabId, opts) => gitGetHandler({
+    smoke, tabId, opts, tabCwd, gitInfo,
+  }));
 
   // Task 4 фазы 6 (панель GitHub): cwd вкладки — тот же tabCwd(), что и git:get
   // выше. smoke: НЕ дёргаем gh вообще — headless-прогон не должен спавнить
   // внешние процессы сверх PTY_OK-смоука. force — ручной повтор, опрокидывает
-  // TTL-кэш ghInfo.
-  ipcMain.handle('gh:repo', async (_e, tabId, opts) => {
-    if (smoke) return null;
-    if (typeof tabId !== 'string') return null;
-    const cwd = tabCwd(tabId);
-    if (!cwd) return null;
-    const force = !!(opts && opts.force);
-    return ghInfo.getRepo(cwd, { force });
-  });
+  // TTL-кэш ghInfo. Логика — в ghRepoHandler() выше по файлу (та же причина,
+  // что у git:get).
+  ipcMain.handle('gh:repo', async (_e, tabId, opts) => ghRepoHandler({
+    smoke, tabId, opts, tabCwd, ghInfo,
+  }));
 
   // gh:global — сводка по ВСЕМ открытым PR/issues пользователя + число
   // непрочитанных уведомлений, без привязки к конкретной вкладке (дашборд,
-  // Task 4 фазы 6). smoke — тот же гейт, что и gh:repo выше.
-  ipcMain.handle('gh:global', async (_e, opts) => {
-    if (smoke) return null;
-    const force = !!(opts && opts.force);
-    return ghInfo.getGlobal({ force });
-  });
+  // Task 4 фазы 6). smoke — тот же гейт, что и gh:repo выше. Логика —
+  // в ghGlobalHandler() выше по файлу.
+  ipcMain.handle('gh:global', async (_e, opts) => ghGlobalHandler({ smoke, opts, ghInfo }));
+
+  // Task 3 фазы 7 (глобальный поиск истории, Ctrl+Shift+H) + I5 (ревью
+  // финальной волны, TTL индекса): смотри search.js (renderer) — оверлей с
+  // дебаунсом/отменой устаревших запросов, здесь только проводка. Логика —
+  // в historySearchHandler()/historyRefreshHandler() выше по файлу (вынесены
+  // ради тестируемости смоук-гейта — «дыра тестов №1», ревью финальной
+  // волны — и TTL-фикса I5, см. подробные комментарии там).
+  ipcMain.handle('history:search', async (_e, query, opts) => historySearchHandler({
+    smoke, query, opts, state: historyIndexState, historyIndex,
+  }));
+
+  ipcMain.handle('history:refresh', async (_e, opts) => historyRefreshHandler({
+    smoke, opts, state: historyIndexState, historyIndex,
+  }));
+
+  // Task 4 фазы 7 (библиотека рецептов промптов): recipes:list отдаёт КАЖДЫЙ
+  // рецепт УЖЕ с посчитанными placeholders (extractPlaceholders — чистая
+  // функция recipes.js, здесь вызывается один раз на рецепт) — renderer
+  // (app.js/buildPaletteActions) решает, показывать ли мини-форму, ПО этому
+  // полю, не таща отдельно текст плейсхолдера через второй IPC-вызов на
+  // каждый рецепт. smoke: не читаем userData вовсе — тот же гейт, что history/
+  // usage/gh выше.
+  // Дыра тестов №1 (ревью финальной волны): логика — в recipesListHandler()
+  // выше по файлу (та же причина, что historySearchHandler/gitGetHandler —
+  // ipc.js целиком не тестируется, а этот канал добавлен в ЭТОЙ ЖЕ ветке
+  // фазы 7 с тем же классом смоук-гейта, но остался без единого теста).
+  ipcMain.handle('recipes:list', () => recipesListHandler({ smoke, recipeStore }));
+
+  // Сохранение/удаление рецепта — CRUD-контракт recipes.js целиком (бриф),
+  // текущий UI (палитра) сам новые рецепты не создаёт и не удаляет (только
+  // читает дефолты + то, что уже лежит в prompts.json) — задел на будущую
+  // форму редактирования библиотеки, тот же приём, что history:refresh выше.
+  // Логика — в recipesSavePromptHandler()/recipesDeletePromptHandler() выше.
+  ipcMain.handle('recipes:savePrompt', (_e, p) => recipesSavePromptHandler({ smoke, recipe: p, recipeStore }));
+
+  ipcMain.handle('recipes:deletePrompt', (_e, id) => recipesDeletePromptHandler({ smoke, id, recipeStore }));
+
+  // fillPrompt — чистая текстовая подстановка без единого обращения к диску,
+  // смысла гейтить smoke'ом нет (тот же довод, что config:get/shell.openExternal
+  // выше по файлу не гейтятся) — просто безвредный no-op на пустых values.
+  ipcMain.handle('recipes:fillPrompt', (_e, text, values) => fillPrompt(text, values));
+
+  // Minor 8 (ревью раунд 1): нормализация переносов строк перед записью в pty —
+  // тоже чистая функция без диска, тот же довод, что recipes:fillPrompt выше,
+  // не гейтим smoke'ом. Зовётся app.js/runRecipe БЕЗУСЛОВНО (даже без
+  // плейсхолдеров), чтобы внутренний \n текста рецепта не ушёл в терминал
+  // отдельным Enter (в т.ч. молчаливым подтверждением диалога разрешения).
+  ipcMain.handle('recipes:normalizeForPty', (_e, text) => normalizeForPty(text));
+
+  // Именованные воркспейсы (Task 4 фазы 7): listWorkspaces/saveWorkspace —
+  // палитра читает и пишет их напрямую (действия «Открыть воркспейс: <name>»/
+  // «Сохранить воркспейс…», см. app.js). deleteWorkspace (ревью раунд 1,
+  // Minor 6) — теперь тоже за действием палитры «Удалить воркспейс: <name>»
+  // (без него накопленный дублями/устаревший мусор в workspaces-library.json
+  // можно было почистить только руками через файл).
+  // Дыра тестов №1 (ревью финальной волны): логика — в
+  // recipesListWorkspacesHandler()/recipesSaveWorkspaceHandler()/
+  // recipesDeleteWorkspaceHandler() выше по файлу (та же причина).
+  ipcMain.handle('recipes:listWorkspaces', () => recipesListWorkspacesHandler({ smoke, recipeStore }));
+
+  ipcMain.handle('recipes:saveWorkspace', (_e, name, tabs) => recipesSaveWorkspaceHandler({
+    smoke, name, tabs, recipeStore,
+  }));
+
+  ipcMain.handle('recipes:deleteWorkspace', (_e, id) => recipesDeleteWorkspaceHandler({ smoke, id, recipeStore }));
 
   // Task 4 фазы 4 (вставка скриншотов): cwd вкладки резолвим тем же путём,
   // что project:connect/status — tabCwd (manager.list()). saveClipboardImage —
@@ -893,6 +1052,31 @@ function registerIpc(win, opts = {}) {
     if (!validDim(cols) || !validDim(rows)) return;
     manager.resize(tabId, cols, rows);
   });
+
+  // Task 1 фазы 7 (очередь промптов): fire-and-forget, тот же приём, что
+  // term:write/term:restart выше — состояние возвращается отдельным событием
+  // (queue:changed, генерируется sessions.js и уходит через generic onEvent
+  // в начале registerIpc), синхронный ответ invoke() здесь не нужен.
+  ipcMain.on('queue:add', (_e, payload) => {
+    if (!payload || typeof payload !== 'object') return;
+    const { tabId, text } = payload;
+    if (typeof tabId !== 'string' || typeof text !== 'string') return;
+    manager.enqueue(tabId, text);
+  });
+
+  ipcMain.on('queue:remove', (_e, payload) => {
+    if (!payload || typeof payload !== 'object') return;
+    const { tabId, index } = payload;
+    if (typeof tabId !== 'string' || !Number.isInteger(index)) return;
+    manager.removeFromQueue(tabId, index);
+  });
+
+  ipcMain.on('queue:clear', (_e, payload) => {
+    if (!payload || typeof payload !== 'object') return;
+    const { tabId } = payload;
+    if (typeof tabId !== 'string') return;
+    manager.clearQueue(tabId);
+  });
 }
 
 // Форсирует немедленную запись манифеста (debounce workspace.js иначе может
@@ -937,18 +1121,20 @@ function disposeSessions() {
   stopBridge();
   if (manager) manager.disposeAll();
   // Задача 5 фазы 6 (carryover): если приложение закрывается, пока
-  // runCcusage/gitRun/ghRun ещё выполняются (npx/git/gh), реестр liveChildren
-  // (см. выше) всё ещё держит их — добиваем ДЕРЕВО принудительно (/T /F, см.
-  // killProcessTree и уточнённое правило про /F там же — это headless-
-  // помощники без состояния, не сам кокпит) для каждого. Снимок ключей в
-  // массив ДО цикла: сам taskkill асинхронный, но 'exit' на child может
-  // сработать синхронно в тестовых дублёрах — итерация по живой Map во время
-  // её же мутации недетерминирована.
-  for (const pid of [...liveChildren.keys()]) {
-    killProcessTree(pid);
-  }
+  // runCcusage/gitRun/ghRun ещё выполняются (npx/git/gh), реестр процессов
+  // runners.js всё ещё держит их — killAllTracked() добивает ДЕРЕВО
+  // принудительно (/T /F — headless-помощники без состояния, не сам кокпит;
+  // подробное обоснование /F и снимка ключей в массив ДО цикла — в runners.js).
+  if (runners) runners.killAllTracked();
 }
 
 module.exports = {
   registerIpc, disposeSessions, stopBridge, getSmokeOutput, flushWorkspace, getActiveTabId,
+  // Экспортированы ТОЛЬКО ради test/ipc-smoke-gate.test.js (п.4 брифа задачи 5
+  // фазы 7 + «дыра тестов №1», ревью финальной волны, см. комментарии у их
+  // определения выше) — не часть публичного API модуля для остального кода.
+  gitGetHandler, ghRepoHandler, ghGlobalHandler,
+  historySearchHandler, historyRefreshHandler, createHistoryIndexState, HISTORY_INDEX_TTL_MS,
+  recipesListHandler, recipesSavePromptHandler, recipesDeletePromptHandler,
+  recipesListWorkspacesHandler, recipesSaveWorkspaceHandler, recipesDeleteWorkspaceHandler,
 };

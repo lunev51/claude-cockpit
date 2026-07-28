@@ -18,6 +18,14 @@
 //     непривязанную вкладку по совпадению рабочей директории. sessions.js
 //     держит findUnboundByCwd экспортированным (Фаза 2b может это переиспользовать
 //     иначе), но мост его больше не вызывает никогда.
+//
+// gen (доп. находка ревью Task 1 фазы 7, задача 5): payload несёт ещё и
+// поколение pty, которое породило хук (cockpit-hook.js кладёт туда свой
+// COCKPIT_TAB_GEN) — прокидываем его в sessions.applyHookEvent() как есть,
+// НЕ решая здесь, актуально оно или нет: это знает только sessions.js
+// (у него единственного есть текущий tab.gen). Найденный tabId — вопрос
+// адресации (кому вообще послать событие); валидность поколения — вопрос
+// применения события внутри уже найденной вкладки, две разные заботы.
 
 const http = require('http');
 const fs = require('fs');
@@ -26,7 +34,7 @@ function createHookBridge({ sessions, port = 0, portFile = null }) {
   let server = null;
   let actualPort = 0;
 
-  function route(event, data, tabId) {
+  function route(event, data, tabId, gen) {
     let targetTab = null;
     if (typeof tabId === 'string' && sessions.has(tabId)) {
       targetTab = tabId;
@@ -34,7 +42,7 @@ function createHookBridge({ sessions, port = 0, portFile = null }) {
       targetTab = sessions.findBySessionId(data.session_id);
     }
     if (!targetTab) return false;
-    sessions.applyHookEvent(targetTab, event, data);
+    sessions.applyHookEvent(targetTab, event, data, gen);
     return true;
   }
 
@@ -63,8 +71,19 @@ function createHookBridge({ sessions, port = 0, portFile = null }) {
         return;
       }
       const data = (parsed.data && typeof parsed.data === 'object') ? parsed.data : {};
+      // gen — Number.isInteger отсекает мусор/отсутствие поля (сторонний
+      // POST, гипотетический старый хук-скрипт без COCKPIT_TAB_GEN) в null.
+      // I4 (ревью финальной волны фазы 7): null здесь — НЕ «гард полностью
+      // выключен» (это было бы дырой — сторонний процесс мог бы вбросить
+      // очередь в чужой pty через session_id-маршрутизацию выше), а «нет
+      // доказательства поколения»: sessions.applyHookEvent() в этом случае
+      // всё ещё применяет статус (заявленная фича port-file — сторонние
+      // сессии двигают статус), но НЕ даёт побочному эффекту (вброс очереди)
+      // случиться без доказанного (числового и совпавшего) gen — подробности
+      // и обоснование узкого фикса в sessions.js/applyHookEvent.
+      const gen = Number.isInteger(parsed.gen) ? parsed.gen : null;
       let routed = false;
-      try { routed = route(parsed.event, data, parsed.tabId); } catch (err) {
+      try { routed = route(parsed.event, data, parsed.tabId, gen); } catch (err) {
         console.warn(`[hook-bridge] ошибка маршрутизации: ${err.message}`);
       }
       res.writeHead(routed ? 200 : 202, { 'content-type': 'application/json' }).end('{"ok":true}');

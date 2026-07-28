@@ -83,6 +83,49 @@ contextBridge.exposeInMainWorld('api', {
     // обмена или нет (main/screenshot.js) — возвращает {path} или null.
     paste: (tabId) => ipcRenderer.invoke('screenshot:paste', tabId),
   },
+  queue: {
+    // Task 1 фазы 7 (очередь промптов): fire-and-forget, тот же приём, что
+    // term.write/term.restart — состояние возвращается отдельно через
+    // queue:changed (onChanged), а не через возврат invoke().
+    add: (tabId, text) => ipcRenderer.send('queue:add', { tabId, text }),
+    remove: (tabId, index) => ipcRenderer.send('queue:remove', { tabId, index }),
+    clear: (tabId) => ipcRenderer.send('queue:clear', { tabId }),
+    onChanged: (cb) => ipcRenderer.on('queue:changed', (_e, p) => cb(p)),
+  },
+  history: {
+    // Task 3 фазы 7 (глобальный поиск истории, Ctrl+Shift+H): main лениво
+    // строит индекс при первом реальном вызове (см. main/ipc.js) — {results,
+    // indexSize} в non-smoke, null в smoke (ни один хендлер тогда не трогает
+    // диск). search.js сам решает, когда звать (дебаунс/минимум 2 символа).
+    search: (query, opts) => ipcRenderer.invoke('history:search', query, opts),
+    // Явный пересбор индекса ({force}) — задел на будущую кнопку «Обновить
+    // индекс»; текущий UI (search.js) полагается на встроенный ленивый
+    // пересбор внутри history:search и этот канал напрямую не зовёт.
+    refresh: (opts) => ipcRenderer.invoke('history:refresh', opts),
+  },
+  recipes: {
+    // Task 4 фазы 7 (библиотека рецептов промптов + именованные воркспейсы):
+    // list() отдаёт [{id,title,text,placeholders}] — placeholders уже
+    // посчитаны на стороне main (см. main/ipc.js/'recipes:list'), палитра
+    // (app.js/buildPaletteActions) решает по этому полю, показывать ли
+    // мини-форму, не тратя отдельный IPC-вызов на каждый рецепт.
+    list: () => ipcRenderer.invoke('recipes:list'),
+    // savePrompt/deletePrompt — полный CRUD-контракт recipes.js; текущий UI их
+    // напрямую не зовёт (палитра только читает list()), задел на будущую
+    // форму редактирования библиотеки — тот же приём, что history.refresh выше.
+    savePrompt: (p) => ipcRenderer.invoke('recipes:savePrompt', p),
+    deletePrompt: (id) => ipcRenderer.invoke('recipes:deletePrompt', id),
+    // fillPrompt(text, values) → строка с подставленными {{плейсхолдерами}} —
+    // используется ПОСЛЕ мини-формы ввода, перед записью текста в pty
+    // активной вкладки (см. app.js/runRecipe).
+    fillPrompt: (text, values) => ipcRenderer.invoke('recipes:fillPrompt', text, values),
+    // Minor 8 (ревью раунд 1): нормализация \r?\n → пробел перед записью в
+    // pty — см. main/ipc.js/'recipes:normalizeForPty' и app.js/runRecipe.
+    normalizeForPty: (text) => ipcRenderer.invoke('recipes:normalizeForPty', text),
+    listWorkspaces: () => ipcRenderer.invoke('recipes:listWorkspaces'),
+    saveWorkspace: (name, tabs) => ipcRenderer.invoke('recipes:saveWorkspace', name, tabs),
+    deleteWorkspace: (id) => ipcRenderer.invoke('recipes:deleteWorkspace', id),
+  },
   usage: {
     // Task 3 фазы 5 (кольца лимитов): {limits, spend} — снапшот слоя A
     // (usage-oauth.js) и последний известный ответ слоя B (usage-ccusage.js,

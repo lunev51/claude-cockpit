@@ -55,6 +55,17 @@
         <div id="terminal-host"></div>
         <div id="diff-panel" class="hidden"></div>
       </div>
+      <!-- Task 1 фазы 7 (очередь промптов): строка чипов очереди и поле
+           ввода — МЕЖДУ терминалом (#main-row) и панелью действий (бриф).
+           #queue-bar скрыта, пока очередь пуста (см. app.js/renderQueueBar);
+           #queue-input-row скрыта, пока не открыта по Ctrl+Q (см.
+           app.js/openQueueInput). Оба наполняются программно — статичная
+           разметка здесь только контейнеры, тот же приём, что #diff-panel. -->
+      <div id="queue-bar" class="hidden"></div>
+      <div id="queue-input-row" class="hidden">
+        <input id="queue-input" type="text" autocomplete="off"
+               placeholder="Промпт в очередь — Enter добавит, Esc закроет" />
+      </div>
       <div id="action-bar">
         <div id="action-commands"></div>
         <div id="action-right">
@@ -90,6 +101,20 @@
        обрезался overflow:auto сайдбара. createPalette() наполняет/чистит
        этот контейнер сама (см. src/renderer/js/palette.js). -->
   <div id="palette-root"></div>
+  <!-- Task 3 фазы 7 (глобальный поиск истории, Ctrl+Shift+H): тот же приём,
+       что peek-root/palette-root — корень вне #sidebar/#main, чтобы оверлей
+       поиска накрывал окно целиком, а не обрезался overflow:auto сайдбара.
+       createSearch() наполняет/чистит этот контейнер сама (см.
+       src/renderer/js/search.js). -->
+  <div id="search-root"></div>
+  <!-- Task 4 фазы 7 (рецепты промптов + именованные воркспейсы): мини-форма
+       ввода (плейсхолдеры рецепта / имя воркспейса) — тот же приём, что
+       peek-root/palette-root/search-root, корень вне #sidebar/#main.
+       createRecipeForm() наполняет/чистит этот контейнер сама (см.
+       src/renderer/js/recipe-form.js). -->
+  <div id="recipe-form-root"></div>
+  <!-- Шпаргалка горячих клавиш (живая приёмка фазы 7) — hotkeys.js -->
+  <div id="hotkeys-root"></div>
   <!-- Находка 4б (ревью фазы 6): тост для app:notice (main/notify.js) — до
        этой правки канал приходил в renderer, но showed только console.warn,
        никакого визуального следа не было. Тот же приём, что peek-root/

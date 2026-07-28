@@ -51,6 +51,40 @@ test('happy path: POST {event,data,tabId} с application/json, exit 0', async ()
   assert.strictEqual(payload.event, 'Stop');
   assert.strictEqual(payload.tabId, 'tab-42');
   assert.strictEqual(payload.data.session_id, 's-1');
+  // Без COCKPIT_TAB_GEN в env (не задан в этом тесте) — gen отдаётся null,
+  // не 0/NaN/строкой (доп. находка ревью Task 1 фазы 7, задача 5).
+  assert.strictEqual(payload.gen, null);
+});
+
+// ---------- доп. находка ревью Task 1 фазы 7 (задача 5): гард поколения ----------
+
+test('COCKPIT_TAB_GEN в env → payload.gen несёт то же целое число', async () => {
+  const { server, received, port } = await stubServer();
+  const res = await runHook({
+    args: ['Stop'],
+    env: { COCKPIT_BRIDGE_PORT: String(port), COCKPIT_TAB_ID: 'tab-42', COCKPIT_TAB_GEN: '3' },
+    stdin: '{"session_id":"s-1"}',
+  });
+  server.close();
+  assert.strictEqual(res.code, 0);
+  const payload = JSON.parse(received[0].body);
+  assert.strictEqual(payload.gen, 3);
+});
+
+test('COCKPIT_TAB_GEN мусорный (не число/отрицательный/ноль) → payload.gen: null', async () => {
+  for (const gen of ['abc', '-1', '0', '1.5', '']) {
+    const { server, received, port } = await stubServer();
+    // eslint-disable-next-line no-await-in-loop
+    const res = await runHook({
+      args: ['Stop'],
+      env: { COCKPIT_BRIDGE_PORT: String(port), COCKPIT_TAB_GEN: gen },
+      stdin: '{}',
+    });
+    server.close();
+    assert.strictEqual(res.code, 0, gen);
+    const payload = JSON.parse(received[0].body);
+    assert.strictEqual(payload.gen, null, `COCKPIT_TAB_GEN=${JSON.stringify(gen)} должен был дать gen:null`);
+  }
 });
 
 test('мёртвый порт, битый stdin, отсутствующий port-file — всегда exit 0', async () => {

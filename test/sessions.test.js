@@ -702,6 +702,46 @@ test('провал резюма (короткоживущий процесс, Se
   assert.strictEqual(notice.payload.tabId, a.tabId);
 });
 
+// I3 (ревью финальной волны фазы 7): очередь переживала авто-респавн и
+// вбрасывалась в НОВУЮ, контекстно ПУСТУЮ сессию — restart() (Ctrl+Shift+R)
+// чистит очередь перед новым spawn, а этот, отдельный путь автоматического
+// перезапуска (провал резюма протухшего sessionId) — не чистил. Сценарий из
+// ревью: вкладка с протухшим sessionId → спавн #1 --resume DEAD → пользователь
+// кладёт в очередь «удали ветку feature/x» → resume падает → авто-
+// восстановление спавнит #2 с голыми args → первый Stop новой сессии
+// (поколение УЖЕ корректное — гард Task 5/Important 1 тут бессилен по
+// построению, событие СВОЁ, не чужое) вбрасывал бы «удали ветку feature/x»
+// в процесс без единого представления об этом контексте.
+test('I3: авто-восстановление чистит очередь протухшей сессии — Stop НОВОГО (доказанного) поколения не вбрасывает контекст, которого новая сессия не видела', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events, tick } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha', sessionId: 'ghost-session' });
+  mgr.start(a.tabId, 80, 24); // спавн #1: --resume ghost-session
+
+  // Пользователь кладёт промпт в очередь ДО того, как узнаёт о провале резюма.
+  mgr.enqueue(a.tabId, 'удали ветку feature/x');
+
+  tick(2000); // короткоживущий — резюм провалился (порог 15с, спека §6)
+  factory.spawned[0].opts.onExit(1); // SessionStart не пришёл → авто-восстановление
+
+  assert.strictEqual(factory.spawned.length, 2, 'авто-спавн #2 должен был произойти');
+
+  // Очередь должна быть очищена авто-восстановлением — новая сессия ничего
+  // не знает о контексте старой.
+  const changed = queueChangedFor(events, a.tabId);
+  assert.deepStrictEqual(
+    changed[changed.length - 1].queue,
+    [],
+    'авто-восстановление должно было очистить очередь протухшей сессии (I3)',
+  );
+
+  // Контрольная проверка: первый Stop НОВОГО (доказанного) поколения ничего
+  // не вбрасывает — очередь пуста, а не потому что gen не совпал.
+  const genAfterAutoRecover = Number(factory.spawned[1].opts.env.COCKPIT_TAB_GEN);
+  mgr.applyHookEvent(a.tabId, 'Stop', {}, genAfterAutoRecover);
+  assert.deepStrictEqual(factory.spawned[1].written, []);
+});
+
 test('долгоживущий процесс с оверрайдом (прожил дольше 15с), умерший сам — НЕ авто-восстанавливается, остаётся dead', () => {
   const factory = makeFakePtyFactory();
   const { mgr, events, tick } = makeManager(factory);
@@ -814,4 +854,366 @@ test('ручной restart() САМ ПО СЕБЕ сбрасывает autoRecov
   );
   assert.deepStrictEqual(factory.spawned[4].opts.args, []);
   assert.strictEqual(statusOf(events, a.tabId).status, 'working');
+});
+
+// ---------- Phase 7 Task 1: очередь промптов ----------
+
+const queueChangedFor = (events, tabId) => events
+  .filter((e) => e.channel === 'queue:changed' && e.payload.tabId === tabId)
+  .map((e) => e.payload);
+
+test('enqueue добавляет текст в конец очереди и эмитит queue:changed', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.enqueue(a.tabId, 'первый промпт');
+  mgr.enqueue(a.tabId, 'второй промпт');
+  const changed = queueChangedFor(events, a.tabId);
+  assert.strictEqual(changed.length, 2);
+  assert.deepStrictEqual(changed[1].queue, ['первый промпт', 'второй промпт']);
+});
+
+test('enqueue игнорирует пустой/пробельный текст — очередь не меняется, событие не эмитится', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.enqueue(a.tabId, '');
+  mgr.enqueue(a.tabId, '   ');
+  mgr.enqueue(a.tabId, '\t\n');
+  assert.strictEqual(queueChangedFor(events, a.tabId).length, 0);
+});
+
+// M2 (ревью финальной волны фазы 7): enqueue кладёт текст КАК ЕСТЬ, путь
+// рецептов (app.js/runRecipe) прогоняет текст через normalizeForPty ПЕРЕД
+// записью в pty — два пути должны быть захардены одинаково: внутренний
+// перенос строки в тексте очереди ушёл бы отдельным Enter в момент вброса
+// (injectQueuedOnStop пишет `${text}\r` одной командой) точно так же, как
+// это уже было починено у рецептов (Minor 8, ревью раунд 1).
+test('enqueue нормализует текст через normalizeForPty (M2) — многострочный текст приходит в pty ОДНОЙ строкой при вбросе', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  const gen = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  mgr.enqueue(a.tabId, 'первая строка\nвторая строка\r\nтретья');
+  const changed = queueChangedFor(events, a.tabId);
+  assert.deepStrictEqual(changed[changed.length - 1].queue, ['первая строка вторая строка третья']);
+  mgr.applyHookEvent(a.tabId, 'Stop', {}, gen);
+  assert.deepStrictEqual(factory.spawned[0].written, ['первая строка вторая строка третья\r']);
+});
+
+test('removeFromQueue убирает элемент по индексу и эмитит queue:changed', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.enqueue(a.tabId, 'a');
+  mgr.enqueue(a.tabId, 'b');
+  mgr.enqueue(a.tabId, 'c');
+  mgr.removeFromQueue(a.tabId, 1);
+  const changed = queueChangedFor(events, a.tabId);
+  assert.deepStrictEqual(changed[changed.length - 1].queue, ['a', 'c']);
+});
+
+test('removeFromQueue с некорректным индексом — no-op, событие не эмитится', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.enqueue(a.tabId, 'a');
+  const before = queueChangedFor(events, a.tabId).length;
+  mgr.removeFromQueue(a.tabId, 5);
+  mgr.removeFromQueue(a.tabId, -1);
+  assert.strictEqual(queueChangedFor(events, a.tabId).length, before);
+});
+
+test('clearQueue опустошает очередь и эмитит queue:changed с пустым массивом', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.enqueue(a.tabId, 'a');
+  mgr.enqueue(a.tabId, 'b');
+  mgr.clearQueue(a.tabId);
+  const changed = queueChangedFor(events, a.tabId);
+  assert.deepStrictEqual(changed[changed.length - 1].queue, []);
+});
+
+test('clearQueue на уже пустой очереди — no-op, лишнего события нет', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.clearQueue(a.tabId);
+  assert.strictEqual(queueChangedFor(events, a.tabId).length, 0);
+});
+
+test('dequeueAll возвращает всю очередь и опустошает её, эмитит queue:changed', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.enqueue(a.tabId, 'a');
+  mgr.enqueue(a.tabId, 'b');
+  const drained = mgr.dequeueAll(a.tabId);
+  assert.deepStrictEqual(drained, ['a', 'b']);
+  const changed = queueChangedFor(events, a.tabId);
+  assert.deepStrictEqual(changed[changed.length - 1].queue, []);
+});
+
+// I4 (ревью финальной волны фазы 7): injectQueuedOnStop требует ДОКАЗАННОГО
+// поколения (см. applyHookEvent в sessions.js) — все тесты ниже, где Stop
+// ДОЛЖЕН реально вбросить элемент очереди, теперь передают ТЕКУЩИЙ (доказанный)
+// gen явно, тем же приёмом, что и гард-тесты Task 5 (COCKPIT_TAB_GEN из
+// env спавна). Это не искусственная подгонка под фикс: в проде hook-bridge.js
+// ВСЕГДА получает такой gen для кокпит-вкладки (COCKPIT_TAB_GEN есть у любого
+// pty, которое спавнит сам sessions.js) — тесты просто перестали занижать
+// требования к самим себе, изображая маршрут «без gen вообще», которым Stop
+// СВОЕЙ ЖЕ вкладки в реальности никогда не приходит.
+
+test('Stop вбрасывает ПЕРВЫЙ элемент очереди в pty (text + \\r) и укорачивает очередь; статус не подделывается', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  const gen = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  mgr.enqueue(a.tabId, 'первый');
+  mgr.enqueue(a.tabId, 'второй');
+  mgr.applyHookEvent(a.tabId, 'Stop', {}, gen);
+  assert.deepStrictEqual(factory.spawned[0].written, ['первый\r']);
+  const changed = queueChangedFor(events, a.tabId);
+  assert.deepStrictEqual(changed[changed.length - 1].queue, ['второй']);
+  // Статус остаётся 'done' от самого Stop — вброс НЕ подделывает 'working',
+  // это придёт следующим хуком (UserPromptSubmit/PreToolUse) от реального CLI.
+  assert.strictEqual(statusOf(events, a.tabId).status, 'done');
+});
+
+test('Stop при пустой очереди ничего не пишет в pty и не эмитит queue:changed', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  const gen = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  mgr.applyHookEvent(a.tabId, 'Stop', {}, gen);
+  assert.deepStrictEqual(factory.spawned[0].written, []);
+  assert.strictEqual(queueChangedFor(events, a.tabId).length, 0);
+});
+
+test('Stop не вбрасывает, если pty мёртв — очередь не трогается (текст не теряется)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  const gen = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  mgr.enqueue(a.tabId, 'висит в очереди');
+  factory.spawned[0].opts.onExit(0); // proc умирает — tab.proc становится null (gen не меняется — обычная смерть, не авто-восстановление)
+  const before = queueChangedFor(events, a.tabId).length;
+  mgr.applyHookEvent(a.tabId, 'Stop', {}, gen); // хук всё равно долетел уже после смерти pty
+  assert.deepStrictEqual(factory.spawned[0].written, []);
+  assert.strictEqual(queueChangedFor(events, a.tabId).length, before);
+});
+
+test('несколько Stop подряд вбрасывают элементы очереди строго по одному за раз', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  const gen = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  mgr.enqueue(a.tabId, 'one');
+  mgr.enqueue(a.tabId, 'two');
+  mgr.enqueue(a.tabId, 'three');
+  mgr.applyHookEvent(a.tabId, 'Stop', {}, gen);
+  assert.deepStrictEqual(factory.spawned[0].written, ['one\r']);
+  mgr.applyHookEvent(a.tabId, 'Stop', {}, gen);
+  assert.deepStrictEqual(factory.spawned[0].written, ['one\r', 'two\r']);
+  mgr.applyHookEvent(a.tabId, 'Stop', {}, gen);
+  assert.deepStrictEqual(factory.spawned[0].written, ['one\r', 'two\r', 'three\r']);
+  // Очередь исчерпана — четвёртый Stop подряд больше ничего не пишет.
+  mgr.applyHookEvent(a.tabId, 'Stop', {}, gen);
+  assert.deepStrictEqual(factory.spawned[0].written, ['one\r', 'two\r', 'three\r']);
+});
+
+test('close чистит очередь вкладки (queue:changed с пустым массивом до удаления)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.enqueue(a.tabId, 'x');
+  mgr.close(a.tabId);
+  const changed = queueChangedFor(events, a.tabId);
+  assert.deepStrictEqual(changed[changed.length - 1].queue, []);
+});
+
+test('restart чистит очередь вкладки — новая сессия не наследует чужой недоотправленный ввод', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.enqueue(a.tabId, 'x');
+  mgr.restart(a.tabId);
+  const changed = queueChangedFor(events, a.tabId);
+  assert.deepStrictEqual(changed[changed.length - 1].queue, []);
+  // Подтверждаем и функционально: следующий Stop НОВОГО (доказанного)
+  // поколения ничего больше не вбрасывает — очередь пуста именно потому, что
+  // restart() её почистил, а НЕ потому, что gen не совпал (I4: без явного
+  // текущего gen здесь эта проверка была бы неспособна заметить регрессию,
+  // если бы clearQueue() внутри restart() вдруг сломался, — assert остался
+  // бы «случайно зелёным» по ДРУГОЙ причине).
+  const genAfterRestart = Number(factory.spawned[1].opts.env.COCKPIT_TAB_GEN);
+  mgr.applyHookEvent(a.tabId, 'Stop', {}, genAfterRestart);
+  assert.deepStrictEqual(factory.spawned[1].written, []);
+});
+
+// ---------- Доп. находка ревью Task 1 фазы 7 (задача 5): гард поколения хук-событий ----------
+// Маршрутизация хуков (hook-bridge.js) раньше не была привязана к поколению
+// pty — опоздавший Stop уже убитого/перезапущенного процесса мог долететь
+// ПОСЛЕ того, как в этой же вкладке поднялась новая сессия, и произвести
+// побочный эффект (вброс очереди промптов) уже в чужом, свежем поколении.
+// gen каждого спавна виден тестам через env.COCKPIT_TAB_GEN — тот же канал,
+// которым в проде реальный cockpit-hook.js получает его и кладёт в payload,
+// а hook-bridge.js прокидывает в applyHookEvent() (см. sessions.js/spawn()).
+
+test('applyHookEvent с устаревшим (не текущим) поколением игнорируется ЦЕЛИКОМ — опоздавший Stop убитого рестартом процесса не вбрасывает чужой элемент очереди в новую сессию и не трогает статус', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24); // спавн #1 — старое поколение
+  const staleGen = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+
+  mgr.restart(a.tabId); // спавн #2 — новое поколение (restart уже почистил очередь сам)
+  const currentGen = Number(factory.spawned[1].opts.env.COCKPIT_TAB_GEN);
+  assert.notStrictEqual(staleGen, currentGen, 'restart() должен был сменить поколение вкладки');
+
+  // Новая сессия получает СВОЙ собственный элемент очереди.
+  mgr.enqueue(a.tabId, 'для новой сессии');
+  const statusBefore = statusOf(events, a.tabId);
+
+  // Опоздавший Stop убитого спавна #1 долетает только сейчас, помеченный
+  // СВОИМ (устаревшим) поколением — не должен произвести НИКАКОГО побочного
+  // эффекта в текущем состоянии вкладки: ни вброса очереди, ни смены статуса.
+  mgr.applyHookEvent(a.tabId, 'Stop', {}, staleGen);
+  assert.deepStrictEqual(factory.spawned[1].written, [], 'опоздавший Stop не должен был писать в НОВЫЙ pty');
+  const changedAfterStale = queueChangedFor(events, a.tabId);
+  assert.deepStrictEqual(
+    changedAfterStale[changedAfterStale.length - 1].queue,
+    ['для новой сессии'],
+    'очередь новой сессии не должна была тронуться устаревшим событием',
+  );
+  assert.deepStrictEqual(statusOf(events, a.tabId), statusBefore, 'статус не должен был измениться устаревшим событием');
+
+  // Контрольная проверка: Stop с ПРАВИЛЬНЫМ (текущим) поколением по-прежнему
+  // работает как обычно — гард не сломал обычный путь, отсекает именно
+  // устаревшие события.
+  mgr.applyHookEvent(a.tabId, 'Stop', {}, currentGen);
+  assert.deepStrictEqual(factory.spawned[1].written, ['для новой сессии\r']);
+});
+
+// I4 (ревью финальной волны фазы 7): этот тест ДО фикса I4 фиксировал дыру
+// как ожидаемое поведение — утверждал, что Stop без gen (сторонняя claude-
+// сессия вне кокпита, найденная мостом по session_id — см. hook-bridge.js —
+// либо гипотетический старый хук-скрипт) вбрасывает очередь как обычно. Это
+// и было находкой I4: сторонняя сессия НЕ должна иметь возможность писать в
+// pty чужой (кокпитной) вкладки, даже если статусы ей двигать можно
+// (заявленная фича port-file). Переписан: статус применяется, вброса нет.
+test('applyHookEvent: gen не передан (I4 — сторонняя сессия/старый хук-скрипт БЕЗ доказанного поколения) — статус применяется как обычно, но вброс очереди НЕ происходит', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.enqueue(a.tabId, 'текст');
+  mgr.applyHookEvent(a.tabId, 'Stop', {}); // gen не передан вовсе — недоказанное поколение
+  // Статус НЕ заблокирован — недоказанное поколение не значит «чужое», это
+  // ЗАЯВЛЕННАЯ фича port-file (сторонние claude-сессии тоже двигают статус
+  // вкладки, которой принадлежит их session_id).
+  assert.strictEqual(statusOf(events, a.tabId).status, 'done');
+  // НО живой побочный эффект (запись в pty) требует ДОКАЗАННОГО поколения —
+  // недоказанное (gen:null) не даёт права писать в pty ЭТОЙ вкладки: иначе
+  // Stop СТОРОННЕГО процесса той же сессии мог бы вбросить чужой элемент
+  // очереди в pty вкладки кокпита (I4, сценарий ревью).
+  assert.deepStrictEqual(factory.spawned[0].written, []);
+  // Очередь остаётся нетронутой — текст не потерян, ждёт следующего
+  // ДОКАЗАННОГО (своего) Stop.
+  const changed = queueChangedFor(events, a.tabId);
+  assert.deepStrictEqual(changed[changed.length - 1].queue, ['текст']);
+});
+
+// ---------- Important 1 (ревью раунд 1, обязательная правка): gen должен быть глобальным, а не по вкладке ----------
+
+test('genSeq глобален: первые спавны РАЗНЫХ вкладок получают РАЗНЫЕ поколения, а не одинаковый gen:1 у каждой', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  const b = mgr.open({ cwd: 'C:\\proj\\beta' });
+  mgr.start(a.tabId, 80, 24); // первый спавн A
+  mgr.start(b.tabId, 80, 24); // первый спавн B
+  const genA = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  const genB = Number(factory.spawned[1].opts.env.COCKPIT_TAB_GEN);
+  assert.notStrictEqual(genA, genB, 'до фикса Important 1 оба были бы gen:1 (счётчик по вкладке, а не по менеджеру)');
+});
+
+test('Important 1: закрытая вкладка A и НОВАЯ вкладка B с ТОЙ ЖЕ сессией не делят совпадающий gen — опоздавший Stop вкладки A (маршрутизированный по session_id уже в B) не производит побочного эффекта в B', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+
+  // Вкладка A: спавн #1, SessionStart привязывает сессию 'S'.
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  const staleGenFromA = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S' });
+
+  // Пользователь закрывает A ровно в момент, когда её Stop-хук уже запущен,
+  // но POST ещё не долетел до моста — close() удаляет вкладку из tabs.
+  mgr.close(a.tabId);
+
+  // Открывается НОВАЯ вкладка B с ТОЙ ЖЕ сессией 'S' (Ctrl+Shift+H/«Открыть
+  // воркспейс»). До фикса её первый спавн ТОЖЕ получил бы gen:1 (счётчик по
+  // вкладке начинался бы с нуля заново) — ровно та коллизия, которую чинит
+  // Important 1.
+  const b = mgr.open({ cwd: 'C:\\proj\\beta', sessionId: 'S' });
+  mgr.start(b.tabId, 80, 24);
+  const bSpawnIndex = factory.spawned.length - 1;
+  const currentGenOfB = Number(factory.spawned[bSpawnIndex].opts.env.COCKPIT_TAB_GEN);
+  assert.notStrictEqual(
+    currentGenOfB,
+    staleGenFromA,
+    'поколения РАЗНЫХ вкладок не должны совпадать даже после закрытия одной из них',
+  );
+
+  // Новая сессия B получает СВОЙ собственный элемент очереди.
+  mgr.enqueue(b.tabId, 'для B');
+  const statusBeforeStale = statusOf(events, b.tabId);
+
+  // Опоздавший Stop вкладки A мосту уже неизвестен по tabId (A удалена из
+  // tabs), маршрутизируется по session_id 'S' — а на неё теперь отвечает B
+  // (findBySessionId в hook-bridge.js). Эмулируем результат этой маршрутизации
+  // напрямую: applyHookEvent для tabId B, но со СТАРЫМ (устаревшим) gen'ом A.
+  mgr.applyHookEvent(b.tabId, 'Stop', {}, staleGenFromA);
+  assert.deepStrictEqual(
+    factory.spawned[bSpawnIndex].written,
+    [],
+    'опоздавший Stop вкладки A не должен был писать в pty вкладки B',
+  );
+  assert.deepStrictEqual(
+    statusOf(events, b.tabId),
+    statusBeforeStale,
+    'статус B не должен был измениться опоздавшим событием A',
+  );
+
+  // Контрольная проверка: Stop с ПРАВИЛЬНЫМ (текущим) поколением B по-прежнему
+  // работает как обычно — гард не сломан, отсекает именно чужие поколения.
+  mgr.applyHookEvent(b.tabId, 'Stop', {}, currentGenOfB);
+  assert.deepStrictEqual(factory.spawned[bSpawnIndex].written, ['для B\r']);
+});
+
+// Minor 5 (ревью раунд 1): отдельный тест "gen ТЕКУЩЕГО поколения применяется
+// как обычно" отсюда убран — он дублировал контрольный шаг в конце теста
+// «applyHookEvent с устаревшим... поколением игнорируется ЦЕЛИКОМ» выше
+// (строки 1019-1023: applyHookEvent с currentGen после restart() и проверка,
+// что вброс всё же произошёл) — тот же случай «текущий gen работает как
+// обычно», без собственного отдельного режима падения.
+
+test('spawn: env несёт COCKPIT_TAB_GEN как строку текущего поколения, растущего с каждым спавном', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24); // спавн #1
+  mgr.restart(a.tabId); // спавн #2
+  const gen1 = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  const gen2 = Number(factory.spawned[1].opts.env.COCKPIT_TAB_GEN);
+  assert.ok(Number.isInteger(gen1) && gen1 > 0);
+  assert.ok(Number.isInteger(gen2) && gen2 > gen1, 'поколение второго спавна должно быть строго больше первого');
 });

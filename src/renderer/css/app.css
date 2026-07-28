@@ -154,7 +154,9 @@ html, body {
    align-items:flex-start (см. .tab-row выше), без этого бейдж прилип бы к
    верхнему краю вместе с .tab-dot вместо визуального центрирования по высоте
    строки. Цвет — по статусу проверок (пороги те же, что rings.js/dashboard.js:
-   --working ждём, --ok прошли, --err упали), --text-dim — нет проверок/черновик. */
+   --working ждём, --ok прошли, --err упали), --text-muted + заливка-микс
+   (color-mix из --text-muted/--bg-hover) — нет проверок/черновик (см.
+   .tab-pr-badge.none ниже, разбор контрастов — там же и в task-5-report.md). */
 .tab-pr-badge {
   flex: none;
   align-self: center;
@@ -172,7 +174,47 @@ html, body {
 .tab-pr-badge.pending { color: var(--working); border-color: var(--working); }
 .tab-pr-badge.passing { color: var(--ok); border-color: var(--ok); }
 .tab-pr-badge.failing { color: var(--err); border-color: var(--err); }
-.tab-pr-badge.none { color: var(--text-dim); border-color: var(--text-dim); }
+/* Carryover фазы 6 (живая приёмка, задача 5 фазы 7) + Minor 2 (ревью раунд 1,
+   задача 5 фазы 7): на репозитории без настроенного CI бейдж «нет проверок»
+   на фоне сайдбара (--bg-panel) был почти неразличим — --text-dim читался
+   как «невидимо». Первая попытка (просто background:var(--bg-card)) ревью
+   справедливо забраковало: --bg-card И ЕСТЬ фон .tab-row.active (строка выше,
+   .tab-row.active), так что на активной строке заливка исчезала ПОЛНОСТЬЮ
+   (контраст 1.00:1, посчитано по формуле WCAG), а на обычной строке (фон
+   --bg-panel) давала лишь 1.11:1 — на глаз неотличимо от отсутствия заливки
+   вовсе. Все фоновые токены v2 (--bg-window/--bg-panel/--bg-card/--bg-hover)
+   лежат в узкой тёмной полосе (15..42 из 255) — никакая ПРЯМАЯ подстановка
+   одного из них никогда не даст «отчётливо видимую» заливку сразу на всех
+   трёх фонах строки (обычном/активном/ждущем). Решение — color-mix() двух
+   существующих токенов (тот же приём, что уже в .tab-row.waiting.active
+   ниже по файлу): --text-muted подмешан в --bg-hover, поднимает заливку
+   заметно выше всей фоновой полосы, оставаясь тёмно-серой (не конкурирует
+   цветом со статусными pending/passing/failing выше). Проверено на всех трёх
+   фонах строки — контраст ~1.8-2.0:1 (было 1.0-1.1:1), т.е. заливка теперь
+   РЕАЛЬНО отличима на глаз, а не только «формально другое число» (полный
+   разбор всех посчитанных пар и почему выбраны именно эти проценты — в
+   task-5-report.md, раздел «Ревью раунд 1 / Minor 2»). Цветовое кодирование
+   остальных статусов (pending/passing/failing выше) не тронуто. */
+.tab-pr-badge.none {
+  background: color-mix(in srgb, var(--text-muted) 25%, var(--bg-hover) 75%);
+  color: var(--text-muted);
+  border-color: var(--text-muted);
+}
+/* Minor 1 (ревью раунд 1): без этого правила общий .tab-pr-badge:hover выше
+   (тоже background:var(--bg-hover), специфичность (0,2,0) — РОВНО такая же,
+   как у .tab-pr-badge.none) проигрывал бы порядку объявления в файле — .none
+   стоит ПОСЛЕ :hover и молча перебивал его фон при любом наведении, наведение
+   мышью на бейдж «нет проверок» переставало что-либо показывать (терялся
+   единственный признак кликабельности у самого частого состояния бейджа).
+   Явное правило .none:hover — специфичность (0,3,0), выигрывает у обоих
+   вне зависимости от порядка в файле (устойчиво к будущим правкам порядка).
+   Фон — ЯРЧЕ состояния покоя (тот же приём color-mix, больший процент
+   --text-muted), а не переиспользование plain --bg-hover: заливка покоя уже
+   ЯРЧЕ голого --bg-hover, реюз дал бы наведению визуально ЗАТЕМНЯТЬ пилюлю
+   (обратный, контринтуитивный эффект). */
+.tab-pr-badge.none:hover {
+  background: color-mix(in srgb, var(--text-muted) 45%, var(--bg-hover) 55%);
+}
 
 .sidebar-footer {
   margin-top: auto;
@@ -725,9 +767,28 @@ html, body {
   padding: 8px 6px 20px;
   position: relative;
 }
-.chart-bar {
+/* Колонка-мишень для наведения (живая приёмка фазы 7): столбик в 2-3px —
+   недосягаемая цель для курсора, поэтому hover ловит вся колонка на высоту
+   графика, а заливка прижата к её низу. Данные дня при наведении выводятся
+   в .dashboard-chart-hint заголовка (см. dashboard.js/renderChartBars). */
+.chart-col {
   flex: 1;
   min-width: 3px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  position: relative;
+}
+.chart-col:hover {
+  background: color-mix(in srgb, var(--text-muted) 8%, transparent);
+  border-radius: 2px;
+}
+.chart-col:hover .chart-bar {
+  background: color-mix(in srgb, var(--working) 80%, white);
+}
+.chart-bar {
+  width: 100%;
   height: 2%;
   background: var(--working);
   border-radius: 2px 2px 0 0;
@@ -824,6 +885,84 @@ html, body {
   color: var(--text-muted);
 }
 .dashboard-github-error { color: var(--err); }
+
+/* --- Очередь промптов (Task 1 фазы 7): строка чипов НАД панелью действий
+   (см. index.html — между #main-row и #action-bar), плюс отдельное поле
+   ввода #queue-input (открывается Ctrl+Q, см. app.js). Оба — обычные
+   flex-соседи колонки #main (как #action-bar), НЕ оверлеи. --- */
+#queue-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: var(--bg-panel);
+  border-top: 1px solid var(--border);
+  font-family: var(--font-ui);
+  font-size: 11px;
+  overflow-x: auto;
+}
+#queue-bar.hidden { display: none; }
+.queue-chip {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 6px 3px 10px;
+  max-width: 320px;
+}
+.queue-chip-text {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.queue-chip-remove {
+  flex: none;
+  border: none;
+  background: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+  padding: 2px 3px;
+  border-radius: 50%;
+}
+.queue-chip-remove:hover { color: var(--text); background: var(--bg-hover); }
+.queue-hint {
+  flex: none;
+  margin-left: auto;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+/* Поле ввода очереди (Ctrl+Q) — отдельная строка, скрыта, пока не открыта. */
+#queue-input-row {
+  flex: none;
+  padding: 6px 10px;
+  background: var(--bg-panel);
+  border-top: 1px solid var(--border);
+}
+#queue-input-row.hidden { display: none; }
+#queue-input {
+  width: 100%;
+  background: var(--bg-window);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  padding: 6px 8px;
+}
+#queue-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
 
 /* --- Панель действий (вместо отладочной статус-строки).
    Теперь внутри #main, после #terminal-host — flex-элемент колонки #main,
@@ -1028,6 +1167,189 @@ html, body {
   text-align: center;
 }
 
+/* --- Глобальный поиск по истории (Task 3 фазы 7): Ctrl+Shift+H, тот же
+   скелет вёрстки, что палитра команд (.palette-*) выше — центр окна,
+   z-index на одном уровне (60), т.к. оба взаимно исключают друг друга
+   (app.js/bindHotkeys). Классы отдельные (.search-*), потому что строка
+   результата сложнее строки палитры: имя проекта + дата + превью первого
+   сообщения + сниппет с подсветкой найденных слов. Корень #search-root —
+   прямой ребёнок <body> (см. index.html), тот же приём, что palette-root. --- */
+.search-overlay {
+  position: fixed;
+  inset: 0;
+  background: color-mix(in srgb, var(--bg-window) 55%, transparent);
+  display: flex;
+  justify-content: center;
+  padding-top: 96px;
+  z-index: 60;
+}
+.search-panel {
+  width: 640px;
+  max-width: 90%;
+  max-height: 70vh;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-l);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+.search-input {
+  background: var(--bg-window);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  padding: 8px 10px;
+}
+.search-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.search-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  /* Больше строк, чем у палитры (320px) — каждая строка результата поиска
+     трёхстрочная (имя+дата / первое сообщение / сниппет), а не однострочная. */
+  max-height: 440px;
+  overflow-y: auto;
+}
+.search-status {
+  font-size: 12px;
+  color: var(--text-dim);
+  padding: 16px 9px;
+  text-align: center;
+}
+.search-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 9px;
+  border-radius: var(--radius-s);
+  cursor: pointer;
+}
+.search-row:hover,
+.search-row.active {
+  background: var(--bg-hover);
+}
+.search-row-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+}
+.search-row-name {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.search-row-date {
+  font-size: 10px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  flex: none;
+}
+.search-row-first {
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.search-row-snippet {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.search-hit {
+  background: color-mix(in srgb, var(--accent) 55%, transparent);
+  color: var(--text);
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+/* --- Мини-форма ввода (Task 4 фазы 7): плейсхолдеры рецепта / имя воркспейса.
+   Тот же скелет вёрстки, что палитра/поиск (.palette-*/.search-*) выше —
+   центр окна, тот же z-index (60), т.к. открывается ИЗ уже закрытой палитры
+   (взаимно с ней не пересекается на практике) и взаимно исключается с
+   дашбордом/поиском по истории (см. app.js/toggleDashboard, toggleHistorySearch,
+   bindHotkeys). Корень #recipe-form-root — прямой ребёнок <body> (см.
+   index.html), тот же приём, что palette-root/search-root. --- */
+.recipe-form-overlay {
+  position: fixed;
+  inset: 0;
+  background: color-mix(in srgb, var(--bg-window) 55%, transparent);
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 96px;
+  z-index: 60;
+}
+.recipe-form-panel {
+  width: 420px;
+  max-width: 90%;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-l);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+.recipe-form-title {
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+}
+.recipe-form-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.recipe-form-label {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.recipe-form-input {
+  background: var(--bg-window);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  padding: 7px 9px;
+}
+.recipe-form-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+/* Форма-подтверждение без полей (ревью раунд 1: «Открыть воркспейс…») — те же
+   кнопки, что #restore-overlay/.restore-actions, тот же приём переиспользования
+   .sidebar-btn вместо отдельного набора цветов под две кнопки. */
+.recipe-form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.recipe-form-actions .sidebar-btn { flex: none; }
+.recipe-form-hint {
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
 /* --- Тосты (находка 4б, ревью фазы 6): app:notice (main/notify.js) — раньше
    долетал до renderer, но показывался ТОЛЬКО console.warn'ом, без единого
    визуального следа (см. app.js/showToast). Корень — прямой ребёнок <body>
@@ -1059,3 +1381,81 @@ html, body {
 .toast-warn { border-color: var(--warn); }
 .toast-error { border-color: var(--err); }
 .toast-info { border-color: var(--accent); }
+
+/* --- Шпаргалка горячих клавиш (живая приёмка фазы 7) ---
+   Тот же слой, что палитра/поиск (60): взаимно исключаются через реестр
+   overlayFlags в app.js, стопка исключена, поэтому общий z-index честен. */
+.hotkeys-overlay {
+  position: fixed;
+  inset: 0;
+  background: color-mix(in srgb, var(--bg-window) 55%, transparent);
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 64px;
+  z-index: 60;
+}
+.hotkeys-panel {
+  width: 520px;
+  max-width: 90%;
+  max-height: 78vh;
+  overflow-y: auto;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-l);
+  padding: 16px 20px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+.hotkeys-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 8px;
+}
+.hotkeys-group-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  margin: 12px 0 4px;
+}
+.hotkeys-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 3px 0;
+}
+.hotkeys-combo {
+  flex: 0 0 220px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-primary);
+}
+.hotkeys-desc {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* Подписи значений на графике расхода (живая приёмка фазы 7: высота столбиков
+   ничего не говорила — ни единицы, ни масштаба). Значение — над столбиком
+   максимума; пояснение единиц — в заголовке секции. */
+.chart-bar-value {
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  margin-bottom: 2px;
+  font-size: 10px;
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+.dashboard-chart-hint {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-left: 8px;
+}
+/* При наведении на колонку в hint выводятся живые цифры дня — выделяем,
+   чтобы взгляд находил их мгновенно. */
+.dashboard-chart-hint.active {
+  color: var(--text-primary);
+}

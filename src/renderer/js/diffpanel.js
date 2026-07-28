@@ -83,6 +83,22 @@ function isUndiffedNewFile(f) {
 
 function formatSummary(snap) {
   const files = snap.files;
+
+  // Живая приёмка фазы 7: «phase7-finish · +0 −0 · 0 файлов» пользователь
+  // ДВАЖДЫ прочитал как поломку панели, хотя это честное «всё закоммичено».
+  // Нули выглядят как отказ — чистое дерево называем словами. ahead/behind
+  // при этом сохраняем: «чисто, но ↑3» — важная информация перед push.
+  if (!files.length) {
+    const parts = [snap.branch || '(без ветки)', 'всё закоммичено ✓'];
+    if (snap.ahead || snap.behind) {
+      const arrows = [];
+      if (snap.ahead) arrows.push(`↑${snap.ahead}`);
+      if (snap.behind) arrows.push(`↓${snap.behind}`);
+      parts.push(arrows.join(' '));
+    }
+    return parts.join(' · ');
+  }
+
   const undiffedNew = files.filter(isUndiffedNewFile);
   // Сумма +N −M — только по файлам, где числа реальные (обычные + успешно
   // добранные untracked); «без диффа» файлы дали бы ложный вклад 0/0, будто
@@ -303,7 +319,10 @@ export function createDiffPanel({ root, api }) {
     summaryEl.textContent = formatSummary(snap);
 
     if (!snap.files.length) {
-      showEmpty('изменений нет');
+      // Та же живая приёмка: «изменений нет» дополняем объяснением, ЧТО
+      // именно показывает панель, — незакоммиченные изменения против HEAD,
+      // а не дифф всей ветки (второй источник той же путаницы).
+      showEmpty('рабочее дерево чистое — все изменения закоммичены');
       return;
     }
 

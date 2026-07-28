@@ -9,6 +9,10 @@ import { createPalette } from './palette.js';
 import { createDashboard } from './dashboard.js';
 import { renderRings } from './rings.js';
 import { createDiffPanel } from './diffpanel.js';
+import { createSearch } from './search.js';
+import { createRecipeForm } from './recipe-form.js';
+import { createHotkeysOverlay } from './hotkeys.js';
+import { pluralTabs } from './format.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -26,6 +30,35 @@ let dashboard = null;
 // Task 2 фазы 6: панель диффа — НЕ оверлей (см. diffpanel.js), createDiffPanel
 // сама владеет своим DOM внутри #diff-panel (строится один раз при boot()).
 let diffPanel = null;
+// Task 3 фазы 7 (глобальный поиск истории): оверлей Ctrl+Shift+H —
+// createSearch сама владеет своим DOM (см. search.js), здесь только ссылка
+// для bindHotkeys/взаимного исключения с palette/dashboard/peek.
+let historySearch = null;
+// Task 4 фазы 7 (рецепты промптов + именованные воркспейсы): createRecipeForm
+// сама владеет своим DOM-оверлеем (мини-форма ввода, см. recipe-form.js) —
+// здесь только ссылка для взаимного исключения с прочими оверлеями (тот же
+// приём, что historySearch/dashboard/palette выше).
+let recipeForm = null;
+let hotkeysOverlay = null; // шпаргалка клавиш (живая приёмка фазы 7) — участник overlayFlags()
+// Локальные зеркала server-side библиотек (main/recipes.js) — тот же приём,
+// что queueByTab/lastUsage/lastGh ниже: buildPaletteActions() должна быть
+// СИНХРОННОЙ (palette.js зовёт getActions() без await, см. palette.js/open()),
+// а recipes:list/recipes:listWorkspaces — асинхронные IPC-вызовы. Кэш
+// заполняется при boot() и обновляется сразу после «Сохранить воркспейс…»
+// (см. saveCurrentWorkspace) — палитра не отстаёт больше чем на один клик.
+let recipesCache = [];
+let workspacesCache = [];
+// Important 2 (ревью раунд 1): реентерабельность openWorkspace() — стаггер
+// открытия воркспейса живёт несколько секунд (1500мс × N вкладок) БЕЗ единой
+// визуальной блокировки UI; повторный вызов, пока первый ещё не закончился
+// (второй клик по «Открыть воркспейс…», в т.ч. на ДРУГОМ сохранённом
+// воркспейсе), запускал бы второй closeAllTabs()/стаггер поверх первого —
+// закрывал бы только что открытые первым циклом вкладки, а его собственный
+// setTimeout-хвост продолжал бы доливать вкладки уже после этого. Флаг
+// проверяется САМОЙ ПЕРВОЙ строкой openWorkspace() (раньше даже диалога
+// подтверждения) и снимается в finally — единственная ошибка внутри цикла не
+// должна навсегда заблокировать открытие воркспейсов до перезапуска.
+let workspaceOpenInFlight = false;
 // Task 3 фазы 4 (peek): tabId, для которого сейчас открыт поповер (или null).
 // Нужен, чтобы обработчик tab:status закрывал peek ТОЛЬКО когда статус меняет
 // именно ту вкладку, что сейчас показана в поповере — peek.hide() идемпотентна,
@@ -56,6 +89,18 @@ let lastGh = null;
 // ipc.js), но лишний IPC-вызов вообще не имеет смысла посылать. Флаг + класс
 // .busy (opacity/cursor:progress, см. app.css) — видимая обратная связь.
 let usageRefreshing = false;
+
+// Task 1 фазы 7 (очередь промптов): tabId → string[], зеркало server-side
+// очереди (main/sessions.js), собираемое ИСКЛЮЧИТЕЛЬНО из queue:changed
+// событий (см. boot() — window.api.queue.onChanged) — тот же приём, что
+// tabStore зеркалит tab:status. Нет отдельного «queue:get» IPC: до первого
+// enqueue для вкладки записи просто нет, что структурно совпадает с «очередь
+// пуста» (renderQueueBar() ниже трактует отсутствующий tabId как []).
+const queueByTab = new Map();
+// Поле ввода очереди (#queue-input, Ctrl+Q) — открыто/закрыто. Отдельно от
+// queueByTab: поле может быть открыто даже при пустой очереди (это и есть
+// способ добавить самый первый элемент).
+let queueInputOpen = false;
 
 // Fix 8 (ревью): точка в титлбаре терракотовая, только пока есть хотя бы одна
 // вкладка в статусе waiting.
@@ -141,6 +186,18 @@ function renderActionBar() {
   diffBtn.addEventListener('mousedown', (e) => e.preventDefault());
   diffBtn.addEventListener('click', () => toggleDiffPanel());
   host.appendChild(diffBtn);
+  // Живая приёмка фазы 7: кнопка ⌨ — шпаргалка горячих клавиш. Тот же
+  // паттерн, что 📊/± выше (пересборка на renderActionBar, mousedown-
+  // preventDefault против кражи фокуса у терминала).
+  const keysBtn = document.createElement('button');
+  keysBtn.type = 'button';
+  keysBtn.id = 'btn-hotkeys';
+  keysBtn.className = 'action-btn';
+  keysBtn.textContent = '⌨';
+  keysBtn.title = 'Горячие клавиши';
+  keysBtn.addEventListener('mousedown', (e) => e.preventDefault());
+  keysBtn.addEventListener('click', () => toggleHotkeys());
+  host.appendChild(keysBtn);
   // deepMerge (config.js) при частичном оверрайде массива объектом даёт
   // {0:…,1:…} вместо массива — Array.isArray отсекает такой и любой другой
   // некорректный actionBar.commands, чтобы не уронить boot() на итерации.
@@ -167,7 +224,8 @@ function renderActionBar() {
     btn.addEventListener('click', () => {
       const id = tabStore.activeId;
       if (id) {
-        window.api.term.write(id, `${command}\r`);
+        // C1 (ревью финальной волны): гард статуса — см. writeCommandToTab.
+        writeCommandToTab(id, command);
         // Возвращаем фокус терминалу активной вкладки на случай, если он
         // всё же ушёл на кнопку (например, при активации с клавиатуры).
         views.get(id)?.view.focus();
@@ -175,6 +233,76 @@ function renderActionBar() {
     });
     host.appendChild(btn);
   }
+}
+
+// Task 1 фазы 7 (очередь промптов): перерисовать строку чипов #queue-bar
+// из queueByTab для АКТИВНОЙ вкладки — очередь это ввод конкретной сессии,
+// чужая вкладка не должна показывать свои чипы поверх текущей. Пустая
+// очередь (или вкладки вообще нет) прячет строку целиком (бриф).
+function renderQueueBar() {
+  const host = $('queue-bar');
+  if (!host) return;
+  const tabId = tabStore.activeId;
+  const queue = (tabId && queueByTab.get(tabId)) || [];
+  host.textContent = '';
+  if (!queue.length) {
+    host.classList.add('hidden');
+    return;
+  }
+  host.classList.remove('hidden');
+  queue.forEach((text, index) => {
+    const chip = document.createElement('span');
+    chip.className = 'queue-chip';
+
+    const label = document.createElement('span');
+    label.className = 'queue-chip-text';
+    label.textContent = `${index + 1} · ${text}`;
+    label.title = text;
+    chip.appendChild(label);
+
+    const removeBtn = document.createElement('button');
+    removeBtn.type = 'button';
+    removeBtn.className = 'queue-chip-remove';
+    removeBtn.textContent = '✕';
+    removeBtn.title = 'Убрать из очереди';
+    // Fix 3 (ревью, тот же приём, что action-btn/tab-close): без preventDefault
+    // на mousedown кнопка забирает фокус у терминала/поля ввода раньше клика.
+    removeBtn.addEventListener('mousedown', (ev) => ev.preventDefault());
+    removeBtn.addEventListener('click', () => {
+      if (tabId) window.api.queue.remove(tabId, index);
+    });
+    chip.appendChild(removeBtn);
+
+    host.appendChild(chip);
+  });
+
+  const hint = document.createElement('span');
+  hint.className = 'queue-hint';
+  hint.textContent = 'уйдёт, когда Claude освободится';
+  host.appendChild(hint);
+}
+
+// Ctrl+Q открывает поле ввода очереди; Enter внутри него — enqueue и
+// ОСТАВИТЬ поле открытым (удобно набивать несколько промптов подряд, бриф);
+// Esc — закрыть и вернуть фокус терминалу активной вкладки (тот же приём
+// возврата фокуса, что peek.js/onHide — см. createPeek в boot()).
+function openQueueInput() {
+  const row = $('queue-input-row');
+  const input = $('queue-input');
+  if (!row || !input) return;
+  row.classList.remove('hidden');
+  queueInputOpen = true;
+  input.value = '';
+  input.focus();
+}
+
+function closeQueueInput() {
+  if (!queueInputOpen) return;
+  const row = $('queue-input-row');
+  row?.classList.add('hidden');
+  queueInputOpen = false;
+  const activeId = tabStore.activeId;
+  if (activeId) views.get(activeId)?.view.focus();
 }
 
 // Task 3 фазы 5 (кольца лимитов): перерисовать #limits из lastUsage.limits.
@@ -302,8 +430,41 @@ function fetchUsageOnDashboardOpen() {
 function toggleDashboard() {
   peek?.hide();
   if (palette.isOpen()) palette.close();
+  // Task 3 фазы 7: та же логика — оверлей поиска не должен остаться висеть
+  // «за спиной» открывающегося дашборда.
+  if (historySearch?.isOpen()) historySearch.close();
+  // Task 4 фазы 7: та же логика — мини-форма рецепта/воркспейса тоже не
+  // должна остаться висеть «за спиной» (close() — no-op, если форма закрыта).
+  recipeForm?.close();
+  hotkeysOverlay?.close(); // живая приёмка фазы 7: шпаргалка — такой же слой 60
   if (dashboard.isOpen()) dashboard.close();
   else dashboard.open();
+}
+
+// Task 3 фазы 7 (глобальный поиск истории): тумблер Ctrl+Shift+H — тот же
+// паттерн, что toggleDashboard() выше (взаимное исключение со всеми прочими
+// оверлеями, второе нажатие закрывает вместо повторного открытия).
+function toggleHistorySearch() {
+  peek?.hide();
+  if (palette.isOpen()) palette.close();
+  dashboard?.close();
+  // Task 4 фазы 7: та же логика, что toggleDashboard() выше.
+  recipeForm?.close();
+  hotkeysOverlay?.close(); // живая приёмка фазы 7: шпаргалка — такой же слой 60
+  if (historySearch.isOpen()) historySearch.close();
+  else historySearch.open(views.get(tabStore.activeId)?.view);
+}
+
+// Живая приёмка фазы 7: тумблер шпаргалки клавиш (кнопка ⌨/действие палитры) —
+// тот же паттерн взаимного исключения, что toggleDashboard()/toggleHistory-
+// Search() выше: оба слоя z-60, стопка запрещена реестром overlayFlags.
+function toggleHotkeys() {
+  peek?.hide();
+  if (palette.isOpen()) palette.close();
+  dashboard?.close();
+  if (historySearch?.isOpen()) historySearch.close();
+  recipeForm?.close();
+  hotkeysOverlay?.toggle();
 }
 
 // Task 2 фазы 6: тумблер панели диффа (Ctrl+G/кнопка «±» панели действий) —
@@ -382,6 +543,19 @@ function activateTab(tabId) {
   // Task 4 фазы 5: та же логика — дашборд накрывает терминальную область
   // целиком, переключение вкладки под ним не должно оставлять его висеть.
   dashboard?.close();
+  // Task 3 фазы 7: та же логика — оверлей поиска истории тоже накрывает окно
+  // целиком (в т.ч. это естественный путь при открытии результата поиска:
+  // openTab({sessionId}) → activateTab — оверлей к этому моменту уже закрыт
+  // самим search.js/openAt, но close() идемпотентна, повторный вызов безвреден).
+  historySearch?.close();
+  // Task 4 фазы 7: та же логика — переключение вкладки (в т.ч. Ctrl+1..9/
+  // Ctrl+Tab, минуя визуальную блокировку оверлея) не должно оставить мини-
+  // форму рецепта/воркспейса висеть «за спиной» с чужим недописанным вводом.
+  recipeForm?.close();
+  // Task 1 фазы 7: очередь — ввод для КОНКРЕТНОЙ сессии; поле ввода, открытое
+  // для одной вкладки, не должно молча остаться висеть (и слать текст уже не
+  // в ту вкладку) после переключения на другую.
+  closeQueueInput();
   for (const [id, v] of views) v.container.classList.toggle('hidden', id !== tabId);
   tabStore.setActive(tabId);
   window.api.workspace.setActive(tabId); // main пересчитает activeIndex манифеста
@@ -389,6 +563,10 @@ function activateTab(tabId) {
   // панели диффа (бриф); setActiveTab сама не делает IPC, если панель сейчас
   // закрыта (см. diffpanel.js).
   diffPanel?.setActiveTab(tabId);
+  // Task 1 фазы 7: строка чипов очереди — перерисовать под НОВУЮ активную
+  // вкладку (queueByTab уже содержит её состояние, если хоть один
+  // queue:changed для неё приходил раньше).
+  renderQueueBar();
   // Task 4 фазы 6 (бейдж PR): активация вкладки — один из двух триггеров
   // обновления бейджа (второй — периодический таймер, см. boot()). Fire-and-
   // forget — сама функция никогда не бросает и обновляет tabStore асинхронно,
@@ -419,6 +597,11 @@ async function closeTab(tabId) {
   entry.view.dispose(); // отключает ResizeObserver и сам term (Task 6)
   entry.container.remove();
   views.delete(tabId);
+  // Task 1 фазы 7: локальное зеркало server-side очереди (main уже почистил
+  // свою половину внутри manager.close(), см. tabs:close в ipc.js) — без
+  // этого закрытая вкладка (tabId никогда не переиспользуется, это UUID)
+  // копилась бы в queueByTab до конца сессии кокпита.
+  queueByTab.delete(tabId);
   // Fix 8 / Task 5 carryover: закрытая вкладка больше не может «ждать» —
   // раньше это гарантировалось отдельным waitingTabs.delete(tabId) здесь же;
   // теперь это следует структурно из tabStore.remove(tabId) — строка (и её
@@ -437,11 +620,15 @@ async function closeTab(tabId) {
   // закрытие фоновой вкладки не должно перебивать фокус пользователя.
   if (!wasActive) return;
   if (fallback) {
-    activateTab(fallback); // activateTab сама зовёт diffPanel?.setActiveTab(fallback)
+    activateTab(fallback); // activateTab сама зовёт diffPanel?.setActiveTab(fallback)/renderQueueBar()
     return;
   }
   // Закрыли последнюю вкладку — панели диффа больше нечего показывать.
   diffPanel?.setActiveTab(null);
+  // Task 1 фазы 7: и очереди тоже — ни поля ввода, ни строки чипов без единой
+  // вкладки не должно оставаться (та же логика, что diffPanel выше).
+  closeQueueInput();
+  renderQueueBar();
 }
 
 // Task 3 фазы 4 (peek): клик (или Space) по строке waiting — открыть поповер
@@ -490,6 +677,32 @@ function showToast(text, level = 'info') {
   setTimeout(() => el.remove(), TOAST_TTL_MS);
 }
 
+// C1 (ревью финальной волны фазы 7, критично): единый гард перед записью
+// команды/текста + '\r' в pty вкладки — если целевая вкладка сейчас 'waiting'
+// (ждёт ответа на диалог разрешения Claude Code), завершающий '\r' молча
+// подтвердил бы подсвеченный вариант диалога, а сам текст команды/рецепта
+// был бы потерян. Сценарий из ревью: Claude спрашивает «Bash: rm -rf build —
+// 1. Yes / 2. No» → статус waiting → Ctrl+P → «Рецепт: Отревьюй мои
+// изменения» → Enter → голый '\r' выбирает вариант №1, инструмент выполняется
+// без ревью. Используется ВЕЗДЕ, где renderer пишет команду в pty НЕ как
+// осознанный ответ на конкретный диалог: рецепты (runRecipe), кнопки панели
+// действий (renderActionBar), палитровые «Отправить /compact»/
+// «/remote-control» (buildPaletteActions). НЕ используется в sendPeek() —
+// peek.js СПЕЦИАЛЬНО предназначен для ответа НА ЭТОТ waiting-диалог, у него
+// СВОЙ гард другой смысловой природы (непустой текст, см. peek.js/send() —
+// не даёт голому Enter молча подтвердить дефолт диалога; статус вкладки его
+// не касается, потому что peek и есть штатный способ ответить, пока статус
+// waiting).
+function writeCommandToTab(tabId, command) {
+  if (!tabId) return false;
+  if (tabStore.statusOf(tabId) === 'waiting') {
+    showToast('Вкладка ждёт ответа на диалог — команда не отправлена', 'warn');
+    return false;
+  }
+  window.api.term.write(tabId, `${command}\r`);
+  return true;
+}
+
 // Клик по ⚡: прописать хуки Cockpit в .claude/settings.json проекта вкладки.
 async function connectProject(tabId) {
   try {
@@ -532,12 +745,235 @@ async function newProject() {
   }
 }
 
+// Task 4 фазы 7 (библиотека рецептов промптов): перечитать recipesCache из
+// main. Fire-and-forget, тот же приём, что usage.get()/gh.global() в boot() —
+// список рецептов не меняется в этой задаче в обход самого файла на диске
+// (палитра только читает), так что одного обновления при старте достаточно.
+async function refreshRecipesCache() {
+  try {
+    recipesCache = await window.api.recipes.list();
+  } catch (err) {
+    console.warn('[recipes] recipes:list не удался:', err);
+    recipesCache = [];
+  }
+}
+
+async function refreshWorkspacesCache() {
+  try {
+    workspacesCache = await window.api.recipes.listWorkspaces();
+  } catch (err) {
+    console.warn('[recipes] recipes:listWorkspaces не удался:', err);
+    workspacesCache = [];
+  }
+}
+
+// Действие палитры «Рецепт: <title>» (Task 4 фазы 7): при наличии
+// плейсхолдеров — сперва мини-форма ввода (recipeForm), затем подстановка
+// (main/recipes.js:fillPrompt, единственный источник истины для этой логики —
+// не дублируем regex здесь) и запись в pty АКТИВНОЙ на момент запуска действия
+// вкладки. tabId резолвим ДО возможного await формы — так что запись уйдёт
+// именно туда, где пользователь фактически выбрал действие, даже если он
+// успеет переключиться на другую вкладку, пока форма ещё на экране.
+async function runRecipe(recipe) {
+  const tabId = tabStore.activeId;
+  if (!tabId) return; // нет ни одной вкладки — писать некуда
+  let text = recipe.text;
+  const placeholders = Array.isArray(recipe.placeholders) ? recipe.placeholders : [];
+  if (placeholders.length) {
+    const fields = placeholders.map((name) => ({ key: name, label: name }));
+    const values = await recipeForm.open({ title: recipe.title, fields });
+    if (!values) return; // Esc/клик вне формы — пользователь отменил
+    text = await window.api.recipes.fillPrompt(recipe.text, values);
+  }
+  // Minor 8 (ревью раунд 1): БЕЗУСЛОВНО (даже без плейсхолдеров) — внутренний
+  // перенос строки в тексте рецепта терминал воспринимает как отдельный
+  // Enter (первая строка ушла бы САМОСТОЯТЕЛЬНЫМ промптом раньше остальных, а
+  // диалог разрешения — молча подтверждён), та же проектная ловушка, что
+  // голый '\r'. normalizeForPty — чистая функция main/recipes.js, единственный
+  // источник истины (не дублируем regex здесь).
+  text = await window.api.recipes.normalizeForPty(text);
+  // Ловушка из брифа: пустой/пробельный текст — НЕ отправляем голый '\r' в pty
+  // (для диалога разрешения Claude Code это молчаливое согласие с вариантом
+  // по умолчанию) — тот же guard, что peek.js/send().
+  if (!text || !text.trim()) return;
+  // C1 (ревью финальной волны, критично): гард статуса — см. writeCommandToTab.
+  // Рецепт — НЕ ответ на конкретный диалог waiting; в отличие от peek.js,
+  // здесь нет иного пути узнать, что пользователь на самом деле хотел ответить
+  // именно на подсвеченный вариант, а не отправить рецепт позже.
+  writeCommandToTab(tabId, text);
+  views.get(tabId)?.view.focus();
+}
+
+// Действие палитры «Сохранить воркспейс…» (Task 4 фазы 7): спросить имя через
+// ту же мини-форму (одно поле), взять ТЕКУЩИЙ состав вкладок из tabStore
+// (cwd+name — то же, что переживает restart/restore, см. tabs.js/peekInfo) и
+// отдать main на запись. workspacesCache обновляется сразу же — следующее же
+// открытие палитры увидит «Открыть воркспейс: <имя>» без перезапуска кокпита.
+async function saveCurrentWorkspace() {
+  const values = await recipeForm.open({
+    title: 'Сохранить воркспейс',
+    fields: [{ key: 'name', label: 'Имя воркспейса' }],
+  });
+  if (!values) return; // отменено
+  const tabs = tabStore.order().map((tabId) => {
+    const info = tabStore.peekInfo(tabId);
+    return { cwd: info ? info.cwd : '', name: info ? info.name : '' };
+  }).filter((t) => t.cwd);
+  const saved = await window.api.recipes.saveWorkspace(values.name, tabs);
+  if (saved) await refreshWorkspacesCache(); // пустое/пробельное имя → saved:null, кэш не трогаем
+}
+
+// Действие палитры «Открыть воркспейс: <name>» (Task 4 фазы 7): закрыть ВСЕ
+// текущие вкладки, затем поднять состав именованного воркспейса со стаггером
+// 1500мс между вкладками — тот же интервал и тот же повод (Claude CLI должен
+// успеть прочитать хуки/сессию, прежде чем поднимется следующая вкладка), что
+// и restoreFlow() выше, но написан ОТДЕЛЬНО от неё: restoreFlow заточена под
+// восстановление манифеста при старте (ghost-буферы, sessionId резюма,
+// activeIndex, сигнал workspace.ready() наружу) — эти сущности здесь не при
+// делах (именованный воркспейс хранит только {cwd, name}, без сессии), а
+// трогать уже несколько раз отревьюженный restoreFlow ради нового сценария
+// рискованнее, чем повторить сам стаггер-цикл в компактном виде.
+async function closeAllTabs() {
+  // Последовательно — closeTab мутирует общий tabStore/views, параллельный
+  // close() нескольких вкладок сразу рискует гонкой (neighborOf/activateTab
+  // внутри closeTab читают tabStore, который в этот же момент меняет другой
+  // параллельный вызов).
+  for (const tabId of tabStore.order()) {
+    await closeTab(tabId);
+  }
+}
+
+async function openWorkspace(ws) {
+  // Important 2 (ревью раунд 1): гард — САМАЯ ПЕРВАЯ строка, раньше даже
+  // restoreOverlaySkip()/диалога подтверждения ниже. Повторный вызов, пока
+  // предыдущий стаггер ещё не завершился, — молчаливый no-op (см. подробности
+  // у объявления workspaceOpenInFlight выше).
+  if (workspaceOpenInFlight) return;
+
+  // N2 (ре-ревью раунда 1): состав профиля проверяем ДО закрытия чего-либо и
+  // до диалога. Иначе существует путь «закрыли всё, не открыли ничего»:
+  // запись с нулём валидных вкладок (их разрешала сохранять сборка до Minor 6,
+  // и в чужой библиотеке такие остались) убивала бы все живые сессии, а
+  // манифест перезаписывался бы пустым составом. Пустой профиль — не ошибка,
+  // а бесполезное действие: говорим об этом и выходим, ничего не тронув.
+  const tabs = (Array.isArray(ws && ws.tabs) ? ws.tabs : [])
+    .filter((t) => t && typeof t.cwd === 'string' && t.cwd);
+  if (!tabs.length) {
+    showToast(`В воркспейсе «${ws.name}» нет ни одной вкладки`, 'warn');
+    return;
+  }
+
+  const currentCount = tabStore.order().length;
+  if (currentCount > 0) {
+    // Требование (не из автоматического ревью, но блокирующее): действие
+    // необратимо — убивает N живых сессий Claude, а манифест воркспейса тут
+    // же перезаписывается пустым составом по мере закрытия каждой вкладки
+    // (tabs:changed → syncWorkspace), то есть sessionId для --resume из него
+    // исчезают безвозвратно. Один Enter не должен уметь это сделать без
+    // явного подтверждения. Нулевой текущий состав — спрашивать нечего.
+    const phrase = currentCount === 1
+      ? 'Текущая вкладка будет закрыта'
+      : `Текущие ${currentCount} ${pluralTabs(currentCount)} будут закрыты`;
+    const confirmed = await recipeForm.open({
+      title: `Открыть воркспейс «${ws.name}»? ${phrase}`,
+      fields: [],
+    });
+    if (!confirmed) return; // Esc/«Отмена»/клик вне — пользователь передумал
+  }
+
+  // Important 1 (ревью раунд 1): оверлей restore мог всё ещё быть на экране
+  // (решение не принято, wsync инертен) — палитра рисуется ПОВЕРХ него
+  // (z-index 60 против 30 у restore) и технически доступна раньше решения по
+  // восстановлению. Открытие именованного воркспейса = неявный отказ от
+  // restore (тот же приём, что newProject() выше) — иначе стаггер этой
+  // функции и ПОЗЖЕ принятое «Восстановить всё» доливают вкладки друг на
+  // друга (дубли вкладок И дубли живых сессий Claude в тех же cwd).
+  //
+  // N1 (ре-ревью раунда 1): вызов стоит ПОСЛЕ отменяемого диалога — раньше
+  // он был первой строкой функции, и Esc в диалоге оставлял пользователя с
+  // уже похороненным списком восстановления.
+  //
+  // [Приведено в соответствие после I2, ревью финальной волны фазы 7]: до
+  // фикса I2 инвариант «пока restoreOverlaySkip не null, tabStore пуст» здесь
+  // был ошибочно назван невыполнимым — результат поиска по истории
+  // (Ctrl+Shift+H, historySearch/onOpenResult) действительно открывал вкладку
+  // мимо оверлея restore, ЭТО и было находкой I2, теперь исправленной там же.
+  // После фикса каждый ИЗВЕСТНЫЙ путь, поднимающий вкладку (newProject,
+  // openWorkspace здесь же, historySearch.onOpenResult), сам гасит
+  // restoreOverlaySkip ДО открытия — так что к моменту, когда мы доходим
+  // ДО ЭТОЙ строки, tabStore пуст, если только restore ещё не решён. Вызов
+  // здесь остаётся НУЖНЫМ по ДРУГОЙ причине: «Открыть воркспейс: <name>» —
+  // действие палитры, а палитра (z-index выше restore) доступна ЛЮБОМУ
+  // пользователю в ЛЮБОЙ момент, в т.ч. пока restore ещё висит на экране И
+  // tabStore ещё пуст (currentCount===0 → диалог подтверждения выше
+  // пропускается вовсе) — restoreOverlaySkip() здесь гасит именно ЭТОТ,
+  // палитровый путь, независимый от historySearch.
+  if (restoreOverlaySkip) restoreOverlaySkip();
+
+  workspaceOpenInFlight = true;
+  try {
+    await closeAllTabs();
+    let firstOpened = null;
+    for (let idx = 0; idx < tabs.length; idx++) {
+      const t = tabs[idx];
+      try {
+        // Первая успешно поднятая вкладка становится видимой сразу — та же
+        // причина, что в restoreFlow (иначе пользователь смотрит в пустой
+        // терминал весь стаггер).
+        const tab = await openTab(t.cwd, { activate: !firstOpened });
+        if (tab && !firstOpened) firstOpened = tab;
+      } catch (err) {
+        // Одна неоткрывшаяся вкладка не должна обрывать открытие остальных —
+        // та же логика, что finding 2a у restoreFlow.
+        console.warn(`[workspace] не удалось открыть вкладку ${t.cwd}:`, err);
+      }
+      if (idx < tabs.length - 1) {
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+    }
+  } finally {
+    // Important 2: флаг обязан сброситься даже при непредвиденной ошибке
+    // внутри цикла (per-tab ошибки уже гасятся выше, но подстраховка снаружи —
+    // тот же приём, что restoreFlow/finally) — иначе одна ошибка навсегда
+    // блокирует «Открыть воркспейс» до перезапуска кокпита.
+    workspaceOpenInFlight = false;
+  }
+}
+
+// Действие палитры «Удалить воркспейс: <name>» (Minor 6, ревью раунд 1): без
+// него дубли/устаревшие записи в workspaces-library.json (например, от старой
+// схемы именования до дедупа saveWorkspace по имени) можно было почистить
+// только руками через файл.
+//
+// N3 (ре-ревью раунда 1): подтверждение обязательно. Живые сессии действие не
+// трогает, но состав папок восстановить неоткуда, если этих вкладок сейчас нет
+// на экране, а в палитре строка стоит СРАЗУ под безобидным близнецом «Открыть
+// воркспейс: <name>» и матчится тем же фильтром — промах стрелкой плюс Enter
+// стирал запись молча и безвозвратно.
+async function deleteNamedWorkspace(ws) {
+  const confirmed = await recipeForm.open({
+    title: `Удалить воркспейс «${ws.name}» из библиотеки? Отменить это нельзя`,
+    fields: [],
+  });
+  if (!confirmed) return;
+  await window.api.recipes.deleteWorkspace(ws.id);
+  await refreshWorkspacesCache();
+}
+
 // Task 4 фазы 4 (палитра команд): полный список действий, собирается заново
 // при КАЖДОМ открытии палитры (palette.js зовёт getActions() внутри open()) —
 // состав вкладок мог измениться с прошлого раза. Действия над «активной»
 // вкладкой (restart/hooks/compact/remote-control) добавляются, только если
 // активная вкладка вообще есть — иначе им нечего делать.
 function buildPaletteActions() {
+  // Minor 5 (ревью раунд 1): пользователь правит prompts.json руками —
+  // единственный способ пополнить библиотеку рецептов в этой задаче.
+  // Fire-and-forget — buildPaletteActions() обязана остаться СИНХРОННОЙ
+  // (palette.js зовёт getActions() без await, см. palette.js/open()), так
+  // что эта правка обновит recipesCache уже к СЛЕДУЮЩЕМУ открытию палитры,
+  // без перезапуска кокпита.
+  refreshRecipesCache();
+
   const actions = [];
 
   for (const tabId of tabStore.order()) {
@@ -566,6 +1002,68 @@ function buildPaletteActions() {
     run: () => toggleDashboard(),
   });
 
+  // Task 3 фазы 7: действие «Поиск по истории» — тот же приём, что
+  // «Дашборд» выше (не привязано к активной вкладке, доступно всегда).
+  actions.push({
+    id: 'history-search',
+    title: 'Поиск по истории',
+    hint: 'Ctrl+Shift+H',
+    run: () => toggleHistorySearch(),
+  });
+
+  // Живая приёмка фазы 7: шпаргалка клавиш — доступна и из палитры, и
+  // кнопкой ⌨ на панели действий (renderActionBar).
+  actions.push({
+    id: 'hotkeys',
+    title: 'Горячие клавиши',
+    hint: 'шпаргалка',
+    run: () => toggleHotkeys(),
+  });
+
+  // Task 4 фазы 7 (библиотека рецептов промптов): по одному действию на
+  // рецепт из recipesCache (см. refreshRecipesCache — заполняется при boot()).
+  // hint показывает имена плейсхолдеров, если они есть, — то же, зачем
+  // мини-форма вообще понадобится при запуске (runRecipe).
+  for (const r of recipesCache) {
+    const placeholders = Array.isArray(r.placeholders) ? r.placeholders : [];
+    actions.push({
+      id: `recipe:${r.id}`,
+      title: `Рецепт: ${r.title}`,
+      hint: placeholders.length ? `{{${placeholders.join('}}, {{')}}}` : '',
+      run: () => runRecipe(r),
+    });
+  }
+
+  // «Сохранить воркспейс…» — не привязано к активной вкладке, доступно
+  // всегда (берёт ВЕСЬ текущий состав вкладок, а не только активную).
+  actions.push({
+    id: 'save-workspace',
+    title: 'Сохранить воркспейс…',
+    hint: 'текущий состав вкладок',
+    run: () => saveCurrentWorkspace(),
+  });
+
+  // По одному действию «Открыть воркспейс: <name>» на сохранённый профиль
+  // (см. refreshWorkspacesCache).
+  for (const w of workspacesCache) {
+    const n = Array.isArray(w.tabs) ? w.tabs.length : 0;
+    actions.push({
+      id: `workspace:${w.id}`,
+      title: `Открыть воркспейс: ${w.name}`,
+      hint: `${n} ${pluralTabs(n)}`,
+      run: () => openWorkspace(w),
+    });
+    // Minor 6 (ревью раунд 1): «Удалить воркспейс: <name>» — без него
+    // накопленный мусор (дубли до дедупа saveWorkspace по имени, устаревшие
+    // профили) можно было почистить только руками через файл.
+    actions.push({
+      id: `workspace-delete:${w.id}`,
+      title: `Удалить воркспейс: ${w.name}`,
+      hint: 'из библиотеки, не трогает открытые вкладки',
+      run: () => deleteNamedWorkspace(w),
+    });
+  }
+
   const activeId = tabStore.activeId;
   if (activeId) {
     actions.push({
@@ -584,13 +1082,14 @@ function buildPaletteActions() {
       id: 'send-compact',
       title: 'Отправить /compact',
       hint: '/compact',
-      run: () => window.api.term.write(activeId, '/compact\r'),
+      // C1 (ревью финальной волны): гард статуса — см. writeCommandToTab.
+      run: () => writeCommandToTab(activeId, '/compact'),
     });
     actions.push({
       id: 'send-remote-control',
       title: 'Отправить /remote-control',
       hint: '/remote-control',
-      run: () => window.api.term.write(activeId, '/remote-control\r'),
+      run: () => writeCommandToTab(activeId, '/remote-control'),
     });
   }
 
@@ -602,6 +1101,47 @@ function buildPaletteActions() {
   });
 
   return actions;
+}
+
+// I1 (ревью финальной волны фазы 7): единый реестр «что из оверлееподобного
+// сейчас открыто» — раньше это было ПЯТЬ РАЗНЫХ инлайн-списков (гард Ctrl+G,
+// гард Ctrl+Q, локальный otherOverlayOpen() внутри showRestoreOverlay, …),
+// каждый со своим НЕПОЛНЫМ набором проверяемых сущностей: restore не знал
+// про queueInputOpen, а Ctrl+Q — про открытый оверлей restore (сценарий
+// ревью: непустой манифест на старте → оверлей restore → Ctrl+Q разворачивает
+// #queue-input-row — он БЕЗ z-index, обычный элемент потока внутри #main, —
+// ПОД restore (z-index 30), невидимо, и забирает фокус → Esc → capture-
+// обработчик restore видит Escape ПЕРВЫМ (его otherOverlayOpen() не знал про
+// открытую очередь) → startEmpty(): решение «начать пусто» принято ЗА
+// пользователя, список проектов на восстановление потерян безвозвратно).
+// Единственный источник правды — обход ЭТОГО объекта, а не N ручных копий
+// одного и того же списка, которые легко развести при следующем изменении
+// (что и произошло: #diff-panel по Ctrl+G — обычный flex-сосед внутри того
+// же #main, что и restore, и без проверки restore имел бы ТОЧНО ТАКОЙ ЖЕ
+// «открывается невидимо под оверлеем» баг, просто без явного отчёта о нём).
+function overlayFlags() {
+  return {
+    dashboard: !!dashboard?.isOpen(),
+    palette: !!palette?.isOpen(),
+    peek: !!peek?.isOpen(),
+    historySearch: !!historySearch?.isOpen(),
+    recipeForm: !!recipeForm?.isOpen(),
+    hotkeys: !!hotkeysOverlay?.isOpen(),
+    queue: queueInputOpen,
+    // restoreOverlaySkip не null ровно пока оверлей restore на экране и
+    // решение по восстановлению ещё не принято (см. showRestoreOverlay).
+    restore: !!restoreOverlaySkip,
+  };
+}
+
+// «Есть ли какой-то ДРУГОЙ модальный элемент открыт прямо сейчас» — excludes
+// (необязательны) исключают из проверки элементы, которым закономерно можно
+// быть открытыми: сам спрашивающий (закрытие/повторный тумблер — не помеха
+// самому себе) и элементы, ГЕОМЕТРИЧЕСКИ не конфликтующие с действием
+// (ре-ревью финальной волны: поле очереди и peek не перекрывают #diff-panel —
+// блокировать Ctrl+G из-за них означало тихий no-op хоткея без причины).
+function otherOverlayOpen(...excludes) {
+  return Object.entries(overlayFlags()).some(([key, val]) => val && !excludes.includes(key));
 }
 
 function bindHotkeys() {
@@ -619,6 +1159,14 @@ function bindHotkeys() {
       // Task 4 фазы 5: взаимное исключение оверлеев — дашборд не должен
       // остаться висеть «за спиной» открывшейся палитры.
       dashboard?.close();
+      // Task 3 фазы 7: та же логика — оверлей поиска истории тоже не должен
+      // остаться висеть «за спиной» открывшейся палитры.
+      if (historySearch?.isOpen()) historySearch.close();
+      // Task 4 фазы 7: та же логика — мини-форма рецепта/воркспейса тоже не
+      // должна остаться висеть «за спиной».
+      recipeForm?.close();
+      // Живая приёмка фазы 7: шпаргалка клавиш — такой же слой 60.
+      hotkeysOverlay?.close();
       // Fix round 1 (ревью): peek?.hide() выше уже мог схлопнуть
       // document.activeElement на <body> (см. подробный разбор в palette.js/
       // open) — передаём терминал активной вкладки как fallback НА СЛУЧАЙ
@@ -658,8 +1206,54 @@ function bindHotkeys() {
       // оверлей. Без гарда пользователь переключал (и сохранял в конфиг)
       // панель, невидимую под оверлеем — интерфейс молча менял состояние,
       // не показывая результат.
-      if (dashboard?.isOpen() || palette?.isOpen()) return;
+      // I1 (ревью финальной волны): otherOverlayOpen() — единый реестр (см.
+      // определение выше), теперь включает и restore — #diff-panel лежит
+      // ВНУТРИ #main, ровно там же, где restore-overlay (z-index 30,
+      // position:absolute inset:0), и без этой строки Ctrl+G точно так же
+      // разворачивал бы панель НЕВИДИМО под ним, как Ctrl+Q разворачивал
+      // #queue-input-row (тот же класс дыры, просто без отдельного отчёта).
+      // Исключения 'queue'/'peek' (ре-ревью волны): #queue-input-row — in-flow
+      // сосед #main-row без z-index, peek — поповер 420px у строки сайдбара;
+      // ни тот ни другой панель диффа не перекрывают, панель отлично видна —
+      // блокировка давала бы тихий no-op хоткея при открытом поле очереди.
+      if (otherOverlayOpen('queue', 'peek')) return;
       toggleDiffPanel();
+      return;
+    }
+    // Ctrl+Q — поле ввода очереди промптов (Task 1 фазы 7), тот же паттерн
+    // preventDefault/stopPropagation/toggle, что Ctrl+P/Ctrl+D/Ctrl+G выше:
+    // иначе xterm получил бы 'q'/'Q' в активный терминал. Гард — тот же
+    // единый otherOverlayOpen(), что и у Ctrl+G выше (I1, ревью финальной
+    // волны): не открывать поле НЕВИДИМО под другим оверлеем, который
+    // перехватывает терминальную область целиком, — ВКЛЮЧАЯ restore (раньше
+    // Ctrl+Q ничего не знал про открытый оверлей restore: непустой манифест
+    // на старте → restore на экране → Ctrl+Q разворачивал #queue-input-row
+    // ПОД ним, невидимо, забирая фокус — следующий Esc доставался capture-
+    // обработчику restore, а не полю ввода, и «начать пусто» срабатывало за
+    // спиной пользователя). exclude:'queue' — собственное состояние очереди
+    // не должно мешать сама себе переключиться.
+    if (ev.ctrlKey && !ev.shiftKey && !ev.altKey
+        && (ev.key === 'q' || ev.key === 'Q' || ev.code === 'KeyQ')) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (otherOverlayOpen('queue')) return;
+      if (queueInputOpen) closeQueueInput();
+      else openQueueInput();
+      return;
+    }
+    // Ctrl+Shift+H — глобальный поиск по истории сессий (Task 3 фазы 7,
+    // history-index.js). ВАЖНО: Ctrl+Shift+F уже занят поиском по буферу
+    // ТЕКУЩЕГО терминала (см. terminal.js/attachCustomKeyEventHandler) —
+    // технической коллизии нет (разные буквы, разные обработчики; этот висит
+    // на window в capture-фазе и обрабатывает ТОЛЬКО 'h'/'H'/KeyH, до Ctrl+
+    // Shift+F вообще не долетал бы, даже если бы совпадал), путаница была
+    // только в исходном плане фазы (оба варианта ошибочно предлагались на
+    // F) — решение зафиксировано в task-3-brief.md: глобальный поиск на H.
+    if (ev.ctrlKey && ev.shiftKey && !ev.altKey && !ev.metaKey
+        && (ev.key === 'h' || ev.key === 'H' || ev.code === 'KeyH')) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      toggleHistorySearch();
       return;
     }
     // Ctrl+1..9 — вкладка по индексу.
@@ -858,14 +1452,19 @@ function showRestoreOverlay(manifest) {
   // «начать пусто» принято за спиной, весь список проектов потерян) и только
   // ВТОРЫМ уже закрывался сам дашборд. Игнорируем оба ключа, если сверху
   // открыт любой другой оверлей — тогда событие без preventDefault уходит
-  // тому, кто ЕГО реально должен обработать (единый стек оверлеев — задача
-  // следующей фазы, здесь достаточно точечной проверки).
-  function otherOverlayOpen() {
-    return !!(dashboard?.isOpen() || palette?.isOpen() || peek?.isOpen());
-  }
-
+  // тому, кто ЕГО реально должен обработать.
+  //
+  // I1 (ревью финальной волны): локальная копия этого списка ЗАМЕНЕНА на
+  // общий otherOverlayOpen(exclude) (см. определение выше по файлу, рядом с
+  // bindHotkeys) — раньше у ЭТОЙ копии не было queueInputOpen в списке:
+  // Ctrl+Q успевал развернуть #queue-input-row ПОД restore ДО того, как
+  // Ctrl+Q сам научился отказывать (см. фикс гарда Ctrl+Q выше) — тогда
+  // Escape долетал бы именно сюда первым (эта копия про очередь не знала) и
+  // startEmpty() срабатывал бы за спиной пользователя. Теперь оба места
+  // читают ОДИН и тот же реестр — пропустить будущий новый оверлей в одном
+  // из них, забыв про другое, структурно невозможно.
   function onKey(ev) {
-    if (otherOverlayOpen()) return;
+    if (otherOverlayOpen('restore')) return;
     if (ev.key === 'Enter') {
       ev.preventDefault();
       startRestore();
@@ -954,6 +1553,44 @@ async function boot() {
   diffPanel = createDiffPanel({ root: $('diff-panel'), api: window.api });
   if (config.ui?.diffPanelOpen) diffPanel.open();
 
+  // Task 3 фазы 7 (глобальный поиск истории, Ctrl+Shift+H): onOpenResult —
+  // открыть НОВУЮ вкладку с продолжением найденной сессии в её исходном cwd,
+  // тот же openTab(cwd, {sessionId}), которым восстановление воркспейса
+  // (restoreFlow выше) резюмит сессии — sessions.js сам достраивает
+  // `--resume <sessionId>` поверх конфигурационных args (FIX 3, ревью).
+  //
+  // I2 (ревью финальной волны фазы 7): restoreOverlaySkip() — ТОТ ЖЕ приём,
+  // что уже есть в newProject() и openWorkspace(), раньше пропущенный именно
+  // здесь. Сценарий А: старт с манифестом на 5 проектов → Ctrl+Shift+H →
+  // Enter на результате → вкладка открыта ЗА оверлеем restore (палитра/поиск
+  // рисуются ПОВЕРХ restore по z-index, см. Important 1 в openWorkspace() —
+  // но решение по restore ЕЩЁ не принято) → Esc на оверлее → startEmpty() →
+  // readyAndSync видит уже НЕПУСТОЙ tabStore (условие «пусто» не
+  // выполняется) → манифест перезаписан ОДНОЙ вкладкой, вчерашний состав
+  // потерян безвозвратно. Сценарий Б: вместо Esc — «Восстановить всё» →
+  // дубли вкладок И дубли живых сессий Claude. Открытие результата поиска =
+  // неявный отказ от restore, тот же принцип, что и у остальных действий,
+  // способных поднять вкладку мимо оверлея.
+  historySearch = createSearch({
+    root: $('search-root'),
+    api: window.api,
+    onOpenResult: (cwd, sessionId) => {
+      if (restoreOverlaySkip) restoreOverlaySkip();
+      return openTab(cwd, { sessionId });
+    },
+  });
+
+  // Task 4 фазы 7 (рецепты промптов + именованные воркспейсы): мини-форма
+  // ввода — единственный владелец своего DOM (см. recipe-form.js). Кэши
+  // рецептов/воркспейсов — НЕ await, тот же приём, что usage.get() ниже: не
+  // задерживаем остальной boot() ради пары дешёвых чтений с диска; палитра
+  // просто увидит пустой список до разрешения промиса (getActions() зовётся
+  // заново при каждом открытии, см. palette.js).
+  recipeForm = createRecipeForm({ root: $('recipe-form-root') });
+  hotkeysOverlay = createHotkeysOverlay({ host: $('hotkeys-root') });
+  refreshRecipesCache();
+  refreshWorkspacesCache();
+
   renderActionBar();
 
   // Task 3 фазы 5 (кольца лимитов): первичный usage:get — НЕ await, чтобы
@@ -1007,6 +1644,17 @@ async function boot() {
   // вкладка) и держит дебаунс 1500мс — здесь только проводка канала.
   window.api.git.onChanged(({ tabId }) => diffPanel?.handleGitChanged(tabId));
 
+  // Task 1 фазы 7 (очередь промптов): queue:changed приходит и от enqueue/
+  // remove/clear (клик по ✕, поле ввода), и от вброса по Stop в main/sessions.js —
+  // единый источник истины, queueByTab всегда зеркалит server-side состояние
+  // независимо от того, кто инициировал изменение. Перерисовываем строку
+  // чипов, только если событие про СЕЙЧАС активную вкладку (чужой tabId не
+  // должен трогать то, что на экране).
+  window.api.queue.onChanged(({ tabId, queue }) => {
+    queueByTab.set(tabId, queue);
+    if (tabId === tabStore.activeId) renderQueueBar();
+  });
+
   // Task 2 фазы 4: клик по Windows-тосту — main прислал {tabId}. activateTab
   // сама тихо игнорирует неизвестный/уже закрытый tabId (views.get → undefined
   // → return), так что здесь ничего дополнительно проверять не нужно.
@@ -1054,6 +1702,26 @@ async function boot() {
   // Task 4 фазы 4: обработчик вынесен в newProject() — тот же сценарий
   // запускает и действие «Новый проект» в палитре команд.
   $('btn-new-tab').addEventListener('click', newProject);
+
+  // Task 1 фазы 7 (очередь промптов): Enter — поставить в очередь и ОСТАВИТЬ
+  // поле открытым (бриф — удобно набивать несколько промптов подряд), Esc —
+  // закрыть (closeQueueInput сама возвращает фокус терминалу активной
+  // вкладки). Пустой/пробельный текст main всё равно проигнорирует
+  // (sessions.js/enqueue), но очищаем поле в любом случае — так же, как peek
+  // не оставляет чужой черновик висеть.
+  const queueInputEl = $('queue-input');
+  queueInputEl?.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') {
+      ev.preventDefault();
+      const tabId = tabStore.activeId;
+      const text = queueInputEl.value;
+      if (tabId) window.api.queue.add(tabId, text);
+      queueInputEl.value = '';
+    } else if (ev.key === 'Escape') {
+      ev.preventDefault();
+      closeQueueInput();
+    }
+  });
 
   bindHotkeys();
 
