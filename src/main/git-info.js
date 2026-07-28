@@ -77,6 +77,14 @@
 const GIT_MISSING_TTL_MS = 10 * 60 * 1000; // 10 минут — не долбим отсутствующий git каждые 3с
 const MAX_FILES = 200;
 const MAX_DIFF_LINES = 2000;
+// Полный фикс находки 1 (ревью фазы 6): untracked-файлы НЕ проходят через
+// `git diff HEAD`/`--numstat HEAD` вообще (git их не диффит против HEAD, им
+// просто нечего сравнивать) — без отдельного шага строка untracked-файла
+// всегда показывала бы +0 −0 (выглядит как «нет изменений», хотя на самом
+// деле весь файл новый) и не имела бы содержимого в тексте диффа. Лимит —
+// не хотим спавнить по 2 git-процесса на каждый из потенциально сотен
+// untracked-файлов (например, node_modules, случайно не в .gitignore).
+const MAX_NEW_FILE_DIFFS = 50;
 
 // XY-коды unmerged/conflict из документации porcelain v1 (это НЕ обязательно
 // содержит букву 'U' — например DD/AA тоже конфликт, «оба удалили»/«оба
@@ -275,6 +283,87 @@ function emptyOkFields() {
   return { branch: null, ahead: 0, behind: 0, files: [], diff: '', truncated: null };
 }
 
+// Полный фикс находки 1: содержимое ОДНОГО untracked-файла через
+// `git diff --no-index` против /dev/null — READ-ONLY (никакого `add -N`,
+// индекс вообще не трогаем). `--no-index` возвращает 0 (идентичны — сюда
+// недостижимо, /dev/null и реальный файл всегда различаются хотя бы
+// существованием) или 1 (есть отличия — ОЖИДАЕМЫЙ путь, а не сбой); любой
+// другой код (>1) — настоящая ошибка (например, путь исчез между status и
+// этим вызовом). Возвращает null (пропустить — бинарник/сбой/неразбираемый
+// вывод) либо {added, removed, diffText}.
+function isExpectedNoIndexCode(res) {
+  return !!res && (res.code === 0 || res.code === 1);
+}
+
+async function fetchUntrackedFileDiff(execGit, cwd, filePath) {
+  let numstatRes;
+  try {
+    numstatRes = await execGit(['diff', '--no-index', '--numstat', '--', '/dev/null', filePath], cwd);
+  } catch {
+    return null; // ENOENT и т.п. — best-effort, сбой ОДНОГО файла не должен ронять всю выдачу
+  }
+  if (!isExpectedNoIndexCode(numstatRes)) return null;
+
+  const firstLine = (numstatRes.stdout || '').split('\n')[0] || '';
+  const tab1 = firstLine.indexOf('\t');
+  const tab2 = tab1 === -1 ? -1 : firstLine.indexOf('\t', tab1 + 1);
+  if (tab1 === -1 || tab2 === -1) return null; // пустой/неразбираемый вывод
+
+  const addedRaw = firstLine.slice(0, tab1);
+  const removedRaw = firstLine.slice(tab1 + 1, tab2);
+  // Бинарник ("-\t-\t...", тот же образец, что и обычный numstat, см. шапку
+  // файла) — числа диффа недоступны, содержимое НЕ тянем (бриф).
+  if (addedRaw === '-' || removedRaw === '-') return null;
+  const added = Number(addedRaw) || 0;
+  const removed = Number(removedRaw) || 0;
+
+  let diffRes;
+  try {
+    diffRes = await execGit(['diff', '--no-index', '--', '/dev/null', filePath], cwd);
+  } catch {
+    return null;
+  }
+  if (!isExpectedNoIndexCode(diffRes)) return null;
+
+  return { added, removed, diffText: diffRes.stdout || '' };
+}
+
+// Склеивает основной дифф (`git diff HEAD`) с патчами untracked-файлов —
+// каждый кусок гарантированно завершается '\n' перед конкатенацией, иначе
+// заголовок следующего файла слипся бы с последней строкой предыдущего.
+function joinDiffChunks(chunks) {
+  return chunks
+    .filter((c) => !!c)
+    .map((c) => (c.endsWith('\n') ? c : `${c}\n`))
+    .join('');
+}
+
+// Добирает диффы untracked-файлов (до MAX_NEW_FILE_DIFFS штук, в порядке
+// files[]) и возвращает {files: files с обновлёнными added/removed и
+// newFileDiffMissing:true там, где добрать не удалось (бинарник/лимит/сбой),
+// diffChunks: тексты патчей для склейки с основным диффом}.
+async function enrichUntrackedFiles(execGit, cwd, files) {
+  const untracked = files.filter((f) => f.status === '?');
+  if (!untracked.length) return { files, diffChunks: [] };
+
+  const toFetch = untracked.slice(0, MAX_NEW_FILE_DIFFS);
+  const results = await Promise.all(toFetch.map((f) => fetchUntrackedFileDiff(execGit, cwd, f.path)));
+
+  const byPath = new Map();
+  toFetch.forEach((f, i) => byPath.set(f.path, results[i]));
+
+  const diffChunks = [];
+  const enrichedFiles = files.map((f) => {
+    if (f.status !== '?') return f;
+    const res = byPath.get(f.path);
+    if (!res) return { ...f, newFileDiffMissing: true }; // за пределами лимита, бинарник или сбой
+    if (res.diffText) diffChunks.push(res.diffText);
+    return { ...f, added: res.added, removed: res.removed };
+  });
+
+  return { files: enrichedFiles, diffChunks };
+}
+
 function createGitInfo({ run, now = Date.now, cache, ttlMs = 3000 }) {
   const cacheMap = cache || new Map();
 
@@ -339,8 +428,18 @@ function createGitInfo({ run, now = Date.now, cache, ttlMs = 3000 }) {
     const filesWithCounts = applyNumstat(parsedStatus.files, numstatMap);
     const rawDiff = diffOk ? (diffRes.stdout || '') : '';
 
-    const { files: limitedFiles, hidden: hiddenFiles } = truncateFiles(filesWithCounts);
-    const { diff, hidden: hiddenLines } = truncateDiff(rawDiff);
+    // Полный фикс находки 1 (ревью фазы 6): содержимое untracked-файлов не
+    // приходит ни через numstat HEAD, ни через diff HEAD выше (git их против
+    // HEAD не диффит) — добираем отдельно, независимо от numstatOk/diffOk
+    // (реалистичный случай: свежий репозиторий без единого коммита, где ВСЕ
+    // файлы untracked, — numstat/diff HEAD там вообще падают, см. ветку
+    // "No commits yet" в правилах деградации, а untracked-содержимое всё
+    // равно должно быть доступно).
+    const { files: filesWithUntracked, diffChunks } = await enrichUntrackedFiles(execGit, cwd, filesWithCounts);
+    const fullDiff = diffChunks.length ? joinDiffChunks([rawDiff, ...diffChunks]) : rawDiff;
+
+    const { files: limitedFiles, hidden: hiddenFiles } = truncateFiles(filesWithUntracked);
+    const { diff, hidden: hiddenLines } = truncateDiff(fullDiff);
     const truncated = (hiddenFiles > 0 || hiddenLines > 0) ? { files: hiddenFiles, lines: hiddenLines } : null;
 
     return {
@@ -356,30 +455,57 @@ function createGitInfo({ run, now = Date.now, cache, ttlMs = 3000 }) {
     };
   }
 
+  // Находка 3 (ревью фазы 6): автоповтор клавиши (Ctrl+Tab/Ctrl+1..9) может
+  // позвать get() для того же cwd несколько раз подряд быстрее, чем успевает
+  // разрешиться первый запрос, — без защиты каждый такой повтор стартовал бы
+  // СВОЮ пару git-процессов поверх ещё летящей. inFlightMap (ключ — тот же
+  // cwd, что и у cacheMap) — повторный вызов, пока promise ещё не разрешился,
+  // получает ЕГО ЖЕ, второй fetchFresh() не запускается вовсе.
+  const inFlightMap = new Map();
+
   async function get(cwd, { force = false } = {}) {
-    const nowMs = now();
+    const startMs = now();
     const cached = cacheMap.get(cwd);
 
     if (!force && cached) {
       const ttl = cached.kind === 'git-missing' ? GIT_MISSING_TTL_MS : ttlMs;
-      if ((nowMs - cached.fetchedAt) < ttl) return cached.result;
+      if ((startMs - cached.fetchedAt) < ttl) return cached.result;
     }
 
-    const outcome = await fetchFresh(cwd);
+    const existing = inFlightMap.get(cwd);
+    if (existing) return existing;
 
-    let result;
-    if (outcome.kind === 'git-missing') {
-      result = failedResult('git-missing', nowMs);
-    } else if (outcome.kind === 'not-a-repo') {
-      result = notARepoResult(nowMs);
-    } else if (outcome.kind === 'failed') {
-      result = failedResult('failed', nowMs);
-    } else {
-      result = buildOkResult(outcome.data, nowMs);
+    const promise = (async () => {
+      const outcome = await fetchFresh(cwd);
+      // Находка 3 (ревью фазы 6): fetchedAt штампуем ПОСЛЕ await fetchFresh(),
+      // а не в момент вызова get() — на медленном репозитории (или под
+      // нагрузкой) старое поведение (nowMs до await) рождало запись уже
+      // «просроченной» относительно TTL ещё до того, как она вообще попала
+      // в кэш, — следующий же вызов get() внутри той же секунды считал её
+      // устаревшей и бил по git заново без всякой пользы.
+      const fetchedAt = now();
+
+      let result;
+      if (outcome.kind === 'git-missing') {
+        result = failedResult('git-missing', fetchedAt);
+      } else if (outcome.kind === 'not-a-repo') {
+        result = notARepoResult(fetchedAt);
+      } else if (outcome.kind === 'failed') {
+        result = failedResult('failed', fetchedAt);
+      } else {
+        result = buildOkResult(outcome.data, fetchedAt);
+      }
+
+      cacheMap.set(cwd, { result, fetchedAt, kind: outcome.kind });
+      return result;
+    })();
+
+    inFlightMap.set(cwd, promise);
+    try {
+      return await promise;
+    } finally {
+      inFlightMap.delete(cwd);
     }
-
-    cacheMap.set(cwd, { result, fetchedAt: nowMs, kind: outcome.kind });
-    return result;
   }
 
   return { get };

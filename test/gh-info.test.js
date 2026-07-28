@@ -90,7 +90,10 @@ function runFixture({ repoView, prStatus, searchPrs, searchIssues, notifications
     if (args[0] === 'search' && args[1] === 'issues') {
       return searchIssues !== undefined ? searchIssues : ok('[]');
     }
-    if (args[0] === 'api' && args[1] === 'notifications') {
+    // args[1] — 'notifications?per_page=50' (находка 6: per_page идёт через
+    // query-строку, не через -f/-F, см. комментарий в gh-info.js), поэтому
+    // startsWith, а не строгое равенство.
+    if (args[0] === 'api' && typeof args[1] === 'string' && args[1].startsWith('notifications')) {
       return notifications !== undefined ? notifications : ok('0');
     }
     if (args[0] === 'pr' && args[1] === 'view') {
@@ -425,7 +428,7 @@ test('getGlobal: notifications парсится из числовой строк
   assert.strictEqual(snap.notifications, 5);
 });
 
-test('getGlobal: сбой добора checks для одного PR (gh pr view упал) НЕ роняет всю выдачу — checks:"none" для этого PR', async () => {
+test('getGlobal: сбой добора checks для одного PR (gh pr view упал) НЕ роняет всю выдачу — checks:"unknown" для этого PR (находка 5, ревью фазы 6)', async () => {
   const searchPrsOut = JSON.stringify([
     { number: 1, repository: { name: 'r', nameWithOwner: 'me/r' }, title: 't1', url: 'u1' },
     { number: 2, repository: { name: 'r', nameWithOwner: 'me/r' }, title: 't2', url: 'u2' },
@@ -444,8 +447,74 @@ test('getGlobal: сбой добора checks для одного PR (gh pr view
   const snap = await info.getGlobal();
   assert.strictEqual(snap.ok, true, 'сбой добора checks одного PR — best-effort, вся выдача остаётся ok:true');
   const byNumber = Object.fromEntries(snap.prs.map((p) => [p.number, p]));
-  assert.strictEqual(byNumber[1].checks, 'none');
+  // 'unknown', а не 'none' — провал добора ("не удалось узнать") не должен
+  // выглядеть в UI так же, как настоящее «нет проверок настроено» (находка 5).
+  assert.strictEqual(byNumber[1].checks, 'unknown');
   assert.strictEqual(byNumber[2].checks, 'failing');
+});
+
+test('enrichPrChecks: gh pr view вернул code!=0 без исключения → checks:"unknown", не "none" (находка 5)', async () => {
+  const searchPrsOut = JSON.stringify([
+    { number: 7, repository: { name: 'r', nameWithOwner: 'me/r' }, title: 't', url: 'u' },
+  ]);
+  const info = createGhInfo({
+    run: runFixture({ searchPrs: ok(searchPrsOut), prView: fail('rate limited', 1) }),
+    cache: noCache(),
+    now: () => 1,
+  });
+  const snap = await info.getGlobal();
+  assert.strictEqual(snap.prs[0].checks, 'unknown');
+});
+
+test('getGlobal: notifications с per_page=50 в args (находка 6) и notificationsAtLimit:true при ровно 50', async () => {
+  const calls = [];
+  const info = createGhInfo({
+    run: runFixture({ notifications: ok('50'), calls }),
+    cache: noCache(),
+    now: () => 1,
+  });
+  const snap = await info.getGlobal();
+  assert.strictEqual(snap.notifications, 50);
+  assert.strictEqual(snap.notificationsAtLimit, true, 'ровно на границе страницы — считаем "как минимум столько"');
+  const notifCall = calls.find((c) => c.args[0] === 'api' && String(c.args[1]).startsWith('notifications'));
+  assert.ok(notifCall.args.includes('notifications?per_page=50'), 'per_page должен быть явным, а не дефолтным API');
+  assert.ok(!notifCall.args.includes('-f') && !notifCall.args.includes('-F'), 'per_page НЕ должен идти через -f/-F — gh api молча переключает метод на POST, который 404 на /notifications');
+});
+
+test('getGlobal: notifications меньше страницы → notificationsAtLimit:false', async () => {
+  const info = createGhInfo({
+    run: runFixture({ notifications: ok('3') }),
+    cache: noCache(),
+    now: () => 1,
+  });
+  const snap = await info.getGlobal();
+  assert.strictEqual(snap.notifications, 3);
+  assert.strictEqual(snap.notificationsAtLimit, false);
+});
+
+test('getGlobal: prsAtLimit/issuesAtLimit true, когда search вернул ровно GLOBAL_LIMIT(20) элементов', async () => {
+  const twenty = JSON.stringify(Array.from({ length: 20 }, (_, i) => (
+    { number: i, repository: { name: 'r', nameWithOwner: 'me/r' }, title: `t${i}`, url: `u${i}` }
+  )));
+  const info = createGhInfo({
+    run: runFixture({ searchPrs: ok(twenty), searchIssues: ok(twenty) }),
+    cache: noCache(),
+    now: () => 1,
+  });
+  const snap = await info.getGlobal();
+  assert.strictEqual(snap.prsAtLimit, true);
+  assert.strictEqual(snap.issuesAtLimit, true);
+});
+
+test('getGlobal: prsAtLimit/issuesAtLimit false, когда элементов меньше лимита', async () => {
+  const info = createGhInfo({
+    run: runFixture({ searchPrs: ok('[]'), searchIssues: ok('[]') }),
+    cache: noCache(),
+    now: () => 1,
+  });
+  const snap = await info.getGlobal();
+  assert.strictEqual(snap.prsAtLimit, false);
+  assert.strictEqual(snap.issuesAtLimit, false);
 });
 
 test('getGlobal: gh не установлен (ENOENT) → ok:false, error:no-gh', async () => {
@@ -533,4 +602,68 @@ test('getGlobal: форма результата — fetchedAt проставл�
   const info = createGhInfo({ run: runFixture(), cache: noCache(), now: () => 999999 });
   const snap = await info.getGlobal();
   assert.strictEqual(snap.fetchedAt, 999999);
+});
+
+// -------------------------------------------------- находка 3 (single-flight) --
+
+test('getRepo: single-flight — два одновременных вызова для одного cwd используют ОДИН fetchRepoFresh (одна пачка run())', async () => {
+  const calls = [];
+  const info = createGhInfo({
+    run: runFixture({ calls }),
+    cache: noCache(),
+    now: () => 1,
+  });
+  const [a, b] = await Promise.all([info.getRepo('C:\\repo'), info.getRepo('C:\\repo')]);
+  assert.deepStrictEqual(a, b);
+  const callsAfterBoth = calls.length;
+  assert.ok(callsAfterBoth > 0);
+  // Третий вызов ПОСЛЕ разрешения — TTL ещё свежий, run() не должен был вызваться заново.
+  await info.getRepo('C:\\repo');
+  assert.strictEqual(calls.length, callsAfterBoth, 'третий вызов должен был взять кэш, не запускать run() снова');
+});
+
+test('getGlobal: single-flight — два одновременных вызова используют ОДИН fetchGlobalFresh (одна пачка run())', async () => {
+  const calls = [];
+  const info = createGhInfo({
+    run: runFixture({ calls }),
+    cache: noCache(),
+    now: () => 1,
+  });
+  const [a, b] = await Promise.all([info.getGlobal(), info.getGlobal()]);
+  assert.deepStrictEqual(a, b);
+  const callsAfterBoth = calls.length;
+  assert.ok(callsAfterBoth > 0);
+  await info.getGlobal();
+  assert.strictEqual(calls.length, callsAfterBoth, 'третий вызов должен был взять кэш, не запускать run() снова');
+});
+
+test('getRepo/getGlobal: single-flight не путает разные ключи (repo:cwd vs global) — оба летят параллельно независимо', async () => {
+  const calls = [];
+  const info = createGhInfo({
+    run: runFixture({ calls }),
+    cache: noCache(),
+    now: () => 1,
+  });
+  const [repoSnap, globalSnap] = await Promise.all([info.getRepo('C:\\repo'), info.getGlobal()]);
+  assert.strictEqual(repoSnap.ok, true);
+  assert.strictEqual(globalSnap.ok, true);
+});
+
+test('getRepo: fetchedAt штампуется ПОСЛЕ await fetchRepoFresh(), а не в момент вызова (находка 3)', async () => {
+  let n = 0;
+  const nowFn = () => { n += 1; return n * 1000; };
+  const info = createGhInfo({ run: runFixture(), cache: noCache(), now: nowFn });
+  const snap = await info.getRepo('C:\\repo');
+  // Старое поведение читало now() ОДИН раз (до await) — fetchedAt был бы 1000.
+  // Честная версия читает now() дважды (TTL-проверка + штамп после await) —
+  // fetchedAt строго больше стартового чтения.
+  assert.ok(snap.fetchedAt > 1000, `fetchedAt (${snap.fetchedAt}) должен быть позже стартового чтения now()`);
+});
+
+test('getGlobal: fetchedAt штампуется ПОСЛЕ await fetchGlobalFresh() (находка 3)', async () => {
+  let n = 0;
+  const nowFn = () => { n += 1; return n * 1000; };
+  const info = createGhInfo({ run: runFixture(), cache: noCache(), now: nowFn });
+  const snap = await info.getGlobal();
+  assert.ok(snap.fetchedAt > 1000, `fetchedAt (${snap.fetchedAt}) должен быть позже стартового чтения now()`);
 });

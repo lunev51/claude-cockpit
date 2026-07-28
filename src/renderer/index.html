@@ -90,6 +90,13 @@
        обрезался overflow:auto сайдбара. createPalette() наполняет/чистит
        этот контейнер сама (см. src/renderer/js/palette.js). -->
   <div id="palette-root"></div>
+  <!-- Находка 4б (ревью фазы 6): тост для app:notice (main/notify.js) — до
+       этой правки канал приходил в renderer, но showed только console.warn,
+       никакого визуального следа не было. Тот же приём, что peek-root/
+       palette-root — корень вне #sidebar/#main, чтобы не обрезаться
+       overflow'ом сайдбара; createDashboard/createPeek стиля не требует —
+       app.js сам наполняет/чистит этот контейнер (см. showToast). -->
+  <div id="toast-root"></div>
   <script type="module" src="./js/app.js"></script>
 </body>
 </html>

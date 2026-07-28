@@ -785,6 +785,17 @@ html, body {
 .dashboard-github-dot.pending { background: var(--working); }
 .dashboard-github-dot.passing { background: var(--ok); }
 .dashboard-github-dot.failing { background: var(--err); }
+/* Находка 5 (ревью фазы 6, минор): 'unknown' (добор checks не удался — сеть/
+   таймаут) — пустотелая точка, отличная от сплошной серой 'none' (там
+   проверок и правда нет настроено). Красный (реально failing) PR, для
+   которого мы просто не смогли узнать статус, не должен выглядеть как
+   зелёный/серый «без CI». */
+.dashboard-github-dot.unknown { background: transparent; border: 1px solid var(--text-dim); }
+.dashboard-github-limit-note {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
 .dashboard-github-repo {
   flex: none;
   font-family: var(--font-mono);
@@ -855,6 +866,7 @@ html, body {
 .action-btn:focus-visible,
 .sidebar-btn:focus-visible,
 .tab-row:focus-visible,
+.tab-pr-badge:focus-visible,
 #limits:focus-visible,
 .restore-row input[type="checkbox"]:focus-visible,
 .chart-preset:focus-visible,
@@ -1015,3 +1027,35 @@ html, body {
   padding: 10px 9px;
   text-align: center;
 }
+
+/* --- Тосты (находка 4б, ревью фазы 6): app:notice (main/notify.js) — раньше
+   долетал до renderer, но показывался ТОЛЬКО console.warn'ом, без единого
+   визуального следа (см. app.js/showToast). Корень — прямой ребёнок <body>
+   (см. index.html), тот же приём, что peek-root/palette-root: не должен
+   обрезаться overflow сайдбара. --- */
+#toast-root {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 1000;
+  pointer-events: none;
+}
+.toast {
+  pointer-events: auto;
+  max-width: 360px;
+  padding: 10px 14px;
+  border-radius: var(--radius-s);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.4;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  cursor: pointer;
+}
+.toast-warn { border-color: var(--warn); }
+.toast-error { border-color: var(--err); }
+.toast-info { border-color: var(--accent); }

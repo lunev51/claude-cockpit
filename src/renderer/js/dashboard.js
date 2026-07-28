@@ -31,11 +31,15 @@ function colorFor(percent) {
   return 'var(--ok)';
 }
 
-// Коды ошибок слоя A (usage-oauth.js: 'auth'|'network'|'rate') → человеко-читаемая причина.
+// Коды ошибок слоя A (usage-oauth.js: 'auth'|'network'|'rate'|'failed') →
+// человеко-читаемая причина. Находка 10 (ревью фазы 6, минор): без ключа
+// 'failed' фолбэк ниже (limitsErrorText) отдавал сырой код как есть —
+// пользователь видел «Лимиты недоступны: failed» вместо связного текста.
 const LIMITS_ERROR_TEXT = {
   auth: 'не удалось подтвердить OAuth-токен',
   network: 'сетевая ошибка при обращении к серверу лимитов',
   rate: 'превышен лимит запросов — подождите и обновите позже',
+  failed: 'не удалось получить данные — попробуйте «Обновить»',
 };
 
 function limitsErrorText(error) {
@@ -429,7 +433,11 @@ export function createDashboard({
     return row;
   }
 
-  function buildGithubGroup(label, items, emptyText, withChecks) {
+  // Находка 7 (ревью фазы 6, минор): atLimit:true — search/api упёрся в
+  // --limit (см. gh-info.js/prsAtLimit,issuesAtLimit) — список показывает
+  // ровно лимит, но реальных элементов может быть больше. Та же честность,
+  // которой панель диффа (diffpanel.js) принципиально не жертвует.
+  function buildGithubGroup(label, items, emptyText, withChecks, atLimit) {
     const wrap = document.createElement('div');
     wrap.className = 'dashboard-github-group';
 
@@ -453,6 +461,13 @@ export function createDashboard({
         checksClass: withChecks ? (item.checks || 'none') : null,
         url: item.url,
       }));
+    }
+
+    if (atLimit) {
+      const note = document.createElement('div');
+      note.className = 'dashboard-github-limit-note';
+      note.textContent = `показано ${items.length}, возможно больше`;
+      wrap.appendChild(note);
     }
     return wrap;
   }
@@ -489,13 +504,16 @@ export function createDashboard({
 
     const prs = Array.isArray(gh.prs) ? gh.prs : [];
     const issues = Array.isArray(gh.issues) ? gh.issues : [];
-    section.appendChild(buildGithubGroup('Мои открытые PR', prs, 'нет открытых PR', true));
-    section.appendChild(buildGithubGroup('Назначенные issues', issues, 'нет назначенных issues', false));
+    section.appendChild(buildGithubGroup('Мои открытые PR', prs, 'нет открытых PR', true, !!gh.prsAtLimit));
+    section.appendChild(buildGithubGroup('Назначенные issues', issues, 'нет назначенных issues', false, !!gh.issuesAtLimit));
 
     const notifRow = document.createElement('div');
     notifRow.className = 'dashboard-github-notif';
     const notifCount = Number(gh.notifications) || 0;
-    notifRow.textContent = `Уведомлений: ${notifCount}`;
+    // Находка 6/7 (ревью фазы 6, минор): notificationsAtLimit — упёрлись в
+    // размер страницы (см. gh-info.js) — «50» без «+» выглядел бы как точный
+    // и окончательный итог, хотя реальных непрочитанных может быть больше.
+    notifRow.textContent = `Уведомлений: ${notifCount}${gh.notificationsAtLimit ? '+' : ''}`;
     notifRow.addEventListener('click', () => api.shell.openExternal('https://github.com/notifications'));
     section.appendChild(notifRow);
 
@@ -573,10 +591,16 @@ export function createDashboard({
     refreshBtn.textContent = 'обновляю…';
     try {
       const fresh = await onRefresh();
-      // onRefresh может вернуть тот же снапшот (single-flight/троттлинг главного
-      // процесса уже мог отбить лишний реальный запрос, см. ipc.js) — render()
-      // всё равно безвреден на неизменных данных, идемпотентная перерисовка.
-      if (fresh) render(fresh, Date.now());
+      // Fix 2 (ревью фазы 6, регресс Task 5): onRefresh — это refreshUsage()
+      // (app.js), которая возвращает lastUsage ({limits, spend}) БЕЗ поля .gh —
+      // раздел GitHub дашборда вообще не её забота (эта кнопка не должна его
+      // трогать, см. комментарий в шапке файла). render(fresh, ...) напрямую
+      // подставлял этот урезанный снапшот вместо полного {limits, spend, gh} —
+      // раздел GitHub, уже показывавший реальные PR/issues, откатывался обратно
+      // в «загружаю…», хотя ничего заново не грузилось. getData() (app.js/
+      // dashboardSnapshot) даёт актуальный ПОЛНЫЙ снапшот — {...lastUsage, gh:
+      // lastGh} — lastUsage к этому моменту уже обновлён самим onRefresh().
+      render(getData ? getData() : fresh, Date.now());
     } catch (err) {
       console.warn('[dashboard] обновление не удалось:', err);
     } finally {

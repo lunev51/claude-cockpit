@@ -12,6 +12,7 @@ const { createPty } = require('./pty');
 const { createSessionManager } = require('./sessions');
 const { createHookBridge } = require('./hook-bridge');
 const { connectProject, isConnected } = require('./connector');
+const { notify } = require('./notify');
 const { createWorkspaceStore } = require('./workspace');
 const { createWorkspaceSync } = require('./workspace-sync');
 const { saveClipboardImage } = require('./screenshot');
@@ -787,10 +788,21 @@ function registerIpc(win, opts = {}) {
   });
   const tabCwd = (tabId) => manager.list().find((t) => t.tabId === tabId)?.cwd || null;
 
+  // Находка 4б (ревью фазы 6): раньше клик по ⚡ гасил кнопку сразу же после
+  // успешного connectProject() — но ТЕКУЩАЯ сессия CLI внутри уже запущенного
+  // pty не перечитывает .claude/settings.json на лету, поэтому она не начнёт
+  // слать новое событие (PostToolUse) до перезапуска — панель диффа молча
+  // не обновлялась бы сама, а пользователь не узнал бы, что нужно сделать.
+  // notify() — тот же канал app:notice, что main уже использует для других
+  // уведомлений (см. main.js) — renderer показывает его тостом (app.js).
   ipcMain.handle('project:connect', (_e, tabId) => {
     const cwd = tabCwd(tabId);
     if (!cwd) return { connected: false, error: 'вкладка не найдена' };
-    return connectProject(cwd, hookOpts());
+    const res = connectProject(cwd, hookOpts());
+    if (res && res.connected) {
+      notify('Хуки обновлены — перезапустите сессию (Ctrl+Shift+R), чтобы панель диффа обновлялась сама', 'info');
+    }
+    return res;
   });
 
   ipcMain.handle('project:status', (_e, tabId) => {

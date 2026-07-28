@@ -564,3 +564,160 @@ test('форма результата: fetchedAt проставлен из now()
   const snap = await info.get('C:\\repo');
   assert.strictEqual(snap.fetchedAt, 424242);
 });
+
+// -------------------------------------------------- находка 3 (single-flight) --
+
+test('single-flight: два одновременных get() для одного cwd используют ОДИН fetchFresh (одна пачка вызовов run())', async () => {
+  const calls = [];
+  const info = createGitInfo({
+    run: runFixture({ status: ok('## main\n M x.js\n'), calls }),
+    cache: noCache(),
+    now: () => 1,
+  });
+  const [a, b] = await Promise.all([info.get('C:\\repo'), info.get('C:\\repo')]);
+  assert.deepStrictEqual(a, b);
+  const callsAfterBoth = calls.length;
+  assert.ok(callsAfterBoth > 0);
+  // Третий вызов ПОСЛЕ разрешения — TTL ещё свежий, run() не должен был вызваться заново.
+  await info.get('C:\\repo');
+  assert.strictEqual(calls.length, callsAfterBoth, 'третий вызов должен был взять кэш, не запускать run() снова');
+});
+
+test('single-flight: разные cwd НЕ делят один и тот же летящий промис', async () => {
+  const calls = [];
+  const info = createGitInfo({
+    run: runFixture({ status: ok('## main\n'), calls }),
+    cache: noCache(),
+    now: () => 1,
+  });
+  const [a, b] = await Promise.all([info.get('C:\\repo-a'), info.get('C:\\repo-b')]);
+  assert.strictEqual(a.ok, true);
+  assert.strictEqual(b.ok, true);
+});
+
+test('fetchedAt: штампуется ПОСЛЕ await fetchFresh(), а не в момент вызова get() (находка 3, ревью фазы 6)', async () => {
+  let n = 0;
+  const nowFn = () => { n += 1; return n * 1000; };
+  const info = createGitInfo({
+    run: runFixture({ status: ok('## main\n') }),
+    cache: noCache(),
+    now: nowFn,
+  });
+  const snap = await info.get('C:\\repo');
+  // Старое поведение читало now() один раз (ДО await fetchFresh) — fetchedAt
+  // был бы равен самому первому чтению (1000). Честная версия читает now()
+  // дважды за один get() (TTL-проверка + штамп ПОСЛЕ await) — fetchedAt строго
+  // больше стартового чтения.
+  assert.ok(snap.fetchedAt > 1000, `fetchedAt (${snap.fetchedAt}) должен быть позже стартового чтения now()`);
+});
+
+// ------------------------------------------- находка 1, полный фикс (untracked) --
+
+test('untracked-файл: numstat+diff через --no-index добираются, added/removed реальные, а не 0/0', async () => {
+  const statusOut = '## main\n?? new.txt\n';
+  const calls = [];
+  const run = async (args, cwd) => {
+    calls.push({ args, cwd });
+    assert.strictEqual(args[0], '-c');
+    assert.strictEqual(args[1], 'core.quotepath=false');
+    const rest = args.slice(2);
+    if (rest[0] === 'status') return ok(statusOut);
+    if (rest.includes('--no-index') && rest.includes('--numstat')) return ok('3\t0\tnew.txt\n');
+    if (rest.includes('--no-index')) {
+      return ok([
+        'diff --git a/dev/null b/new.txt',
+        'new file mode 100644',
+        'index 0000000..abcdef1',
+        '--- /dev/null',
+        '+++ b/new.txt',
+        '@@ -0,0 +1,3 @@',
+        '+line1',
+        '+line2',
+        '+line3',
+        '',
+      ].join('\n'));
+    }
+    if (rest.includes('--numstat')) return ok(''); // diff --numstat HEAD — файл untracked, numstat HEAD его не видит
+    if (rest[0] === 'diff') return ok(''); // diff HEAD — тоже нечего показать
+    throw new Error(`неожиданные args: ${JSON.stringify(args)}`);
+  };
+  const info = createGitInfo({ run, cache: noCache(), now: () => 1 });
+  const snap = await info.get('C:\\repo');
+  assert.strictEqual(snap.files.length, 1);
+  assert.strictEqual(snap.files[0].added, 3);
+  assert.strictEqual(snap.files[0].removed, 0);
+  assert.ok(!snap.files[0].newFileDiffMissing, 'диф успешно добран — файл НЕ должен быть помечен как «без диффа»');
+  assert.ok(snap.diff.includes('diff --git a/dev/null b/new.txt'), 'патч untracked-файла должен попасть в общий текст диффа');
+  assert.ok(snap.diff.includes('+line1'));
+});
+
+test('untracked-файл: бинарник ("-\\t-\\t...") — содержимое НЕ тянем, added/removed остаются 0, newFileDiffMissing:true', async () => {
+  const statusOut = '## main\n?? new.bin\n';
+  const run = async (args) => {
+    const rest = args.slice(2);
+    if (rest[0] === 'status') return ok(statusOut);
+    if (rest.includes('--no-index') && rest.includes('--numstat')) return ok('-\t-\tnew.bin\n');
+    if (rest.includes('--numstat')) return ok('');
+    return ok('');
+  };
+  const info = createGitInfo({ run, cache: noCache(), now: () => 1 });
+  const snap = await info.get('C:\\repo');
+  assert.strictEqual(snap.files[0].added, 0);
+  assert.strictEqual(snap.files[0].removed, 0);
+  assert.strictEqual(snap.files[0].newFileDiffMissing, true);
+  assert.ok(!snap.diff.includes('new.bin'), 'бинарник не должен попасть в текст диффа');
+});
+
+test('untracked-файлы: не больше MAX_NEW_FILE_DIFFS(50) добираются — избыток помечен newFileDiffMissing:true', async () => {
+  const lines = ['## main'];
+  for (let i = 0; i < 60; i++) lines.push(`?? file-${i}.txt`);
+  const noIndexCalls = [];
+  const run = async (args) => {
+    const rest = args.slice(2);
+    if (rest[0] === 'status') return ok(`${lines.join('\n')}\n`);
+    if (rest.includes('--no-index')) {
+      noIndexCalls.push(rest);
+      if (rest.includes('--numstat')) return ok('1\t0\tx\n');
+      return ok('diff --git a/dev/null b/x\n');
+    }
+    return ok('');
+  };
+  const info = createGitInfo({ run, cache: noCache(), now: () => 1 });
+  const snap = await info.get('C:\\repo');
+  const missing = snap.files.filter((f) => f.newFileDiffMissing);
+  const diffed = snap.files.filter((f) => !f.newFileDiffMissing);
+  assert.strictEqual(diffed.length, 50, 'ровно 50 файлов должны были получить реальный дифф');
+  assert.strictEqual(missing.length, 10, 'остаток (60-50) должен быть помечен как «без диффа», а не молча получить 0/0');
+});
+
+test('untracked-файл: сбой (ENOENT) при добирании no-index диффа — best-effort, newFileDiffMissing:true, вся выдача остаётся ok:true', async () => {
+  const statusOut = '## main\n?? new.txt\n';
+  const run = async (args) => {
+    const rest = args.slice(2);
+    if (rest[0] === 'status') return ok(statusOut);
+    if (rest.includes('--no-index')) { const err = new Error('spawn git ENOENT'); err.code = 'ENOENT'; throw err; }
+    return ok('');
+  };
+  const info = createGitInfo({ run, cache: noCache(), now: () => 1 });
+  const snap = await info.get('C:\\repo');
+  assert.strictEqual(snap.ok, true);
+  assert.strictEqual(snap.files[0].newFileDiffMissing, true);
+});
+
+test('untracked-файл: свежий репозиторий без коммитов (numstat/diff HEAD падают) — untracked-содержимое всё равно добирается', async () => {
+  const statusOut = '## No commits yet on main\n?? new.txt\n';
+  const run = async (args) => {
+    const rest = args.slice(2);
+    if (rest[0] === 'status') return ok(statusOut);
+    if (rest.includes('--no-index') && rest.includes('--numstat')) return ok('2\t0\tnew.txt\n');
+    if (rest.includes('--no-index')) return ok('diff --git a/dev/null b/new.txt\n+a\n+b\n');
+    // diff/--numstat HEAD — нет ref HEAD, обе падают
+    return fail("fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree.");
+  };
+  const info = createGitInfo({ run, cache: noCache(), now: () => 1 });
+  const snap = await info.get('C:\\repo');
+  assert.strictEqual(snap.ok, true);
+  assert.strictEqual(snap.files[0].added, 2);
+  assert.ok(!snap.files[0].newFileDiffMissing);
+  assert.ok(snap.diff.includes('diff --git a/dev/null b/new.txt'));
+});

@@ -72,11 +72,40 @@ function sumCounts(files, key) {
   return files.reduce((sum, f) => sum + (Number(f[key]) || 0), 0);
 }
 
+// Untracked-файл, для которого main НЕ смог добрать реальный дифф (бинарник/
+// лимит MAX_NEW_FILE_DIFFS/сбой запроса — см. git-info.js). added/removed у
+// такого файла — не «настоящий ноль», а «не измеряли» — включать его в общую
+// сумму +N −M или в общий счётчик файлов БЕЗ оговорки значило бы молча
+// соврать (находка 1, главная тема ревью: «интерфейс утверждает то, чего нет»).
+function isUndiffedNewFile(f) {
+  return f.status === '?' && !!f.newFileDiffMissing;
+}
+
 function formatSummary(snap) {
+  const files = snap.files;
+  const undiffedNew = files.filter(isUndiffedNewFile);
+  // Сумма +N −M — только по файлам, где числа реальные (обычные + успешно
+  // добранные untracked); «без диффа» файлы дали бы ложный вклад 0/0, будто
+  // у них и правда нет изменений.
+  const countedFiles = undiffedNew.length ? files.filter((f) => !isUndiffedNewFile(f)) : files;
+
   const parts = [];
   parts.push(snap.branch || '(без ветки)');
-  parts.push(`+${sumCounts(snap.files, 'added')} −${sumCounts(snap.files, 'removed')}`);
-  parts.push(`${snap.files.length} ${filesWord(snap.files.length)}`);
+  parts.push(`+${sumCounts(countedFiles, 'added')} −${sumCounts(countedFiles, 'removed')}`);
+
+  // Находка 9 (ревью фазы 6, минор): formatSummary суммирует по уже
+  // урезанному truncateFiles() массиву (макс. 200) — «200 файлов» без
+  // оговорки читается как ПОЛНЫЙ итог, хотя ниже панель отдельно показывает
+  // «показано 200 из N» ровно затем, чтобы так не получалось.
+  const hiddenFiles = (snap.truncated && snap.truncated.files) || 0;
+  const filesLabel = `${files.length} ${filesWord(files.length)}${hiddenFiles ? ' (показано)' : ''}`;
+  parts.push(filesLabel);
+
+  // Находка 1 (главная тема ревью): вместо того чтобы молча включать
+  // «непродифференные» untracked-файлы в общий счёт, называем их отдельно —
+  // «· N новых» — та же честность, что и остальные пометки truncated ниже.
+  if (undiffedNew.length) parts.push(`${undiffedNew.length} ${newFilesWord(undiffedNew.length)}`);
+
   if (snap.ahead || snap.behind) {
     const arrows = [];
     if (snap.ahead) arrows.push(`↑${snap.ahead}`);
@@ -94,6 +123,15 @@ function filesWord(n) {
   if (mod10 === 1 && mod100 !== 11) return 'файл';
   if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return 'файла';
   return 'файлов';
+}
+
+// Склонение «новый/новых» — то же правило, что filesWord() выше, для
+// пометки «· N новых» (находка 1).
+function newFilesWord(n) {
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  if (mod10 === 1 && mod100 !== 11) return 'новый';
+  return 'новых';
 }
 
 export function createDiffPanel({ root, api }) {
@@ -187,9 +225,20 @@ export function createDiffPanel({ root, api }) {
 
       const countsEl = document.createElement('span');
       countsEl.className = 'diff-file-counts';
-      countsEl.textContent = `+${f.added} −${f.removed}`;
+      // Находка 1 (главная тема ревью): untracked-файл без реально добранного
+      // диффа (бинарник/лимит/сбой, см. isUndiffedNewFile выше) НЕ должен
+      // показывать «+0 −0» — это выглядит как «нет изменений», хотя на самом
+      // деле файл целиком новый, просто содержимое не входит в дифф.
+      const undiffedNew = isUndiffedNewFile(f);
+      countsEl.textContent = undiffedNew ? 'новый' : `+${f.added} −${f.removed}`;
 
       row.append(statusEl, pathEl, countsEl);
+      if (undiffedNew) {
+        // Клик по такой строке — no-op (scrollToFile ниже сам не найдёт якорь,
+        // раз для этого файла нет заголовка "diff --git" в тексте), но explicit
+        // подсказка честнее, чем молчаливое бездействие.
+        row.title = 'содержимое нового файла не входит в дифф';
+      }
       row.addEventListener('click', () => scrollToFile(f.path));
       row.addEventListener('keydown', (ev) => {
         if (ev.key === 'Enter' || ev.key === ' ' || ev.code === 'Space') {
@@ -233,6 +282,10 @@ export function createDiffPanel({ root, api }) {
   function render(snap) {
     if (!isOpenFlag) return; // панель закрыта — рисовать некуда и незачем
     if (!snap) {
+      // Находка 8 (ревью фазы 6, минор): без явной очистки здесь заголовок
+      // ПРЕДЫДУЩЕЙ вкладки продолжал висеть над «нет данных» — единственная
+      // ветка render(), которая раньше не трогала summaryEl вообще.
+      summaryEl.textContent = '';
       showEmpty('нет данных');
       return;
     }

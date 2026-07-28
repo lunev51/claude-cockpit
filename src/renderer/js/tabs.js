@@ -73,16 +73,36 @@ export function createTabStore({
     // слушает click для activate/peek, см. trigger() ниже).
     const prBadge = document.createElement('span');
     prBadge.className = 'tab-pr-badge hidden';
-    prBadge.addEventListener('click', (ev) => {
+    // Находка 12 (ревью фазы 6, минор): бейдж был кликабелен только мышью —
+    // <span> без tabIndex/role внутри уже фокусируемой строки (row.tabIndex
+    // ниже) недостижим с клавиатуры отдельно от неё. tabIndex=0 безвреден,
+    // пока бейдж скрыт (.hidden → display:none, не участвует в табуляции) —
+    // становится реальным табстопом ровно тогда, когда setPr() его показывает.
+    prBadge.tabIndex = 0;
+    prBadge.setAttribute('role', 'button');
+    function openPrUrl(ev) {
       ev.stopPropagation();
       if (r.prUrl) api.shell.openExternal(r.prUrl);
+    }
+    prBadge.addEventListener('click', openPrUrl);
+    prBadge.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ' || ev.key === 'Spacebar') {
+        ev.preventDefault();
+        openPrUrl(ev);
+      }
     });
 
     // ⚡ — проект не подключён к хукам (статусы «молчат»); клик прописывает их.
     const connectBtn = document.createElement('button');
     connectBtn.className = 'tab-connect hidden';
     connectBtn.textContent = '⚡';
-    connectBtn.title = 'Статусы молчат: подключить хуки Cockpit к проекту';
+    // Находка 4а (ревью фазы 6): ужесточение isConnected() (см. connector.js)
+    // заставило ⚡ загораться и на проектах, подключённых ДО появления
+    // PostToolUse, — там статусы РАБОТАЮТ (хуки шлют события), не хватает
+    // только PostToolUse (обновление панели диффа при каждом вызове
+    // инструмента). Старый текст «статусы молчат» в этом (самом частом
+    // теперь) случае был прямой ложью.
+    connectBtn.title = 'Хуки Cockpit неполные (нет PostToolUse) — подключить';
     connectBtn.addEventListener('click', (ev) => {
       ev.stopPropagation();
       onConnect(tabId);

@@ -469,6 +469,27 @@ function openTabFromPeek(tabId) {
   activateTab(tabId);
 }
 
+// Находка 4б (ревью фазы 6): app:notice (main/notify.js) раньше долетал до
+// renderer, но показывался ИСКЛЮЧИТЕЛЬНО console.warn'ом (см. boot() ниже) —
+// никакого визуального следа в самом приложении не было. showToast — простой
+// тост в #toast-root (index.html/app.css): авто-исчезает через TOAST_TTL_MS,
+// клик закрывает раньше. Используется и здесь (app:notice), и после успешного
+// connectProject() ниже — тот же канал/тот же визуальный язык для обоих
+// случаев «сообщить пользователю о важном факте, не блокируя его работу».
+const TOAST_TTL_MS = 6000;
+function showToast(text, level = 'info') {
+  const root = $('toast-root');
+  if (!root) return;
+  const el = document.createElement('div');
+  const cls = level === 'error' ? 'error' : (level === 'warn' ? 'warn' : 'info');
+  el.className = `toast toast-${cls}`;
+  el.textContent = text;
+  el.setAttribute('role', 'status');
+  el.addEventListener('click', () => el.remove());
+  root.appendChild(el);
+  setTimeout(() => el.remove(), TOAST_TTL_MS);
+}
+
 // Клик по ⚡: прописать хуки Cockpit в .claude/settings.json проекта вкладки.
 async function connectProject(tabId) {
   try {
@@ -629,6 +650,15 @@ function bindHotkeys() {
         && (ev.key === 'g' || ev.key === 'G' || ev.code === 'KeyG')) {
       ev.preventDefault();
       ev.stopPropagation();
+      // Находка 14 (ревью фазы 6, минор): дашборд/палитра — оверлеи ПОВЕРХ
+      // #main-row (где живёт #diff-panel, см. diffpanel.js) и перехватывают
+      // это же сочетание раньше через bubble-обработчики самих оверлеев (у
+      // них нет своего Ctrl+G) — этот обработчик висит на window в capture-
+      // фазе, то есть срабатывает ПЕРВЫМ, даже когда сверху открыт другой
+      // оверлей. Без гарда пользователь переключал (и сохранял в конфиг)
+      // панель, невидимую под оверлеем — интерфейс молча менял состояние,
+      // не показывая результат.
+      if (dashboard?.isOpen() || palette?.isOpen()) return;
       toggleDiffPanel();
       return;
     }
@@ -1079,7 +1109,13 @@ async function boot() {
     }
   }
 
-  window.api.app.onNotice(({ text }) => console.warn(`[notice] ${text}`));
+  // Находка 4б (ревью фазы 6): раньше это был единственный потребитель
+  // app:notice — и он ТОЛЬКО логировал в консоль, ни один визуальный сигнал
+  // пользователю не показывался. showToast (см. выше) — простой тост.
+  window.api.app.onNotice(({ text, level }) => {
+    console.warn(`[notice] ${text}`);
+    showToast(text, level);
+  });
 }
 
 // Необработанный reject/throw внутри boot() раньше гас молча — приложение
