@@ -5,6 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const https = require('https');
+const readline = require('readline');
 const { execFile } = require('child_process');
 const { ipcMain, shell, dialog, app, clipboard } = require('electron');
 const { getConfig, setConfig } = require('./config');
@@ -21,6 +22,7 @@ const { createUsagePoller } = require('./usage-oauth');
 const { createCcusage } = require('./usage-ccusage');
 const { createGitInfo } = require('./git-info');
 const { createGhInfo } = require('./gh-info');
+const { createHistoryIndex } = require('./history-index');
 
 let manager = null;
 let smokeOutput = '';
@@ -33,6 +35,11 @@ let usagePoller = null;  // поллер официальных лимитов (
 let ccusage = null;      // слой расходов ccusage (usage-ccusage.js) — слой B
 let gitInfo = null;      // Task 2 фазы 6 (панель диффа): git-info.js, чистое ядро + реальный run()
 let ghInfo = null;       // Task 4 фазы 6 (панель GitHub): gh-info.js, чистое ядро + реальный run()
+let historyIndex = null;      // Task 3 фазы 7 (поиск истории): history-index.js, чистое ядро + реальные зависимости
+let historyIndexBuilt = false; // индекс уже собран хотя бы раз ЛЕНИВО (см. 'history:search' ниже) — не на старте
+let historyIndexSize = 0;      // число сессий последнего refresh() — уходит в ответ history:search как indexSize
+                                // (см. src/renderer/js/search.js — единственный способ отличить «ничего не
+                                // нашлось» от «в истории вообще нет сессий» без отдельного дорогого запроса)
 let usageMonitorTimer = null; // лёгкий сторож (только snapshot(), без сети) — рассылает usage:update
 let lastBroadcastKey = null;    // `fetchedAt|stale|error` последнего разосланного usage:update — см. usageBroadcastKey()
 let lastCcusageResult = null;   // последний известный ответ ccusage.get() — уходит и в usage:get/usage:refresh, и в usage:update
@@ -108,6 +115,12 @@ function usageOauthCacheFile() {
 
 function usageCcusageCacheFile() {
   return path.join(app.getPath('userData'), 'usage-ccusage.json');
+}
+
+// Task 3 фазы 7 (поиск истории): тот же файл-кэш, что и у слоёв usage выше —
+// createJsonFileCache ниже используется третий раз, каждый со своим путём.
+function historyIndexCacheFile() {
+  return path.join(app.getPath('userData'), 'history-index.json');
 }
 
 // JSON-файл кэша: read/write в try/catch (битый/отсутствующий файл → null,
@@ -388,6 +401,78 @@ function ghRun(args, cwd) {
   });
 }
 
+// --- Task 3 фазы 7 (глобальный поиск истории): реальные зависимости для
+// createHistoryIndex (history-index.js, Task 2, чистое ядро — listProjects/
+// readFileLines/stat/cache только инжектируются, сам модуль ни fs, ни path,
+// ни electron не видит).
+
+function historyProjectsRoot() {
+  return path.join(os.homedir(), '.claude', 'projects');
+}
+
+// listProjects() → массив {projectDir, sessionId, filePath} — ТОЛЬКО файлы
+// ПЕРВОГО уровня <project>/<sessionId>.jsonl, БЕЗ рекурсии. ВАЖНО (ревью
+// задачи 2): вложенные транскрипты субагентов живут в
+// <project>/<sessionId>/subagents/agent-*.jsonl — рекурсивный обход захватил
+// бы их как «сессии» и замусорил индекс тем, что вне контракта history-index.js.
+// withFileTypes+isFile() — тот же фильтр, что временная живая проверка задачи 2
+// (task-2-report.md) уже подтвердила на реальных данных этой машины (47
+// сессий, ровно столько же, сколько верхнеуровневых .jsonl файлов).
+async function listHistoryProjects() {
+  const base = historyProjectsRoot();
+  let projectDirs;
+  try {
+    projectDirs = await fs.promises.readdir(base, { withFileTypes: true });
+  } catch {
+    return []; // ~/.claude/projects ещё нет (свежая машина/чистый профиль) — истории нет
+  }
+  const out = [];
+  for (const pd of projectDirs) {
+    if (!pd.isDirectory()) continue;
+    const projectDir = path.join(base, pd.name);
+    let files;
+    try {
+      files = await fs.promises.readdir(projectDir, { withFileTypes: true });
+    } catch {
+      continue; // папка проекта исчезла между двумя readdir — пропустить
+    }
+    for (const f of files) {
+      if (!f.isFile() || !f.name.toLowerCase().endsWith('.jsonl')) continue;
+      out.push({
+        projectDir,
+        sessionId: f.name.slice(0, -'.jsonl'.length),
+        filePath: path.join(projectDir, f.name),
+      });
+    }
+  }
+  return out;
+}
+
+// stat(filePath) → {mtimeMs, size} — совпадает по именам полей с fs.Stats.
+async function statHistoryFile(filePath) {
+  const st = await fs.promises.stat(filePath);
+  return { mtimeMs: st.mtimeMs, size: st.size };
+}
+
+// readFileLines(filePath) → асинхронный генератор строк — потоково, ЧЕРЕЗ
+// fs.createReadStream+readline, файл НИКОГДА не читается целиком (транскрипты
+// бывают десятками МБ). Ошибка потока (файл исчез между stat() и этим вызовом)
+// доходит до history-index.js как reject внутри `for await` — readline
+// пробрасывает 'error' входного стрима в асинхронный итератор (проверено
+// живьём: ENOENT на несуществующем файле ловится именно так, не проглатывается).
+async function* readHistoryJsonlLines(filePath) {
+  const stream = fs.createReadStream(filePath, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  try {
+    for await (const line of rl) {
+      yield line;
+    }
+  } finally {
+    rl.close();
+    stream.destroy();
+  }
+}
+
 // FINDING 1 (ревью, fix round 1): usage-oauth.js/applyError() при сбое
 // оставляет fetchedAt ПРЕЖНИМ (берёт из lastGood) — сторож, сравнивавший
 // только fetchedAt, никогда не замечал переход в stale (истёк токен → 15-мин
@@ -425,6 +510,21 @@ function registerIpc(win, opts = {}) {
   // не делает I/O сам по себе, безопасно создавать безусловно даже в smoke (сам
   // IPC-хендлер ниже просто не зовёт .getRepo()/.getGlobal() в smoke).
   ghInfo = createGhInfo({ run: ghRun });
+  // Task 3 фазы 7 (глобальный поиск истории): historyIndex — чистое ядро
+  // (history-index.js) + реальные зависимости выше (обход ~/.claude/projects,
+  // потоковое чтение JSONL, fs.stat, JSON-кэш в userData). Конструктор не
+  // делает I/O сам по себе — безопасно создавать всегда, даже в smoke (сам
+  // IPC-хендлер 'history:search'/'history:refresh' ниже просто не зовёт
+  // .refresh()/.search() в smoke). Сборка индекса — ЛЕНИВАЯ, при первом
+  // РЕАЛЬНОМ history:search (см. хендлер ниже), не здесь и не на старте.
+  historyIndex = createHistoryIndex({
+    listProjects: listHistoryProjects,
+    readFileLines: readHistoryJsonlLines,
+    stat: statHistoryFile,
+    cache: createJsonFileCache(historyIndexCacheFile()),
+  });
+  historyIndexBuilt = false;
+  historyIndexSize = 0;
   lastBroadcastKey = null;
   lastCcusageResult = null;
   manualRefreshInFlight = null;
@@ -844,6 +944,44 @@ function registerIpc(win, opts = {}) {
     if (smoke) return null;
     const force = !!(opts && opts.force);
     return ghInfo.getGlobal({ force });
+  });
+
+  // Task 3 фазы 7 (глобальный поиск истории, Ctrl+Shift+H): смотри search.js
+  // (renderer) — оверлей с дебаунсом/отменой устаревших запросов, здесь только
+  // проводка. Индекс собирается ЛЕНИВО: если ещё ни разу не собран за жизнь
+  // этого окна (historyIndexBuilt) — СНАЧАЛА historyIndex.refresh() (полный
+  // обход ~/.claude/projects + инкрементальное чтение), и только ПОТОМ
+  // historyIndex.search() — не на старте приложения (registerIpc() выше
+  // только конструирует historyIndex, без единого I/O). indexSize — снимок
+  // числа сессий из ПОСЛЕДНЕГО refresh() (не пересчитывается на каждый поиск —
+  // сам поиск и так не дешёвый, см. review задачи 2: 1.5-2.2с на 47 сессиях)
+  // — единственный способ renderer'у отличить «ничего не найдено» от «в
+  // истории вообще нет сессий» без отдельного дорогого запроса.
+  // smoke — БЕЗ единого обращения к диску, тот же гейт, что gh:global выше.
+  ipcMain.handle('history:search', async (_e, query, opts) => {
+    if (smoke) return null;
+    if (!historyIndexBuilt) {
+      const entries = await historyIndex.refresh({});
+      historyIndexBuilt = true;
+      historyIndexSize = entries.length;
+    }
+    const o = opts && typeof opts === 'object' ? opts : {};
+    const results = await historyIndex.search(query, o);
+    return { results, indexSize: historyIndexSize };
+  });
+
+  // Явный пересбор индекса ({force:true} игнорирует mtime/size-эвристику
+  // history-index.js целиком). Канал существует по брифу задачи 3 —
+  // текущий UI (search.js) им не пользуется напрямую (полагается на
+  // встроенный ленивый пересбор внутри history:search выше), задел на
+  // будущую кнопку «Обновить индекс». smoke — тот же гейт.
+  ipcMain.handle('history:refresh', async (_e, opts) => {
+    if (smoke) return null;
+    const force = !!(opts && opts.force);
+    const entries = await historyIndex.refresh({ force });
+    historyIndexBuilt = true;
+    historyIndexSize = entries.length;
+    return entries;
   });
 
   // Task 4 фазы 4 (вставка скриншотов): cwd вкладки резолвим тем же путём,

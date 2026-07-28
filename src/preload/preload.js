@@ -92,6 +92,17 @@ contextBridge.exposeInMainWorld('api', {
     clear: (tabId) => ipcRenderer.send('queue:clear', { tabId }),
     onChanged: (cb) => ipcRenderer.on('queue:changed', (_e, p) => cb(p)),
   },
+  history: {
+    // Task 3 фазы 7 (глобальный поиск истории, Ctrl+Shift+H): main лениво
+    // строит индекс при первом реальном вызове (см. main/ipc.js) — {results,
+    // indexSize} в non-smoke, null в smoke (ни один хендлер тогда не трогает
+    // диск). search.js сам решает, когда звать (дебаунс/минимум 2 символа).
+    search: (query, opts) => ipcRenderer.invoke('history:search', query, opts),
+    // Явный пересбор индекса ({force}) — задел на будущую кнопку «Обновить
+    // индекс»; текущий UI (search.js) полагается на встроенный ленивый
+    // пересбор внутри history:search и этот канал напрямую не зовёт.
+    refresh: (opts) => ipcRenderer.invoke('history:refresh', opts),
+  },
   usage: {
     // Task 3 фазы 5 (кольца лимитов): {limits, spend} — снапшот слоя A
     // (usage-oauth.js) и последний известный ответ слоя B (usage-ccusage.js,

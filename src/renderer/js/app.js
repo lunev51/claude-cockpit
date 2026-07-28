@@ -9,6 +9,7 @@ import { createPalette } from './palette.js';
 import { createDashboard } from './dashboard.js';
 import { renderRings } from './rings.js';
 import { createDiffPanel } from './diffpanel.js';
+import { createSearch } from './search.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -26,6 +27,10 @@ let dashboard = null;
 // Task 2 фазы 6: панель диффа — НЕ оверлей (см. diffpanel.js), createDiffPanel
 // сама владеет своим DOM внутри #diff-panel (строится один раз при boot()).
 let diffPanel = null;
+// Task 3 фазы 7 (глобальный поиск истории): оверлей Ctrl+Shift+H —
+// createSearch сама владеет своим DOM (см. search.js), здесь только ссылка
+// для bindHotkeys/взаимного исключения с palette/dashboard/peek.
+let historySearch = null;
 // Task 3 фазы 4 (peek): tabId, для которого сейчас открыт поповер (или null).
 // Нужен, чтобы обработчик tab:status закрывал peek ТОЛЬКО когда статус меняет
 // именно ту вкладку, что сейчас показана в поповере — peek.hide() идемпотентна,
@@ -384,8 +389,22 @@ function fetchUsageOnDashboardOpen() {
 function toggleDashboard() {
   peek?.hide();
   if (palette.isOpen()) palette.close();
+  // Task 3 фазы 7: та же логика — оверлей поиска не должен остаться висеть
+  // «за спиной» открывающегося дашборда.
+  if (historySearch?.isOpen()) historySearch.close();
   if (dashboard.isOpen()) dashboard.close();
   else dashboard.open();
+}
+
+// Task 3 фазы 7 (глобальный поиск истории): тумблер Ctrl+Shift+H — тот же
+// паттерн, что toggleDashboard() выше (взаимное исключение со всеми прочими
+// оверлеями, второе нажатие закрывает вместо повторного открытия).
+function toggleHistorySearch() {
+  peek?.hide();
+  if (palette.isOpen()) palette.close();
+  dashboard?.close();
+  if (historySearch.isOpen()) historySearch.close();
+  else historySearch.open(views.get(tabStore.activeId)?.view);
 }
 
 // Task 2 фазы 6: тумблер панели диффа (Ctrl+G/кнопка «±» панели действий) —
@@ -464,6 +483,11 @@ function activateTab(tabId) {
   // Task 4 фазы 5: та же логика — дашборд накрывает терминальную область
   // целиком, переключение вкладки под ним не должно оставлять его висеть.
   dashboard?.close();
+  // Task 3 фазы 7: та же логика — оверлей поиска истории тоже накрывает окно
+  // целиком (в т.ч. это естественный путь при открытии результата поиска:
+  // openTab({sessionId}) → activateTab — оверлей к этому моменту уже закрыт
+  // самим search.js/openAt, но close() идемпотентна, повторный вызов безвреден).
+  historySearch?.close();
   // Task 1 фазы 7: очередь — ввод для КОНКРЕТНОЙ сессии; поле ввода, открытое
   // для одной вкладки, не должно молча остаться висеть (и слать текст уже не
   // в ту вкладку) после переключения на другую.
@@ -665,6 +689,15 @@ function buildPaletteActions() {
     run: () => toggleDashboard(),
   });
 
+  // Task 3 фазы 7: действие «Поиск по истории» — тот же приём, что
+  // «Дашборд» выше (не привязано к активной вкладке, доступно всегда).
+  actions.push({
+    id: 'history-search',
+    title: 'Поиск по истории',
+    hint: 'Ctrl+Shift+H',
+    run: () => toggleHistorySearch(),
+  });
+
   const activeId = tabStore.activeId;
   if (activeId) {
     actions.push({
@@ -718,6 +751,9 @@ function bindHotkeys() {
       // Task 4 фазы 5: взаимное исключение оверлеев — дашборд не должен
       // остаться висеть «за спиной» открывшейся палитры.
       dashboard?.close();
+      // Task 3 фазы 7: та же логика — оверлей поиска истории тоже не должен
+      // остаться висеть «за спиной» открывшейся палитры.
+      if (historySearch?.isOpen()) historySearch.close();
       // Fix round 1 (ревью): peek?.hide() выше уже мог схлопнуть
       // document.activeElement на <body> (см. подробный разбор в palette.js/
       // open) — передаём терминал активной вкладки как fallback НА СЛУЧАЙ
@@ -757,7 +793,7 @@ function bindHotkeys() {
       // оверлей. Без гарда пользователь переключал (и сохранял в конфиг)
       // панель, невидимую под оверлеем — интерфейс молча менял состояние,
       // не показывая результат.
-      if (dashboard?.isOpen() || palette?.isOpen()) return;
+      if (dashboard?.isOpen() || palette?.isOpen() || historySearch?.isOpen()) return;
       toggleDiffPanel();
       return;
     }
@@ -771,9 +807,24 @@ function bindHotkeys() {
         && (ev.key === 'q' || ev.key === 'Q' || ev.code === 'KeyQ')) {
       ev.preventDefault();
       ev.stopPropagation();
-      if (dashboard?.isOpen() || palette?.isOpen()) return;
+      if (dashboard?.isOpen() || palette?.isOpen() || historySearch?.isOpen()) return;
       if (queueInputOpen) closeQueueInput();
       else openQueueInput();
+      return;
+    }
+    // Ctrl+Shift+H — глобальный поиск по истории сессий (Task 3 фазы 7,
+    // history-index.js). ВАЖНО: Ctrl+Shift+F уже занят поиском по буферу
+    // ТЕКУЩЕГО терминала (см. terminal.js/attachCustomKeyEventHandler) —
+    // технической коллизии нет (разные буквы, разные обработчики; этот висит
+    // на window в capture-фазе и обрабатывает ТОЛЬКО 'h'/'H'/KeyH, до Ctrl+
+    // Shift+F вообще не долетал бы, даже если бы совпадал), путаница была
+    // только в исходном плане фазы (оба варианта ошибочно предлагались на
+    // F) — решение зафиксировано в task-3-brief.md: глобальный поиск на H.
+    if (ev.ctrlKey && ev.shiftKey && !ev.altKey && !ev.metaKey
+        && (ev.key === 'h' || ev.key === 'H' || ev.code === 'KeyH')) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      toggleHistorySearch();
       return;
     }
     // Ctrl+1..9 — вкладка по индексу.
@@ -975,7 +1026,7 @@ function showRestoreOverlay(manifest) {
   // тому, кто ЕГО реально должен обработать (единый стек оверлеев — задача
   // следующей фазы, здесь достаточно точечной проверки).
   function otherOverlayOpen() {
-    return !!(dashboard?.isOpen() || palette?.isOpen() || peek?.isOpen());
+    return !!(dashboard?.isOpen() || palette?.isOpen() || peek?.isOpen() || historySearch?.isOpen());
   }
 
   function onKey(ev) {
@@ -1067,6 +1118,17 @@ async function boot() {
   // обновит содержимое, раз панель уже открыта.
   diffPanel = createDiffPanel({ root: $('diff-panel'), api: window.api });
   if (config.ui?.diffPanelOpen) diffPanel.open();
+
+  // Task 3 фазы 7 (глобальный поиск истории, Ctrl+Shift+H): onOpenResult —
+  // открыть НОВУЮ вкладку с продолжением найденной сессии в её исходном cwd,
+  // тот же openTab(cwd, {sessionId}), которым восстановление воркспейса
+  // (restoreFlow выше) резюмит сессии — sessions.js сам достраивает
+  // `--resume <sessionId>` поверх конфигурационных args (FIX 3, ревью).
+  historySearch = createSearch({
+    root: $('search-root'),
+    api: window.api,
+    onOpenResult: (cwd, sessionId) => openTab(cwd, { sessionId }),
+  });
 
   renderActionBar();
 
