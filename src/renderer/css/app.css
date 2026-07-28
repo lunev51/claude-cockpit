@@ -154,7 +154,10 @@ html, body {
   border-top: 1px solid var(--border);
   padding-top: 8px;
   display: flex;
-  gap: 6px;
+  /* Task 3 фазы 5: колонка вместо строки — #limits (кольца лимитов) теперь
+     занимает верхнюю часть подвала, кнопка «+ Проект» остаётся прижатой к низу. */
+  flex-direction: column;
+  gap: 8px;
 }
 .sidebar-btn {
   flex: 1;
@@ -168,6 +171,73 @@ html, body {
   cursor: pointer;
 }
 .sidebar-btn:hover { background: var(--bg-hover); color: var(--text); }
+
+/* --- Кольца лимитов (Task 3 фазы 5): #limits в подвале сайдбара, НАД кнопкой
+   «+ Проект» (см. .sidebar-footer flex-direction:column выше). Два кольца
+   (5ч/неделя) рисует rings.js через conic-gradient — переменные --ring-pct
+   (0..100, число без %) и --ring-color (var(--ok)/var(--warn)/var(--err))
+   ставит сам rings.js на каждый .ring-visual инлайново. --- */
+#limits {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  padding: 6px 2px;
+  border-radius: var(--radius-s);
+  cursor: pointer;
+}
+#limits:hover { background: var(--bg-hover); }
+/* Task 3 фазы 5: snapshot.stale — данные из кэша, последний живой запрос не
+   удался. Приглушаем весь блок целиком (не ломая вёрстку) — title «данные
+   устарели» ставит сам rings.js на #limits. */
+#limits.stale { opacity: .55; }
+
+.limit-ring {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  flex: 1;
+  min-width: 0;
+}
+.ring-visual {
+  --ring-pct: 0;
+  --ring-color: var(--ok);
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  flex: none;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: conic-gradient(var(--ring-color) calc(var(--ring-pct) * 1%), var(--bg-card) 0);
+}
+/* Внутренний вырез поверх conic-gradient — получается кольцо, а не залитый круг. */
+.ring-visual::before {
+  content: '';
+  position: absolute;
+  inset: 5px;
+  border-radius: 50%;
+  background: var(--bg-panel);
+}
+.ring-percent {
+  position: relative; /* поверх ::before */
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+}
+.ring-label {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-dim);
+}
+.ring-countdown {
+  font-size: 10px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
 
 /* --- Главная область --- */
 #main {
@@ -293,6 +363,7 @@ html, body {
 .action-btn:focus-visible,
 .sidebar-btn:focus-visible,
 .tab-row:focus-visible,
+#limits:focus-visible,
 .restore-row input[type="checkbox"]:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;

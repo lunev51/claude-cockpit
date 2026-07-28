@@ -3,6 +3,9 @@
 
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
+const https = require('https');
+const { execFile } = require('child_process');
 const { ipcMain, shell, dialog, app, clipboard } = require('electron');
 const { getConfig, setConfig } = require('./config');
 const { createPty } = require('./pty');
@@ -13,6 +16,8 @@ const { createWorkspaceStore } = require('./workspace');
 const { createWorkspaceSync } = require('./workspace-sync');
 const { saveClipboardImage } = require('./screenshot');
 const { appRoot } = require('./paths');
+const { createUsagePoller } = require('./usage-oauth');
+const { createCcusage } = require('./usage-ccusage');
 
 let manager = null;
 let smokeOutput = '';
@@ -21,6 +26,11 @@ let stuckTimer = null;
 let store = null;        // стор манифеста воркспейса (workspace.js)
 let wsync = null;        // гейт синхронизации манифеста (workspace-sync.js) — FIX 1/2 ревью
 let activeTabId = null;  // последний tabId, о котором сообщил renderer через workspace:setActive
+let usagePoller = null;  // поллер официальных лимитов (usage-oauth.js) — слой A
+let ccusage = null;      // слой расходов ccusage (usage-ccusage.js) — слой B
+let usageMonitorTimer = null; // лёгкий сторож (только snapshot(), без сети) — рассылает usage:update
+let lastBroadcastFetchedAt = 0; // fetchedAt последнего разосланного usage:update — детектор «случился успешный refresh»
+let lastCcusageResult = null;   // последний известный ответ ccusage.get() — уходит и в usage:get/usage:refresh, и в usage:update
 
 function getSmokeOutput() {
   return smokeOutput;
@@ -75,8 +85,116 @@ function validDim(n) {
   return Number.isInteger(n) && n >= 2 && n <= 500;
 }
 
+// --- Проводка слоёв usage (Task 3 фазы 5): usage-oauth.js/usage-ccusage.js —
+// готовые ЧИСТЫЕ модули (readToken/httpGet/cache/run — только инжектируемые
+// зависимости), здесь только реальные реализации этих зависимостей.
+
+function usageOauthCacheFile() {
+  return path.join(app.getPath('userData'), 'usage-oauth.json');
+}
+
+function usageCcusageCacheFile() {
+  return path.join(app.getPath('userData'), 'usage-ccusage.json');
+}
+
+// JSON-файл кэша: read/write в try/catch (битый/отсутствующий файл → null,
+// ошибка записи — не критична, просто предупреждение). Оба слоя используют
+// эту же фабрику, каждый со своим путём.
+function createJsonFileCache(file) {
+  return {
+    read() {
+      try {
+        return JSON.parse(fs.readFileSync(file, 'utf8'));
+      } catch {
+        return null; // нет файла или битый — трактуем как «нет кэша», не бросаем
+      }
+    },
+    write(obj) {
+      try {
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, JSON.stringify(obj), 'utf8');
+      } catch (err) {
+        console.warn(`[usage] не удалось записать кэш ${path.basename(file)}: ${err.message}`);
+      }
+    },
+  };
+}
+
+// Токен НИКУДА, кроме заголовка запроса, не уходит — не логируется даже здесь.
+function readOauthToken() {
+  try {
+    const file = path.join(os.homedir(), '.claude', '.credentials.json');
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const oauth = data && data.claudeAiOauth;
+    if (!oauth || typeof oauth.accessToken !== 'string' || !oauth.accessToken) return null;
+    return { accessToken: oauth.accessToken, expiresAt: oauth.expiresAt || null };
+  } catch {
+    return null; // файла нет / битый JSON / нет полей — трактуем как «не залогинен»
+  }
+}
+
+// httpGet(url, headers) → {status, body}; НЕ бросает на не-200 (usage-oauth.js
+// сам разбирает 401/403/429 по status) — бросает (reject) только на реальный
+// сетевой сбой/таймаут, ЭТО ловит usage-oauth.js как error:'network'.
+// Таймаут 20с (бриф) — и на весь запрос (req.on('timeout')), и как safety-net
+// на уровне https.get options.
+function usageHttpGet(url, headers) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, { headers, timeout: 20000 }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') });
+      });
+      res.on('error', reject);
+    });
+    req.on('timeout', () => {
+      req.destroy(new Error('usage httpGet: таймаут 20с'));
+    });
+    req.on('error', reject);
+  });
+}
+
+// run(args) для ccusage: execFile('npx', ...) БЕЗ shell:true падает на Windows
+// с ENOENT (npx — это .cmd-шим, не бинарник); execFile('npx.cmd', ...) БЕЗ
+// shell:true падает с ENOENT/EINVAL — известная особенность обработки .cmd в
+// child_process на Windows (проверено фактически на этой машине: npx.cmd без
+// shell → 'spawn EINVAL'). Рабочий вариант — execFile('npx', args, {shell:true})
+// (проверено: реальный вызов `ccusage claude daily --json` вернулся за ~1.5с
+// с валидным JSON). args — фиксированные литералы вида ['claude','daily','--json'],
+// без пользовательского ввода — риск инъекции через DEP0190 (аргументы не
+// экранируются под shell:true) отсутствует.
+function runCcusage(args) {
+  return new Promise((resolve) => {
+    execFile('npx', ['--yes', 'ccusage@latest', ...args], {
+      timeout: 60000,
+      windowsHide: true,
+      shell: true,
+      maxBuffer: 16 * 1024 * 1024,
+    }, (err, stdout, stderr) => {
+      resolve({ code: err ? (err.code || 1) : 0, stdout: stdout || '', stderr: stderr || '' });
+    });
+  });
+}
+
 function registerIpc(win, opts = {}) {
   const { smoke = false, attention = null, toaster = null } = opts;
+
+  // Слои usage (Task 3 фазы 5): инстансы создаются ВСЕГДА (конструктор — это
+  // просто замыкания над зависимостями, никакого I/O до первого refresh()/get()),
+  // а вот сама автономная жизнь поллера (start()) — ТОЛЬКО не в smoke, ниже.
+  usagePoller = createUsagePoller({
+    readToken: readOauthToken,
+    httpGet: usageHttpGet,
+    cache: createJsonFileCache(usageOauthCacheFile()),
+    log: (msg) => console.warn(msg),
+  });
+  ccusage = createCcusage({
+    run: runCcusage,
+    cache: createJsonFileCache(usageCcusageCacheFile()),
+  });
+  lastBroadcastFetchedAt = 0;
+  lastCcusageResult = null;
 
   // Стор манифеста создаётся один раз на регистрацию — независимо от smoke,
   // чтобы workspace:get всегда мог отдать хоть что-то (в smoke он просто
@@ -172,6 +290,35 @@ function registerIpc(win, opts = {}) {
   stuckTimer = setInterval(() => manager.checkStuck(), 30000);
   stuckTimer.unref?.();
 
+  // Task 3 фазы 5 (кольца лимитов): поллер официальных лимитов стартует ТОЛЬКО
+  // не в smoke — headless-прогон не должен трогать сеть. usagePoller.start()
+  // сам вызывает немедленный refresh() и дальше живёт по своему расписанию
+  // (с бэкоффом при 401/403/429, см. usage-oauth.js) — этот цикл ЕДИНСТВЕННЫЙ
+  // источник реальных сетевых обращений к слою A.
+  //
+  // usage-oauth.js не даёт колбэка «после refresh» (контракт модуля — только
+  // start/stop/snapshot/refresh, переписывать не в объёме этой задачи) — вместо
+  // повторного собственного планировщика (который задвоил бы сетевые вызовы
+  // параллельно с внутренним таймером поллера) здесь лёгкий сторож: раз в 5с
+  // читает ТОЛЬКО snapshot() (синхронно, без сети) и сравнивает fetchedAt с
+  // последним разосланным — смена fetchedAt означает, что где-то между
+  // проверками случился успешный refresh (живьём или восстановлением из кэша),
+  // и тогда шлём usage:update. Гранулярность обнаружения — до 5с, сети это не
+  // стоит ничего (snapshot() — синхронное чтение из памяти).
+  if (!smoke) {
+    usagePoller.start();
+    usageMonitorTimer = setInterval(() => {
+      const snap = usagePoller.snapshot();
+      if (snap.fetchedAt !== lastBroadcastFetchedAt) {
+        lastBroadcastFetchedAt = snap.fetchedAt;
+        if (!win.isDestroyed()) {
+          win.webContents.send('usage:update', { limits: snap, spend: lastCcusageResult });
+        }
+      }
+    }, 5000);
+    usageMonitorTimer.unref?.();
+  }
+
   ipcMain.handle('config:get', () => getConfig());
 
   ipcMain.handle('config:set', (_e, partial) => {
@@ -179,6 +326,28 @@ function registerIpc(win, opts = {}) {
       throw new TypeError('config:set ожидает plain-object');
     }
     return setConfig(partial);
+  });
+
+  // Task 3 фазы 5 (кольца лимитов): usagePoller.snapshot() — синхронный, без
+  // сети. ccusage.get() — лениво: первый usage:get и есть тот самый «первый
+  // запуск», дальше TTL-кэш внутри usage-ccusage.js сам не даёт бить по npx
+  // чаще ttlMs (проводить свой отдельный троттлинг здесь не нужно — это уже
+  // сделано в модуле). smoke: НИ сети, НИ npx — spend всегда null, ccusage.get()
+  // не зовётся вовсе.
+  ipcMain.handle('usage:get', async () => {
+    const limits = usagePoller.snapshot();
+    if (smoke) return { limits, spend: null };
+    lastCcusageResult = await ccusage.get({ force: false });
+    return { limits, spend: lastCcusageResult };
+  });
+
+  // Принудительное обновление ОБОИХ слоёв (кнопка/клик по кольцам, дашборд
+  // Task 4). smoke — тот же гейт, что и usage:get.
+  ipcMain.handle('usage:refresh', async () => {
+    if (smoke) return { limits: usagePoller.snapshot(), spend: null };
+    const [, spend] = await Promise.all([usagePoller.refresh(), ccusage.get({ force: true })]);
+    lastCcusageResult = spend;
+    return { limits: usagePoller.snapshot(), spend };
   });
 
   ipcMain.handle('shell:openExternal', (_e, url) => {
@@ -438,6 +607,14 @@ function disposeSessions() {
     clearInterval(stuckTimer);
     stuckTimer = null;
   }
+  // Task 3 фазы 5: гасим сторож usage:update и сам поллер лимитов — симметрично
+  // usagePoller.start() в registerIpc (в smoke оба всё равно no-op: сторож не
+  // создавался, start() не звался, а stop() на незапущенном поллере безопасен).
+  if (usageMonitorTimer) {
+    clearInterval(usageMonitorTimer);
+    usageMonitorTimer = null;
+  }
+  if (usagePoller) usagePoller.stop();
   stopBridge();
   if (manager) manager.disposeAll();
 }

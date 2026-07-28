@@ -6,6 +6,7 @@ import { createTabStore } from './tabs.js';
 import { renderBadge } from './badge.js';
 import { createPeek } from './peek.js';
 import { createPalette } from './palette.js';
+import { renderRings } from './rings.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -28,6 +29,11 @@ let peekedTabId = null;
 // этого крючка пользователь мог открыть вкладку мимо оверлея, пока решение
 // по восстановлению ещё не принято (см. btn-new-tab ниже и showRestoreOverlay).
 let restoreOverlaySkip = null;
+// Task 3 фазы 5 (кольца лимитов): последний известный ответ usage:get/
+// usage:refresh/usage:update — {limits, spend}. null до первого разрешившегося
+// usage.get() (см. boot()); redrawLimits() сама терпит null (rings.js рисует
+// прочерки, не ломая вёрстку).
+let lastUsage = null;
 
 // Fix 8 (ревью): точка в титлбаре терракотовая, только пока есть хотя бы одна
 // вкладка в статусе waiting — локальный Set, потому что удобного агрегата
@@ -83,6 +89,27 @@ function renderActionBar() {
     });
     host.appendChild(btn);
   }
+}
+
+// Task 3 фазы 5 (кольца лимитов): перерисовать #limits из lastUsage.limits.
+// now инжектируется вызывающим кодом — локальный таймер 30с (см. boot()) зовёт
+// это же саму функцию с новым Date.now(), чтобы обновить только отсчёт
+// («сброс через …») без единого сетевого запроса, IPC или свежего снапшота.
+function redrawLimits(now = Date.now()) {
+  const host = $('limits');
+  if (!host) return;
+  renderRings(host, lastUsage ? lastUsage.limits : null, now);
+}
+
+// Клик/Enter/Space по #limits — форс-обновление обоих слоёв usage. Дашборд
+// (Task 4) станет вторым эффектом того же клика — пока только обновляем кольца.
+async function refreshUsage() {
+  try {
+    lastUsage = await window.api.usage.refresh();
+  } catch (err) {
+    console.warn('[usage] usage:refresh не удался:', err);
+  }
+  redrawLimits();
 }
 
 // Создать вкладку: контейнер + xterm + запись в стор. activate — переключиться сразу.
@@ -584,6 +611,40 @@ async function boot() {
   });
 
   renderActionBar();
+
+  // Task 3 фазы 5 (кольца лимитов): первичный usage:get — НЕ await, чтобы
+  // первый (потенциально небыстрый — ленивый ccusage.get() дёргает npx на
+  // первом вызове, до 60с таймаута) запрос не задерживал остальной boot()
+  // (восстановление воркспейса, открытие вкладок). Кольца просто показывают
+  // прочерки (ok:false — snapshot ещё не пришёл), пока промис не разрешится.
+  window.api.usage.get().then((payload) => {
+    lastUsage = payload;
+    redrawLimits();
+  }).catch((err) => console.warn('[usage] usage:get не удался:', err));
+
+  // main шлёт это после каждого успешно обнаруженного refresh поллера (см.
+  // usageMonitorTimer в main/ipc.js) — payload той же формы {limits, spend}.
+  window.api.usage.onUpdate((payload) => {
+    lastUsage = payload;
+    redrawLimits();
+  });
+
+  // Клик по кольцам — форс-обновление (дашборд появится в Task 4, пока просто
+  // usage:refresh). Enter/Space — та же клавиатурная доступность, что и
+  // остальные интерактивные элементы сайдбара (tabindex=0 в index.html).
+  const limitsEl = $('limits');
+  limitsEl?.addEventListener('click', refreshUsage);
+  limitsEl?.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter' || ev.key === ' ' || ev.code === 'Space') {
+      ev.preventDefault();
+      refreshUsage();
+    }
+  });
+
+  // Локальный таймер 30с — ТОЛЬКО обновление обратного отсчёта («сброс через
+  // …»), без единого сетевого запроса: redrawLimits() просто перечитывает уже
+  // известный lastUsage.limits с новым Date.now().
+  setInterval(() => redrawLimits(), 30000);
 
   // Глобальный диспатч событий терминалов по tabId.
   window.api.term.onData(({ tabId, data }) => views.get(tabId)?.view.handlers.onData(data));
