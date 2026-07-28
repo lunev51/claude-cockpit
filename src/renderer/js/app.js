@@ -8,6 +8,7 @@ import { createPeek } from './peek.js';
 import { createPalette } from './palette.js';
 import { createDashboard } from './dashboard.js';
 import { renderRings } from './rings.js';
+import { createDiffPanel } from './diffpanel.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -22,6 +23,9 @@ let palette = null;
 // своим DOM (см. dashboard.js), здесь только держим ссылку для bindHotkeys/
 // панели действий/палитры и для проброса свежих usage-снапшотов, пока открыт.
 let dashboard = null;
+// Task 2 фазы 6: панель диффа — НЕ оверлей (см. diffpanel.js), createDiffPanel
+// сама владеет своим DOM внутри #diff-panel (строится один раз при boot()).
+let diffPanel = null;
 // Task 3 фазы 4 (peek): tabId, для которого сейчас открыт поповер (или null).
 // Нужен, чтобы обработчик tab:status закрывал peek ТОЛЬКО когда статус меняет
 // именно ту вкладку, что сейчас показана в поповере — peek.hide() идемпотентна,
@@ -39,6 +43,13 @@ let restoreOverlaySkip = null;
 // usage.get() (см. boot()); redrawLimits() сама терпит null (rings.js рисует
 // прочерки, не ломая вёрстку).
 let lastUsage = null;
+// Task 4 фазы 6 (раздел GitHub дашборда): последний ответ gh:global —
+// {ok, error, prs, issues, notifications, fetchedAt} или null ДО первого
+// открытия дашборда (лениво, тот же приём, что и ccusage — см.
+// fetchUsageOnDashboardOpen). Отдельно от lastUsage, потому что источник другой
+// (gh-info.js, не usage-oauth/ccusage), но передаётся в dashboard.render()
+// вместе с ним как поле .gh (см. redrawUsageViews/getData ниже).
+let lastGh = null;
 // FINDING 2 (ревью, fix round 1): пока предыдущий usage:refresh не разрешился,
 // повторный клик/автоповтор Enter-Space по #limits не должен запускать
 // параллельный ещё один — main и сам защищён (single-flight + троттлинг, см.
@@ -68,6 +79,37 @@ function pushAttention() {
   window.api.attention.update(n, renderBadge(n));
 }
 
+// Task 4 фазы 6 (бейдж PR): «вид ошибки» уже залогирован — не спамим консоль
+// на каждый тик 3-минутного таймера/активацию вкладки (папка без remote,
+// отсутствующий gh и т.п. не меняются от вызова к вызову).
+const loggedGhErrors = new Set();
+function logGhErrorOnce(kind, detail) {
+  if (loggedGhErrors.has(kind)) return;
+  loggedGhErrors.add(kind);
+  console.warn(`[gh] ${kind}${detail ? `: ${detail}` : ''}`);
+}
+
+// gh.repo(tabId) → бейдж PR строки сайдбара. ok:true+pr — рисуем бейдж; любой
+// другой исход (нет PR на ветке, no-remote/no-gh/auth/failed, сбой самого IPC)
+// молча гасит бейдж — setPr(tabId, null) уже умеет прятать его (см. tabs.js).
+// gh-info.js кэширует по cwd (TTL 3 мин, дольше для 'no-gh') — повторные вызовы
+// отсюда (активация вкладки/таймер ниже) не спавнят gh чаще, чем реально нужно.
+async function refreshTabPr(tabId) {
+  try {
+    const res = await window.api.gh.repo(tabId);
+    if (res && res.ok && res.pr) {
+      tabStore.setPr(tabId, res.pr);
+      return;
+    }
+    if (res && !res.ok) logGhErrorOnce(res.error || 'failed');
+    else if (res && res.error === 'no-remote') logGhErrorOnce('no-remote');
+    tabStore.setPr(tabId, null);
+  } catch (err) {
+    logGhErrorOnce('ipc-failed', err && err.message);
+    tabStore.setPr(tabId, null);
+  }
+}
+
 // Панель действий: кнопки шлют слэш-команду в pty активной вкладки (фича 23/26).
 function renderActionBar() {
   const host = $('action-commands');
@@ -86,6 +128,19 @@ function renderActionBar() {
   dashBtn.addEventListener('mousedown', (e) => e.preventDefault());
   dashBtn.addEventListener('click', () => toggleDashboard());
   host.appendChild(dashBtn);
+  // Task 2 фазы 6: кнопка «±» — тумблер панели диффа (та же логика, что
+  // Ctrl+G, см. bindHotkeys). Тоже пересобирается на каждый renderActionBar()
+  // (вызывается один раз за boot()), а не лежит статикой в index.html — тот
+  // же приём, что и dashBtn выше.
+  const diffBtn = document.createElement('button');
+  diffBtn.type = 'button';
+  diffBtn.id = 'btn-diffpanel';
+  diffBtn.className = 'action-btn';
+  diffBtn.textContent = '±';
+  diffBtn.title = 'Панель диффа (Ctrl+G)';
+  diffBtn.addEventListener('mousedown', (e) => e.preventDefault());
+  diffBtn.addEventListener('click', () => toggleDiffPanel());
+  host.appendChild(diffBtn);
   // deepMerge (config.js) при частичном оверрайде массива объектом даёт
   // {0:…,1:…} вместо массива — Array.isArray отсекает такой и любой другой
   // некорректный actionBar.commands, чтобы не уронить boot() на итерации.
@@ -138,9 +193,17 @@ function redrawLimits(now = Date.now()) {
 // звать её вообще, если оверлея нет). Используется вместо голого redrawLimits()
 // во всех трёх местах, где мог обновиться lastUsage: первичный usage:get в
 // boot(), usage:update от main, локальный таймер 30с (см. ниже).
+// Task 4 фазы 6: снапшот, который видит дашборд — {limits, spend} из lastUsage
+// плюс отдельно подтянутое поле .gh (lastGh, null до первого открытия
+// дашборда) — см. fetchUsageOnDashboardOpen. dashboard.js/render() и getData()
+// (см. createDashboard ниже) используют ровно эту же форму.
+function dashboardSnapshot() {
+  return { ...(lastUsage || {}), gh: lastGh };
+}
+
 function redrawUsageViews(now = Date.now()) {
   redrawLimits(now);
-  if (dashboard?.isOpen()) dashboard.render(lastUsage, now);
+  if (dashboard?.isOpen()) dashboard.render(dashboardSnapshot(), now);
 }
 
 // Клик/Enter/Space по #limits — форс-обновление обоих слоёв usage. Кнопка
@@ -184,13 +247,52 @@ async function refreshUsage() {
 // свежий, реального npx не будет, это дешёвый no-op. redrawUsageViews() уже
 // умеет перерисовать дашборд, если он сейчас открыт, — а он открыт, раз это
 // вообще было вызвано.
-async function fetchUsageOnDashboardOpen() {
-  try {
-    lastUsage = await window.api.usage.get();
-  } catch (err) {
+// Task 4 фазы 6: тем же обработчиком (тот же принцип «лениво, при каждом
+// открытии») тянем сводку GitHub (gh:global). ВАЖНО: usage.get() и gh.global()
+// запускаются НЕЗАВИСИМО (каждый — свой .then/.catch, тот же fire-and-forget
+// приём, что и первичный usage.get() в boot()), а НЕ через один общий await —
+// первый вызов usage.get() (ленивый ccusage.get() внутри может спавнить npx,
+// до 60с по таймауту) не должен задерживать отрисовку раздела GitHub, если тот
+// уже готов раньше. Каждый источник сам зовёт redrawUsageViews() по своему
+// разрешению — раздел «загружаю…» (dashboard.js/buildGithubSection) сменится
+// на реальные данные ровно тогда, когда придёт ИМЕННО его ответ, а не когда
+// придут оба разом.
+// FIX (ревью задачи 4 фазы 6, carryover в задачу 5): раньше оба .catch ниже
+// только логировали ошибку в консоль — ни lastUsage/lastGh, ни перерисовка
+// не трогались. window.api.usage.get()/gh.global() штатно НЕ бросают (main
+// сам ловит любой сбой и отдаёт {ok:false,...} через .then) — .catch здесь
+// это на случай РЕАЛЬНОГО отказа промиса (обрыв IPC-моста, исключение вне
+// try/catch и т.п.). Без присвоения+редро в этой ветке плашка «загружаю…» у
+// раздела GitHub (dashboard.js/buildGithubSection: gh===null → «загружаю…»)
+// виснет навсегда до полного закрытия и повторного открытия дашборда — ни
+// один последующий тик (usage:update, таймер 30с) её не перерисует, потому
+// что lastGh как был null, так и остаётся. Синтетика ok:false — та же форма,
+// что и настоящий error-путь usage-oauth.js/usage-ccusage.js/gh-info.js,
+// dashboard.js уже умеет её рисовать («недоступны»/SPEND_UNAVAILABLE_TEXT/
+// ghErrorText с фолбэком на неизвестный код).
+function fetchUsageOnDashboardOpen() {
+  window.api.usage.get().then((v) => {
+    lastUsage = v;
+    redrawUsageViews();
+  }).catch((err) => {
     console.warn('[usage] usage:get при открытии дашборда не удался:', err);
-  }
-  redrawUsageViews();
+    lastUsage = {
+      limits: { ok: false, error: 'failed', fetchedAt: 0 },
+      spend: { ok: false, error: 'failed' },
+    };
+    redrawUsageViews();
+  });
+
+  window.api.gh.global().then((v) => {
+    lastGh = v;
+    redrawUsageViews();
+  }).catch((err) => {
+    console.warn('[gh] gh:global при открытии дашборда не удался:', err);
+    lastGh = {
+      ok: false, error: 'failed', prs: [], issues: [], notifications: 0,
+    };
+    redrawUsageViews();
+  });
 }
 
 // Task 4 фазы 5: тумблер Ctrl+D/кнопка панели действий/действие палитры —
@@ -202,6 +304,16 @@ function toggleDashboard() {
   if (palette.isOpen()) palette.close();
   if (dashboard.isOpen()) dashboard.close();
   else dashboard.open();
+}
+
+// Task 2 фазы 6: тумблер панели диффа (Ctrl+G/кнопка «±» панели действий) —
+// НЕ оверлей (см. diffpanel.js), так что, в отличие от toggleDashboard() выше,
+// не нужно закрывать peek/palette/dashboard — панель просто раздвигает layout
+// рядом с терминалом, а не накрывает его. Состояние переживает перезапуск —
+// пишем в config.ui.diffPanelOpen сразу после toggle().
+function toggleDiffPanel() {
+  diffPanel?.toggle();
+  window.api.config.set({ ui: { diffPanelOpen: !!diffPanel?.isOpen() } });
 }
 
 // Создать вкладку: контейнер + xterm + запись в стор. activate — переключиться сразу.
@@ -273,6 +385,15 @@ function activateTab(tabId) {
   for (const [id, v] of views) v.container.classList.toggle('hidden', id !== tabId);
   tabStore.setActive(tabId);
   window.api.workspace.setActive(tabId); // main пересчитает activeIndex манифеста
+  // Task 2 фазы 6: переключение вкладки — один из триггеров обновления
+  // панели диффа (бриф); setActiveTab сама не делает IPC, если панель сейчас
+  // закрыта (см. diffpanel.js).
+  diffPanel?.setActiveTab(tabId);
+  // Task 4 фазы 6 (бейдж PR): активация вкладки — один из двух триггеров
+  // обновления бейджа (второй — периодический таймер, см. boot()). Fire-and-
+  // forget — сама функция никогда не бросает и обновляет tabStore асинхронно,
+  // когда IPC разрешится.
+  refreshTabPr(tabId);
   // fit после показа: скрытый контейнер имеет нулевые размеры (рефит запускает
   // ResizeObserver в terminal.js сам, когда контейнер становится видимым).
   requestAnimationFrame(() => {
@@ -315,7 +436,12 @@ async function closeTab(tabId) {
   // Переключаемся на соседнюю вкладку, только если закрыли активную —
   // закрытие фоновой вкладки не должно перебивать фокус пользователя.
   if (!wasActive) return;
-  if (fallback) activateTab(fallback);
+  if (fallback) {
+    activateTab(fallback); // activateTab сама зовёт diffPanel?.setActiveTab(fallback)
+    return;
+  }
+  // Закрыли последнюю вкладку — панели диффа больше нечего показывать.
+  diffPanel?.setActiveTab(null);
 }
 
 // Task 3 фазы 4 (peek): клик (или Space) по строке waiting — открыть поповер
@@ -341,6 +467,27 @@ function sendPeek(tabId, text) {
 // Ctrl+Enter в поповере — перейти во вкладку вместо ответа из сайдбара.
 function openTabFromPeek(tabId) {
   activateTab(tabId);
+}
+
+// Находка 4б (ревью фазы 6): app:notice (main/notify.js) раньше долетал до
+// renderer, но показывался ИСКЛЮЧИТЕЛЬНО console.warn'ом (см. boot() ниже) —
+// никакого визуального следа в самом приложении не было. showToast — простой
+// тост в #toast-root (index.html/app.css): авто-исчезает через TOAST_TTL_MS,
+// клик закрывает раньше. Используется и здесь (app:notice), и после успешного
+// connectProject() ниже — тот же канал/тот же визуальный язык для обоих
+// случаев «сообщить пользователю о важном факте, не блокируя его работу».
+const TOAST_TTL_MS = 6000;
+function showToast(text, level = 'info') {
+  const root = $('toast-root');
+  if (!root) return;
+  const el = document.createElement('div');
+  const cls = level === 'error' ? 'error' : (level === 'warn' ? 'warn' : 'info');
+  el.className = `toast toast-${cls}`;
+  el.textContent = text;
+  el.setAttribute('role', 'status');
+  el.addEventListener('click', () => el.remove());
+  root.appendChild(el);
+  setTimeout(() => el.remove(), TOAST_TTL_MS);
 }
 
 // Клик по ⚡: прописать хуки Cockpit в .claude/settings.json проекта вкладки.
@@ -494,6 +641,25 @@ function bindHotkeys() {
       ev.preventDefault();
       ev.stopPropagation();
       toggleDashboard();
+      return;
+    }
+    // Ctrl+G — панель диффа (Task 2 фазы 6), тот же паттерн preventDefault/
+    // stopPropagation, что Ctrl+P/Ctrl+D выше: иначе xterm получил бы 'g'/'G'
+    // в активный терминал.
+    if (ev.ctrlKey && !ev.shiftKey && !ev.altKey
+        && (ev.key === 'g' || ev.key === 'G' || ev.code === 'KeyG')) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      // Находка 14 (ревью фазы 6, минор): дашборд/палитра — оверлеи ПОВЕРХ
+      // #main-row (где живёт #diff-panel, см. diffpanel.js) и перехватывают
+      // это же сочетание раньше через bubble-обработчики самих оверлеев (у
+      // них нет своего Ctrl+G) — этот обработчик висит на window в capture-
+      // фазе, то есть срабатывает ПЕРВЫМ, даже когда сверху открыт другой
+      // оверлей. Без гарда пользователь переключал (и сохранял в конфиг)
+      // панель, невидимую под оверлеем — интерфейс молча менял состояние,
+      // не показывая результат.
+      if (dashboard?.isOpen() || palette?.isOpen()) return;
+      toggleDiffPanel();
       return;
     }
     // Ctrl+1..9 — вкладка по индексу.
@@ -730,6 +896,10 @@ async function boot() {
     onClose: closeTab,
     onConnect: connectProject,
     onPeek: openPeek,
+    // Task 4 фазы 6 (бейдж PR): api — тот же приём, что diffPanel ниже
+    // (createDiffPanel({..., api})) — клик по бейджу зовёт
+    // api.shell.openExternal() напрямую, без отдельного колбэка на каждое действие.
+    api: window.api,
   });
 
   // Task 3 фазы 4: peek — ответить Claude из сайдбара, не переключая вкладку.
@@ -764,13 +934,25 @@ async function boot() {
   // palette.js/open(fallbackFocus)).
   dashboard = createDashboard({
     root: $('dashboard-root'),
-    getData: () => lastUsage,
+    getData: dashboardSnapshot,
     onRefresh: refreshUsage,
     // FIX 2 (ревью): usage:get при каждом открытии — см. подробный комментарий
     // у fetchUsageOnDashboardOpen выше и в dashboard.js/open().
     onOpen: fetchUsageOnDashboardOpen,
     fallbackFocus: () => views.get(tabStore.activeId)?.view,
+    // Task 4 фазы 6: клик по строке раздела GitHub открывает URL в браузере —
+    // тот же приём, что и api в createTabStore выше (diffpanel.js тоже так
+    // получает api целиком, а не по колбэку на каждое действие).
+    api: window.api,
   });
+
+  // Task 2 фазы 6 (панель диффа): состояние открыта/закрыта переживает
+  // перезапуск (config.ui.diffPanelOpen, см. toggleDiffPanel). open() внутри
+  // безопасен даже без единой открытой вкладки — setActiveTab(tabId) позже
+  // (при первом activateTab внутри openTab/restoreFlow) сама подхватит и
+  // обновит содержимое, раз панель уже открыта.
+  diffPanel = createDiffPanel({ root: $('diff-panel'), api: window.api });
+  if (config.ui?.diffPanelOpen) diffPanel.open();
 
   renderActionBar();
 
@@ -820,6 +1002,11 @@ async function boot() {
   window.api.term.onExit((p) => {
     views.get(p.tabId)?.view.handlers.onExit(p);
   });
+  // Task 2 фазы 6 (панель диффа): PostToolUse (main/sessions.js) → git:changed.
+  // diffPanel сама решает, актуально ли событие (открыта ли панель, та ли это
+  // вкладка) и держит дебаунс 1500мс — здесь только проводка канала.
+  window.api.git.onChanged(({ tabId }) => diffPanel?.handleGitChanged(tabId));
+
   // Task 2 фазы 4: клик по Windows-тосту — main прислал {tabId}. activateTab
   // сама тихо игнорирует неизвестный/уже закрытый tabId (views.get → undefined
   // → return), так что здесь ничего дополнительно проверять не нужно.
@@ -878,6 +1065,15 @@ async function boot() {
     if (tabStore.activeId) saveGhost(tabStore.activeId);
   }, 30000);
 
+  // Task 4 фазы 6 (бейдж PR): раз в 3 мин обновляем бейдж для ВСЕХ открытых
+  // вкладок (бриф) — gh-info.js сам кэширует ответ по cwd (TTL 3 мин, дольше
+  // при отсутствующем gh), так что реальный спавн gh произойдёт только там,
+  // где кэш и правда успел устареть. Закрытые вкладки просто выпадают из
+  // tabStore.order() — отдельная чистка таймера при закрытии не нужна (бриф).
+  setInterval(() => {
+    for (const tabId of tabStore.order()) refreshTabPr(tabId);
+  }, 180000);
+
   // Манифест воркспейса (Task 3): пуст/отсутствует — старое поведение
   // (стартовая вкладка из конфига). Непуст — оверлей restore (Task 4).
   const manifest = await window.api.workspace.get();
@@ -913,7 +1109,13 @@ async function boot() {
     }
   }
 
-  window.api.app.onNotice(({ text }) => console.warn(`[notice] ${text}`));
+  // Находка 4б (ревью фазы 6): раньше это был единственный потребитель
+  // app:notice — и он ТОЛЬКО логировал в консоль, ни один визуальный сигнал
+  // пользователю не показывался. showToast (см. выше) — простой тост.
+  window.api.app.onNotice(({ text, level }) => {
+    console.warn(`[notice] ${text}`);
+    showToast(text, level);
+  });
 }
 
 // Необработанный reject/throw внутри boot() раньше гас молча — приложение

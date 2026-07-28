@@ -258,6 +258,31 @@ test('переходы: PreToolUse→working с tool_name, Notification→waitin
   assert.strictEqual(st.status, 'done');
 });
 
+// ---------- Task 2 фазы 6: PostToolUse → git:changed, статус не трогает ----------
+
+test('applyHookEvent: PostToolUse НЕ меняет статус вкладки, но эмитит git:changed с tabId', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'PreToolUse', { tool_name: 'Bash' });
+  const statusBefore = statusOf(events, a.tabId);
+  assert.strictEqual(statusBefore.status, 'working');
+
+  const gitChangedBefore = events.filter((e) => e.channel === 'git:changed').length;
+  mgr.applyHookEvent(a.tabId, 'PostToolUse', { tool_name: 'Bash' });
+
+  // Статус — тот же самый объект, что и до PostToolUse: ни новый tab:status
+  // не пришёл с другим статусом, ни существующий не изменился.
+  const statusAfter = statusOf(events, a.tabId);
+  assert.strictEqual(statusAfter.status, 'working');
+  assert.deepStrictEqual(statusAfter, statusBefore);
+
+  const gitChanged = events.filter((e) => e.channel === 'git:changed');
+  assert.strictEqual(gitChanged.length, gitChangedBefore + 1);
+  assert.deepStrictEqual(gitChanged[gitChanged.length - 1].payload, { tabId: a.tabId });
+});
+
 test('UserPromptSubmit переводит done в working', () => {
   const factory = makeFakePtyFactory();
   const { mgr, events } = makeManager(factory);

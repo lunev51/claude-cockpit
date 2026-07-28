@@ -22,6 +22,9 @@ const DEFAULTS = {
     useConptyDll: true,
   },
   bridge: { port: 48200 },
+  // Task 2 фазы 6 (панель диффа): открыта/закрыта панель — переживает
+  // перезапуск приложения (config:set пишет сюда при каждом Ctrl+G/клике).
+  ui: { diffPanelOpen: false },
   actionBar: {
     commands: [
       { label: '/remote-control', command: '/remote-control' },

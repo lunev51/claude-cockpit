@@ -149,6 +149,31 @@ html, body {
 }
 .tab-connect:hover { color: var(--text); }
 
+/* Task 4 фазы 6 (бейдж PR): «#123» справа от имени проекта, перед ⚡/✕ (см.
+   row.append в tabs.js). flex:none + align-self:center — строка сайдбара
+   align-items:flex-start (см. .tab-row выше), без этого бейдж прилип бы к
+   верхнему краю вместе с .tab-dot вместо визуального центрирования по высоте
+   строки. Цвет — по статусу проверок (пороги те же, что rings.js/dashboard.js:
+   --working ждём, --ok прошли, --err упали), --text-dim — нет проверок/черновик. */
+.tab-pr-badge {
+  flex: none;
+  align-self: center;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.4;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--text-dim);
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.tab-pr-badge:hover { background: var(--bg-hover); }
+.tab-pr-badge.hidden { display: none; }
+.tab-pr-badge.pending { color: var(--working); border-color: var(--working); }
+.tab-pr-badge.passing { color: var(--ok); border-color: var(--ok); }
+.tab-pr-badge.failing { color: var(--err); border-color: var(--err); }
+.tab-pr-badge.none { color: var(--text-dim); border-color: var(--text-dim); }
+
 .sidebar-footer {
   margin-top: auto;
   border-top: 1px solid var(--border);
@@ -249,12 +274,132 @@ html, body {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  position: relative; /* якорь для #restore-overlay */
+  position: relative; /* якорь для #restore-overlay/#dashboard-root — накрывают ВЕСЬ #main, включая диафф-панель */
 }
-#terminal-host { flex: 1; min-height: 0; position: relative; }
+/* Task 2 фазы 6 (панель диффа): строка терминал+панель — #action-bar остаётся
+   ПОД ней, на всю ширину #main (см. index.html). НЕ оверлей: оверлеев уже
+   четыре (restore/dashboard/palette/peek) и они дерутся за Escape — панель
+   диффа просто раздвигает/сдвигает layout, как обычный flex-сосед. */
+#main-row {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+}
+#terminal-host { flex: 1; min-height: 0; min-width: 0; position: relative; }
 /* Контейнеры терминалов вкладок (Task 4 создаёт .term-view на вкладку) */
 .term-view { position: absolute; inset: 0; padding: 4px 0 0 8px; }
 .term-view.hidden { display: none; }
+
+/* --- Панель диффа (Task 2 фазы 6): 380px справа от терминала, flex:none —
+   сворачивается/разворачивается по Ctrl+G и кнопке «±» в панели действий
+   (см. app.js/diffpanel.js). .hidden убирает её из #main-row целиком —
+   #terminal-host (flex:1) тут же занимает освободившееся место. --- */
+#diff-panel {
+  width: 380px;
+  flex: none;
+  min-width: 0;
+  border-left: 1px solid var(--border);
+  background: var(--bg-panel);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+#diff-panel.hidden { display: none; }
+.diff-panel-header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.diff-panel-summary {
+  font-size: 11px;
+  color: var(--text-muted);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.diff-panel-refresh { flex: none; }
+.diff-panel-empty {
+  padding: 16px 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+  text-align: center;
+}
+.diff-panel-files {
+  flex: none;
+  max-height: 40%;
+  overflow-y: auto;
+  border-bottom: 1px solid var(--border);
+}
+.diff-panel-files:empty { border-bottom: none; }
+.diff-file-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  cursor: pointer;
+  font-size: 11px;
+}
+.diff-file-row:hover { background: var(--bg-hover); }
+.diff-file-status {
+  flex: none;
+  width: 14px;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--text-muted);
+}
+.diff-file-status.diff-status-add { color: var(--ok); }
+.diff-file-status.diff-status-del { color: var(--err); }
+.diff-file-status.diff-status-conflict { color: var(--warn); }
+.diff-file-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+.diff-file-counts {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-dim);
+}
+/* Уведомления «показано N из M» — файлы и строки диффа НЕЗАВИСИМЫ (ревью
+   Task 1: разные лимиты могут обрезать не синхронно), поэтому это ДВЕ
+   отдельные строки, каждая появляется только когда её собственный лимит
+   реально сработал. */
+.diff-panel-truncated {
+  flex: none;
+  padding: 4px 10px;
+  font-size: 10px;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border);
+}
+.diff-panel-truncated.hidden { display: none; }
+.diff-panel-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+.diff-panel-text {
+  margin: 0;
+  padding: 8px 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.diff-line { white-space: pre; }
+.diff-line-add { color: var(--ok); }
+.diff-line-del { color: var(--err); }
+.diff-line-hunk { color: var(--text-dim); }
+.diff-line-context { color: var(--text-muted); }
 
 /* --- Оверлей восстановления воркспейса (Task 4): показывается на boot,
    если манифест воркспейса непуст — накрывает всю главную область. --- */
@@ -603,6 +748,83 @@ html, body {
   padding: 8px;
 }
 
+/* --- Раздел GitHub (Task 4 фазы 6): ПОСЛЕ блока расходов (бриф) — «Мои
+   открытые PR» / «Назначенные issues» / «Уведомлений: N». Строки кликабельны
+   (открывают URL в браузере, см. dashboard.js/buildGithubRow) — те же
+   .dashboard-github-row задействованы и для PR/issues, и для строки
+   уведомлений. --- */
+.dashboard-github-group { margin-bottom: 10px; }
+.dashboard-github-group:last-of-type { margin-bottom: 0; }
+.dashboard-github-group-title {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+.dashboard-github-empty {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.dashboard-github-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: var(--radius-s);
+  font-size: 12px;
+}
+.dashboard-github-row.clickable { cursor: pointer; }
+.dashboard-github-row.clickable:hover { background: var(--bg-hover); }
+.dashboard-github-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-dim);
+}
+.dashboard-github-dot.pending { background: var(--working); }
+.dashboard-github-dot.passing { background: var(--ok); }
+.dashboard-github-dot.failing { background: var(--err); }
+/* Находка 5 (ревью фазы 6, минор): 'unknown' (добор checks не удался — сеть/
+   таймаут) — пустотелая точка, отличная от сплошной серой 'none' (там
+   проверок и правда нет настроено). Красный (реально failing) PR, для
+   которого мы просто не смогли узнать статус, не должен выглядеть как
+   зелёный/серый «без CI». */
+.dashboard-github-dot.unknown { background: transparent; border: 1px solid var(--text-dim); }
+.dashboard-github-limit-note {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+.dashboard-github-repo {
+  flex: none;
+  font-family: var(--font-mono);
+  color: var(--text);
+  white-space: nowrap;
+}
+.dashboard-github-row-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+.dashboard-github-notif {
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: var(--radius-s);
+}
+.dashboard-github-notif:hover { background: var(--bg-hover); }
+.dashboard-github-loading,
+.dashboard-github-error {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.dashboard-github-error { color: var(--err); }
+
 /* --- Панель действий (вместо отладочной статус-строки).
    Теперь внутри #main, после #terminal-host — flex-элемент колонки #main,
    поэтому по ширине автоматически равна терминалу (align-items: stretch по
@@ -644,9 +866,11 @@ html, body {
 .action-btn:focus-visible,
 .sidebar-btn:focus-visible,
 .tab-row:focus-visible,
+.tab-pr-badge:focus-visible,
 #limits:focus-visible,
 .restore-row input[type="checkbox"]:focus-visible,
-.chart-preset:focus-visible {
+.chart-preset:focus-visible,
+.diff-file-row:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
@@ -803,3 +1027,35 @@ html, body {
   padding: 10px 9px;
   text-align: center;
 }
+
+/* --- Тосты (находка 4б, ревью фазы 6): app:notice (main/notify.js) — раньше
+   долетал до renderer, но показывался ТОЛЬКО console.warn'ом, без единого
+   визуального следа (см. app.js/showToast). Корень — прямой ребёнок <body>
+   (см. index.html), тот же приём, что peek-root/palette-root: не должен
+   обрезаться overflow сайдбара. --- */
+#toast-root {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 1000;
+  pointer-events: none;
+}
+.toast {
+  pointer-events: auto;
+  max-width: 360px;
+  padding: 10px 14px;
+  border-radius: var(--radius-s);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.4;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  cursor: pointer;
+}
+.toast-warn { border-color: var(--warn); }
+.toast-error { border-color: var(--err); }
+.toast-info { border-color: var(--accent); }

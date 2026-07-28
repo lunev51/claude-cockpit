@@ -12,8 +12,19 @@ const GROUP_OF = {
   idle: 'working', // idle пока живёт в «Работают» (реальный idle появится в 2b)
 };
 
+// Task 4 фазы 6 (бейдж PR): классификация checks ('passing'|'failing'|'pending'|
+// 'none') → CSS-модификатор .tab-pr-badge. Черновик (isDraft) визуально
+// приглушаем так же, как 'none' (нет проверок) — бриф явно требует --text-dim
+// для «нет проверок/черновик», не выделяя эти два случая цветом отдельно.
+function prBadgeClass(pr) {
+  if (pr.isDraft) return 'none';
+  return pr.checks === 'passing' || pr.checks === 'failing' || pr.checks === 'pending'
+    ? pr.checks
+    : 'none';
+}
+
 export function createTabStore({
-  root, onActivate, onClose, onConnect, onPeek,
+  root, onActivate, onClose, onConnect, onPeek, api,
 }) {
   const rows = new Map(); // tabId → {row, dot, sub, connectBtn, name, cwd, status, waitingText}
   const order = [];
@@ -55,11 +66,43 @@ export function createTabStore({
     sub.title = cwd;
     info.append(nameEl, sub);
 
+    // Task 4 фазы 6 (бейдж PR): маленький значок «#123» справа от имени, перед
+    // кнопками ⚡/✕ (см. порядок row.append ниже) — скрыт, пока setPr(tabId, ...)
+    // не принесёт данные (нет PR на текущей ветке/gh не установлен/ошибка).
+    // stopPropagation — клик по бейджу не должен переключать вкладку (row сам
+    // слушает click для activate/peek, см. trigger() ниже).
+    const prBadge = document.createElement('span');
+    prBadge.className = 'tab-pr-badge hidden';
+    // Находка 12 (ревью фазы 6, минор): бейдж был кликабелен только мышью —
+    // <span> без tabIndex/role внутри уже фокусируемой строки (row.tabIndex
+    // ниже) недостижим с клавиатуры отдельно от неё. tabIndex=0 безвреден,
+    // пока бейдж скрыт (.hidden → display:none, не участвует в табуляции) —
+    // становится реальным табстопом ровно тогда, когда setPr() его показывает.
+    prBadge.tabIndex = 0;
+    prBadge.setAttribute('role', 'button');
+    function openPrUrl(ev) {
+      ev.stopPropagation();
+      if (r.prUrl) api.shell.openExternal(r.prUrl);
+    }
+    prBadge.addEventListener('click', openPrUrl);
+    prBadge.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ' || ev.key === 'Spacebar') {
+        ev.preventDefault();
+        openPrUrl(ev);
+      }
+    });
+
     // ⚡ — проект не подключён к хукам (статусы «молчат»); клик прописывает их.
     const connectBtn = document.createElement('button');
     connectBtn.className = 'tab-connect hidden';
     connectBtn.textContent = '⚡';
-    connectBtn.title = 'Статусы молчат: подключить хуки Cockpit к проекту';
+    // Находка 4а (ревью фазы 6): ужесточение isConnected() (см. connector.js)
+    // заставило ⚡ загораться и на проектах, подключённых ДО появления
+    // PostToolUse, — там статусы РАБОТАЮТ (хуки шлют события), не хватает
+    // только PostToolUse (обновление панели диффа при каждом вызове
+    // инструмента). Старый текст «статусы молчат» в этом (самом частом
+    // теперь) случае был прямой ложью.
+    connectBtn.title = 'Хуки Cockpit неполные (нет PostToolUse) — подключить';
     connectBtn.addEventListener('click', (ev) => {
       ev.stopPropagation();
       onConnect(tabId);
@@ -74,7 +117,7 @@ export function createTabStore({
       onClose(tabId);
     });
 
-    row.append(dot, info, connectBtn, close);
+    row.append(dot, info, prBadge, connectBtn, close);
 
     // Task 3 фазы 4 (peek): строка со статусом waiting открывает поповер
     // ВМЕСТО переключения вкладки — остальные статусы ведут себя как раньше.
@@ -94,6 +137,7 @@ export function createTabStore({
 
     const r = {
       row, dot, sub, connectBtn, name, cwd, status: 'working', waitingText: '',
+      prBadge, prUrl: null,
     };
     rows.set(tabId, r);
     order.push(tabId);
@@ -155,6 +199,28 @@ export function createTabStore({
     if (r) r.connectBtn.classList.toggle('hidden', !visible);
   }
 
+  // Task 4 фазы 6 (бейдж PR): pr — {number, checks, title, url, isDraft} или
+  // null (нет PR на текущей ветке/gh не установлен/репозиторий без remote/
+  // сбой запроса — app.js сам решает, когда звать это с null, см. app.js).
+  // Молча игнорируем неизвестный/уже закрытый tabId — тот же приём, что и
+  // setStatus/setConnectVisible выше (звонок может прилететь позже закрытия
+  // вкладки, гонка неважна).
+  function setPr(tabId, pr) {
+    const r = rows.get(tabId);
+    if (!r) return;
+    if (!pr || typeof pr !== 'object' || typeof pr.number !== 'number') {
+      r.prUrl = null;
+      r.prBadge.className = 'tab-pr-badge hidden';
+      r.prBadge.textContent = '';
+      r.prBadge.title = '';
+      return;
+    }
+    r.prUrl = typeof pr.url === 'string' ? pr.url : null;
+    r.prBadge.textContent = `#${pr.number}`;
+    r.prBadge.title = typeof pr.title === 'string' ? pr.title : '';
+    r.prBadge.className = `tab-pr-badge ${prBadgeClass(pr)}`;
+  }
+
   // Сосед по порядку создания: предыдущий, иначе следующий (carryover 4).
   function neighborOf(tabId) {
     const i = order.indexOf(tabId);
@@ -184,6 +250,7 @@ export function createTabStore({
     setActive,
     setStatus,
     setConnectVisible,
+    setPr,
     neighborOf,
     peekInfo,
     waitingCount,

@@ -401,6 +401,38 @@ test('cache.read()/cache.write() бросают исключения — get() �
   assert.strictEqual(snap.totals.costUsd, 3497);
 });
 
+test('single-flight: два одновременных get({force:true}) шарят ОДИН запрос — run() вызывается ровно раз (daily+session), а не дважды, и оба вызова получают идентичный результат', async () => {
+  const calls = [];
+  const baseRun = runFixture({ calls });
+  // Небольшая асинхронная задержка — имитирует реальный npx (не мгновенный
+  // resolve), чтобы окно гонки было заведомо шире одного микротика.
+  const run = async (args) => {
+    await new Promise((r) => setTimeout(r, 5));
+    return baseRun(args);
+  };
+  const ccusage = createCcusage({ run, cache: noopCache(), now: () => 42 });
+
+  const [a, b] = await Promise.all([
+    ccusage.get({ force: true }),
+    ccusage.get({ force: true }),
+  ]);
+
+  assert.strictEqual(calls.length, 2, 'ожидали ровно одну пару run() (daily+session), а не две');
+  assert.strictEqual(a, b, 'оба вызова должны получить один и тот же объект результата — single-flight, а не два независимых запроса');
+  assert.strictEqual(a.totals.costUsd, 3497);
+});
+
+test('single-flight: после разрешения предыдущего get() следующий вызов запускает НОВЫЙ запрос', async () => {
+  let calls = 0;
+  const run = async (args) => { calls++; return runFixture({})(args); };
+  const ccusage = createCcusage({ run, cache: noopCache(), now: () => 1000 });
+
+  await ccusage.get({ force: true });
+  await ccusage.get({ force: true });
+
+  assert.strictEqual(calls, 4, 'inFlight должен сбрасываться после каждого завершения — второй вызов не должен молча схлопнуться с первым');
+});
+
 test('rounding: дробные центы округляются до 2 знаков, токены — до целых', async () => {
   const dailyBody = {
     daily: [
