@@ -190,6 +190,10 @@ html, body {
    удался. Приглушаем весь блок целиком (не ломая вёрстку) — title «данные
    устарели» ставит сам rings.js на #limits. */
 #limits.stale { opacity: .55; }
+/* FINDING 2 (ревью, fix round 1): пока usage:refresh летит (app.js —
+   usageRefreshing), визуально показываем «занято» и блокируем повторный клик
+   курсором ожидания — сама блокировка живёт в JS (класс тут только для вида). */
+#limits.busy { opacity: .6; cursor: progress; }
 
 .limit-ring {
   display: flex;

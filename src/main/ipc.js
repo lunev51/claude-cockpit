@@ -29,8 +29,10 @@ let activeTabId = null;  // последний tabId, о котором сооб
 let usagePoller = null;  // поллер официальных лимитов (usage-oauth.js) — слой A
 let ccusage = null;      // слой расходов ccusage (usage-ccusage.js) — слой B
 let usageMonitorTimer = null; // лёгкий сторож (только snapshot(), без сети) — рассылает usage:update
-let lastBroadcastFetchedAt = 0; // fetchedAt последнего разосланного usage:update — детектор «случился успешный refresh»
+let lastBroadcastKey = null;    // `fetchedAt|stale|error` последнего разосланного usage:update — см. usageBroadcastKey()
 let lastCcusageResult = null;   // последний известный ответ ccusage.get() — уходит и в usage:get/usage:refresh, и в usage:update
+let manualRefreshInFlight = null; // Promise текущего usage:refresh, если уже выполняется (single-flight, FINDING 2 ревью)
+let lastManualRefreshAt = 0;       // Date.now() последнего РЕАЛЬНО выполненного (не отбитого троттлингом) usage:refresh
 
 function getSmokeOutput() {
   return smokeOutput;
@@ -60,6 +62,12 @@ function ghostFile(ghostId) {
 }
 
 const GHOST_MAX_BYTES = 512 * 1024;
+
+// FINDING 2 (ревью, fix round 1): минимальный интервал между РЕАЛЬНЫМИ ручными
+// usage:refresh — двойной клик или зажатый Enter/Space (автоповтор клавиши) по
+// #limits не должен бомбить сеть/npx на каждое срабатывание (в пределе —
+// поймать настоящий 429 от Anthropic, который сам себя гасит на 10 минут).
+const MANUAL_REFRESH_MIN_INTERVAL_MS = 10000;
 
 // Стартует мост на сконфигурированном порту; если порт занят (EADDRINUSE
 // или что угодно другое) — пересоздаёт мост с эфемерным портом (0).
@@ -177,6 +185,17 @@ function runCcusage(args) {
   });
 }
 
+// FINDING 1 (ревью, fix round 1): usage-oauth.js/applyError() при сбое
+// оставляет fetchedAt ПРЕЖНИМ (берёт из lastGood) — сторож, сравнивавший
+// только fetchedAt, никогда не замечал переход в stale (истёк токен → 15-мин
+// бэкофф) и renderer вечно показывал бы старые проценты без приглушения.
+// Ключ теперь — связка (fetchedAt, stale, error): смена ЛЮБОЙ из трёх частей
+// (включая переход ok:true→stale:true при том же fetchedAt) считается
+// «состояние изменилось» и рассылается.
+function usageBroadcastKey(snap) {
+  return `${snap.fetchedAt}|${snap.stale}|${snap.error}`;
+}
+
 function registerIpc(win, opts = {}) {
   const { smoke = false, attention = null, toaster = null } = opts;
 
@@ -193,8 +212,10 @@ function registerIpc(win, opts = {}) {
     run: runCcusage,
     cache: createJsonFileCache(usageCcusageCacheFile()),
   });
-  lastBroadcastFetchedAt = 0;
+  lastBroadcastKey = null;
   lastCcusageResult = null;
+  manualRefreshInFlight = null;
+  lastManualRefreshAt = 0;
 
   // Стор манифеста создаётся один раз на регистрацию — независимо от smoke,
   // чтобы workspace:get всегда мог отдать хоть что-то (в smoke он просто
@@ -300,17 +321,21 @@ function registerIpc(win, opts = {}) {
   // start/stop/snapshot/refresh, переписывать не в объёме этой задачи) — вместо
   // повторного собственного планировщика (который задвоил бы сетевые вызовы
   // параллельно с внутренним таймером поллера) здесь лёгкий сторож: раз в 5с
-  // читает ТОЛЬКО snapshot() (синхронно, без сети) и сравнивает fetchedAt с
-  // последним разосланным — смена fetchedAt означает, что где-то между
-  // проверками случился успешный refresh (живьём или восстановлением из кэша),
-  // и тогда шлём usage:update. Гранулярность обнаружения — до 5с, сети это не
+  // читает ТОЛЬКО snapshot() (синхронно, без сети) и сравнивает КЛЮЧ
+  // usageBroadcastKey (fetchedAt+stale+error) с последним разосланным — смена
+  // ЛЮБОЙ из трёх частей означает «состояние изменилось» (успешный refresh,
+  // ИЛИ переход в stale/error при том же fetchedAt — FINDING 1, ревью fix
+  // round 1: applyError() в usage-oauth.js оставляет fetchedAt прежним, чистое
+  // сравнение по fetchedAt никогда не заметило бы протухание при сбое) — и
+  // тогда шлём usage:update. Гранулярность обнаружения — до 5с, сети это не
   // стоит ничего (snapshot() — синхронное чтение из памяти).
   if (!smoke) {
     usagePoller.start();
     usageMonitorTimer = setInterval(() => {
       const snap = usagePoller.snapshot();
-      if (snap.fetchedAt !== lastBroadcastFetchedAt) {
-        lastBroadcastFetchedAt = snap.fetchedAt;
+      const key = usageBroadcastKey(snap);
+      if (key !== lastBroadcastKey) {
+        lastBroadcastKey = key;
         if (!win.isDestroyed()) {
           win.webContents.send('usage:update', { limits: snap, spend: lastCcusageResult });
         }
@@ -343,11 +368,38 @@ function registerIpc(win, opts = {}) {
 
   // Принудительное обновление ОБОИХ слоёв (кнопка/клик по кольцам, дашборд
   // Task 4). smoke — тот же гейт, что и usage:get.
+  //
+  // FINDING 2 (ревью, fix round 1): без защиты двойной клик / зажатый
+  // Enter-Space (автоповтор клавиши) на #limits плодил параллельные прогоны
+  // npx на каждое срабатывание, а при достаточном спаме мог словить настоящий
+  // 429 от Anthropic (поллер тогда сам гасит себя на 10 минут). Два независимых
+  // барьера:
+  // (а) single-flight — пока предыдущий usage:refresh не разрешился,
+  //     повторный вызов получает ТОТ ЖЕ промис, второго refresh()/ccusage.get()
+  //     не запускается вовсе;
+  // (б) минимальный интервал MANUAL_REFRESH_MIN_INTERVAL_MS (10с) между
+  //     РЕАЛЬНО выполненными обновлениями — вызов внутри окна получает текущий
+  //     снапшот без единой сетевой/npx операции.
   ipcMain.handle('usage:refresh', async () => {
     if (smoke) return { limits: usagePoller.snapshot(), spend: null };
-    const [, spend] = await Promise.all([usagePoller.refresh(), ccusage.get({ force: true })]);
-    lastCcusageResult = spend;
-    return { limits: usagePoller.snapshot(), spend };
+    if (manualRefreshInFlight) return manualRefreshInFlight;
+
+    const nowMs = Date.now();
+    if (nowMs - lastManualRefreshAt < MANUAL_REFRESH_MIN_INTERVAL_MS) {
+      return { limits: usagePoller.snapshot(), spend: lastCcusageResult };
+    }
+    lastManualRefreshAt = nowMs;
+
+    manualRefreshInFlight = (async () => {
+      const [, spend] = await Promise.all([usagePoller.refresh(), ccusage.get({ force: true })]);
+      lastCcusageResult = spend;
+      return { limits: usagePoller.snapshot(), spend };
+    })();
+    try {
+      return await manualRefreshInFlight;
+    } finally {
+      manualRefreshInFlight = null;
+    }
   });
 
   ipcMain.handle('shell:openExternal', (_e, url) => {

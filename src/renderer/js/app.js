@@ -34,6 +34,12 @@ let restoreOverlaySkip = null;
 // usage.get() (см. boot()); redrawLimits() сама терпит null (rings.js рисует
 // прочерки, не ломая вёрстку).
 let lastUsage = null;
+// FINDING 2 (ревью, fix round 1): пока предыдущий usage:refresh не разрешился,
+// повторный клик/автоповтор Enter-Space по #limits не должен запускать
+// параллельный ещё один — main и сам защищён (single-flight + троттлинг, см.
+// ipc.js), но лишний IPC-вызов вообще не имеет смысла посылать. Флаг + класс
+// .busy (opacity/cursor:progress, см. app.css) — видимая обратная связь.
+let usageRefreshing = false;
 
 // Fix 8 (ревью): точка в титлбаре терракотовая, только пока есть хотя бы одна
 // вкладка в статусе waiting — локальный Set, потому что удобного агрегата
@@ -103,13 +109,26 @@ function redrawLimits(now = Date.now()) {
 
 // Клик/Enter/Space по #limits — форс-обновление обоих слоёв usage. Дашборд
 // (Task 4) станет вторым эффектом того же клика — пока только обновляем кольца.
+//
+// FINDING 2 (ревью, fix round 1): guard usageRefreshing — повторный вызов,
+// пока предыдущий IPC-round-trip ещё не разрешился, попросту НЕ отправляется
+// (main всё равно бы отбил его single-flight'ом/троттлингом, см. ipc.js, но
+// незачем даже слать лишний usage:refresh). .busy — визуальная обратная связь
+// (opacity + cursor:progress, app.css), пока запрос летит.
 async function refreshUsage() {
+  if (usageRefreshing) return;
+  usageRefreshing = true;
+  const host = $('limits');
+  host?.classList.add('busy');
   try {
     lastUsage = await window.api.usage.refresh();
   } catch (err) {
     console.warn('[usage] usage:refresh не удался:', err);
+  } finally {
+    usageRefreshing = false;
+    host?.classList.remove('busy');
+    redrawLimits();
   }
-  redrawLimits();
 }
 
 // Создать вкладку: контейнер + xterm + запись в стор. activate — переключиться сразу.
