@@ -156,15 +156,20 @@ test('runCcusage: child трекается в реестре и убираетс
   assert.ok(!runners.liveChildren.has(child.pid));
 });
 
-test('runCcusage: err с числовым code → resolve({code: err.code, stdout, stderr})', async () => {
+test('runCcusage: err с числовым code → resolve({code: err.code, stdout, stderr}), дерево НЕ добивается (Minor 6, ревью раунд 1)', async () => {
   const fake = makeFakeExecFile();
   const runners = createRunners({ execFile: fake });
   const p = runners.runCcusage(['x']);
   const err = new Error('boom');
-  err.code = 7;
+  err.code = 7; // обычный код завершения, НЕ убийство по таймауту (err.killed отсутствует)
   fake.calls[0].cb(err, '', 'stderr text');
   const res = await p;
   assert.deepStrictEqual(res, { code: 7, stdout: '', stderr: 'stderr text' });
+  // Minor 6: без этой проверки регрессия killTreeOnTimeout (замена
+  // `if (err && err.killed)` на `if (err)`) осталась бы зелёной — обычный
+  // code!=0 (например, штатный "not a git repository" в gitRun) НЕ должен
+  // порождать лишний вызов killProcessTree(taskkill) по уже мёртвому pid.
+  assert.strictEqual(fake.calls.length, 1, 'обычный code!=0 не должен вызывать killProcessTree — только сам runCcusage-вызов execFile');
 });
 
 test('runCcusage: err без code → code:1 по умолчанию', async () => {
@@ -229,15 +234,20 @@ test('gitRun: ENOENT → reject (git не установлен)', async () => {
   await assert.rejects(p, /ENOENT/);
 });
 
-test('gitRun: code!=0 (не ENOENT, напр. "not a git repository") → resolve с числовым code, НЕ reject', async () => {
+test('gitRun: code!=0 (не ENOENT, напр. "not a git repository") → resolve с числовым code, НЕ reject, дерево НЕ добивается (Minor 6, ревью раунд 1)', async () => {
   const fake = makeFakeExecFile();
   const runners = createRunners({ execFile: fake });
   const p = runners.gitRun(['status', '--porcelain=v1', '-b'], 'C:\\not-a-repo');
   const err = new Error('exit 1');
-  err.code = 1;
+  err.code = 1; // штатный код (не убийство по таймауту) — именно тот сценарий, что Minor 6 просит покрыть явно
   fake.calls[0].cb(err, '', 'fatal: not a git repository\n');
   const res = await p;
   assert.deepStrictEqual(res, { code: 1, stdout: '', stderr: 'fatal: not a git repository\n' });
+  // Каждый git:get на репозитории без .git штатно получает именно этот код —
+  // без этой проверки регрессия killTreeOnTimeout (if(err) вместо
+  // if(err&&err.killed)) начала бы спавнить лишний taskkill по мёртвому pid
+  // на КАЖДОЕ такое обновление панели, и тест остался бы зелёным.
+  assert.strictEqual(fake.calls.length, 1, 'обычный code!=0 не должен вызывать killProcessTree');
 });
 
 test('gitRun: err.code не число (сигнал/таймаут) → code:1 по умолчанию', async () => {
@@ -291,15 +301,16 @@ test('ghRun: ENOENT → reject (gh не установлен)', async () => {
   await assert.rejects(p, /ENOENT/);
 });
 
-test('ghRun: code!=0 (напр. не авторизован) → resolve с кодом, НЕ reject', async () => {
+test('ghRun: code!=0 (напр. не авторизован) → resolve с кодом, НЕ reject, дерево НЕ добивается (Minor 6, ревью раунд 1)', async () => {
   const fake = makeFakeExecFile();
   const runners = createRunners({ execFile: fake });
   const p = runners.ghRun(['pr', 'status'], 'C:\\repo');
   const err = new Error('exit 4');
-  err.code = 4;
+  err.code = 4; // штатный код (не убийство по таймауту)
   fake.calls[0].cb(err, '', 'gh auth login\n');
   const res = await p;
   assert.deepStrictEqual(res, { code: 4, stdout: '', stderr: 'gh auth login\n' });
+  assert.strictEqual(fake.calls.length, 1, 'обычный code!=0 не должен вызывать killProcessTree');
 });
 
 // -------------------------------------------------------------- killAllTracked --

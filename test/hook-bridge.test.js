@@ -225,19 +225,11 @@ test('gen: целое число в payload передаётся в applyHookEve
   }
 });
 
-test('gen: поле отсутствует в payload (сторонняя сессия/старый хук-скрипт) → null, не гардится', async () => {
-  const sessions = makeFakeSessions();
-  sessions.bySession.set('sess-1', 'tab-1');
-  const bridge = createHookBridge({ sessions, port: 0 });
-  try {
-    const port = await bridge.start();
-    const res = await post(port, { event: 'Stop', data: { session_id: 'sess-1' } });
-    assert.strictEqual(res.status, 200);
-    assert.strictEqual(sessions.calls[0].gen, null);
-  } finally {
-    bridge.stop();
-  }
-});
+// Minor 4 (ревью раунд 1): тест "gen: поле отсутствует → null" отсюда убран —
+// он слал ТОТ ЖЕ POST-body и проверял ТО ЖЕ самое, что уже покрыто тестом
+// «маршрутизация по session_id доставляет applyHookEvent» выше (после
+// обновления его deepStrictEqual на gen:null) — полный дубль без собственного
+// режима падения. Случай «поле отсутствует» остаётся покрыт ИМ.
 
 test('gen: мусорное значение (строка, дробное) в payload нормализуется в null', async () => {
   const sessions = makeFakeSessions();

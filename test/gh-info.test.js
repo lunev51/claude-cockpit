@@ -232,6 +232,27 @@ test('checks: StatusContext классифицируется по __typename, д
   assert.strictEqual(snap.pr.checks, 'failing');
 });
 
+// Minor 7 (ревью раунд 1, задача 5 фазы 7): чистый переход на "только
+// __typename" сломал бы СИММЕТРИЧНЫЙ случай — элемент БЕЗ __typename вовсе
+// (другая версия gh/другой путь получения rollup), но по форме StatusContext
+// (несёт state, не несёт status). Старая эвристика (item.status === undefined
+// && typeof item.state === 'string') опознавала такой элемент верно —
+// classifyChecks должен продолжать это делать ФОЛБЭКОМ, когда __typename
+// отсутствует, а не только когда он явно равен 'StatusContext'.
+const STATUS_CONTEXT_WITHOUT_TYPENAME_ROLLUP = [
+  { __typename: 'CheckRun', status: 'COMPLETED', conclusion: 'SUCCESS', name: 'build' },
+  { state: 'FAILURE', name: 'ci/circleci' }, // нет __typename вовсе, нет status — форма StatusContext
+];
+
+test('checks: StatusContext БЕЗ поля __typename вовсе классифицируется фолбэком по отсутствию status (Minor 7, ревью раунд 1) — не проваливается сквозь "только __typename"', async () => {
+  const currentBranch = {
+    number: 1, title: 't', state: 'OPEN', isDraft: false, reviewDecision: null, url: 'u', statusCheckRollup: STATUS_CONTEXT_WITHOUT_TYPENAME_ROLLUP,
+  };
+  const info = createGhInfo({ run: runFixture({ prStatus: ok(JSON.stringify({ currentBranch })) }), cache: noCache(), now: () => 1 });
+  const snap = await info.getRepo('C:\\repo');
+  assert.strictEqual(snap.pr.checks, 'failing');
+});
+
 test('getRepo: не git-репозиторий вообще (реальная фикстура "failed to run git: ... not a git repository", код 1) → ok:true, error:no-remote', async () => {
   const info = createGhInfo({
     run: runFixture({

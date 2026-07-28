@@ -146,17 +146,30 @@ function classifyChecks(rollup) {
   for (const item of rollup) {
     if (!item) continue;
     // Различаем CheckRun/StatusContext по __typename — полю, которое --json
-    // statusCheckRollup отдаёт ВСЕГДА (см. шапку файла), а не по отсутствию
-    // поля status, как было раньше (находка 2, ревью carryover фазы 6):
-    // прежняя эвристика ошибочно доверяла форме объекта. Если бы
+    // statusCheckRollup отдаёт ВСЕГДА (см. шапку файла), а не ТОЛЬКО по
+    // отсутствию поля status, как было раньше (находка 2, ревью carryover
+    // фазы 6): прежняя эвристика ошибочно доверяла форме объекта. Если бы
     // StatusContext когда-нибудь тоже нёс поле status (документацией это не
     // исключено), старая проверка молча приняла бы его за CheckRun и
     // проигнорировала бы провал (conclusion для StatusContext всегда
     // undefined, не входит в FAILING_CONCLUSIONS). __typename — явный
-    // дискриминатор API, ему доверяем безусловно; незнакомый/отсутствующий
-    // __typename (другая версия gh) — трактуем как CheckRun, самый частый и
-    // документированный случай, не бросаем и не роняем всю классификацию.
-    const isStatusContext = item.__typename === 'StatusContext';
+    // дискриминатор API, ему доверяем В ПЕРВУЮ очередь.
+    //
+    // Minor 7 (ревью раунд 1): чистая замена на "только __typename" сломала
+    // ДРУГОЙ, симметричный случай — элемент БЕЗ __typename вовсе (другая
+    // версия gh/другой путь получения rollup) с формой StatusContext
+    // ({state:'FAILURE', ...} без status) раньше опознавался верно старой
+    // эвристикой, а новой — ошибочно трактовался бы как CheckRun (тот же
+    // false-green, который эта находка и чинит). Поэтому старая эвристика
+    // не выброшена, а понижена до ФОЛБЭКА: применяется, только когда
+    // __typename вообще отсутствует (undefined) — если он ЕСТЬ и говорит
+    // 'CheckRun', это по-прежнему безусловно побеждает (учитывая гипотетичный
+    // CheckRun без status из комментария выше). Единственный случай, где
+    // классификация остаётся честной неопределённостью — __typename отсутствует
+    // И объект не подходит ни под одну форму (совсем незнакомый path) —
+    // тогда трактуем как CheckRun, самый частый документированный случай.
+    const isStatusContext = item.__typename === 'StatusContext'
+      || (item.__typename === undefined && item.status === undefined && typeof item.state === 'string');
     if (isStatusContext) {
       if (FAILING_STATES.has(item.state)) return 'failing';
       if (PENDING_STATES.has(item.state)) hasPending = true;

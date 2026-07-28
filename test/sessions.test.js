@@ -1033,16 +1033,80 @@ test('applyHookEvent: gen не передан (обратная совмести
   assert.deepStrictEqual(factory.spawned[0].written, ['текст\r']);
 });
 
-test('applyHookEvent: gen ТЕКУЩЕГО поколения (совпадает с tab.gen) — событие применяется как обычно', () => {
+// ---------- Important 1 (ревью раунд 1, обязательная правка): gen должен быть глобальным, а не по вкладке ----------
+
+test('genSeq глобален: первые спавны РАЗНЫХ вкладок получают РАЗНЫЕ поколения, а не одинаковый gen:1 у каждой', () => {
   const factory = makeFakePtyFactory();
   const { mgr } = makeManager(factory);
   const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
-  mgr.start(a.tabId, 80, 24);
-  const gen = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
-  mgr.enqueue(a.tabId, 'текст');
-  mgr.applyHookEvent(a.tabId, 'Stop', {}, gen);
-  assert.deepStrictEqual(factory.spawned[0].written, ['текст\r']);
+  const b = mgr.open({ cwd: 'C:\\proj\\beta' });
+  mgr.start(a.tabId, 80, 24); // первый спавн A
+  mgr.start(b.tabId, 80, 24); // первый спавн B
+  const genA = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  const genB = Number(factory.spawned[1].opts.env.COCKPIT_TAB_GEN);
+  assert.notStrictEqual(genA, genB, 'до фикса Important 1 оба были бы gen:1 (счётчик по вкладке, а не по менеджеру)');
 });
+
+test('Important 1: закрытая вкладка A и НОВАЯ вкладка B с ТОЙ ЖЕ сессией не делят совпадающий gen — опоздавший Stop вкладки A (маршрутизированный по session_id уже в B) не производит побочного эффекта в B', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+
+  // Вкладка A: спавн #1, SessionStart привязывает сессию 'S'.
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  const staleGenFromA = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S' });
+
+  // Пользователь закрывает A ровно в момент, когда её Stop-хук уже запущен,
+  // но POST ещё не долетел до моста — close() удаляет вкладку из tabs.
+  mgr.close(a.tabId);
+
+  // Открывается НОВАЯ вкладка B с ТОЙ ЖЕ сессией 'S' (Ctrl+Shift+H/«Открыть
+  // воркспейс»). До фикса её первый спавн ТОЖЕ получил бы gen:1 (счётчик по
+  // вкладке начинался бы с нуля заново) — ровно та коллизия, которую чинит
+  // Important 1.
+  const b = mgr.open({ cwd: 'C:\\proj\\beta', sessionId: 'S' });
+  mgr.start(b.tabId, 80, 24);
+  const bSpawnIndex = factory.spawned.length - 1;
+  const currentGenOfB = Number(factory.spawned[bSpawnIndex].opts.env.COCKPIT_TAB_GEN);
+  assert.notStrictEqual(
+    currentGenOfB,
+    staleGenFromA,
+    'поколения РАЗНЫХ вкладок не должны совпадать даже после закрытия одной из них',
+  );
+
+  // Новая сессия B получает СВОЙ собственный элемент очереди.
+  mgr.enqueue(b.tabId, 'для B');
+  const statusBeforeStale = statusOf(events, b.tabId);
+
+  // Опоздавший Stop вкладки A мосту уже неизвестен по tabId (A удалена из
+  // tabs), маршрутизируется по session_id 'S' — а на неё теперь отвечает B
+  // (findBySessionId в hook-bridge.js). Эмулируем результат этой маршрутизации
+  // напрямую: applyHookEvent для tabId B, но со СТАРЫМ (устаревшим) gen'ом A.
+  mgr.applyHookEvent(b.tabId, 'Stop', {}, staleGenFromA);
+  assert.deepStrictEqual(
+    factory.spawned[bSpawnIndex].written,
+    [],
+    'опоздавший Stop вкладки A не должен был писать в pty вкладки B',
+  );
+  assert.deepStrictEqual(
+    statusOf(events, b.tabId),
+    statusBeforeStale,
+    'статус B не должен был измениться опоздавшим событием A',
+  );
+
+  // Контрольная проверка: Stop с ПРАВИЛЬНЫМ (текущим) поколением B по-прежнему
+  // работает как обычно — гард не сломан, отсекает именно чужие поколения.
+  mgr.applyHookEvent(b.tabId, 'Stop', {}, currentGenOfB);
+  assert.deepStrictEqual(factory.spawned[bSpawnIndex].written, ['для B\r']);
+});
+
+// Minor 5 (ревью раунд 1): отдельный тест "gen ТЕКУЩЕГО поколения применяется
+// как обычно" отсюда убран — он дублировал контрольный шаг в конце теста
+// «applyHookEvent с устаревшим... поколением игнорируется ЦЕЛИКОМ» выше
+// (строки 1019-1023: applyHookEvent с currentGen после restart() и проверка,
+// что вброс всё же произошёл) — тот же случай «текущий gen работает как
+// обычно», без собственного отдельного режима падения.
 
 test('spawn: env несёт COCKPIT_TAB_GEN как строку текущего поколения, растущего с каждым спавном', () => {
   const factory = makeFakePtyFactory();
