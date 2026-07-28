@@ -9,6 +9,22 @@ const DEFAULT_USER_AGENT_VERSION = '2.1.220';
 const AUTH_BACKOFF_MS = 15 * 60 * 1000; // 401/403 — токен могли обновить, не долбим лимит запросов
 const RATE_BACKOFF_MS = 10 * 60 * 1000; // 429 — сервер прямо просит подождать
 
+// Маска на случай, если в тексте чужой ошибки (httpGet/net) окажется
+// какой-то токен, похожий на наш формат, — защита в глубину сверх точного
+// вырезания известного значения ниже.
+const TOKEN_LIKE_RE = /sk-ant-[A-Za-z0-9_-]+/g;
+
+// Вырезает из текста ЛЮБЫЕ вхождения известного токена (если он передан) и
+// любую подстроку, похожую на токен по формату. Применяется ко ВСЕМ
+// сообщениям перед логированием — токен не должен просочиться, даже если
+// он попал в текст стороннего err.message (например, если реализация
+// httpGet echo'ит заголовки запроса в исключении).
+function sanitizeForLog(text, token) {
+  let out = String(text);
+  if (token) out = out.split(token).join('***');
+  return out.replace(TOKEN_LIKE_RE, '***');
+}
+
 function emptyPart() {
   return { percent: 0, resetsAt: null };
 }
@@ -56,6 +72,15 @@ function parseBody(body) {
   };
 }
 
+// Кэш валиден, только если percent у обеих частей реально числа — не просто
+// «поле присутствует» (при смене схемы кэша на диске легко словить
+// percent:undefined, который иначе тихо просочился бы в снапшот как валидный).
+function isGoodCacheShape(c) {
+  return !!c
+    && c.fiveHour && typeof c.fiveHour.percent === 'number'
+    && c.sevenDay && typeof c.sevenDay.percent === 'number';
+}
+
 function createUsagePoller({
   readToken,
   httpGet,
@@ -72,6 +97,15 @@ function createUsagePoller({
   let nextAllowedAt = 0; // now() раньше которого refresh() не бьёт по сети (жёсткий гейт 429)
   let started = false;
   let timer = null;
+  let currentToken = null; // accessToken текущего refresh() — только для санитайзинга log, никуда больше не уходит
+
+  // Обёртка над инжектированным log: вырезает токен из ЛЮБОГО сообщения.
+  // Используется вместо «сырого» log везде, а не только в местах, где мы
+  // сами формируем текст, — на случай, если токен просочился в чужой
+  // err.message (см. FINDING 1 ревью).
+  function safeLog(msg) {
+    log(sanitizeForLog(msg, currentToken));
+  }
 
   function applyGood(parsed, fetchedAt) {
     lastGood = { ...parsed, fetchedAt };
@@ -84,7 +118,7 @@ function createUsagePoller({
     try {
       cache.write(lastGood);
     } catch (err) {
-      log(`[usage-oauth] cache.write упал: ${err.message}`);
+      safeLog(`[usage-oauth] cache.write упал: ${err.message}`);
     }
   }
 
@@ -94,9 +128,9 @@ function createUsagePoller({
       try {
         cached = cache.read();
       } catch (err) {
-        log(`[usage-oauth] cache.read упал: ${err.message}`);
+        safeLog(`[usage-oauth] cache.read упал: ${err.message}`);
       }
-      if (cached && cached.fiveHour && cached.sevenDay) {
+      if (isGoodCacheShape(cached)) {
         lastGood = cached;
         haveGood = true;
       }
@@ -117,6 +151,7 @@ function createUsagePoller({
     if (now() < nextAllowedAt) return state;
 
     const token = readToken ? readToken() : null;
+    currentToken = token && token.accessToken ? token.accessToken : null;
     if (!token || !token.accessToken) {
       applyError('auth');
       currentIntervalMs = AUTH_BACKOFF_MS;
@@ -131,7 +166,7 @@ function createUsagePoller({
         'User-Agent': `claude-code/${userAgentVersion}`,
       });
     } catch (err) {
-      log(`[usage-oauth] сетевой сбой: ${err.message}`);
+      safeLog(`[usage-oauth] сетевой сбой: ${err.message}`);
       applyError('network');
       currentIntervalMs = intervalMs;
       return state;
@@ -159,7 +194,7 @@ function createUsagePoller({
       const body = typeof res.body === 'string' ? JSON.parse(res.body) : res.body;
       parsed = parseBody(body);
     } catch (err) {
-      log(`[usage-oauth] не удалось разобрать ответ: ${err.message}`);
+      safeLog(`[usage-oauth] не удалось разобрать ответ: ${err.message}`);
       applyError('network');
       currentIntervalMs = intervalMs;
       return state;

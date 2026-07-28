@@ -299,3 +299,71 @@ test('токен никогда не появляется ни в одном а�
     assert.ok(!line.includes(TOKEN.accessToken), `log содержит токен: ${line}`);
   }
 });
+
+// FINDING 1 (ревью): чужая ошибка (httpGet/net) может сама содержать токен в
+// тексте (например, если реализация echo'ит заголовки запроса в message).
+// Модуль обязан вырезать токен из ЛЮБОГО текста перед логированием, а не
+// полагаться на то, что сторонние ошибки его никогда не содержат.
+test('АДВЕРСАРИАЛЬНО: сообщение ошибки САМО содержит токен — санитайзер вырезает его перед log', async () => {
+  const logs = [];
+  const log = (...args) => { logs.push(args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ')); };
+  const poller = createUsagePoller({
+    readToken: () => TOKEN,
+    httpGet: async () => { throw new Error(`connect ECONNREFUSED, headers: Authorization: Bearer ${TOKEN.accessToken}`); },
+    cache: noopCache(),
+    now: () => 1,
+    log,
+  });
+
+  await poller.refresh();
+
+  assert.ok(logs.length > 0, 'ожидали хотя бы одну запись в log');
+  for (const line of logs) {
+    assert.ok(!line.includes(TOKEN.accessToken), `log содержит токен: ${line}`);
+  }
+  assert.ok(logs.some((l) => l.includes('***')), 'ожидали маску *** вместо вырезанного токена');
+});
+
+// FINDING 2 (ревью, minor): мусорная дата не должна давать NaN.
+test('resets_at — мусорная строка (не дата) → resetsAt:null, не NaN', async () => {
+  const body = {
+    five_hour: { utilization: 1, resets_at: 'not-a-date' },
+    seven_day: { utilization: 1, resets_at: null },
+    limits: [],
+  };
+  const poller = createUsagePoller({
+    readToken: () => TOKEN,
+    httpGet: async () => ({ status: 200, body }),
+    cache: noopCache(),
+    now: () => 1,
+  });
+
+  const snap = await poller.refresh();
+
+  assert.strictEqual(snap.fiveHour.resetsAt, null);
+  assert.strictEqual(snap.sevenDay.resetsAt, null);
+});
+
+// FINDING 3 (ревью, minor): кэш проверялся только на наличие полей, не на их
+// форму — «percent: undefined» проходил бы как валидный кэш. Ужесточаем.
+test('кэш с некорректной формой (percent не число) отвергается — трактуем как отсутствие кэша', async () => {
+  const badCache = {
+    fiveHour: { percent: undefined, resetsAt: null },
+    sevenDay: { percent: 5, resetsAt: 1 },
+    scoped: [],
+    fetchedAt: 1,
+  };
+  const poller = createUsagePoller({
+    readToken: () => TOKEN,
+    httpGet: async () => { throw new Error('ECONNRESET'); },
+    cache: { read: () => badCache, write: () => {} },
+    now: () => 1,
+  });
+
+  const snap = await poller.refresh();
+
+  assert.strictEqual(snap.ok, false);
+  assert.strictEqual(snap.stale, false);
+  assert.strictEqual(snap.fiveHour.percent, 0);
+  assert.strictEqual(snap.sevenDay.percent, 0);
+});
