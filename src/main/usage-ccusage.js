@@ -2,12 +2,14 @@
 // Слой расходов ccusage (по проектам/дням/моделям). Модуль ЧИСТЫЙ: процесс
 // (`run`), кэш (`cache`) и время (`now`) — только инжектируются. Никакого
 // electron и никакого child_process здесь: в проде run(args) будет
-// execFile('npx', ['--yes', 'ccusage@latest', ...args]) с таймаутом 60с —
-// это делает проводка вне этого модуля.
+// execFile('npx', ['--yes', CCUSAGE_PACKAGE, ...args]) с таймаутом 60с —
+// это делает проводка вне этого модуля (константа версии — в ipc.js, рядом
+// с самим раннером, задача 5 фазы 6: версия запинена на 20.0.19, не @latest).
 //
-// Фактические команды (зафиксировано в отчёте задачи):
-//   npx --yes ccusage@latest claude daily --json    → byDay + byModel + totals
-//   npx --yes ccusage@latest claude session --json  → byProject + totals.sessions
+// Фактические команды (зафиксировано в отчёте задачи; версия пакета с тех
+// пор запинена — см. CCUSAGE_PACKAGE в ipc.js, — набор аргументов не менялся):
+//   npx --yes ccusage@X.Y.Z claude daily --json    → byDay + byModel + totals
+//   npx --yes ccusage@X.Y.Z claude session --json  → byProject + totals.sessions
 // Оба вызова идут параллельно через Promise.all — каждый npx стоит секунды.
 //
 // Правило деградации: run бросил / code!=0 / вывод не парсится →
@@ -118,6 +120,16 @@ function normalize(dailyBody, sessionBody) {
 function createCcusage({ run, cache, now = Date.now, ttlMs = 600000 }) {
   let lastGood = null; // { totals, byProject, byDay, byModel, fetchedAt }
   let loadedFromDisk = false;
+  // Задача 5 фазы 6 (carryover, single-flight get()): ipc.js защищает от
+  // параллельных usage:refresh (manualRefreshInFlight), но usage:get() и
+  // usage:refresh — РАЗНЫЕ IPC-каналы, и ничто снаружи не мешало им обоим
+  // одновременно дёрнуть ccusage.get() (один — ленивый usage:get при открытии
+  // дашборда, другой — usage:refresh по клику «Обновить») — до ЧЕТЫРЁХ
+  // параллельных npx (daily+session от каждого). inFlight — промис ТЕКУЩЕГО
+  // выполняющегося get(), пока он не разрешится: любой ДРУГОЙ вызов get(),
+  // пришедший, пока inFlight ещё не null, получает ЭТОТ ЖЕ промис (тот же
+  // объект — второй fetchFresh() не запускается вовсе), а не свой отдельный.
+  let inFlight = null;
 
   // Читаем дисковый кэш лениво один раз за жизнь инстанса — дальше доверяем
   // накопленному в памяти lastGood (аналог usage-oauth).
@@ -180,7 +192,7 @@ function createCcusage({ run, cache, now = Date.now, ttlMs = 600000 }) {
     return { kind: null, data: normalize(dailyBody, sessionBody) };
   }
 
-  async function get({ force = false } = {}) {
+  async function doGet({ force = false } = {}) {
     ensureLoadedFromCache();
 
     const nowMs = now();
@@ -200,6 +212,21 @@ function createCcusage({ run, cache, now = Date.now, ttlMs = 600000 }) {
       // запись кэша упала — не критично, отдаём свежие данные всё равно.
     }
     return buildResult(true, false, lastGood, nowMs, null);
+  }
+
+  // single-flight (см. комментарий у объявления inFlight выше): если запрос
+  // уже выполняется, возвращаем ТОТ ЖЕ промис вместо второго fetchFresh().
+  // opts вызова-«присоединившегося» при этом игнорируется (в т.ч. его
+  // собственный force:true) — он получит результат уже идущего запроса;
+  // doGet() сама никогда не бросает, так что .finally() достаточно, чтобы
+  // гарантированно сбросить inFlight по завершении (успех или уже пойманная
+  // внутри ошибка — без разницы).
+  async function get(opts = {}) {
+    if (inFlight) return inFlight;
+    inFlight = doGet(opts).finally(() => {
+      inFlight = null;
+    });
+    return inFlight;
   }
 
   return { get };

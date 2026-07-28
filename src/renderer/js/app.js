@@ -257,16 +257,42 @@ async function refreshUsage() {
 // разрешению — раздел «загружаю…» (dashboard.js/buildGithubSection) сменится
 // на реальные данные ровно тогда, когда придёт ИМЕННО его ответ, а не когда
 // придут оба разом.
+// FIX (ревью задачи 4 фазы 6, carryover в задачу 5): раньше оба .catch ниже
+// только логировали ошибку в консоль — ни lastUsage/lastGh, ни перерисовка
+// не трогались. window.api.usage.get()/gh.global() штатно НЕ бросают (main
+// сам ловит любой сбой и отдаёт {ok:false,...} через .then) — .catch здесь
+// это на случай РЕАЛЬНОГО отказа промиса (обрыв IPC-моста, исключение вне
+// try/catch и т.п.). Без присвоения+редро в этой ветке плашка «загружаю…» у
+// раздела GitHub (dashboard.js/buildGithubSection: gh===null → «загружаю…»)
+// виснет навсегда до полного закрытия и повторного открытия дашборда — ни
+// один последующий тик (usage:update, таймер 30с) её не перерисует, потому
+// что lastGh как был null, так и остаётся. Синтетика ok:false — та же форма,
+// что и настоящий error-путь usage-oauth.js/usage-ccusage.js/gh-info.js,
+// dashboard.js уже умеет её рисовать («недоступны»/SPEND_UNAVAILABLE_TEXT/
+// ghErrorText с фолбэком на неизвестный код).
 function fetchUsageOnDashboardOpen() {
   window.api.usage.get().then((v) => {
     lastUsage = v;
     redrawUsageViews();
-  }).catch((err) => console.warn('[usage] usage:get при открытии дашборда не удался:', err));
+  }).catch((err) => {
+    console.warn('[usage] usage:get при открытии дашборда не удался:', err);
+    lastUsage = {
+      limits: { ok: false, error: 'failed', fetchedAt: 0 },
+      spend: { ok: false, error: 'failed' },
+    };
+    redrawUsageViews();
+  });
 
   window.api.gh.global().then((v) => {
     lastGh = v;
     redrawUsageViews();
-  }).catch((err) => console.warn('[gh] gh:global при открытии дашборда не удался:', err));
+  }).catch((err) => {
+    console.warn('[gh] gh:global при открытии дашборда не удался:', err);
+    lastGh = {
+      ok: false, error: 'failed', prs: [], issues: [], notifications: 0,
+    };
+    redrawUsageViews();
+  });
 }
 
 // Task 4 фазы 5: тумблер Ctrl+D/кнопка панели действий/действие палитры —

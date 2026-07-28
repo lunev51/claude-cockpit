@@ -167,6 +167,66 @@ function usageHttpGet(url, headers) {
   });
 }
 
+// Задача 5 фазы 6 (carryover): реестр живых дочерних процессов всех трёх
+// раннеров ниже (runCcusage/gitRun/ghRun) — pid → ChildProcess, который
+// вернул сам execFile(). Нужен по двум причинам:
+//   (а) execFile(..., {shell:true, timeout}) на Windows спавнит cmd.exe,
+//       который сам спавнит РЕАЛЬНЫЙ процесс (node.exe при npx, gh.exe и
+//       т.п.) — это ВНУК, а не прямой child_process. Штатный timeout/kill()
+//       у execFile убивает только cmd.exe; внук остаётся жить осиротевшим
+//       (например, npx продолжает молотить сеть уже после того, как main
+//       решил, что вызов провалился по таймауту).
+//   (б) disposeSessions() (закрытие приложения) раньше вообще не трогал эти
+//       execFile — если git/gh/npx ещё выполнялись в момент выхода, они
+//       переживали родительский процесс Electron целиком.
+// Убираем запись из реестра сами по событию 'exit' — так disposeSessions()
+// всегда видит актуальный набор РЕАЛЬНО ещё живых процессов, а не тех, что
+// уже успели завершиться штатно.
+const liveChildren = new Map();
+
+function trackChild(child) {
+  if (child && typeof child.pid === 'number') {
+    liveChildren.set(child.pid, child);
+    child.once('exit', () => liveChildren.delete(child.pid));
+  }
+  return child;
+}
+
+// Мягко «убивает» дерево процессов по pid: taskkill /PID <pid> /T БЕЗ /F —
+// это просьба закрыться штатно (аналог закрытия окна), а не принудительное
+// завершение. Правила проекта запрещают taskkill /F (жёсткое убийство) —
+// если процесс её проигнорирует, он остаётся висеть до собственного
+// завершения; это осознанный компромисс, зафиксированный в брифе задачи.
+// /T — рекурсивно по всему дереву потомков указанного pid (это и лечит
+// проблему (а) в комментарии реестра выше: убивает не только cmd.exe, но и
+// его внука node/gh). Код возврата taskkill не проверяем — он падает, если
+// процесс уже успел завершиться сам между таймаутом/dispose и этим вызовом,
+// и это не ошибка.
+function killProcessTree(pid) {
+  if (typeof pid !== 'number') return;
+  execFile('taskkill', ['/PID', String(pid), '/T'], { windowsHide: true }, () => {});
+}
+
+// Убивает дерево ПО ТАЙМАУТУ (err.killed — execFile сам взвёл SIGTERM/kill,
+// потому что процесс не уложился в options.timeout): по обычному коду
+// завершения (в т.ч. code!=0) дерево трогать не нужно — процесс и так уже
+// закончился сам, taskkill там был бы просто лишним no-op вызовом.
+function killTreeOnTimeout(err, child) {
+  if (err && err.killed) killProcessTree(child.pid);
+}
+
+// Версия ccusage запинена сознательно (не @latest): скорость (npx не лезет
+// в реестр проверять свежую версию при КАЖДОМ вызове — a это на счету у
+// каждого usage:get/usage:refresh), предсказуемость (один и тот же формат
+// JSON-вывода тут и у клиента, а не «что там лежит в реестре сегодня») и
+// меньше supply-chain-поверхности (обновление версии — осознанный шаг в
+// коде, а не молчаливая подмена пакета выше по цепочке между двумя запусками).
+// Как обновлять: проверить changelog ccusage на breaking changes в формате
+// вывода `claude daily/session --json` (см. test/usage-ccusage.test.js —
+// normalize() читает конкретные поля), прогнать тесты на реальном выводе
+// новой версии, и только потом поднять номер здесь одной строкой.
+const CCUSAGE_PACKAGE = 'ccusage@20.0.19';
+
 // run(args) для ccusage: execFile('npx', ...) БЕЗ shell:true падает на Windows
 // с ENOENT (npx — это .cmd-шим, не бинарник); execFile('npx.cmd', ...) БЕЗ
 // shell:true падает с ENOENT/EINVAL — известная особенность обработки .cmd в
@@ -178,14 +238,16 @@ function usageHttpGet(url, headers) {
 // экранируются под shell:true) отсутствует.
 function runCcusage(args) {
   return new Promise((resolve) => {
-    execFile('npx', ['--yes', 'ccusage@latest', ...args], {
+    const child = execFile('npx', ['--yes', CCUSAGE_PACKAGE, ...args], {
       timeout: 60000,
       windowsHide: true,
       shell: true,
       maxBuffer: 16 * 1024 * 1024,
     }, (err, stdout, stderr) => {
+      killTreeOnTimeout(err, child);
       resolve({ code: err ? (err.code || 1) : 0, stdout: stdout || '', stderr: stderr || '' });
     });
+    trackChild(child);
   });
 }
 
@@ -199,9 +261,16 @@ function runCcusage(args) {
 // что usageHttpGet (20с), git локальный и обычно быстрее сети.
 function gitRun(args, cwd) {
   return new Promise((resolve, reject) => {
-    execFile('git', args, {
+    const child = execFile('git', args, {
       cwd, windowsHide: true, timeout: 15000, maxBuffer: 10 * 1024 * 1024,
     }, (err, stdout, stderr) => {
+      // Задача 5 фазы 6: та же осторожность по таймауту, что и у runCcusage
+      // выше (реестр/killProcessTree в начале этого файла) — здесь без
+      // shell:true child и есть сам git.exe (не обёрнут в cmd.exe), но
+      // унификация раннеров важнее: killProcessTree(pid, /T) безвредна и для
+      // «бездетного» процесса, а если git когда-нибудь всё же породит
+      // потомка (hook, pager), дерево уберётся тоже.
+      killTreeOnTimeout(err, child);
       if (err && err.code === 'ENOENT') {
         reject(err);
         return;
@@ -214,6 +283,7 @@ function gitRun(args, cwd) {
       const code = err ? (typeof err.code === 'number' ? err.code : 1) : 0;
       resolve({ code, stdout: stdout || '', stderr: stderr || '' });
     });
+    trackChild(child);
   });
 }
 
@@ -232,9 +302,13 @@ function gitRun(args, cwd) {
 // maxBuffer 5 МБ — с запасом под JSON-ответы gh (бриф).
 function ghRun(args, cwd) {
   return new Promise((resolve, reject) => {
-    execFile('gh', args, {
+    const child = execFile('gh', args, {
       cwd, windowsHide: true, timeout: 30000, maxBuffer: 5 * 1024 * 1024, shell: true,
     }, (err, stdout, stderr) => {
+      // Задача 5 фазы 6: shell:true здесь — тот же класс проблемы, что и у
+      // runCcusage (комментарий у реестра выше) — child при таймауте нужно
+      // добивать деревом, а не просто оставлять cmd.exe/gh.exe висеть.
+      killTreeOnTimeout(err, child);
       if (err && err.code === 'ENOENT') {
         reject(err);
         return;
@@ -242,6 +316,7 @@ function ghRun(args, cwd) {
       const code = err ? (typeof err.code === 'number' ? err.code : 1) : 0;
       resolve({ code, stdout: stdout || '', stderr: stderr || '' });
     });
+    trackChild(child);
   });
 }
 
@@ -782,6 +857,16 @@ function disposeSessions() {
   if (usagePoller) usagePoller.stop();
   stopBridge();
   if (manager) manager.disposeAll();
+  // Задача 5 фазы 6 (carryover): если приложение закрывается, пока
+  // runCcusage/gitRun/ghRun ещё выполняются (npx/git/gh), реестр liveChildren
+  // (см. выше) всё ещё держит их — добиваем ДЕРЕВО мягко (/T без /F, см.
+  // killProcessTree) для каждого. Снимок ключей в массив ДО цикла: сам
+  // taskkill асинхронный, но 'exit' на child может сработать синхронно в
+  // тестовых дублёрах — итерация по живой Map во время её же мутации
+  // недетерминирована.
+  for (const pid of [...liveChildren.keys()]) {
+    killProcessTree(pid);
+  }
 }
 
 module.exports = {
