@@ -331,7 +331,15 @@ export function createDashboard({
     return section;
   }
 
-  function renderChartBars(barsHost, byDay) {
+  // hintEl — строка в заголовке секции: по умолчанию показывает единицы
+  // измерения, при наведении на колонку — точные цифры её дня (живая приёмка
+  // фазы 7: системный title не работал — у столбика в 2-3px некуда попасть
+  // курсором, плюс секундная задержка нативной подсказки; поэтому зона
+  // наведения — ВСЯ колонка на высоту графика, а вывод мгновенный и в
+  // фиксированном месте).
+  const CHART_HINT_DEFAULT = '$ за день · наведи на столбик';
+
+  function renderChartBars(barsHost, byDay, hintEl) {
     barsHost.textContent = '';
     const slice = byDay.slice(-chartPreset);
     if (!slice.length) {
@@ -345,18 +353,22 @@ export function createDashboard({
     // Живая приёмка фазы 7: высота столбиков ничего не говорила — ни единиц,
     // ни масштаба. Подписываем ЗНАЧЕНИЕ над столбиком-максимумом (он задаёт
     // масштаб всей сетки: остальные — доли от него); каждое из 30 значений
-    // не подписать — 10px-цифры слипнутся, для точечных цифр остаётся title.
+    // не подписать — 10px-цифры слипнутся, для точечных цифр есть наведение.
     // При нескольких равных максимумах подписываем первый — остальные видны
     // по одинаковой высоте.
     const maxIdx = slice.findIndex((d) => d.costUsd === maxCost);
     slice.forEach((d, i) => {
+      // Колонка на полную высоту графика — hover-мишень; заливка-столбик
+      // прижата к её низу.
+      const col = document.createElement('div');
+      col.className = 'chart-col';
+
       const bar = document.createElement('div');
       bar.className = 'chart-bar';
       // Минимум 2% высоты — нулевой/почти нулевой день остаётся видимым
       // штрихом, а не пропадает из сетки полностью.
       const h = maxCost > 0 ? Math.max(2, Math.round((d.costUsd / maxCost) * 100)) : 2;
       bar.style.height = `${h}%`;
-      bar.title = `${formatShortDate(d.date)}: ${formatUsd(d.costUsd)}, ${formatTokens(d.tokens)} токенов`;
       if (i === maxIdx && maxCost > 0) {
         const value = document.createElement('span');
         value.className = 'chart-bar-value';
@@ -370,7 +382,19 @@ export function createDashboard({
         label.textContent = formatShortDate(d.date);
         bar.appendChild(label);
       }
-      barsHost.appendChild(bar);
+      col.appendChild(bar);
+
+      if (hintEl) {
+        col.addEventListener('mouseenter', () => {
+          hintEl.textContent = `${formatShortDate(d.date)} · ${formatUsd(d.costUsd)} · ${formatTokens(d.tokens)} токенов`;
+          hintEl.classList.add('active');
+        });
+        col.addEventListener('mouseleave', () => {
+          hintEl.textContent = CHART_HINT_DEFAULT;
+          hintEl.classList.remove('active');
+        });
+      }
+      barsHost.appendChild(col);
     });
   }
 
@@ -386,10 +410,11 @@ export function createDashboard({
     header.appendChild(title);
     // Живая приёмка фазы 7: без пояснения единиц было «непонятно, что
     // конкретно показывают столбики». $ — данные ccusage (те же, что карточка
-    // «Расход» выше); наведение даёт точные цифры дня.
+    // «Расход» выше); при наведении на колонку сюда выводятся точные цифры
+    // её дня (см. renderChartBars).
     const hint = document.createElement('span');
     hint.className = 'dashboard-chart-hint';
-    hint.textContent = '$ за день · курсор на столбик — детали';
+    hint.textContent = CHART_HINT_DEFAULT;
     header.appendChild(hint);
 
     const presets = document.createElement('div');
@@ -417,7 +442,7 @@ export function createDashboard({
 
     const bars = document.createElement('div');
     bars.className = 'dashboard-chart-bars';
-    renderChartBars(bars, Array.isArray(spend.byDay) ? spend.byDay : []);
+    renderChartBars(bars, Array.isArray(spend.byDay) ? spend.byDay : [], hint);
     section.appendChild(bars);
 
     return section;

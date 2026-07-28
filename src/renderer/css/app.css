@@ -767,9 +767,28 @@ html, body {
   padding: 8px 6px 20px;
   position: relative;
 }
-.chart-bar {
+/* Колонка-мишень для наведения (живая приёмка фазы 7): столбик в 2-3px —
+   недосягаемая цель для курсора, поэтому hover ловит вся колонка на высоту
+   графика, а заливка прижата к её низу. Данные дня при наведении выводятся
+   в .dashboard-chart-hint заголовка (см. dashboard.js/renderChartBars). */
+.chart-col {
   flex: 1;
   min-width: 3px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  position: relative;
+}
+.chart-col:hover {
+  background: color-mix(in srgb, var(--text-muted) 8%, transparent);
+  border-radius: 2px;
+}
+.chart-col:hover .chart-bar {
+  background: color-mix(in srgb, var(--working) 80%, white);
+}
+.chart-bar {
+  width: 100%;
   height: 2%;
   background: var(--working);
   border-radius: 2px 2px 0 0;
@@ -1434,4 +1453,9 @@ html, body {
   font-size: 11px;
   color: var(--text-dim);
   margin-left: 8px;
+}
+/* При наведении на колонку в hint выводятся живые цифры дня — выделяем,
+   чтобы взгляд находил их мгновенно. */
+.dashboard-chart-hint.active {
+  color: var(--text-primary);
 }
