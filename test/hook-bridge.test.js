@@ -17,7 +17,9 @@ function makeFakeSessions() {
     has: (tabId) => knownTabs.has(tabId),
     findBySessionId: (sid) => bySession.get(sid) || null,
     findUnboundByCwd: (cwd) => byCwd.get(cwd) || null,
-    applyHookEvent: (tabId, event, data) => calls.push({ tabId, event, data }),
+    applyHookEvent: (tabId, event, data, gen) => calls.push({
+      tabId, event, data, gen,
+    }),
   };
 }
 
@@ -46,7 +48,9 @@ test('маршрутизация по session_id доставляет applyHookE
     const port = await bridge.start();
     const res = await post(port, { event: 'Stop', data: { session_id: 'sess-1' } });
     assert.strictEqual(res.status, 200);
-    assert.deepStrictEqual(sessions.calls[0], { tabId: 'tab-1', event: 'Stop', data: { session_id: 'sess-1' } });
+    assert.deepStrictEqual(sessions.calls[0], {
+      tabId: 'tab-1', event: 'Stop', data: { session_id: 'sess-1' }, gen: null,
+    });
   } finally {
     bridge.stop();
   }
@@ -86,6 +90,7 @@ test('tabId, известный sessions, маршрутизируется на�
       tabId: 'tab-3',
       event: 'PreToolUse',
       data: { session_id: 'unknown-sess', tool_name: 'Bash' },
+      gen: null,
     });
   } finally {
     bridge.stop();
@@ -193,6 +198,59 @@ test('POST с text/plain content-type → 400, applyHookEvent не зовётс�
     const res = await post(port, { event: 'Stop', data: { session_id: 'sess-1' } }, { 'content-type': 'text/plain' });
     assert.strictEqual(res.status, 400);
     assert.strictEqual(sessions.calls.length, 0);
+  } finally {
+    bridge.stop();
+  }
+});
+
+// ---------- доп. находка ревью Task 1 фазы 7 (задача 5): гард поколения ----------
+// Мост сам НЕ решает, актуально ли поколение (это знает только sessions.js —
+// у него единственного есть текущий tab.gen) — его дело только вытащить gen
+// из payload и передать дальше как есть. Эти тесты проверяют именно
+// передачу/нормализацию, а не сам гард (тот покрыт test/sessions.test.js).
+
+test('gen: целое число в payload передаётся в applyHookEvent как есть', async () => {
+  const sessions = makeFakeSessions();
+  sessions.bySession.set('sess-1', 'tab-1');
+  const bridge = createHookBridge({ sessions, port: 0 });
+  try {
+    const port = await bridge.start();
+    const res = await post(port, { event: 'Stop', data: { session_id: 'sess-1' }, gen: 3 });
+    assert.strictEqual(res.status, 200);
+    assert.deepStrictEqual(sessions.calls[0], {
+      tabId: 'tab-1', event: 'Stop', data: { session_id: 'sess-1' }, gen: 3,
+    });
+  } finally {
+    bridge.stop();
+  }
+});
+
+test('gen: поле отсутствует в payload (сторонняя сессия/старый хук-скрипт) → null, не гардится', async () => {
+  const sessions = makeFakeSessions();
+  sessions.bySession.set('sess-1', 'tab-1');
+  const bridge = createHookBridge({ sessions, port: 0 });
+  try {
+    const port = await bridge.start();
+    const res = await post(port, { event: 'Stop', data: { session_id: 'sess-1' } });
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(sessions.calls[0].gen, null);
+  } finally {
+    bridge.stop();
+  }
+});
+
+test('gen: мусорное значение (строка, дробное) в payload нормализуется в null', async () => {
+  const sessions = makeFakeSessions();
+  sessions.bySession.set('sess-1', 'tab-1');
+  const bridge = createHookBridge({ sessions, port: 0 });
+  try {
+    const port = await bridge.start();
+    const res1 = await post(port, { event: 'Stop', data: { session_id: 'sess-1' }, gen: 'три' });
+    assert.strictEqual(sessions.calls[0].gen, null);
+    const res2 = await post(port, { event: 'Stop', data: { session_id: 'sess-1' }, gen: 1.5 });
+    assert.strictEqual(sessions.calls[1].gen, null);
+    assert.strictEqual(res1.status, 200);
+    assert.strictEqual(res2.status, 200);
   } finally {
     bridge.stop();
   }

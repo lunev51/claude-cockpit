@@ -978,3 +978,80 @@ test('restart чистит очередь вкладки — новая сесс
   mgr.applyHookEvent(a.tabId, 'Stop', {});
   assert.deepStrictEqual(factory.spawned[1].written, []);
 });
+
+// ---------- Доп. находка ревью Task 1 фазы 7 (задача 5): гард поколения хук-событий ----------
+// Маршрутизация хуков (hook-bridge.js) раньше не была привязана к поколению
+// pty — опоздавший Stop уже убитого/перезапущенного процесса мог долететь
+// ПОСЛЕ того, как в этой же вкладке поднялась новая сессия, и произвести
+// побочный эффект (вброс очереди промптов) уже в чужом, свежем поколении.
+// gen каждого спавна виден тестам через env.COCKPIT_TAB_GEN — тот же канал,
+// которым в проде реальный cockpit-hook.js получает его и кладёт в payload,
+// а hook-bridge.js прокидывает в applyHookEvent() (см. sessions.js/spawn()).
+
+test('applyHookEvent с устаревшим (не текущим) поколением игнорируется ЦЕЛИКОМ — опоздавший Stop убитого рестартом процесса не вбрасывает чужой элемент очереди в новую сессию и не трогает статус', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24); // спавн #1 — старое поколение
+  const staleGen = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+
+  mgr.restart(a.tabId); // спавн #2 — новое поколение (restart уже почистил очередь сам)
+  const currentGen = Number(factory.spawned[1].opts.env.COCKPIT_TAB_GEN);
+  assert.notStrictEqual(staleGen, currentGen, 'restart() должен был сменить поколение вкладки');
+
+  // Новая сессия получает СВОЙ собственный элемент очереди.
+  mgr.enqueue(a.tabId, 'для новой сессии');
+  const statusBefore = statusOf(events, a.tabId);
+
+  // Опоздавший Stop убитого спавна #1 долетает только сейчас, помеченный
+  // СВОИМ (устаревшим) поколением — не должен произвести НИКАКОГО побочного
+  // эффекта в текущем состоянии вкладки: ни вброса очереди, ни смены статуса.
+  mgr.applyHookEvent(a.tabId, 'Stop', {}, staleGen);
+  assert.deepStrictEqual(factory.spawned[1].written, [], 'опоздавший Stop не должен был писать в НОВЫЙ pty');
+  const changedAfterStale = queueChangedFor(events, a.tabId);
+  assert.deepStrictEqual(
+    changedAfterStale[changedAfterStale.length - 1].queue,
+    ['для новой сессии'],
+    'очередь новой сессии не должна была тронуться устаревшим событием',
+  );
+  assert.deepStrictEqual(statusOf(events, a.tabId), statusBefore, 'статус не должен был измениться устаревшим событием');
+
+  // Контрольная проверка: Stop с ПРАВИЛЬНЫМ (текущим) поколением по-прежнему
+  // работает как обычно — гард не сломал обычный путь, отсекает именно
+  // устаревшие события.
+  mgr.applyHookEvent(a.tabId, 'Stop', {}, currentGen);
+  assert.deepStrictEqual(factory.spawned[1].written, ['для новой сессии\r']);
+});
+
+test('applyHookEvent: gen не передан (обратная совместимость — внутренние вызовы) — гард не применяется, событие обрабатывается как обычно', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.enqueue(a.tabId, 'текст');
+  mgr.applyHookEvent(a.tabId, 'Stop', {}); // gen не передан вовсе
+  assert.deepStrictEqual(factory.spawned[0].written, ['текст\r']);
+});
+
+test('applyHookEvent: gen ТЕКУЩЕГО поколения (совпадает с tab.gen) — событие применяется как обычно', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  const gen = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  mgr.enqueue(a.tabId, 'текст');
+  mgr.applyHookEvent(a.tabId, 'Stop', {}, gen);
+  assert.deepStrictEqual(factory.spawned[0].written, ['текст\r']);
+});
+
+test('spawn: env несёт COCKPIT_TAB_GEN как строку текущего поколения, растущего с каждым спавном', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24); // спавн #1
+  mgr.restart(a.tabId); // спавн #2
+  const gen1 = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  const gen2 = Number(factory.spawned[1].opts.env.COCKPIT_TAB_GEN);
+  assert.ok(Number.isInteger(gen1) && gen1 > 0);
+  assert.ok(Number.isInteger(gen2) && gen2 > gen1, 'поколение второго спавна должно быть строго больше первого');
+});
