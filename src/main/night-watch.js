@@ -286,7 +286,12 @@ function createNightWatch({
       // может оказаться в прошлом. Планировать пробуждение «в прошлое»
       // означало бы, что scheduleWaitAt тут же выстрелит немедленно —
       // честнее сразу отказаться от детекта, как от «нечем планировать».
-      if (usage.fiveHour.resetsAt <= now()) {
+      // N2 (ре-ревью раунда 1): сравниваем МОМЕНТ ПРОБУЖДЕНИЯ (resetsAt +
+      // wakeMarginMs) с now(), а не сам resetsAt — иначе секундное
+      // расхождение часов клиент/сервер (resetsAt «только что в прошлом»)
+      // молча выбрасывало бы честный детект, и вкладка не продолжилась бы
+      // за ночь, хотя будильник на now()+почти-минута полностью рабочий.
+      if (usage.fiveHour.resetsAt + cfg.wakeMarginMs <= now()) {
         appendJournal({ type: 'no-resets-at', tabId, detail: 'resets-at-in-past' });
         emitChange();
         return;
@@ -397,10 +402,15 @@ function createNightWatch({
       emitChange();
 
       if (index + 1 < total) {
-        staggerTimer = setTimer(() => {
-          staggerTimer = null;
+        // N1 (ре-ревью раунда 1): замыкание обнуляет staggerTimer ТОЛЬКО
+        // если это всё ещё его собственный дескриптор — хвост прошлого
+        // взвода (переживший disarm→arm) иначе затирал бы живой хендл
+        // НОВОГО прохода, и dispose() тот таймер уже не снял бы.
+        const id = setTimer(() => {
+          if (staggerTimer === id) staggerTimer = null;
           runStagger(list, index + 1, total, newCount, gen);
         }, cfg.staggerMs);
+        staggerTimer = id;
       } else {
         wakePassInFlight = false;
         appendJournal({ type: 'wake-complete', detail: `${newCount} of ${total}` });
@@ -446,6 +456,13 @@ function createNightWatch({
         && usage.fiveHour && usage.fiveHour.percent < cfg.fiveHourThreshold);
 
       if (windowReset) {
+        // N3 (ре-ревью раунда 1): конкурентный детект, дорезолвившийся во
+        // время НАШЕГО await выше, мог успеть добавиться в pending И
+        // поставить свой waitTimer. Его вкладку заберёт текущий проход
+        // (list ниже), а вот его будильник без этой строки остался бы жить:
+        // выстрелил бы позже с пустым pending, сжёг слот maxResets и записал
+        // фантомный «wake-complete: 0 of 0».
+        stopWaitTimer();
         resetsHandled += 1; // потолок считается по пробуждениям, не по вкладкам (тонкость 5 брифа)
         retries = 0;
         wakePassInFlight = true; // держит блокер весь стаггер-проход, даже когда pending уже опустошён ниже

@@ -215,8 +215,13 @@ test('Critical 2: stale:true → трактуется как no-usage-data, pend
 // Critical 2, доп. санити-гард: resetsAt уже в прошлом относительно now() —
 // планировать пробуждение «назад во времени» нельзя (иначе будильник
 // стрельнул бы немедленно). Трактуем как «нечем планировать».
-test('Critical 2: resetsAt уже в прошлом → no-resets-at, будильник не планируется в прошлое', async () => {
-  const ctx = setup({ refreshUsage: async () => usageOk({ fiveHourPercent: 95, resetsAt: -5000 }) });
+// N2 (ре-ревью раунда 1) уточнил границу: отбрасывается только resetsAt,
+// у которого МОМЕНТ ПРОБУЖДЕНИЯ (resetsAt + wakeMarginMs) уже в прошлом —
+// ровно граница (равенство) сюда входит. resetsAt «чуть в прошлом» при ещё
+// будущем моменте пробуждения — честный детект, см. тест N2 ниже.
+test('Critical 2/N2: момент пробуждения (resetsAt+margin) в прошлом → no-resets-at, будильник не планируется', async () => {
+  // clock=0, resetsAt=-60000: resetsAt + wakeMarginMs(60000) = 0 <= now(0) — граница включительно.
+  const ctx = setup({ refreshUsage: async () => usageOk({ fiveHourPercent: 95, resetsAt: -60000 }) });
   ctx.nw.arm();
 
   await ctx.nw.onTabStop('tab1', 'working');
@@ -936,4 +941,116 @@ test('переданный config переопределяет дефолт (fiv
   ctx.nw.arm();
   await ctx.nw.onTabStop('tab1', 'working');
   assert.strictEqual(ctx.nw.snapshot().pendingCount, 1);
+});
+
+// === ре-ревью раунда 1: N1/N2/N3 ===
+
+// N2: resetsAt «только что в прошлом» (секундное расхождение часов клиент/
+// сервер) — детект НЕ выбрасывается: момент пробуждения resetsAt+margin ещё
+// в будущем, будильник полностью рабочий. Раньше гард сравнивал сам resetsAt
+// с now() и молча ронял честный детект — вкладка не продолжалась за ночь.
+test('N2: resetsAt чуть в прошлом (часы разошлись) → детект живёт, будильник на resetsAt+margin', async () => {
+  const clock = makeClock(10000);
+  const resetsAt = 7000; // на 3 секунды «в прошлом»
+  const ctx = setup({
+    clock,
+    refreshUsage: async () => usageOk({ fiveHourPercent: 96, resetsAt }),
+  });
+  ctx.nw.arm();
+
+  await ctx.nw.onTabStop('tab1', 'working');
+
+  const snap = ctx.nw.snapshot();
+  assert.strictEqual(snap.pendingCount, 1, 'детект не должен быть отброшен');
+  assert.strictEqual(snap.wakeAt, resetsAt + 60000); // 67000 > now=10000 — в будущем
+  assert.strictEqual(lastEntry(ctx).type, 'limit-stop');
+});
+
+// N1: хвост стаггера ПРОШЛОГО взвода (переживший disarm→arm) не должен
+// затирать живой дескриптор таймера нового прохода — иначе dispose() его
+// не снимет и «прервано» напишется уже после выхода из приложения.
+test('N1: выстрел хвоста старого взвода не обнуляет staggerTimer нового прохода', async () => {
+  // staggerMs больше wakeMarginMs — единственная конфигурация, где хвост
+  // старого прохода может дожить до стаггера нового (см. коммент N1 в ядре).
+  const cfg = { staggerMs: 100000, wakeMarginMs: 1000, retryMs: 500 };
+  const clock = makeClock(0);
+  const timers = fakeTimers();
+  const statuses = new Map([['a', 'done'], ['b', 'done'], ['c', 'done'], ['d', 'done']]);
+  const refreshUsage = makeUsageToggle({ resetsAt: 5000 });
+  const ctx = setup({ clock, timers, statuses, refreshUsage, config: cfg });
+  ctx.nw.arm();
+
+  // Взвод №1: две вкладки → пробуждение → первая сразу, хвост для второй запланирован.
+  await ctx.nw.onTabStop('a', 'working');
+  await ctx.nw.onTabStop('b', 'working');
+  refreshUsage.markReset();
+  clock.set(7000);
+  const wait1 = ctx.timers.lastId();
+  await ctx.timers.fire(wait1); // doWake: резюм 'a', хвост 'b' на +staggerMs
+  const oldTail = ctx.timers.lastId();
+
+  // Перевзвод: хвост старого прохода ещё жив (staggerMs=100000 больше
+  // wakeMarginMs=1000, см. комментарий у cfg выше). Новый детект тут не
+  // нужен — для N1 достаточно, что выстрел хвоста не трогает чужое
+  // состояние И что после него dispose() снимает всё живое.
+  ctx.nw.disarm();
+  ctx.nw.arm();
+  const before = ctx.nw.snapshot();
+  await ctx.timers.fire(oldTail); // хвост старого взвода (delta >= 2 — молчание)
+  const after = ctx.nw.snapshot();
+  assert.deepStrictEqual(
+    { armed: after.armed, pendingCount: after.pendingCount, journalLen: after.journal.length },
+    { armed: before.armed, pendingCount: before.pendingCount, journalLen: before.journal.length },
+    'хвост старого взвода не должен менять состояние нового',
+  );
+  // Ключевой ассерт N1: dispose снимает ВСЕ живые таймеры — ничего не переживает его.
+  ctx.nw.dispose();
+  assert.strictEqual(ctx.timers.liveCount(), 0, 'после dispose живых таймеров быть не должно');
+});
+
+// N3: детект, дорезолвившийся во время await пробуждения, ставил СВОЙ
+// waitTimer, который ветка windowReset не снимала: он стрелял позже с пустым
+// pending, сжигал слот maxResets и писал фантомный «wake-complete: 0 of 0».
+test('N3: windowReset снимает будильник конкурентного детекта — фантомного пробуждения нет', async () => {
+  const clock = makeClock(0);
+  const timers = fakeTimers();
+  const statuses = new Map([['a', 'done'], ['b', 'done']]);
+  let phase = 'limit'; // 'limit' → детекты видят 96%; 'reset' → пробуждение видит 10%
+  let releaseWake = null;
+  const refreshUsage = () => {
+    if (phase === 'limit') return Promise.resolve(usageOk({ fiveHourPercent: 96, resetsAt: 5000 }));
+    // Пробуждение: подвешиваем промис, чтобы тест успел вклинить конкурентный детект.
+    return new Promise((resolve) => {
+      releaseWake = () => resolve(usageOk({ fiveHourPercent: 10 }));
+    });
+  };
+  const ctx = setup({ clock, timers, statuses, refreshUsage });
+  ctx.nw.arm();
+
+  await ctx.nw.onTabStop('a', 'working');
+  const wait1 = ctx.timers.lastId();
+
+  phase = 'reset';
+  clock.set(66000);
+  const wakePromise = ctx.timers.fire(wait1); // doWake повис на refreshUsage
+
+  // Конкурентный детект во время await: пока doWake ждёт сеть, вкладка b
+  // упирается в лимит (детект идёт по СВОЕЙ фазе — подсовываем через
+  // прямой резолв: phase уже 'reset', поэтому шлём Stop руками с limit-фазой).
+  phase = 'limit';
+  const detectPromise = ctx.nw.onTabStop('b', 'working');
+  phase = 'reset';
+  await detectPromise; // b в pending, у него СВОЙ waitTimer
+  releaseWake();
+  await wakePromise;
+
+  // Ветка windowReset обязана была снять будильник конкурентного детекта:
+  // после завершения стаггер-прохода живых waitTimer'ов не остаётся.
+  // (Хвост стаггера для 'b' — часть текущего прохода, добиваем его.)
+  while (ctx.timers.liveCount() > 0) {
+    await ctx.timers.fire(ctx.timers.lastId());
+  }
+  const wakeCompletes = ctx.journal.entries.filter((e) => e.type === 'wake-complete');
+  assert.strictEqual(wakeCompletes.length, 1, 'ровно одно настоящее пробуждение');
+  assert.strictEqual(ctx.nw.snapshot().resetsHandled, 1, 'фантом не сжёг слот maxResets');
 });
