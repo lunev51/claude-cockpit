@@ -1,8 +1,17 @@
 'use strict';
 // Библиотека рецептов промптов и именованные воркспейсы (Phase 7, Task 4).
 // Два независимых плоских JSON-файла в userData:
-//   prompts.json:    [{id, title, text}]      — text может содержать плейсхолдеры {{имя}}
-//   workspaces.json: [{id, name, tabs:[{cwd, name}]}]
+//   prompts.json:            [{id, title, text}] — text может содержать плейсхолдеры {{имя}}
+//   workspaces-library.json: [{id, name, tabs:[{cwd, name}]}]
+// Имя второго файла НЕ workspaces.json (ревью раунд 1: исходное обоснование в
+// отчёте задачи — «коллизия с workspace.json» — было неверным, единственное и
+// множественное число не путаются на диске). Причина — читаемость: workspace.json
+// (манифест ТЕКУЩЕГО состава вкладок, workspace.js/createWorkspaceStore) и
+// workspaces.json отличались бы РОВНО одной буквой в одной папке — ловушка для
+// человека, который будет это отлаживать (два файла с почти неразличимыми
+// именами и разным назначением рядом на диске). workspaces-library.json читается
+// однозначно как «библиотека сохранённых профилей», а не «тот же манифест, только
+// во множественном числе».
 // Стиль — тот же, что у соседнего workspace.js (манифест воркспейса): путь к
 // файлу инжектируется вызывающим кодом (ipc.js резолвит его через
 // app.getPath('userData')), само чтение/запись — прямой fs, атомарно
@@ -21,9 +30,9 @@
 // что FIX 8 у workspace.js: битый file никогда не копируется в .bak, чтобы не
 // затереть страховку испорченным содержимым).
 //
-// extractPlaceholders()/fillPrompt() — чистые функции без единого обращения к
-// диску, вынесены отдельно от createRecipeStore(): им не нужен путь к файлу,
-// незачем прятать их за инстансом стора.
+// extractPlaceholders()/fillPrompt()/normalizeForPty() — чистые функции без
+// единого обращения к диску, вынесены отдельно от createRecipeStore(): им не
+// нужен путь к файлу, незачем прятать их за инстансом стора.
 
 const fs = require('fs');
 const path = require('path');
@@ -98,6 +107,23 @@ function isCurrentFileCorrupted(file, isValid) {
   }
 }
 
+// true, только если file СУЩЕСТВУЕТ, парсится и проходит isValid. В отличие
+// от isCurrentFileCorrupted() выше (где «файла нет» — НЕ битый, обычная
+// ветка первой записи), здесь «файла нет» — тоже false: используется
+// ensureDefaultPrompts() (Important 3, ревью раунд 1), где ОБА случая —
+// «файла нет вовсе» И «файл есть, но битый» — одинаково повод засеять
+// дефолты; отличать нужно только их ОБА от «файл валиден, но пуст»
+// (пользователь осознанно удалил все рецепты — это НЕ повод реанимировать
+// дефолты).
+function isFileValidJson(file, isValid) {
+  try {
+    const raw = fs.readFileSync(file, 'utf8');
+    return isValid(JSON.parse(raw));
+  } catch {
+    return false;
+  }
+}
+
 // Пишет list в file атомарно (temp+rename), никогда не бросает наружу (ошибку
 // только логируем — тот же приём, что workspace.js/writeNow). Перед
 // перезаписью — если текущее содержимое file битое, сохраняет его КАК ЕСТЬ в
@@ -157,6 +183,21 @@ function fillPrompt(text, values) {
   });
 }
 
+// normalizeForPty(text) → text с переносами строк, схлопнутыми в пробел, и
+// обрезанными пробелами по краям (Minor 8, ревью раунд 1). Текст рецепта
+// уходит в pty ОДНОЙ записью (app.js/runRecipe: term.write(tabId, `${text}\r`)) —
+// внутренний перенос строки терминал воспринимает как отдельный Enter: первая
+// строка ушла бы САМОСТОЯТЕЛЬНЫМ промптом раньше остальных, а если сессия в
+// этот момент показывает диалог разрешения — молча подтвердила бы его (та же
+// проектная ловушка, что и голый '\r', см. runRecipe/peek.js). Схлопывает ЛЮБУЮ
+// последовательность \r\n/\r/\n (и повторы подряд) в ОДИН пробел, а не в
+// пробел на каждый символ перевода строки — иначе несколько пустых строк
+// подряд превратились бы в вереницу пробелов.
+function normalizeForPty(text) {
+  if (typeof text !== 'string') return '';
+  return text.replace(/(\r\n|\r|\n)+/g, ' ').trim();
+}
+
 function createRecipeStore({ promptsFile, workspacesFile }) {
   function listPrompts() {
     return readList(promptsFile, isValidPromptsList);
@@ -182,6 +223,13 @@ function createRecipeStore({ promptsFile, workspacesFile }) {
     return entry;
   }
 
+  // deletePrompt(id): неизвестный id — намеренный no-op БЕЗ записи на диск
+  // (ревью раунд 1, Minor 10: рассматривали и вариант «писать всегда», но он
+  // означал бы, что даже удаление НЕСУЩЕСТВУЮЩЕГО рецепта на битом
+  // prompts.json тратит единственный шанс сохранить исходное повреждённое
+  // содержимое в .bak — на пустом месте, без единого реального изменения.
+  // Восстановление после порчи — забота ensureDefaultPrompts() ниже, не этой
+  // функции; тест на файл-не-тронут см. test/recipes.test.js).
   function deletePrompt(id) {
     if (typeof id !== 'string' || !id) return;
     const list = listPrompts();
@@ -190,12 +238,18 @@ function createRecipeStore({ promptsFile, workspacesFile }) {
     writeList(promptsFile, isValidPromptsList, next);
   }
 
-  // Первый запуск (файла ещё нет вовсе — ОТЛИЧАЕМ от «пользователь удалил все
-  // рецепты», когда файл существует и содержит []): засеваем DEFAULT_PROMPTS.
-  // Вызывается явно из ipc.js (не изнутри listPrompts()) — чтение не должно
-  // иметь побочных эффектов записи на диск.
+  // Первый запуск — засеваем DEFAULT_PROMPTS. «Первый запуск» — это ЛИБО
+  // файла нет вовсе, ЛИБО файл есть, но битый/неверной формы (Important 3,
+  // ревью раунд 1: раньше проверялся только fs.existsSync — повреждённый
+  // prompts.json навсегда оставлял палитру без единого рецепта, потому что
+  // ни один путь UI в этой задаче не вызывает savePrompt/deletePrompt —
+  // некому больше запустить repair через writeList, а .bak в такой ситуации
+  // не создавался НИКОГДА). Валидный, но ПУСТОЙ файл (пользователь осознанно
+  // удалил все рецепты) — это НЕ повод реанимировать дефолты, isFileValidJson
+  // отличает такой файл от битого. Вызывается явно из ipc.js (не изнутри
+  // listPrompts()) — чтение не должно иметь побочных эффектов записи на диск.
   function ensureDefaultPrompts() {
-    if (fs.existsSync(promptsFile)) return;
+    if (isFileValidJson(promptsFile, isValidPromptsList)) return;
     const seeded = DEFAULT_PROMPTS.map((p) => ({ id: crypto.randomUUID(), ...p }));
     writeList(promptsFile, isValidPromptsList, seeded);
   }
@@ -205,28 +259,48 @@ function createRecipeStore({ promptsFile, workspacesFile }) {
   }
 
   // saveWorkspace(name, tabs) → сохранённая запись, либо null при пустом
-  // имени. tabs — [{cwd, name}] (состав вкладок на момент сохранения,
-  // собирает вызывающий код из tabStore); элементы без cwd отбрасываются,
-  // отсутствующее/пустое name у вкладки подстраховано именем из cwd —
-  // соответствует форме, которую сама sessions.js даёт новой вкладке
-  // (path.basename(cwd)), так что список воркспейса не остаётся с пустыми
-  // именами вкладок в UI.
+  // (после трима) имени ИЛИ нулевом составе вкладок. tabs — [{cwd, name}]
+  // (состав вкладок на момент сохранения, собирает вызывающий код из
+  // tabStore); элементы без cwd отбрасываются, отсутствующее/пустое name у
+  // вкладки подстраховано именем из cwd так же, как sessions.js называет
+  // НОВУЮ вкладку (path.basename(cwd) || cwd, Minor 9 ревью раунд 1 — код и
+  // комментарий раньше расходились: комментарий обещал basename, код
+  // подставлял cwd целиком).
   function saveWorkspace(name, tabs) {
-    if (typeof name !== 'string' || !name.trim()) return null;
+    const trimmedName = typeof name === 'string' ? name.trim() : '';
     const list = Array.isArray(tabs) ? tabs : [];
     const cleanTabs = list
       .filter((t) => t && typeof t.cwd === 'string' && t.cwd)
       .map((t) => ({
         cwd: t.cwd,
-        name: typeof t.name === 'string' && t.name ? t.name : t.cwd,
+        name: typeof t.name === 'string' && t.name ? t.name : (path.basename(t.cwd) || t.cwd),
       }));
-    const entry = { id: crypto.randomUUID(), name, tabs: cleanTabs };
+    // Minor 6 (ревью раунд 1): пустое имя ПОСЛЕ трима ИЛИ нулевой состав
+    // вкладок (после фильтрации без cwd) — отказ без записи на диск:
+    // воркспейс без единой вкладки только захламляет палитру бесполезной
+    // строкой «Открыть воркспейс: …», которую и открыть-то нечем.
+    if (!trimmedName || cleanTabs.length === 0) return null;
+
     const all = listWorkspaces();
-    all.push(entry);
-    writeList(workspacesFile, isValidWorkspacesList, all);
+    // Сохранение под УЖЕ существующим именем (после трима) ПЕРЕЗАПИСЫВАЕТ
+    // запись НА МЕСТЕ (id сохраняется) — иначе повторное «Сохранить
+    // воркспейс…» под тем же именем копит неразличимые дубли, которые
+    // раньше можно было убрать только руками через файл (сценарий ревью:
+    // сохранил «работа», добавил вкладку, сохранил «работа» ещё раз).
+    const existing = all.find((w) => w.name === trimmedName);
+    const entry = {
+      id: existing ? existing.id : crypto.randomUUID(),
+      name: trimmedName,
+      tabs: cleanTabs,
+    };
+    const next = existing ? all.map((w) => (w.id === entry.id ? entry : w)) : [...all, entry];
+    writeList(workspacesFile, isValidWorkspacesList, next);
     return entry;
   }
 
+  // deleteWorkspace(id): та же логика намеренного no-op на неизвестном id,
+  // что deletePrompt выше (Minor 10, ревью раунд 1) — не тратим единственный
+  // шанс бэкапа битого файла на удаление того, чего и так не было.
   function deleteWorkspace(id) {
     if (typeof id !== 'string' || !id) return;
     const list = listWorkspaces();
@@ -247,5 +321,5 @@ function createRecipeStore({ promptsFile, workspacesFile }) {
 }
 
 module.exports = {
-  createRecipeStore, extractPlaceholders, fillPrompt,
+  createRecipeStore, extractPlaceholders, fillPrompt, normalizeForPty,
 };

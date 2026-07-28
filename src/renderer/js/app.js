@@ -45,6 +45,17 @@ let recipeForm = null;
 // (см. saveCurrentWorkspace) — палитра не отстаёт больше чем на один клик.
 let recipesCache = [];
 let workspacesCache = [];
+// Important 2 (ревью раунд 1): реентерабельность openWorkspace() — стаггер
+// открытия воркспейса живёт несколько секунд (1500мс × N вкладок) БЕЗ единой
+// визуальной блокировки UI; повторный вызов, пока первый ещё не закончился
+// (второй клик по «Открыть воркспейс…», в т.ч. на ДРУГОМ сохранённом
+// воркспейсе), запускал бы второй closeAllTabs()/стаггер поверх первого —
+// закрывал бы только что открытые первым циклом вкладки, а его собственный
+// setTimeout-хвост продолжал бы доливать вкладки уже после этого. Флаг
+// проверяется САМОЙ ПЕРВОЙ строкой openWorkspace() (раньше даже диалога
+// подтверждения) и снимается в finally — единственная ошибка внутри цикла не
+// должна навсегда заблокировать открытие воркспейсов до перезапуска.
+let workspaceOpenInFlight = false;
 // Task 3 фазы 4 (peek): tabId, для которого сейчас открыт поповер (или null).
 // Нужен, чтобы обработчик tab:status закрывал peek ТОЛЬКО когда статус меняет
 // именно ту вкладку, что сейчас показана в поповере — peek.hide() идемпотентна,
@@ -718,6 +729,13 @@ async function runRecipe(recipe) {
     if (!values) return; // Esc/клик вне формы — пользователь отменил
     text = await window.api.recipes.fillPrompt(recipe.text, values);
   }
+  // Minor 8 (ревью раунд 1): БЕЗУСЛОВНО (даже без плейсхолдеров) — внутренний
+  // перенос строки в тексте рецепта терминал воспринимает как отдельный
+  // Enter (первая строка ушла бы САМОСТОЯТЕЛЬНЫМ промптом раньше остальных, а
+  // диалог разрешения — молча подтверждён), та же проектная ловушка, что
+  // голый '\r'. normalizeForPty — чистая функция main/recipes.js, единственный
+  // источник истины (не дублируем regex здесь).
+  text = await window.api.recipes.normalizeForPty(text);
   // Ловушка из брифа: пустой/пробельный текст — НЕ отправляем голый '\r' в pty
   // (для диалога разрешения Claude Code это молчаливое согласие с вариантом
   // по умолчанию) — тот же guard, что peek.js/send().
@@ -766,27 +784,82 @@ async function closeAllTabs() {
 }
 
 async function openWorkspace(ws) {
-  await closeAllTabs();
-  const tabs = Array.isArray(ws && ws.tabs) ? ws.tabs : [];
-  let firstOpened = null;
-  for (let idx = 0; idx < tabs.length; idx++) {
-    const t = tabs[idx];
-    if (!t || typeof t.cwd !== 'string' || !t.cwd) continue;
-    try {
-      // Первая успешно поднятая вкладка становится видимой сразу — та же
-      // причина, что в restoreFlow (иначе пользователь смотрит в пустой
-      // терминал весь стаггер).
-      const tab = await openTab(t.cwd, { activate: !firstOpened });
-      if (tab && !firstOpened) firstOpened = tab;
-    } catch (err) {
-      // Одна неоткрывшаяся вкладка не должна обрывать открытие остальных —
-      // та же логика, что finding 2a у restoreFlow.
-      console.warn(`[workspace] не удалось открыть вкладку ${t.cwd}:`, err);
-    }
-    if (idx < tabs.length - 1) {
-      await new Promise((r) => setTimeout(r, 1500));
-    }
+  // Important 2 (ревью раунд 1): гард — САМАЯ ПЕРВАЯ строка, раньше даже
+  // restoreOverlaySkip()/диалога подтверждения ниже. Повторный вызов, пока
+  // предыдущий стаггер ещё не завершился, — молчаливый no-op (см. подробности
+  // у объявления workspaceOpenInFlight выше).
+  if (workspaceOpenInFlight) return;
+
+  // Important 1 (ревью раунд 1): оверлей restore мог всё ещё быть на экране
+  // (решение не принято, wsync инертен) — палитра рисуется ПОВЕРХ него
+  // (z-index 60 против 30 у restore) и технически доступна раньше решения по
+  // восстановлению. Открытие именованного воркспейса = неявный отказ от
+  // restore (тот же приём, что newProject() выше) — иначе стаггер этой
+  // функции и ПОЗЖЕ принятое «Восстановить всё» доливают вкладки друг на
+  // друга (дубли вкладок И дубли живых сессий Claude в тех же cwd). Инвариант:
+  // пока restoreOverlaySkip не null, tabStore ВСЕГДА пуст (restoreFlow гасит
+  // сам себя первой строкой и обнуляет restoreOverlaySkip ДО открытия хотя бы
+  // одной вкладки) — поэтому currentCount ниже в этом случае всегда 0 и
+  // диалог подтверждения корректно не покажется (спрашивать нечего).
+  if (restoreOverlaySkip) restoreOverlaySkip();
+
+  const currentCount = tabStore.order().length;
+  if (currentCount > 0) {
+    // Требование (не из автоматического ревью, но блокирующее): действие
+    // необратимо — убивает N живых сессий Claude, а манифест воркспейса тут
+    // же перезаписывается пустым составом по мере закрытия каждой вкладки
+    // (tabs:changed → syncWorkspace), то есть sessionId для --resume из него
+    // исчезают безвозвратно. Один Enter не должен уметь это сделать без
+    // явного подтверждения. Нулевой текущий состав — спрашивать нечего.
+    const wordTabs = currentCount === 1 ? 'вкладка будет закрыта' : 'вкладок будут закрыты';
+    const confirmed = await recipeForm.open({
+      title: `Открыть воркспейс «${ws.name}»? Текущие ${currentCount} ${wordTabs}`,
+      fields: [],
+    });
+    if (!confirmed) return; // Esc/«Отмена»/клик вне — пользователь передумал
   }
+
+  workspaceOpenInFlight = true;
+  try {
+    await closeAllTabs();
+    const tabs = Array.isArray(ws && ws.tabs) ? ws.tabs : [];
+    let firstOpened = null;
+    for (let idx = 0; idx < tabs.length; idx++) {
+      const t = tabs[idx];
+      if (!t || typeof t.cwd !== 'string' || !t.cwd) continue;
+      try {
+        // Первая успешно поднятая вкладка становится видимой сразу — та же
+        // причина, что в restoreFlow (иначе пользователь смотрит в пустой
+        // терминал весь стаггер).
+        const tab = await openTab(t.cwd, { activate: !firstOpened });
+        if (tab && !firstOpened) firstOpened = tab;
+      } catch (err) {
+        // Одна неоткрывшаяся вкладка не должна обрывать открытие остальных —
+        // та же логика, что finding 2a у restoreFlow.
+        console.warn(`[workspace] не удалось открыть вкладку ${t.cwd}:`, err);
+      }
+      if (idx < tabs.length - 1) {
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+    }
+  } finally {
+    // Important 2: флаг обязан сброситься даже при непредвиденной ошибке
+    // внутри цикла (per-tab ошибки уже гасятся выше, но подстраховка снаружи —
+    // тот же приём, что restoreFlow/finally) — иначе одна ошибка навсегда
+    // блокирует «Открыть воркспейс» до перезапуска кокпита.
+    workspaceOpenInFlight = false;
+  }
+}
+
+// Действие палитры «Удалить воркспейс: <name>» (Minor 6, ревью раунд 1): без
+// него дубли/устаревшие записи в workspaces-library.json (например, от старой
+// схемы именования до дедупа saveWorkspace по имени) можно было почистить
+// только руками через файл. Низкие ставки по сравнению с «Открыть
+// воркспейс…» (не трогает живые сессии, отменяется повторным сохранением под
+// тем же именем) — отдельного подтверждения не требует.
+async function deleteNamedWorkspace(id) {
+  await window.api.recipes.deleteWorkspace(id);
+  await refreshWorkspacesCache();
 }
 
 // Task 4 фазы 4 (палитра команд): полный список действий, собирается заново
@@ -795,6 +868,14 @@ async function openWorkspace(ws) {
 // вкладкой (restart/hooks/compact/remote-control) добавляются, только если
 // активная вкладка вообще есть — иначе им нечего делать.
 function buildPaletteActions() {
+  // Minor 5 (ревью раунд 1): пользователь правит prompts.json руками —
+  // единственный способ пополнить библиотеку рецептов в этой задаче.
+  // Fire-and-forget — buildPaletteActions() обязана остаться СИНХРОННОЙ
+  // (palette.js зовёт getActions() без await, см. palette.js/open()), так
+  // что эта правка обновит recipesCache уже к СЛЕДУЮЩЕМУ открытию палитры,
+  // без перезапуска кокпита.
+  refreshRecipesCache();
+
   const actions = [];
 
   for (const tabId of tabStore.order()) {
@@ -864,6 +945,15 @@ function buildPaletteActions() {
       title: `Открыть воркспейс: ${w.name}`,
       hint: `${n} ${n === 1 ? 'вкладка' : 'вкладок'}`,
       run: () => openWorkspace(w),
+    });
+    // Minor 6 (ревью раунд 1): «Удалить воркспейс: <name>» — без него
+    // накопленный мусор (дубли до дедупа saveWorkspace по имени, устаревшие
+    // профили) можно было почистить только руками через файл.
+    actions.push({
+      id: `workspace-delete:${w.id}`,
+      title: `Удалить воркспейс: ${w.name}`,
+      hint: 'из библиотеки, не трогает открытые вкладки',
+      run: () => deleteNamedWorkspace(w.id),
     });
   }
 

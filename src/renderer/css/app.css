@@ -1275,6 +1275,15 @@ html, body {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
+/* Форма-подтверждение без полей (ревью раунд 1: «Открыть воркспейс…») — те же
+   кнопки, что #restore-overlay/.restore-actions, тот же приём переиспользования
+   .sidebar-btn вместо отдельного набора цветов под две кнопки. */
+.recipe-form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.recipe-form-actions .sidebar-btn { flex: none; }
 .recipe-form-hint {
   font-size: 10px;
   color: var(--text-dim);

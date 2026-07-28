@@ -23,7 +23,9 @@ const { createCcusage } = require('./usage-ccusage');
 const { createGitInfo } = require('./git-info');
 const { createGhInfo } = require('./gh-info');
 const { createHistoryIndex } = require('./history-index');
-const { createRecipeStore, extractPlaceholders, fillPrompt } = require('./recipes');
+const {
+  createRecipeStore, extractPlaceholders, fillPrompt, normalizeForPty,
+} = require('./recipes');
 
 let manager = null;
 let smokeOutput = '';
@@ -1070,11 +1072,19 @@ function registerIpc(win, opts = {}) {
   // выше по файлу не гейтятся) — просто безвредный no-op на пустых values.
   ipcMain.handle('recipes:fillPrompt', (_e, text, values) => fillPrompt(text, values));
 
+  // Minor 8 (ревью раунд 1): нормализация переносов строк перед записью в pty —
+  // тоже чистая функция без диска, тот же довод, что recipes:fillPrompt выше,
+  // не гейтим smoke'ом. Зовётся app.js/runRecipe БЕЗУСЛОВНО (даже без
+  // плейсхолдеров), чтобы внутренний \n текста рецепта не ушёл в терминал
+  // отдельным Enter (в т.ч. молчаливым подтверждением диалога разрешения).
+  ipcMain.handle('recipes:normalizeForPty', (_e, text) => normalizeForPty(text));
+
   // Именованные воркспейсы (Task 4 фазы 7): listWorkspaces/saveWorkspace —
   // палитра читает и пишет их напрямую (действия «Открыть воркспейс: <name>»/
-  // «Сохранить воркспейс…», см. app.js). deleteWorkspace пока без UI-действия
-  // (бриф явно требует только сохранение/открытие) — тот же задел на будущее,
-  // что recipes:deletePrompt выше.
+  // «Сохранить воркспейс…», см. app.js). deleteWorkspace (ревью раунд 1,
+  // Minor 6) — теперь тоже за действием палитры «Удалить воркспейс: <name>»
+  // (без него накопленный дублями/устаревший мусор в workspaces-library.json
+  // можно было почистить только руками через файл).
   ipcMain.handle('recipes:listWorkspaces', () => {
     if (smoke) return [];
     return recipeStore.listWorkspaces();

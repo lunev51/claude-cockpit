@@ -119,6 +119,9 @@ contextBridge.exposeInMainWorld('api', {
     // используется ПОСЛЕ мини-формы ввода, перед записью текста в pty
     // активной вкладки (см. app.js/runRecipe).
     fillPrompt: (text, values) => ipcRenderer.invoke('recipes:fillPrompt', text, values),
+    // Minor 8 (ревью раунд 1): нормализация \r?\n → пробел перед записью в
+    // pty — см. main/ipc.js/'recipes:normalizeForPty' и app.js/runRecipe.
+    normalizeForPty: (text) => ipcRenderer.invoke('recipes:normalizeForPty', text),
     listWorkspaces: () => ipcRenderer.invoke('recipes:listWorkspaces'),
     saveWorkspace: (name, tabs) => ipcRenderer.invoke('recipes:saveWorkspace', name, tabs),
     deleteWorkspace: (id) => ipcRenderer.invoke('recipes:deleteWorkspace', id),
