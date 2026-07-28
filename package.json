@@ -1,7 +1,13 @@
 {
   "name": "claude-cockpit",
-  "version": "0.1.0",
-  "description": "Cockpit для Claude Code: вкладки-проекты, авто-resume, дашборд лимитов",
+  "version": "1.0.0",
+  "description": "Multi-project command center for Claude Code: tabs, live hook-driven statuses, workspace restore, prompt queue, history search, usage dashboards",
+  "author": "lunev51",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lunev51/claude-cockpit.git"
+  },
   "main": "src/main/main.js",
   "scripts": {
     "start": "electron .",
