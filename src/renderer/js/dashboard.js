@@ -386,7 +386,11 @@ export function createDashboard({
 
       if (hintEl) {
         col.addEventListener('mouseenter', () => {
-          hintEl.textContent = `${formatShortDate(d.date)} · ${formatUsd(d.costUsd)} · ${formatTokens(d.tokens)} токенов`;
+          // «(вкл. кэш)» — живая приёмка фазы 7: 97% дневных токенов обычно
+          // кэш-чтения (перечитывание контекста на каждый запрос), они в
+          // ~10 раз дешевле обычного ввода — поэтому токены и высота
+          // столбика ($) друг другу не пропорциональны, и это не баг.
+          hintEl.textContent = `${formatShortDate(d.date)} · ${formatUsd(d.costUsd)} · ${formatTokens(d.tokens)} токенов (вкл. кэш)`;
           hintEl.classList.add('active');
         });
         col.addEventListener('mouseleave', () => {
