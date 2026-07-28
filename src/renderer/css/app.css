@@ -1095,6 +1095,11 @@ html, body {
   background: color-mix(in srgb, var(--bg-window) 55%, transparent);
   display: flex;
   justify-content: center;
+  /* Живая приёмка фазы 7: без align-items флекс растягивал панель на всю
+     высоту оверлея (align-items:stretch по умолчанию) — рамка занимала 70vh
+     при списке в 320px, под ним зияла пустота. flex-start = панель по
+     содержимому; recipe-form/hotkeys с самого начала сделаны правильно. */
+  align-items: flex-start;
   padding-top: 96px;
   z-index: 60;
 }
@@ -1180,6 +1185,9 @@ html, body {
   background: color-mix(in srgb, var(--bg-window) 55%, transparent);
   display: flex;
   justify-content: center;
+  /* Тот же баг растяжения, что у .palette-overlay выше, — панель поиска
+     занимала 70vh независимо от числа результатов. */
+  align-items: flex-start;
   padding-top: 96px;
   z-index: 60;
 }
