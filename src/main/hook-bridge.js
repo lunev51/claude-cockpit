@@ -72,8 +72,15 @@ function createHookBridge({ sessions, port = 0, portFile = null }) {
       }
       const data = (parsed.data && typeof parsed.data === 'object') ? parsed.data : {};
       // gen — Number.isInteger отсекает мусор/отсутствие поля (сторонний
-      // POST, гипотетический старый хук-скрипт без COCKPIT_TAB_GEN) в null —
-      // sessions.applyHookEvent() в этом случае просто не гардит поколение.
+      // POST, гипотетический старый хук-скрипт без COCKPIT_TAB_GEN) в null.
+      // I4 (ревью финальной волны фазы 7): null здесь — НЕ «гард полностью
+      // выключен» (это было бы дырой — сторонний процесс мог бы вбросить
+      // очередь в чужой pty через session_id-маршрутизацию выше), а «нет
+      // доказательства поколения»: sessions.applyHookEvent() в этом случае
+      // всё ещё применяет статус (заявленная фича port-file — сторонние
+      // сессии двигают статус), но НЕ даёт побочному эффекту (вброс очереди)
+      // случиться без доказанного (числового и совпавшего) gen — подробности
+      // и обоснование узкого фикса в sessions.js/applyHookEvent.
       const gen = Number.isInteger(parsed.gen) ? parsed.gen : null;
       let routed = false;
       try { routed = route(parsed.event, data, parsed.tabId, gen); } catch (err) {
