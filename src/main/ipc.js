@@ -192,27 +192,84 @@ function trackChild(child) {
   return child;
 }
 
-// Мягко «убивает» дерево процессов по pid: taskkill /PID <pid> /T БЕЗ /F —
-// это просьба закрыться штатно (аналог закрытия окна), а не принудительное
-// завершение. Правила проекта запрещают taskkill /F (жёсткое убийство) —
-// если процесс её проигнорирует, он остаётся висеть до собственного
-// завершения; это осознанный компромисс, зафиксированный в брифе задачи.
-// /T — рекурсивно по всему дереву потомков указанного pid (это и лечит
-// проблему (а) в комментарии реестра выше: убивает не только cmd.exe, но и
-// его внука node/gh). Код возврата taskkill не проверяем — он падает, если
-// процесс уже успел завершиться сам между таймаутом/dispose и этим вызовом,
-// и это не ошибка.
+// Убивает дерево процессов по pid: taskkill /PID <pid> /T /F.
+//
+// УТОЧНЁННОЕ ПРАВИЛО ПРОЕКТА (после живой проверки задачи 5): запрет на
+// `taskkill /F` касается ЗАВЕРШЕНИЯ САМОГО ПРИЛОЖЕНИЯ КОКПИТА в тестах и
+// живых проверках — жёсткое убийство электрона мимо его обработчиков выхода
+// прячет баги (так один раз проглядели обнуление манифеста воркспейса).
+// К ЭТИМ процессам (headless-помощники runCcusage/gitRun/ghRun — npx/gh/git)
+// это соображение не относится: у них нет состояния, которое нужно сохранить
+// корректным выходом, они headless (нет окна/UI, которые могли бы потерять
+// несохранённое), и killProcessTree() зовётся ТОЛЬКО когда они уже либо
+// просрочили свой собственный таймаут (killTreeOnTimeout), либо приложение
+// закрывается, а они всё ещё висят (disposeSessions()) — то есть их штатное
+// время уже вышло. Здесь `/F` — не обход правила, а его точное применение:
+// для завершения ПОМОЩНИКОВ (не самого кокпита) он разрешён и необходим.
+//
+// Почему обязателен именно `/F`: эмпирически проверено (см. отчёт задачи 5) —
+// `taskkill /PID <pid> /T` БЕЗ `/F` на Windows структурно не может закрыть
+// headless-дерево (node.exe/gh.exe/git.exe без своего окна): ОС отвечает
+// «этот процесс можно завершить только принудительно», причём даже когда
+// цель ещё жива на момент вызова. То есть без `/F` вызов — чистая
+// косметика: создаёт ложное ощущение, что уборка сработала, а внук остаётся
+// висеть точно так же, как и без всякого фикса. `/T` — рекурсивно по всему
+// дереву потомков (лечит проблему (а) в комментарии реестра выше — убивает
+// не только cmd.exe, но и его внука node/gh).
+//
+// Колбэк-заглушка ниже — код возврата/ошибку taskkill сознательно
+// проглатываем: она падает, если процесс уже успел завершиться сам между
+// таймаутом/dispose и этим вызовом (гонка, не баг), и в любом случае это
+// best-effort уборка ПОСЛЕ факта — её неуспех не должен прерывать
+// (ни синхронно бросить, ни залогировать шумно) выход самого приложения.
 function killProcessTree(pid) {
   if (typeof pid !== 'number') return;
-  execFile('taskkill', ['/PID', String(pid), '/T'], { windowsHide: true }, () => {});
+  execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, () => {});
 }
 
 // Убивает дерево ПО ТАЙМАУТУ (err.killed — execFile сам взвёл SIGTERM/kill,
 // потому что процесс не уложился в options.timeout): по обычному коду
 // завершения (в т.ч. code!=0) дерево трогать не нужно — процесс и так уже
 // закончился сам, taskkill там был бы просто лишним no-op вызовом.
+// ВАЖНО (найдено живой проверкой задачи 5, после перехода на /F): это
+// ВТОРИЧНЫЙ, подстраховочный вызов — к моменту, когда колбэк execFile вообще
+// срабатывает с err.killed:true, Node УЖЕ дождался смерти child (это и есть
+// смысл колбэка — «процесс завершился»), то есть child.pid к этому моменту
+// как правило МЁРТВ, и taskkill /PID <мёртвый pid> /T /F не находит его,
+// чтобы пройтись по /T («не удалось найти этот процесс» — воспроизведено
+// эмпирически). Основную работу по факту делает armKillWatchdog() ниже —
+// он бьёт по дереву, ПОКА родитель ещё жив, ДО того как это увидит Node.
 function killTreeOnTimeout(err, child) {
   if (err && err.killed) killProcessTree(child.pid);
+}
+
+// Запас времени, на который наш собственный вотчдог должен сработать РАНЬШЕ,
+// чем options.timeout самого execFile.
+const KILL_WATCHDOG_GUARD_MS = 500;
+
+// Проактивный вотчдог: форсит ДЕРЕВО по child.pid чуть РАНЬШЕ, чем истечёт
+// options.timeout execFile. Причина существования этой функции — тот же
+// вывод живой проверки, что и в комментарии killTreeOnTimeout выше: если
+// положиться ИСКЛЮЧИТЕЛЬНО на err.killed постфактум (внутри колбэка), к
+// этому моменту Node уже сам дождался смерти child и вызвал колбэк — то
+// есть pid уже мёртв, и taskkill (что с /F, что без) физически не может его
+// найти, чтобы пройтись по /T, а обречённый внук (node/gh) остаётся жить.
+// Вотчдог с ЧУТЬ меньшей задержкой (`timeoutMs - KILL_WATCHDOG_GUARD_MS`)
+// форсит дерево, ПОКА и cmd.exe/git/gh, и его потомки ЕЩЁ живы — это и есть
+// сценарий, который живая проверка подтвердила рабочим (taskkill /T /F
+// реально убивает всё дерево целиком, если процесс ещё существует на
+// момент вызова). Сам options.timeout execFile остаётся как страховочный
+// бэкстоп на случай, если наш вотчдог почему-то не сработал вовремя —
+// двойной защиты не бывает лишней, а повторный/поздний killProcessTree на
+// уже мёртвый pid безвреден (см. killProcessTree — ошибку глотаем).
+// .unref() — вотчдог не должен сам по себе держать процесс живым, если всё
+// остальное уже завершилось (симметрично stuckTimer/usageMonitorTimer ниже
+// по файлу).
+function armKillWatchdog(child, timeoutMs) {
+  const delay = Math.max(0, timeoutMs - KILL_WATCHDOG_GUARD_MS);
+  const timer = setTimeout(() => killProcessTree(child.pid), delay);
+  timer.unref?.();
+  return timer;
 }
 
 // Версия ccusage запинена сознательно (не @latest): скорость (npx не лезет
@@ -238,16 +295,19 @@ const CCUSAGE_PACKAGE = 'ccusage@20.0.19';
 // экранируются под shell:true) отсутствует.
 function runCcusage(args) {
   return new Promise((resolve) => {
+    const TIMEOUT_MS = 60000;
     const child = execFile('npx', ['--yes', CCUSAGE_PACKAGE, ...args], {
-      timeout: 60000,
+      timeout: TIMEOUT_MS,
       windowsHide: true,
       shell: true,
       maxBuffer: 16 * 1024 * 1024,
     }, (err, stdout, stderr) => {
+      clearTimeout(watchdog);
       killTreeOnTimeout(err, child);
       resolve({ code: err ? (err.code || 1) : 0, stdout: stdout || '', stderr: stderr || '' });
     });
     trackChild(child);
+    const watchdog = armKillWatchdog(child, TIMEOUT_MS);
   });
 }
 
@@ -261,15 +321,17 @@ function runCcusage(args) {
 // что usageHttpGet (20с), git локальный и обычно быстрее сети.
 function gitRun(args, cwd) {
   return new Promise((resolve, reject) => {
+    const TIMEOUT_MS = 15000;
     const child = execFile('git', args, {
-      cwd, windowsHide: true, timeout: 15000, maxBuffer: 10 * 1024 * 1024,
+      cwd, windowsHide: true, timeout: TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024,
     }, (err, stdout, stderr) => {
       // Задача 5 фазы 6: та же осторожность по таймауту, что и у runCcusage
-      // выше (реестр/killProcessTree в начале этого файла) — здесь без
-      // shell:true child и есть сам git.exe (не обёрнут в cmd.exe), но
-      // унификация раннеров важнее: killProcessTree(pid, /T) безвредна и для
-      // «бездетного» процесса, а если git когда-нибудь всё же породит
+      // выше (реестр/killProcessTree/armKillWatchdog в начале этого файла) —
+      // здесь без shell:true child и есть сам git.exe (не обёрнут в cmd.exe),
+      // но унификация раннеров важнее: killProcessTree(pid, /T /F) безвредна
+      // и для «бездетного» процесса, а если git когда-нибудь всё же породит
       // потомка (hook, pager), дерево уберётся тоже.
+      clearTimeout(watchdog);
       killTreeOnTimeout(err, child);
       if (err && err.code === 'ENOENT') {
         reject(err);
@@ -284,6 +346,7 @@ function gitRun(args, cwd) {
       resolve({ code, stdout: stdout || '', stderr: stderr || '' });
     });
     trackChild(child);
+    const watchdog = armKillWatchdog(child, TIMEOUT_MS);
   });
 }
 
@@ -302,12 +365,15 @@ function gitRun(args, cwd) {
 // maxBuffer 5 МБ — с запасом под JSON-ответы gh (бриф).
 function ghRun(args, cwd) {
   return new Promise((resolve, reject) => {
+    const TIMEOUT_MS = 30000;
     const child = execFile('gh', args, {
-      cwd, windowsHide: true, timeout: 30000, maxBuffer: 5 * 1024 * 1024, shell: true,
+      cwd, windowsHide: true, timeout: TIMEOUT_MS, maxBuffer: 5 * 1024 * 1024, shell: true,
     }, (err, stdout, stderr) => {
       // Задача 5 фазы 6: shell:true здесь — тот же класс проблемы, что и у
-      // runCcusage (комментарий у реестра выше) — child при таймауте нужно
-      // добивать деревом, а не просто оставлять cmd.exe/gh.exe висеть.
+      // runCcusage (реестр/killProcessTree/armKillWatchdog выше) — child при
+      // таймауте нужно добивать деревом ПРОАКТИВНО (см. armKillWatchdog),
+      // а не просто оставлять cmd.exe/gh.exe висеть.
+      clearTimeout(watchdog);
       killTreeOnTimeout(err, child);
       if (err && err.code === 'ENOENT') {
         reject(err);
@@ -317,6 +383,7 @@ function ghRun(args, cwd) {
       resolve({ code, stdout: stdout || '', stderr: stderr || '' });
     });
     trackChild(child);
+    const watchdog = armKillWatchdog(child, TIMEOUT_MS);
   });
 }
 
@@ -859,11 +926,12 @@ function disposeSessions() {
   if (manager) manager.disposeAll();
   // Задача 5 фазы 6 (carryover): если приложение закрывается, пока
   // runCcusage/gitRun/ghRun ещё выполняются (npx/git/gh), реестр liveChildren
-  // (см. выше) всё ещё держит их — добиваем ДЕРЕВО мягко (/T без /F, см.
-  // killProcessTree) для каждого. Снимок ключей в массив ДО цикла: сам
-  // taskkill асинхронный, но 'exit' на child может сработать синхронно в
-  // тестовых дублёрах — итерация по живой Map во время её же мутации
-  // недетерминирована.
+  // (см. выше) всё ещё держит их — добиваем ДЕРЕВО принудительно (/T /F, см.
+  // killProcessTree и уточнённое правило про /F там же — это headless-
+  // помощники без состояния, не сам кокпит) для каждого. Снимок ключей в
+  // массив ДО цикла: сам taskkill асинхронный, но 'exit' на child может
+  // сработать синхронно в тестовых дублёрах — итерация по живой Map во время
+  // её же мутации недетерминирована.
   for (const pid of [...liveChildren.keys()]) {
     killProcessTree(pid);
   }
