@@ -83,6 +83,15 @@ contextBridge.exposeInMainWorld('api', {
     // обмена или нет (main/screenshot.js) — возвращает {path} или null.
     paste: (tabId) => ipcRenderer.invoke('screenshot:paste', tabId),
   },
+  queue: {
+    // Task 1 фазы 7 (очередь промптов): fire-and-forget, тот же приём, что
+    // term.write/term.restart — состояние возвращается отдельно через
+    // queue:changed (onChanged), а не через возврат invoke().
+    add: (tabId, text) => ipcRenderer.send('queue:add', { tabId, text }),
+    remove: (tabId, index) => ipcRenderer.send('queue:remove', { tabId, index }),
+    clear: (tabId) => ipcRenderer.send('queue:clear', { tabId }),
+    onChanged: (cb) => ipcRenderer.on('queue:changed', (_e, p) => cb(p)),
+  },
   usage: {
     // Task 3 фазы 5 (кольца лимитов): {limits, spend} — снапшот слоя A
     // (usage-oauth.js) и последний известный ответ слоя B (usage-ccusage.js,

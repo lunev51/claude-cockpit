@@ -893,6 +893,31 @@ function registerIpc(win, opts = {}) {
     if (!validDim(cols) || !validDim(rows)) return;
     manager.resize(tabId, cols, rows);
   });
+
+  // Task 1 фазы 7 (очередь промптов): fire-and-forget, тот же приём, что
+  // term:write/term:restart выше — состояние возвращается отдельным событием
+  // (queue:changed, генерируется sessions.js и уходит через generic onEvent
+  // в начале registerIpc), синхронный ответ invoke() здесь не нужен.
+  ipcMain.on('queue:add', (_e, payload) => {
+    if (!payload || typeof payload !== 'object') return;
+    const { tabId, text } = payload;
+    if (typeof tabId !== 'string' || typeof text !== 'string') return;
+    manager.enqueue(tabId, text);
+  });
+
+  ipcMain.on('queue:remove', (_e, payload) => {
+    if (!payload || typeof payload !== 'object') return;
+    const { tabId, index } = payload;
+    if (typeof tabId !== 'string' || !Number.isInteger(index)) return;
+    manager.removeFromQueue(tabId, index);
+  });
+
+  ipcMain.on('queue:clear', (_e, payload) => {
+    if (!payload || typeof payload !== 'object') return;
+    const { tabId } = payload;
+    if (typeof tabId !== 'string') return;
+    manager.clearQueue(tabId);
+  });
 }
 
 // Форсирует немедленную запись манифеста (debounce workspace.js иначе может

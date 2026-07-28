@@ -55,6 +55,17 @@
         <div id="terminal-host"></div>
         <div id="diff-panel" class="hidden"></div>
       </div>
+      <!-- Task 1 фазы 7 (очередь промптов): строка чипов очереди и поле
+           ввода — МЕЖДУ терминалом (#main-row) и панелью действий (бриф).
+           #queue-bar скрыта, пока очередь пуста (см. app.js/renderQueueBar);
+           #queue-input-row скрыта, пока не открыта по Ctrl+Q (см.
+           app.js/openQueueInput). Оба наполняются программно — статичная
+           разметка здесь только контейнеры, тот же приём, что #diff-panel. -->
+      <div id="queue-bar" class="hidden"></div>
+      <div id="queue-input-row" class="hidden">
+        <input id="queue-input" type="text" autocomplete="off"
+               placeholder="Промпт в очередь — Enter добавит, Esc закроет" />
+      </div>
       <div id="action-bar">
         <div id="action-commands"></div>
         <div id="action-right">

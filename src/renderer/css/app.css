@@ -825,6 +825,84 @@ html, body {
 }
 .dashboard-github-error { color: var(--err); }
 
+/* --- Очередь промптов (Task 1 фазы 7): строка чипов НАД панелью действий
+   (см. index.html — между #main-row и #action-bar), плюс отдельное поле
+   ввода #queue-input (открывается Ctrl+Q, см. app.js). Оба — обычные
+   flex-соседи колонки #main (как #action-bar), НЕ оверлеи. --- */
+#queue-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: var(--bg-panel);
+  border-top: 1px solid var(--border);
+  font-family: var(--font-ui);
+  font-size: 11px;
+  overflow-x: auto;
+}
+#queue-bar.hidden { display: none; }
+.queue-chip {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 6px 3px 10px;
+  max-width: 320px;
+}
+.queue-chip-text {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.queue-chip-remove {
+  flex: none;
+  border: none;
+  background: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+  padding: 2px 3px;
+  border-radius: 50%;
+}
+.queue-chip-remove:hover { color: var(--text); background: var(--bg-hover); }
+.queue-hint {
+  flex: none;
+  margin-left: auto;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+/* Поле ввода очереди (Ctrl+Q) — отдельная строка, скрыта, пока не открыта. */
+#queue-input-row {
+  flex: none;
+  padding: 6px 10px;
+  background: var(--bg-panel);
+  border-top: 1px solid var(--border);
+}
+#queue-input-row.hidden { display: none; }
+#queue-input {
+  width: 100%;
+  background: var(--bg-window);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  padding: 6px 8px;
+}
+#queue-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 /* --- Панель действий (вместо отладочной статус-строки).
    Теперь внутри #main, после #terminal-host — flex-элемент колонки #main,
    поэтому по ширине автоматически равна терминалу (align-items: stretch по

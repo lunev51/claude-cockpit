@@ -815,3 +815,166 @@ test('ручной restart() САМ ПО СЕБЕ сбрасывает autoRecov
   assert.deepStrictEqual(factory.spawned[4].opts.args, []);
   assert.strictEqual(statusOf(events, a.tabId).status, 'working');
 });
+
+// ---------- Phase 7 Task 1: очередь промптов ----------
+
+const queueChangedFor = (events, tabId) => events
+  .filter((e) => e.channel === 'queue:changed' && e.payload.tabId === tabId)
+  .map((e) => e.payload);
+
+test('enqueue добавляет текст в конец очереди и эмитит queue:changed', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.enqueue(a.tabId, 'первый промпт');
+  mgr.enqueue(a.tabId, 'второй промпт');
+  const changed = queueChangedFor(events, a.tabId);
+  assert.strictEqual(changed.length, 2);
+  assert.deepStrictEqual(changed[1].queue, ['первый промпт', 'второй промпт']);
+});
+
+test('enqueue игнорирует пустой/пробельный текст — очередь не меняется, событие не эмитится', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.enqueue(a.tabId, '');
+  mgr.enqueue(a.tabId, '   ');
+  mgr.enqueue(a.tabId, '\t\n');
+  assert.strictEqual(queueChangedFor(events, a.tabId).length, 0);
+});
+
+test('removeFromQueue убирает элемент по индексу и эмитит queue:changed', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.enqueue(a.tabId, 'a');
+  mgr.enqueue(a.tabId, 'b');
+  mgr.enqueue(a.tabId, 'c');
+  mgr.removeFromQueue(a.tabId, 1);
+  const changed = queueChangedFor(events, a.tabId);
+  assert.deepStrictEqual(changed[changed.length - 1].queue, ['a', 'c']);
+});
+
+test('removeFromQueue с некорректным индексом — no-op, событие не эмитится', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.enqueue(a.tabId, 'a');
+  const before = queueChangedFor(events, a.tabId).length;
+  mgr.removeFromQueue(a.tabId, 5);
+  mgr.removeFromQueue(a.tabId, -1);
+  assert.strictEqual(queueChangedFor(events, a.tabId).length, before);
+});
+
+test('clearQueue опустошает очередь и эмитит queue:changed с пустым массивом', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.enqueue(a.tabId, 'a');
+  mgr.enqueue(a.tabId, 'b');
+  mgr.clearQueue(a.tabId);
+  const changed = queueChangedFor(events, a.tabId);
+  assert.deepStrictEqual(changed[changed.length - 1].queue, []);
+});
+
+test('clearQueue на уже пустой очереди — no-op, лишнего события нет', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.clearQueue(a.tabId);
+  assert.strictEqual(queueChangedFor(events, a.tabId).length, 0);
+});
+
+test('dequeueAll возвращает всю очередь и опустошает её, эмитит queue:changed', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.enqueue(a.tabId, 'a');
+  mgr.enqueue(a.tabId, 'b');
+  const drained = mgr.dequeueAll(a.tabId);
+  assert.deepStrictEqual(drained, ['a', 'b']);
+  const changed = queueChangedFor(events, a.tabId);
+  assert.deepStrictEqual(changed[changed.length - 1].queue, []);
+});
+
+test('Stop вбрасывает ПЕРВЫЙ элемент очереди в pty (text + \\r) и укорачивает очередь; статус не подделывается', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.enqueue(a.tabId, 'первый');
+  mgr.enqueue(a.tabId, 'второй');
+  mgr.applyHookEvent(a.tabId, 'Stop', {});
+  assert.deepStrictEqual(factory.spawned[0].written, ['первый\r']);
+  const changed = queueChangedFor(events, a.tabId);
+  assert.deepStrictEqual(changed[changed.length - 1].queue, ['второй']);
+  // Статус остаётся 'done' от самого Stop — вброс НЕ подделывает 'working',
+  // это придёт следующим хуком (UserPromptSubmit/PreToolUse) от реального CLI.
+  assert.strictEqual(statusOf(events, a.tabId).status, 'done');
+});
+
+test('Stop при пустой очереди ничего не пишет в pty и не эмитит queue:changed', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'Stop', {});
+  assert.deepStrictEqual(factory.spawned[0].written, []);
+  assert.strictEqual(queueChangedFor(events, a.tabId).length, 0);
+});
+
+test('Stop не вбрасывает, если pty мёртв — очередь не трогается (текст не теряется)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.enqueue(a.tabId, 'висит в очереди');
+  factory.spawned[0].opts.onExit(0); // proc умирает — tab.proc становится null
+  const before = queueChangedFor(events, a.tabId).length;
+  mgr.applyHookEvent(a.tabId, 'Stop', {}); // хук всё равно долетел уже после смерти pty
+  assert.deepStrictEqual(factory.spawned[0].written, []);
+  assert.strictEqual(queueChangedFor(events, a.tabId).length, before);
+});
+
+test('несколько Stop подряд вбрасывают элементы очереди строго по одному за раз', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.enqueue(a.tabId, 'one');
+  mgr.enqueue(a.tabId, 'two');
+  mgr.enqueue(a.tabId, 'three');
+  mgr.applyHookEvent(a.tabId, 'Stop', {});
+  assert.deepStrictEqual(factory.spawned[0].written, ['one\r']);
+  mgr.applyHookEvent(a.tabId, 'Stop', {});
+  assert.deepStrictEqual(factory.spawned[0].written, ['one\r', 'two\r']);
+  mgr.applyHookEvent(a.tabId, 'Stop', {});
+  assert.deepStrictEqual(factory.spawned[0].written, ['one\r', 'two\r', 'three\r']);
+  // Очередь исчерпана — четвёртый Stop подряд больше ничего не пишет.
+  mgr.applyHookEvent(a.tabId, 'Stop', {});
+  assert.deepStrictEqual(factory.spawned[0].written, ['one\r', 'two\r', 'three\r']);
+});
+
+test('close чистит очередь вкладки (queue:changed с пустым массивом до удаления)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.enqueue(a.tabId, 'x');
+  mgr.close(a.tabId);
+  const changed = queueChangedFor(events, a.tabId);
+  assert.deepStrictEqual(changed[changed.length - 1].queue, []);
+});
+
+test('restart чистит очередь вкладки — новая сессия не наследует чужой недоотправленный ввод', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.enqueue(a.tabId, 'x');
+  mgr.restart(a.tabId);
+  const changed = queueChangedFor(events, a.tabId);
+  assert.deepStrictEqual(changed[changed.length - 1].queue, []);
+  // Подтверждаем и функционально: следующий Stop ничего больше не вбрасывает.
+  mgr.applyHookEvent(a.tabId, 'Stop', {});
+  assert.deepStrictEqual(factory.spawned[1].written, []);
+});

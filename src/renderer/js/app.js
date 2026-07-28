@@ -57,6 +57,18 @@ let lastGh = null;
 // .busy (opacity/cursor:progress, см. app.css) — видимая обратная связь.
 let usageRefreshing = false;
 
+// Task 1 фазы 7 (очередь промптов): tabId → string[], зеркало server-side
+// очереди (main/sessions.js), собираемое ИСКЛЮЧИТЕЛЬНО из queue:changed
+// событий (см. boot() — window.api.queue.onChanged) — тот же приём, что
+// tabStore зеркалит tab:status. Нет отдельного «queue:get» IPC: до первого
+// enqueue для вкладки записи просто нет, что структурно совпадает с «очередь
+// пуста» (renderQueueBar() ниже трактует отсутствующий tabId как []).
+const queueByTab = new Map();
+// Поле ввода очереди (#queue-input, Ctrl+Q) — открыто/закрыто. Отдельно от
+// queueByTab: поле может быть открыто даже при пустой очереди (это и есть
+// способ добавить самый первый элемент).
+let queueInputOpen = false;
+
 // Fix 8 (ревью): точка в титлбаре терракотовая, только пока есть хотя бы одна
 // вкладка в статусе waiting.
 // Task 5 carryover фазы 4/5: раньше здесь был отдельный локальный Set
@@ -175,6 +187,76 @@ function renderActionBar() {
     });
     host.appendChild(btn);
   }
+}
+
+// Task 1 фазы 7 (очередь промптов): перерисовать строку чипов #queue-bar
+// из queueByTab для АКТИВНОЙ вкладки — очередь это ввод конкретной сессии,
+// чужая вкладка не должна показывать свои чипы поверх текущей. Пустая
+// очередь (или вкладки вообще нет) прячет строку целиком (бриф).
+function renderQueueBar() {
+  const host = $('queue-bar');
+  if (!host) return;
+  const tabId = tabStore.activeId;
+  const queue = (tabId && queueByTab.get(tabId)) || [];
+  host.textContent = '';
+  if (!queue.length) {
+    host.classList.add('hidden');
+    return;
+  }
+  host.classList.remove('hidden');
+  queue.forEach((text, index) => {
+    const chip = document.createElement('span');
+    chip.className = 'queue-chip';
+
+    const label = document.createElement('span');
+    label.className = 'queue-chip-text';
+    label.textContent = `${index + 1} · ${text}`;
+    label.title = text;
+    chip.appendChild(label);
+
+    const removeBtn = document.createElement('button');
+    removeBtn.type = 'button';
+    removeBtn.className = 'queue-chip-remove';
+    removeBtn.textContent = '✕';
+    removeBtn.title = 'Убрать из очереди';
+    // Fix 3 (ревью, тот же приём, что action-btn/tab-close): без preventDefault
+    // на mousedown кнопка забирает фокус у терминала/поля ввода раньше клика.
+    removeBtn.addEventListener('mousedown', (ev) => ev.preventDefault());
+    removeBtn.addEventListener('click', () => {
+      if (tabId) window.api.queue.remove(tabId, index);
+    });
+    chip.appendChild(removeBtn);
+
+    host.appendChild(chip);
+  });
+
+  const hint = document.createElement('span');
+  hint.className = 'queue-hint';
+  hint.textContent = 'уйдёт, когда Claude освободится';
+  host.appendChild(hint);
+}
+
+// Ctrl+Q открывает поле ввода очереди; Enter внутри него — enqueue и
+// ОСТАВИТЬ поле открытым (удобно набивать несколько промптов подряд, бриф);
+// Esc — закрыть и вернуть фокус терминалу активной вкладки (тот же приём
+// возврата фокуса, что peek.js/onHide — см. createPeek в boot()).
+function openQueueInput() {
+  const row = $('queue-input-row');
+  const input = $('queue-input');
+  if (!row || !input) return;
+  row.classList.remove('hidden');
+  queueInputOpen = true;
+  input.value = '';
+  input.focus();
+}
+
+function closeQueueInput() {
+  if (!queueInputOpen) return;
+  const row = $('queue-input-row');
+  row?.classList.add('hidden');
+  queueInputOpen = false;
+  const activeId = tabStore.activeId;
+  if (activeId) views.get(activeId)?.view.focus();
 }
 
 // Task 3 фазы 5 (кольца лимитов): перерисовать #limits из lastUsage.limits.
@@ -382,6 +464,10 @@ function activateTab(tabId) {
   // Task 4 фазы 5: та же логика — дашборд накрывает терминальную область
   // целиком, переключение вкладки под ним не должно оставлять его висеть.
   dashboard?.close();
+  // Task 1 фазы 7: очередь — ввод для КОНКРЕТНОЙ сессии; поле ввода, открытое
+  // для одной вкладки, не должно молча остаться висеть (и слать текст уже не
+  // в ту вкладку) после переключения на другую.
+  closeQueueInput();
   for (const [id, v] of views) v.container.classList.toggle('hidden', id !== tabId);
   tabStore.setActive(tabId);
   window.api.workspace.setActive(tabId); // main пересчитает activeIndex манифеста
@@ -389,6 +475,10 @@ function activateTab(tabId) {
   // панели диффа (бриф); setActiveTab сама не делает IPC, если панель сейчас
   // закрыта (см. diffpanel.js).
   diffPanel?.setActiveTab(tabId);
+  // Task 1 фазы 7: строка чипов очереди — перерисовать под НОВУЮ активную
+  // вкладку (queueByTab уже содержит её состояние, если хоть один
+  // queue:changed для неё приходил раньше).
+  renderQueueBar();
   // Task 4 фазы 6 (бейдж PR): активация вкладки — один из двух триггеров
   // обновления бейджа (второй — периодический таймер, см. boot()). Fire-and-
   // forget — сама функция никогда не бросает и обновляет tabStore асинхронно,
@@ -419,6 +509,11 @@ async function closeTab(tabId) {
   entry.view.dispose(); // отключает ResizeObserver и сам term (Task 6)
   entry.container.remove();
   views.delete(tabId);
+  // Task 1 фазы 7: локальное зеркало server-side очереди (main уже почистил
+  // свою половину внутри manager.close(), см. tabs:close в ipc.js) — без
+  // этого закрытая вкладка (tabId никогда не переиспользуется, это UUID)
+  // копилась бы в queueByTab до конца сессии кокпита.
+  queueByTab.delete(tabId);
   // Fix 8 / Task 5 carryover: закрытая вкладка больше не может «ждать» —
   // раньше это гарантировалось отдельным waitingTabs.delete(tabId) здесь же;
   // теперь это следует структурно из tabStore.remove(tabId) — строка (и её
@@ -437,11 +532,15 @@ async function closeTab(tabId) {
   // закрытие фоновой вкладки не должно перебивать фокус пользователя.
   if (!wasActive) return;
   if (fallback) {
-    activateTab(fallback); // activateTab сама зовёт diffPanel?.setActiveTab(fallback)
+    activateTab(fallback); // activateTab сама зовёт diffPanel?.setActiveTab(fallback)/renderQueueBar()
     return;
   }
   // Закрыли последнюю вкладку — панели диффа больше нечего показывать.
   diffPanel?.setActiveTab(null);
+  // Task 1 фазы 7: и очереди тоже — ни поля ввода, ни строки чипов без единой
+  // вкладки не должно оставаться (та же логика, что diffPanel выше).
+  closeQueueInput();
+  renderQueueBar();
 }
 
 // Task 3 фазы 4 (peek): клик (или Space) по строке waiting — открыть поповер
@@ -660,6 +759,21 @@ function bindHotkeys() {
       // не показывая результат.
       if (dashboard?.isOpen() || palette?.isOpen()) return;
       toggleDiffPanel();
+      return;
+    }
+    // Ctrl+Q — поле ввода очереди промптов (Task 1 фазы 7), тот же паттерн
+    // preventDefault/stopPropagation/toggle, что Ctrl+P/Ctrl+D/Ctrl+G выше:
+    // иначе xterm получил бы 'q'/'Q' в активный терминал. Гард по dashboard/
+    // palette — тот же приём, что Ctrl+G («Находка 14» выше): не открывать
+    // поле НЕВИДИМО под другим оверлеем, который перехватывает терминальную
+    // область целиком.
+    if (ev.ctrlKey && !ev.shiftKey && !ev.altKey
+        && (ev.key === 'q' || ev.key === 'Q' || ev.code === 'KeyQ')) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (dashboard?.isOpen() || palette?.isOpen()) return;
+      if (queueInputOpen) closeQueueInput();
+      else openQueueInput();
       return;
     }
     // Ctrl+1..9 — вкладка по индексу.
@@ -1007,6 +1121,17 @@ async function boot() {
   // вкладка) и держит дебаунс 1500мс — здесь только проводка канала.
   window.api.git.onChanged(({ tabId }) => diffPanel?.handleGitChanged(tabId));
 
+  // Task 1 фазы 7 (очередь промптов): queue:changed приходит и от enqueue/
+  // remove/clear (клик по ✕, поле ввода), и от вброса по Stop в main/sessions.js —
+  // единый источник истины, queueByTab всегда зеркалит server-side состояние
+  // независимо от того, кто инициировал изменение. Перерисовываем строку
+  // чипов, только если событие про СЕЙЧАС активную вкладку (чужой tabId не
+  // должен трогать то, что на экране).
+  window.api.queue.onChanged(({ tabId, queue }) => {
+    queueByTab.set(tabId, queue);
+    if (tabId === tabStore.activeId) renderQueueBar();
+  });
+
   // Task 2 фазы 4: клик по Windows-тосту — main прислал {tabId}. activateTab
   // сама тихо игнорирует неизвестный/уже закрытый tabId (views.get → undefined
   // → return), так что здесь ничего дополнительно проверять не нужно.
@@ -1054,6 +1179,26 @@ async function boot() {
   // Task 4 фазы 4: обработчик вынесен в newProject() — тот же сценарий
   // запускает и действие «Новый проект» в палитре команд.
   $('btn-new-tab').addEventListener('click', newProject);
+
+  // Task 1 фазы 7 (очередь промптов): Enter — поставить в очередь и ОСТАВИТЬ
+  // поле открытым (бриф — удобно набивать несколько промптов подряд), Esc —
+  // закрыть (closeQueueInput сама возвращает фокус терминалу активной
+  // вкладки). Пустой/пробельный текст main всё равно проигнорирует
+  // (sessions.js/enqueue), но очищаем поле в любом случае — так же, как peek
+  // не оставляет чужой черновик висеть.
+  const queueInputEl = $('queue-input');
+  queueInputEl?.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') {
+      ev.preventDefault();
+      const tabId = tabStore.activeId;
+      const text = queueInputEl.value;
+      if (tabId) window.api.queue.add(tabId, text);
+      queueInputEl.value = '';
+    } else if (ev.key === 'Escape') {
+      ev.preventDefault();
+      closeQueueInput();
+    }
+  });
 
   bindHotkeys();
 

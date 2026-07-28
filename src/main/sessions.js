@@ -75,6 +75,13 @@ function createSessionManager({
       sessionBound: false,     // true, только когда SessionStart реально привязал сессию (bindSession)
       status: null, subtitle: '', waitingText: '',
       lastOutputAt: now(),
+      // Очередь промптов (Task 1 фазы 7): ввод для КОНКРЕТНОЙ сессии этой
+      // вкладки — переживает обычное переключение вкладок, но НЕ переживает
+      // close()/restart() (см. соответствующие функции ниже). Вбрасывается
+      // строго по одному элементу на каждый хук Stop, только если pty жив
+      // (см. applyHookEvent) — статус после вброса не подделывается, он
+      // придёт следующим хуком от самого CLI.
+      queue: [],
       pendingExtraArgs: null,  // одноразовый оверрайд args на следующий spawn() (хотфикс restart, спека §3.14)
       overrideFailed: false,   // true = процесс с оверрайдом (--resume <id>/--resume) умер, а SessionStart так и не привязал сессию
       spawnedAt: 0,            // now() на момент последнего spawn() — мерило «быстрой смерти» для авто-восстановления
@@ -246,11 +253,72 @@ function createSessionManager({
     if (tab.proc) tab.proc.resize(cols, rows);
   }
 
+  // --- очередь промптов (Task 1 фазы 7) ---
+
+  // Пустой/пробельный текст молча игнорируется — не плодим бессмысленные
+  // элементы очереди и лишние queue:changed.
+  function enqueue(tabId, text) {
+    const tab = tabs.get(tabId);
+    if (!tab) return;
+    if (typeof text !== 'string' || !text.trim()) return;
+    tab.queue.push(text);
+    onEvent('queue:changed', { tabId, queue: tab.queue.slice() });
+  }
+
+  function removeFromQueue(tabId, index) {
+    const tab = tabs.get(tabId);
+    if (!tab) return;
+    if (!Number.isInteger(index) || index < 0 || index >= tab.queue.length) return;
+    tab.queue.splice(index, 1);
+    onEvent('queue:changed', { tabId, queue: tab.queue.slice() });
+  }
+
+  // Опустошает очередь; на уже пустой — no-op (не эмитит лишнее queue:changed).
+  // Переиспользуется close()/restart() ниже — очередь это ввод для конкретной
+  // сессии вкладки, не переживает ни закрытие, ни рестарт.
+  function clearQueue(tabId) {
+    const tab = tabs.get(tabId);
+    if (!tab || !tab.queue.length) return;
+    tab.queue = [];
+    onEvent('queue:changed', { tabId, queue: [] });
+  }
+
+  // Возвращает ВЕСЬ текущий массив очереди и опустошает её — в отличие от
+  // clearQueue (которая просто чистит), отдаёт вызывающему код снятое
+  // содержимое (на будущее — сценарии вроде «показать, что было в очереди»).
+  function dequeueAll(tabId) {
+    const tab = tabs.get(tabId);
+    if (!tab) return [];
+    const drained = tab.queue;
+    tab.queue = [];
+    onEvent('queue:changed', { tabId, queue: [] });
+    return drained;
+  }
+
+  // Вброс РОВНО ОДНОГО элемента очереди на хук Stop (спека задачи 1 фазы 7):
+  // только если pty жив — мёртвый процесс не должен терять текст пользователя,
+  // элемент остаётся в очереди до следующего живого Stop (после restart()
+  // очередь уже будет расчищена — см. restart() ниже, так что зависшие
+  // элементы этой веткой не разрастаются бесконечно). Статус НЕ трогаем —
+  // 'done', выставленный самим Stop чуть выше по applyHookEvent, останется,
+  // пока реальный CLI не пришлёт следующий хук (UserPromptSubmit/PreToolUse).
+  function injectQueuedOnStop(tab) {
+    if (!tab.proc || !tab.queue.length) return;
+    const text = tab.queue[0];
+    tab.proc.write(`${text}\r`);
+    tab.queue.shift();
+    onEvent('queue:changed', { tabId: tab.tabId, queue: tab.queue.slice() });
+  }
+
   // Рестарт «на месте» (Ctrl+Shift+R) не должен терять сессию — три уровня
   // деградации из спеки §3.14:
   function restart(tabId) {
     const tab = tabs.get(tabId);
     if (!tab) return;
+
+    // Очередь — ввод для СТАРОЙ сессии этой вкладки; новая жизнь (новый
+    // spawn ниже) не должна унаследовать чужой недоотправленный текст.
+    clearQueue(tabId);
 
     // Поколение растёт ДО kill() — так же, как в close(). Если фабрика (реальный
     // node-pty) синхронно зовёt onExit прямо из kill(), этот exit уже попадёт на
@@ -300,6 +368,9 @@ function createSessionManager({
   function close(tabId) {
     const tab = tabs.get(tabId);
     if (!tab) return;
+    // Очередь — ввод для ЭТОЙ сессии; закрытие вкладки не должно оставлять
+    // висящий queue:changed на несуществующий tabId ни у кого из подписчиков.
+    clearQueue(tabId);
     tab.gen += 1; // отсекаем любые будущие колбэки процесса
     if (tab.proc) {
       try { tab.proc.kill(); } catch { /* мог уже завершиться */ }
@@ -371,6 +442,10 @@ function createSessionManager({
         break;
       case 'Stop':
         setStatus(tab, 'done', '');
+        // Task 1 фазы 7 (очередь промптов): вбрасываем СТРОГО один элемент
+        // очереди на этот Stop — не всю очередь разом. Гарды (pty жив,
+        // очередь непуста) — внутри injectQueuedOnStop().
+        injectQueuedOnStop(tab);
         break;
       case 'PostToolUse':
         // Task 2 фазы 6 (панель диффа): PostToolUse — не сигнал ожидания и не
@@ -412,6 +487,7 @@ function createSessionManager({
   return {
     open, start, write, resize, restart, close, list, disposeAll,
     bindSession, has, findBySessionId, findUnboundByCwd, applyHookEvent, checkStuck,
+    enqueue, removeFromQueue, clearQueue, dequeueAll,
   };
 }
 
