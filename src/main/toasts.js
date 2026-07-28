@@ -76,8 +76,7 @@ function createToaster({
     if (status === 'dead') {
       // Вкладка мертва — дальше по этому tabId событий не будет; чистим карты,
       // чтобы они не копились бесконечно на каждую закрытую вкладку (finding 3).
-      workingSince.delete(tabId);
-      lastStatus.delete(tabId);
+      forget(tabId);
     }
 
     if (isSuppressed(tabId)) return;
@@ -101,7 +100,21 @@ function createToaster({
     show(tabId, `${tabName}: сессия завершилась`, '');
   }
 
-  return { onStatus };
+  // forget(tabId) (Task 5 carryover фазы 4/5, утечка карт): та же чистка, что
+  // onStatus уже делает на статусе 'dead' — вынесена сюда, чтобы её мог
+  // вызвать и вызывающий код НАПРЯМУЮ, минуя ожидание статуса dead. Нужно,
+  // потому что закрытие вкладки (tabs:close) НЕ гарантирует прихода dead в
+  // этот toaster: manager.close() в sessions.js инкрементит generation ДО
+  // kill() pty — события уже "неактуального" (закрытого) поколения попросту
+  // не долетают сюда, и workingSince/lastStatus по её tabId оставались бы в
+  // памяти НАВСЕГДА на каждую вкладку, закрытую пользователем (а не умершую
+  // естественно). ipc.js зовёт forget() из обработчика tabs:close.
+  function forget(tabId) {
+    workingSince.delete(tabId);
+    lastStatus.delete(tabId);
+  }
+
+  return { onStatus, forget };
 }
 
 module.exports = { createToaster };

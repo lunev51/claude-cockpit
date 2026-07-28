@@ -461,6 +461,13 @@ function registerIpc(win, opts = {}) {
     // рядом с самим закрытием вкладки.
     const tab = manager.list().find((t) => t.tabId === tabId);
     manager.close(tabId);
+    // Task 5 carryover фазы 4/5 (утечка карт в toasts.js): manager.close()
+    // инкрементит generation ДО kill() pty — закрытая (а не естественно
+    // умершая) вкладка не гарантированно эмитит статус 'dead' в этот тостер,
+    // так что без явного forget() записи workingSince/lastStatus по её tabId
+    // копились бы в памяти навсегда. Симметрично с уборкой ghost-файла ниже —
+    // обе чистки естественно живут рядом с самим закрытием вкладки.
+    if (toaster) toaster.forget(tabId);
     if (!smoke && tab && tab.ghostId) {
       try {
         fs.unlinkSync(ghostFile(tab.ghostId));

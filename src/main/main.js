@@ -127,6 +127,31 @@ function createWindow() {
       // (мусор перед курсором Claude Code), а не только открывает окно.
       e.preventDefault();
       win.webContents.toggleDevTools();
+      return;
+    }
+
+    // Carryover Task 5 фазы 5 (пункт 2, phase5-carryover-notes): Menu.setApplicationMenu(null)
+    // ниже уже срубил Ctrl+R как акселератор МЕНЮ (Housekeeping #14), но F12
+    // вернул доступ к DevTools — а внутри открытых DevTools Ctrl+R/F5 всё
+    // равно перезагружают renderer НАПРЯМУЮ, как обычные клавиши страницы,
+    // мимо меню. Перезагрузка поднимает boot() заново поверх ЖИВЫХ вкладок
+    // main-процесса (сам pty/manager не перезапускается) — дубликаты вкладок
+    // и второй restore-оверлей. Гасим её здесь же, тем же приёмом, что F12.
+    //
+    // КРИТИЧНО: гасим ТОЛЬКО чистый Ctrl+R (без Shift) и голый F5.
+    // Ctrl+Shift+R НЕ трогаем — это наш хоткей «перезапустить сессию» (см.
+    // terminal.js/attachCustomKeyEventHandler), обрабатывается в renderer.
+    // before-input-event срабатывает здесь, в main, РАНЬШЕ, чем событие
+    // вообще доходит до renderer/textarea xterm — глухой preventDefault на
+    // Ctrl+Shift+R не дал бы событию долететь до terminal.js и НАВСЕГДА
+    // сломал бы перезапуск сессии. Сознательный компромисс (зафиксирован и
+    // в отчёте task-5-report.md): reload по Ctrl+Shift+R внутри DevTools
+    // остаётся возможным — это осознанно принятая цена, а не недосмотр.
+    const isCtrlR = input.control && !input.shift && !input.alt && !input.meta
+      && (input.key === 'r' || input.key === 'R' || input.code === 'KeyR');
+    const isF5 = input.key === 'F5' || input.code === 'F5';
+    if (input.type === 'keyDown' && (isCtrlR || isF5)) {
+      e.preventDefault();
     }
   });
 

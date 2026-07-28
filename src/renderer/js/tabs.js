@@ -162,6 +162,22 @@ export function createTabStore({
     return order[i - 1] || order[i + 1] || null;
   }
 
+  // waitingCount() (Task 5 carryover фазы 4/5): агрегат «сколько вкладок
+  // сейчас waiting» — считаем по ТОЙ ЖЕ карте rows и тому же полю r.status,
+  // которое placeRow() уже использует, чтобы решить, класть ли строку в
+  // секцию «Ждут тебя» (GROUP_OF.waiting === 'waiting') — структурно тот же
+  // критерий, а не отдельный Set в app.js, который нужно было вручную держать
+  // в синхроне (add/remove/setStatus) и который однажды рассинхронизировался
+  // бы сам по себе. Дёшево: вкладок обычно единицы, полный проход по rows на
+  // каждый пересчёт бейджа/точки в титлбаре не создаёт заметной нагрузки.
+  function waitingCount() {
+    let n = 0;
+    for (const r of rows.values()) {
+      if (r.status === 'waiting') n += 1;
+    }
+    return n;
+  }
+
   return {
     add,
     remove,
@@ -170,6 +186,7 @@ export function createTabStore({
     setConnectVisible,
     neighborOf,
     peekInfo,
+    waitingCount,
     order: () => [...order],
     get activeId() { return activeId; },
   };

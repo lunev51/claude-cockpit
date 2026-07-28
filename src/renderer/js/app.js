@@ -47,19 +47,25 @@ let lastUsage = null;
 let usageRefreshing = false;
 
 // Fix 8 (ревью): точка в титлбаре терракотовая, только пока есть хотя бы одна
-// вкладка в статусе waiting — локальный Set, потому что удобного агрегата
-// «сколько вкладок ждут» у tabStore нет.
-const waitingTabs = new Set();
+// вкладка в статусе waiting.
+// Task 5 carryover фазы 4/5: раньше здесь был отдельный локальный Set
+// (waitingTabs), который приходилось вручную держать в синхроне с реальным
+// статусом строк (add/remove/setStatus) — источник рассинхронизации по
+// построению. Теперь агрегат структурно совпадает с инвариантом «бейдж =
+// число строк в секции „Ждут тебя“»: tabStore.waitingCount() считает ровно
+// то же самое поле r.status, что и placeRow() при решении, в какую секцию
+// класть строку (см. tabs.js).
 const titlebarDot = document.querySelector('#titlebar .dot');
 function updateTitlebarAlert() {
-  titlebarDot?.classList.toggle('alert', waitingTabs.size > 0);
+  titlebarDot?.classList.toggle('alert', tabStore.waitingCount() > 0);
 }
 
-// Task 1 фазы 4: тот же waitingTabs.size — агрегат для main-процесса
-// (overlay-иконка таскбара + заголовок окна, см. main/attention.js).
-// renderBadge рисует canvas здесь, в renderer — main про canvas не знает.
+// Task 1 фазы 4: тот же агрегат — для main-процесса (overlay-иконка таскбара
+// + заголовок окна, см. main/attention.js). renderBadge рисует canvas здесь,
+// в renderer — main про canvas не знает.
 function pushAttention() {
-  window.api.attention.update(waitingTabs.size, renderBadge(waitingTabs.size));
+  const n = tabStore.waitingCount();
+  window.api.attention.update(n, renderBadge(n));
 }
 
 // Панель действий: кнопки шлют слэш-команду в pty активной вкладки (фича 23/26).
@@ -231,6 +237,12 @@ function activateTab(tabId) {
   // безусловно — контекст (какая строка ждёт) сменился, отвечать «в сторону»
   // от текущего экрана не место.
   peek?.hide();
+  // Task 5 carryover фазы 4/5: peekedTabId раньше не сбрасывался здесь — было
+  // безопасно только благодаря внутренним гардам peek (peek.hide() идемпотентна,
+  // а сверки tabId === peekedTabId в других местах не давали протухшему id
+  // навредить), но сам факт «висит id уже закрытого поповера» — несогласованное
+  // состояние. Сбрасываем для консистентности, раз поповер выше уже спрятан.
+  peekedTabId = null;
   // Task 4 фазы 4 (палитра): та же логика — переключение вкладки (в т.ч. само
   // действие «Перейти: …» из палитры, которая к этому моменту уже закрыла
   // себя сама, см. palette.js/runAt) не должно оставлять палитру открытой
@@ -267,10 +279,11 @@ async function closeTab(tabId) {
   entry.view.dispose(); // отключает ResizeObserver и сам term (Task 6)
   entry.container.remove();
   views.delete(tabId);
+  // Fix 8 / Task 5 carryover: закрытая вкладка больше не может «ждать» —
+  // раньше это гарантировалось отдельным waitingTabs.delete(tabId) здесь же;
+  // теперь это следует структурно из tabStore.remove(tabId) — строка (и её
+  // r.status) исчезает из rows ДО того, как ниже вызывается waitingCount().
   tabStore.remove(tabId);
-  // Fix 8: закрытая вкладка больше не может «ждать» — иначе терракота в
-  // титлбаре могла бы залипнуть, если закрыли последнюю waiting-вкладку.
-  waitingTabs.delete(tabId);
   updateTitlebarAlert();
   pushAttention();
   // Task 3 фазы 4 (peek): закрытая вкладка не должна оставлять поповер,
@@ -800,8 +813,10 @@ async function boot() {
       peekedTabId = null;
     }
     // Fix 8: терракота в титлбаре горит, только пока есть хотя бы одна
-    // вкладка в статусе waiting — снимаем, когда ждущих не осталось.
-    if (status === 'waiting') waitingTabs.add(tabId); else waitingTabs.delete(tabId);
+    // вкладка в статусе waiting. tabStore.setStatus(...) выше уже обновил
+    // r.status этой строки ДО этой точки — waitingCount() внутри
+    // updateTitlebarAlert()/pushAttention() ниже увидит актуальное значение
+    // без отдельного waitingTabs.add/delete (Task 5 carryover).
     updateTitlebarAlert();
     pushAttention();
     // Ghost-буфер (Task 5): переход в done/waiting — момент «Claude закончил
