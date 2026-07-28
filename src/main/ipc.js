@@ -7,13 +7,17 @@ const os = require('os');
 const https = require('https');
 const readline = require('readline');
 const { execFile } = require('child_process');
-const { ipcMain, shell, dialog, app, clipboard } = require('electron');
+const {
+  ipcMain, shell, dialog, app, clipboard, powerSaveBlocker,
+} = require('electron');
 const { getConfig, setConfig } = require('./config');
 const { createPty } = require('./pty');
 const { createSessionManager } = require('./sessions');
 const { createHookBridge } = require('./hook-bridge');
 const { connectProject, isConnected } = require('./connector');
 const { notify } = require('./notify');
+const { createNightWatch } = require('./night-watch');
+const { createNightJournal } = require('./night-journal');
 const { createWorkspaceStore } = require('./workspace');
 const { createWorkspaceSync } = require('./workspace-sync');
 const { saveClipboardImage } = require('./screenshot');
@@ -56,6 +60,20 @@ let lastBroadcastKey = null;    // `fetchedAt|stale|error` последнего 
 let lastCcusageResult = null;   // последний известный ответ ccusage.get() — уходит и в usage:get/usage:refresh, и в usage:update
 let manualRefreshInFlight = null; // Promise текущего usage:refresh, если уже выполняется (single-flight, FINDING 2 ревью)
 let lastManualRefreshAt = 0;       // Date.now() последнего РЕАЛЬНО выполненного (не отбитого троттлингом) usage:refresh
+let nightWatch = null;   // Task 2 фазы 8 («Ночная смена»): инстанс createNightWatch (night-watch.js), см. регистрацию ниже
+// Task 2 фазы 8, КРИТИЧЕСКАЯ ЛОВУШКА (найдена на ревью Task 1, зафиксирована в
+// брифе Task 2): sessions.js на Stop-хуке СИНХРОННО ставит статус 'done' и
+// наружу отдаёт ТОЛЬКО событие 'tab:status' с уже НОВЫМ статусом (см.
+// sessions.js/applyHookEvent, case 'Stop' → setStatus(tab,'done','') —
+// единственное место во всём коде, где статус вкладки переходит именно
+// working→done, других путей в 'done' нет). Если бы обвязка читала prevStatus
+// ПОСЛЕ обновления этой карты, prev всегда совпадал бы с уже новым статусом
+// ('done'), nightWatch.onTabStop никогда не увидел бы условие
+// prevStatus==='working' — детект остановки по лимиту превратился бы в
+// мёртвый код НАВСЕГДА. Карта хранит статус ДО применения текущего события —
+// см. обработчик 'tab:status' в onEvent ниже, где prev читается ИЗ карты
+// СТРОГО ДО set(). Запись чистится на tabs:close (вкладки больше нет).
+let lastStatusByTab = new Map();
 
 function getSmokeOutput() {
   return smokeOutput;
@@ -146,6 +164,112 @@ function workspacesLibraryFile() {
   // вкладок (workspace.js/createWorkspaceStore, переменная store выше); это
   // отдельная библиотека ИМЕНОВАННЫХ, явно сохранённых пользователем профилей.
   return path.join(app.getPath('userData'), 'workspaces-library.json');
+}
+
+// Task 2 фазы 8 («Ночная смена»): файл журнала взводов — night-journal.js
+// само про app.getPath() ничего не знает (чистый модуль, тот же приём, что
+// promptsFile()/workspacesLibraryFile() выше), путь резолвит только этот файл.
+function nightJournalFile() {
+  return path.join(app.getPath('userData'), 'night-journal.json');
+}
+
+// --- Task 2 фазы 8 («Ночная смена»): реальные зависимости для createNightWatch
+// (night-watch.js, Task 1, чистое ядро) — powerBlocker/journal здесь, единственном
+// месте, где ipc.js касается require('electron').powerSaveBlocker и диска ради
+// ночной смены.
+
+// Обёртка над electron.powerSaveBlocker: идемпотентна через id-гард (бриф) —
+// start() второй раз без предшествующего stop() не плодит второй системный
+// блокер (id !== null → no-op), stop() без активного id — тоже no-op. Само
+// ядро (night-watch.js/updateBlocker) уже не зовёт start()/stop() на каждый
+// чих благодаря собственному blockerOn, но гард здесь — дополнительный
+// рубеж, а не дублирование: чужой код мог бы дёрнуть powerBlocker напрямую.
+function createRealPowerBlocker() {
+  let id = null;
+  return {
+    start() {
+      if (id === null) id = powerSaveBlocker.start('prevent-app-suspension');
+    },
+    stop() {
+      if (id !== null) {
+        try {
+          if (powerSaveBlocker.isStarted(id)) powerSaveBlocker.stop(id);
+        } catch { /* блокер мог уже быть снят системой — не критично */ }
+        id = null;
+      }
+    },
+  };
+}
+
+// Глобальное ограничение (бриф/спека): в smoke НИКОГДА не стартовать
+// powerSaveBlocker — headless-прогон не должен трогать системное состояние
+// энергосбережения. no-op объект вместо реальной обёртки.
+function createNoopPowerBlocker() {
+  return { start() {}, stop() {} };
+}
+
+// In-memory фейк журнала для smoke (бриф): append/readAll/reset на простом
+// массиве в памяти процесса — headless-прогон не должен писать в userData
+// ничего нового, но ядру (night-watch.js) всё равно нужен рабочий journal.
+function createInMemoryNightJournal() {
+  let entries = [];
+  return {
+    append(e) { entries.push(e); },
+    readAll() { return entries; },
+    reset() { entries = []; },
+  };
+}
+
+// HH:MM из ms-таймстампа (локальное время) — брифом заказан именно этот
+// формат для тоста «Лимит: продолжу в HH:MM». Нечисловой/некорректный вход
+// (защита от неожиданной формы entry.detail) → '?', тост всё равно не падает.
+function formatHHMM(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n)) return '?';
+  const d = new Date(n);
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  return `${hh}:${mm}`;
+}
+
+// Тосты ключевых моментов (бриф): journal.append() — ЕДИНСТВЕННАЯ точка, куда
+// night-watch.js стекает АБСОЛЮТНО ВСЕ свои события (см. appendJournal() в
+// night-watch.js — она вызывается на каждый переход состояния). Оборачиваем
+// append() реального/in-memory журнала: для конкретных типов записи
+// дополнительно шлём notify() (существующий канал app:notice) человеческим
+// текстом. journal.append(entry) вызывается ВСЕГДА, независимо от исхода
+// тоста — запись в журнал первична, тост — побочный эффект поверх неё,
+// обёрнутый в try/catch, чтобы сбой форматирования не проглотил саму запись.
+function withNightToasts(journal) {
+  return {
+    ...journal,
+    append(entry) {
+      journal.append(entry);
+      try {
+        if (!entry) return;
+        switch (entry.type) {
+          case 'limit-stop':
+            notify(`Лимит: продолжу в ${formatHHMM(entry.detail)}`, 'info');
+            break;
+          case 'wake-complete': {
+            // detail — вида "N of M" (см. night-watch.js/runStagger) — тосту
+            // нужно только N (сколько РЕАЛЬНО продолжили).
+            const m = /^(\d+)/.exec(String(entry.detail || ''));
+            notify(`Ночная смена: продолжил ${m ? m[1] : '0'} вкладок`, 'info');
+            break;
+          }
+          case 'weekly-limit':
+            notify('Недельный лимит — продолжение невозможно', 'warn');
+            break;
+          case 'gave-up':
+            notify('Окно не сбросилось — сдаюсь', 'warn');
+            break;
+          default:
+            break;
+        }
+      } catch { /* тост не должен ронять запись в журнал */ }
+    },
+  };
 }
 
 // JSON-файл кэша: read/write в try/catch (битый/отсутствующий файл → null,
@@ -471,6 +595,28 @@ function recipesDeleteWorkspaceHandler({ smoke, id, recipeStore }) {
   if (typeof id === 'string') recipeStore.deleteWorkspace(id);
 }
 
+// Task 2 фазы 8 («Ночная смена»): night:toggle/night:get вынесены в отдельные
+// функции с явными зависимостями — та же причина, что у gitGetHandler/
+// ghRepoHandler/recipesListHandler и т.д. выше (ipc.js целиком не
+// тестируется под node --test, require('electron') вне настоящего рантайма
+// не даёт объект). smoke-гейт здесь ОСОБЕННО важен: nightWatch, созданный в
+// smoke (см. registerIpc ниже), уже сам по себе получает in-memory журнал и
+// no-op powerBlocker — но `if (smoke) return null;` ДО обращения к nightWatch
+// вообще (а не полагание только на его безопасные зависимости) — тот же
+// защитный рубеж, что у всех остальных смоук-гейтов проекта: headless-прогон
+// не должен трогать ЖУРНАЛ ядра ночной смены вовсе, даже in-memory.
+function nightToggleHandler({ smoke, nightWatch: nw }) {
+  if (smoke) return null;
+  if (nw.isArmed()) nw.disarm();
+  else nw.arm();
+  return nw.snapshot();
+}
+
+function nightGetHandler({ smoke, nightWatch: nw }) {
+  if (smoke) return null;
+  return nw.snapshot();
+}
+
 function registerIpc(win, opts = {}) {
   const { smoke = false, attention = null, toaster = null } = opts;
 
@@ -599,6 +745,18 @@ function registerIpc(win, opts = {}) {
     onEvent: (channel, payload) => {
       if (smoke && channel === 'term:data') smokeOutput += payload.data;
       if (channel === 'tabs:changed') syncWorkspace();
+      // Task 2 фазы 8 («Ночная смена») — детект остановки по лимиту. См.
+      // подробный комментарий у объявления lastStatusByTab выше по файлу:
+      // prevStatus ОБЯЗАН читаться из карты ДО её обновления новым значением
+      // из payload — иначе prev всегда совпадёт с уже применённым Stop'ом
+      // статусом 'done', и переход working→done никогда не будет замечен.
+      if (channel === 'tab:status') {
+        const prev = lastStatusByTab.get(payload.tabId);
+        lastStatusByTab.set(payload.tabId, payload.status);
+        if (nightWatch && payload.status === 'done' && prev === 'working') {
+          nightWatch.onTabStop(payload.tabId, prev);
+        }
+      }
       // Task 2 фазы 4: тот же поток, что шлёт tab:status в renderer, — тостер
       // (toasts.js, чистый модуль) сам решает, показывать ли уведомление
       // Windows, по правилу «не уведомлять о том, на что смотришь». Имя
@@ -615,6 +773,47 @@ function registerIpc(win, opts = {}) {
       }
       if (!win.isDestroyed()) win.webContents.send(channel, payload);
     },
+  });
+
+  // Task 2 фазы 8 («Ночная смена»): инстанс СРАЗУ после manager/usagePoller
+  // (бриф) — все реальные зависимости ядра собраны в одном месте. journal/
+  // powerBlocker — smoke-безопасные варианты в headless-прогоне (глобальное
+  // ограничение: в smoke не трогать userData и не стартовать powerSaveBlocker),
+  // withNightToasts() оборачивает ОБА варианта журнала одинаково — сам тост
+  // безвреден и в smoke (арминг там всё равно недостижим — см. nightToggleHandler
+  // с гейтом `if (smoke) return null;` до обращения к nightWatch вообще).
+  lastStatusByTab = new Map();
+  nightWatch = createNightWatch({
+    now: Date.now,
+    // unref — так же, как stuckTimer/usageMonitorTimer ниже: таймеры ночной
+    // смены (ожидание сброса окна, стаггер резюма, ретраи) не должны сами по
+    // себе держать процесс живым.
+    setTimer: (fn, ms) => {
+      const id = setTimeout(fn, ms);
+      if (id.unref) id.unref();
+      return id;
+    },
+    clearTimer: (id) => clearTimeout(id),
+    refreshUsage: () => usagePoller.refresh(),
+    getTabStatus: (tabId) => {
+      const tab = manager.list().find((t) => t.tabId === tabId);
+      return tab ? tab.status : null;
+    },
+    // Гард непустого текста + '\r' (бриф) — тот же приём, что normalizeForPty/
+    // injectQueuedOnStop, только текст здесь всегда буквальное «продолжай»
+    // (решение пользователя, брейншторм 28.07), нормализовывать нечего.
+    writeToTab: (tabId, text) => {
+      const t = String(text || '').trim();
+      if (t) manager.write(tabId, `${t}\r`);
+    },
+    emit: (event, payload) => {
+      if (!win.isDestroyed()) win.webContents.send(event, payload);
+    },
+    powerBlocker: smoke ? createNoopPowerBlocker() : createRealPowerBlocker(),
+    journal: withNightToasts(
+      smoke ? createInMemoryNightJournal() : createNightJournal({ file: nightJournalFile() }),
+    ),
+    config: getConfig().nightWatch,
   });
 
   // Мост создаётся ПОСЛЕ manager — маршрутизация по tabId из env pty,
@@ -669,6 +868,16 @@ function registerIpc(win, opts = {}) {
     }
     return setConfig(partial);
   });
+
+  // Task 2 фазы 8 («Ночная смена»): кнопка 🌙/действие палитры дёргают toggle,
+  // дашборд читает снапшот через get(); push-обновления между ними — событие
+  // 'night:changed', которое зовёт сам nightWatch (emit-зависимость выше) на
+  // КАЖДОЕ изменение состояния, отдельного IPC для него не требуется. Логика
+  // смоук-гейта — в nightToggleHandler()/nightGetHandler() выше по файлу (та
+  // же причина, что и у остальных вынесенных хендлеров — см. комментарий там).
+  ipcMain.handle('night:toggle', () => nightToggleHandler({ smoke, nightWatch }));
+
+  ipcMain.handle('night:get', () => nightGetHandler({ smoke, nightWatch }));
 
   // Task 3 фазы 5 (кольца лимитов): usagePoller.snapshot() — синхронный, без
   // сети. ccusage.get() — лениво: первый usage:get и есть тот самый «первый
@@ -785,6 +994,10 @@ function registerIpc(win, opts = {}) {
     // копились бы в памяти навсегда. Симметрично с уборкой ghost-файла ниже —
     // обе чистки естественно живут рядом с самим закрытием вкладки.
     if (toaster) toaster.forget(tabId);
+    // Task 2 фазы 8: вкладки больше нет — запись в карте статусов ночной
+    // смены (lastStatusByTab) больше никому не нужна и не должна копиться в
+    // памяти навсегда, тот же приём, что toaster.forget()/ghost-файл выше.
+    lastStatusByTab.delete(tabId);
     if (!smoke && tab && tab.ghostId) {
       try {
         fs.unlinkSync(ghostFile(tab.ghostId));
@@ -1043,6 +1256,12 @@ function registerIpc(win, opts = {}) {
     const { tabId, data } = payload;
     if (typeof tabId !== 'string' || typeof data !== 'string') return;
     manager.write(tabId, data);
+    // Task 2 фазы 8 («Ночная смена»): единственный путь клавиатуры пользователя
+    // в pty (спека, раздел «Точки интеграции») — если пользователь сам
+    // перехватил вкладку после остановки по лимиту, ядро не должно позже
+    // вбросить туда «продолжай» поверх его ручного ввода (processResumeTab в
+    // night-watch.js сверяет lastInputAt с моментом детекта).
+    if (nightWatch) nightWatch.onUserInput(tabId);
   });
 
   ipcMain.on('term:resize', (_e, payload) => {
@@ -1118,6 +1337,13 @@ function disposeSessions() {
     usageMonitorTimer = null;
   }
   if (usagePoller) usagePoller.stop();
+  // Task 2 фазы 8 («Ночная смена»): dispose() снимает ВСЕ таймеры ядра
+  // (ожидание/ретрай + хвост стаггера) и гасит powerSaveBlocker, если он был
+  // включён, — без этого приложение могло бы выйти с реально удерживаемым
+  // системным блокером энергосбережения (см. night-watch.js/dispose()).
+  // Идемпотентно (как и остальные вызовы этой функции) — disposeSessions()
+  // зовётся несколько раз за один выход (window-all-closed, потом before-quit).
+  if (nightWatch) nightWatch.dispose();
   stopBridge();
   if (manager) manager.disposeAll();
   // Задача 5 фазы 6 (carryover): если приложение закрывается, пока
@@ -1137,4 +1363,7 @@ module.exports = {
   historySearchHandler, historyRefreshHandler, createHistoryIndexState, HISTORY_INDEX_TTL_MS,
   recipesListHandler, recipesSavePromptHandler, recipesDeletePromptHandler,
   recipesListWorkspacesHandler, recipesSaveWorkspaceHandler, recipesDeleteWorkspaceHandler,
+  // Task 2 фазы 8 («Ночная смена»): та же причина — см. комментарий у их
+  // определения выше.
+  nightToggleHandler, nightGetHandler,
 };

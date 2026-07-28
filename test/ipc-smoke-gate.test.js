@@ -18,6 +18,7 @@ const {
   historySearchHandler, historyRefreshHandler, createHistoryIndexState, HISTORY_INDEX_TTL_MS,
   recipesListHandler, recipesSavePromptHandler, recipesDeletePromptHandler,
   recipesListWorkspacesHandler, recipesSaveWorkspaceHandler, recipesDeleteWorkspaceHandler,
+  nightToggleHandler, nightGetHandler,
 } = require('../src/main/ipc');
 
 // gitInfo/ghInfo-заглушки, которые ПАДАЮТ, если их дёрнули: смоук-гейт по
@@ -333,4 +334,67 @@ test('recipesDeleteWorkspaceHandler: smoke:false, валидный id → зов
   const recipeStore = { deleteWorkspace: (id) => calls.push(id) };
   recipesDeleteWorkspaceHandler({ smoke: false, id: '1', recipeStore });
   assert.deepStrictEqual(calls, ['1']);
+});
+
+// -------------------------------------------------- night:toggle/night:get --
+// Task 2 фазы 8 («Ночная смена»): nightToggleHandler/nightGetHandler
+// добавлены в ЭТОЙ ЖЕ ветке с тем же классом смоук-гейта, что git:get/
+// gh:repo/recipes:* выше — тот же приём (заглушка nightWatch, которая ПАДАЕТ
+// при вызове ЛЮБОГО метода, делает регрессию «забыли `if (smoke) return null`»
+// красной, а не просто «вернула не то значение»). Брифом отдельно подчёркнуто:
+// в smoke журнал ядра (даже in-memory) не должен получать новых записей и
+// powerBlocker не должен звать — гейт здесь ДО обращения к nightWatch вообще
+// это гарантирует безусловно, вне зависимости от того, какие именно
+// зависимости (реальные/in-memory/no-op) собраны внутри самого nightWatch.
+
+function throwingNightWatch() {
+  const boom = (name) => () => { throw new Error(`nightWatch.${name} НЕ должен был вызваться в smoke`); };
+  return {
+    isArmed: boom('isArmed'),
+    arm: boom('arm'),
+    disarm: boom('disarm'),
+    snapshot: boom('snapshot'),
+  };
+}
+
+test('nightToggleHandler: smoke:true → null, nightWatch НИКОГДА не вызывается', () => {
+  const res = nightToggleHandler({ smoke: true, nightWatch: throwingNightWatch() });
+  assert.strictEqual(res, null);
+});
+
+test('nightToggleHandler: smoke:false, не взведён → зовёт arm(), отдаёт snapshot() ПОСЛЕ переключения', () => {
+  const calls = [];
+  const nightWatch = {
+    isArmed: () => false,
+    arm: () => calls.push('arm'),
+    disarm: () => calls.push('disarm'),
+    snapshot: () => ({ armed: true }),
+  };
+  const res = nightToggleHandler({ smoke: false, nightWatch });
+  assert.deepStrictEqual(calls, ['arm']);
+  assert.deepStrictEqual(res, { armed: true });
+});
+
+test('nightToggleHandler: smoke:false, уже взведён → зовёт disarm(), а не arm()', () => {
+  const calls = [];
+  const nightWatch = {
+    isArmed: () => true,
+    arm: () => calls.push('arm'),
+    disarm: () => calls.push('disarm'),
+    snapshot: () => ({ armed: false }),
+  };
+  const res = nightToggleHandler({ smoke: false, nightWatch });
+  assert.deepStrictEqual(calls, ['disarm']);
+  assert.deepStrictEqual(res, { armed: false });
+});
+
+test('nightGetHandler: smoke:true → null, nightWatch.snapshot НИКОГДА не вызывается', () => {
+  const res = nightGetHandler({ smoke: true, nightWatch: throwingNightWatch() });
+  assert.strictEqual(res, null);
+});
+
+test('nightGetHandler: smoke:false → отдаёт nightWatch.snapshot() как есть', () => {
+  const nightWatch = { snapshot: () => ({ armed: true, pendingCount: 2 }) };
+  const res = nightGetHandler({ smoke: false, nightWatch });
+  assert.deepStrictEqual(res, { armed: true, pendingCount: 2 });
 });
