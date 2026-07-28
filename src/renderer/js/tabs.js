@@ -14,8 +14,10 @@ const GROUP_OF = {
 
 // Task 4 фазы 6 (бейдж PR): классификация checks ('passing'|'failing'|'pending'|
 // 'none') → CSS-модификатор .tab-pr-badge. Черновик (isDraft) визуально
-// приглушаем так же, как 'none' (нет проверок) — бриф явно требует --text-dim
-// для «нет проверок/черновик», не выделяя эти два случая цветом отдельно.
+// приглушаем так же, как 'none' (нет проверок) — бриф требует единого
+// приглушённого стиля для «нет проверок/черновик» (app.css/.tab-pr-badge.none,
+// --text-muted + фон --bg-card после carryover фазы 6, живая приёмка),
+// не выделяя эти два случая цветом отдельно.
 function prBadgeClass(pr) {
   if (pr.isDraft) return 'none';
   return pr.checks === 'passing' || pr.checks === 'failing' || pr.checks === 'pending'

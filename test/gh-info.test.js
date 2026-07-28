@@ -210,6 +210,28 @@ test('checks: statusCheckRollup пуст/отсутствует → none', async
   assert.strictEqual(snap2.pr.checks, 'none');
 });
 
+// Находка 2 (carryover ревью фазы 6, задача 5 фазы 7): classifyChecks должен
+// различать CheckRun/StatusContext по __typename, а НЕ по отсутствию поля
+// status. Гипотетический StatusContext, который (в отличие от документации
+// в шапке файла) всё же несёт непустое поле status, — старая эвристика
+// (item.status === undefined) приняла бы это за CheckRun и молча
+// проигнорировала бы провал (conclusion для такого элемента undefined, не
+// входит в FAILING_CONCLUSIONS): PR с реально упавшей внешней проверкой
+// показался бы 'passing'.
+const STATUS_CONTEXT_WITH_STATUS_FIELD_ROLLUP = [
+  { __typename: 'CheckRun', status: 'COMPLETED', conclusion: 'SUCCESS', name: 'build' },
+  { __typename: 'StatusContext', status: 'irrelevant', state: 'FAILURE', name: 'ci/circleci' },
+];
+
+test('checks: StatusContext классифицируется по __typename, даже если несёт непустое поле status (находка 2, carryover) — не проваливается сквозь старую эвристику "нет status"', async () => {
+  const currentBranch = {
+    number: 1, title: 't', state: 'OPEN', isDraft: false, reviewDecision: null, url: 'u', statusCheckRollup: STATUS_CONTEXT_WITH_STATUS_FIELD_ROLLUP,
+  };
+  const info = createGhInfo({ run: runFixture({ prStatus: ok(JSON.stringify({ currentBranch })) }), cache: noCache(), now: () => 1 });
+  const snap = await info.getRepo('C:\\repo');
+  assert.strictEqual(snap.pr.checks, 'failing');
+});
+
 test('getRepo: не git-репозиторий вообще (реальная фикстура "failed to run git: ... not a git repository", код 1) → ok:true, error:no-remote', async () => {
   const info = createGhInfo({
     run: runFixture({

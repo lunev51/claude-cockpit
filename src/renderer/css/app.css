@@ -154,7 +154,9 @@ html, body {
    align-items:flex-start (см. .tab-row выше), без этого бейдж прилип бы к
    верхнему краю вместе с .tab-dot вместо визуального центрирования по высоте
    строки. Цвет — по статусу проверок (пороги те же, что rings.js/dashboard.js:
-   --working ждём, --ok прошли, --err упали), --text-dim — нет проверок/черновик. */
+   --working ждём, --ok прошли, --err упали), --text-muted + фон --bg-card —
+   нет проверок/черновик (см. .tab-pr-badge.none ниже — фон добавлен позже,
+   живая приёмка фазы 6). */
 .tab-pr-badge {
   flex: none;
   align-self: center;
@@ -172,7 +174,13 @@ html, body {
 .tab-pr-badge.pending { color: var(--working); border-color: var(--working); }
 .tab-pr-badge.passing { color: var(--ok); border-color: var(--ok); }
 .tab-pr-badge.failing { color: var(--err); border-color: var(--err); }
-.tab-pr-badge.none { color: var(--text-dim); border-color: var(--text-dim); }
+/* Carryover фазы 6 (живая приёмка, задача 5 фазы 7): на репозитории без
+   настроенного CI бейдж «нет проверок» на фоне сайдбара (--bg-panel) был
+   почти неразличим — --text-dim читался как «невидимо», не как «приглушено».
+   --bg-card даёт пилюле собственную заливку (светлее сайдбара — читается как
+   элемент интерфейса), --text-muted чуть ярче --text-dim. Цветовое кодирование
+   остальных статусов (pending/passing/failing выше) не тронуто. */
+.tab-pr-badge.none { background: var(--bg-card); color: var(--text-muted); border-color: var(--text-muted); }
 
 .sidebar-footer {
   margin-top: auto;

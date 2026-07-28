@@ -22,6 +22,7 @@ const { createUsagePoller } = require('./usage-oauth');
 const { createCcusage } = require('./usage-ccusage');
 const { createGitInfo } = require('./git-info');
 const { createGhInfo } = require('./gh-info');
+const { createRunners } = require('./runners');
 const { createHistoryIndex } = require('./history-index');
 const {
   createRecipeStore, extractPlaceholders, fillPrompt, normalizeForPty,
@@ -38,6 +39,7 @@ let usagePoller = null;  // поллер официальных лимитов (
 let ccusage = null;      // слой расходов ccusage (usage-ccusage.js) — слой B
 let gitInfo = null;      // Task 2 фазы 6 (панель диффа): git-info.js, чистое ядро + реальный run()
 let ghInfo = null;       // Task 4 фазы 6 (панель GitHub): gh-info.js, чистое ядро + реальный run()
+let runners = null;      // Task 5 carryover фазы 6 (задача 5 фазы 7): runners.js, реестр процессов + раннеры npx/git/gh
 let recipeStore = null;       // Task 4 фазы 7 (рецепты + именованные воркспейсы): recipes.js, чистое ядро + реальные пути в userData
 let historyIndex = null;      // Task 3 фазы 7 (поиск истории): history-index.js, чистое ядро + реальные зависимости
 let historyIndexBuilt = false; // индекс уже собран хотя бы раз ЛЕНИВО (см. 'history:search' ниже) — не на старте
@@ -201,225 +203,15 @@ function usageHttpGet(url, headers) {
   });
 }
 
-// Задача 5 фазы 6 (carryover): реестр живых дочерних процессов всех трёх
-// раннеров ниже (runCcusage/gitRun/ghRun) — pid → ChildProcess, который
-// вернул сам execFile(). Нужен по двум причинам:
-//   (а) execFile(..., {shell:true, timeout}) на Windows спавнит cmd.exe,
-//       который сам спавнит РЕАЛЬНЫЙ процесс (node.exe при npx, gh.exe и
-//       т.п.) — это ВНУК, а не прямой child_process. Штатный timeout/kill()
-//       у execFile убивает только cmd.exe; внук остаётся жить осиротевшим
-//       (например, npx продолжает молотить сеть уже после того, как main
-//       решил, что вызов провалился по таймауту).
-//   (б) disposeSessions() (закрытие приложения) раньше вообще не трогал эти
-//       execFile — если git/gh/npx ещё выполнялись в момент выхода, они
-//       переживали родительский процесс Electron целиком.
-// Убираем запись из реестра сами по событию 'exit' — так disposeSessions()
-// всегда видит актуальный набор РЕАЛЬНО ещё живых процессов, а не тех, что
-// уже успели завершиться штатно.
-const liveChildren = new Map();
-
-function trackChild(child) {
-  if (child && typeof child.pid === 'number') {
-    liveChildren.set(child.pid, child);
-    child.once('exit', () => liveChildren.delete(child.pid));
-  }
-  return child;
-}
-
-// Убивает дерево процессов по pid: taskkill /PID <pid> /T /F.
-//
-// УТОЧНЁННОЕ ПРАВИЛО ПРОЕКТА (после живой проверки задачи 5): запрет на
-// `taskkill /F` касается ЗАВЕРШЕНИЯ САМОГО ПРИЛОЖЕНИЯ КОКПИТА в тестах и
-// живых проверках — жёсткое убийство электрона мимо его обработчиков выхода
-// прячет баги (так один раз проглядели обнуление манифеста воркспейса).
-// К ЭТИМ процессам (headless-помощники runCcusage/gitRun/ghRun — npx/gh/git)
-// это соображение не относится: у них нет состояния, которое нужно сохранить
-// корректным выходом, они headless (нет окна/UI, которые могли бы потерять
-// несохранённое), и killProcessTree() зовётся ТОЛЬКО когда они уже либо
-// просрочили свой собственный таймаут (killTreeOnTimeout), либо приложение
-// закрывается, а они всё ещё висят (disposeSessions()) — то есть их штатное
-// время уже вышло. Здесь `/F` — не обход правила, а его точное применение:
-// для завершения ПОМОЩНИКОВ (не самого кокпита) он разрешён и необходим.
-//
-// Почему обязателен именно `/F`: эмпирически проверено (см. отчёт задачи 5) —
-// `taskkill /PID <pid> /T` БЕЗ `/F` на Windows структурно не может закрыть
-// headless-дерево (node.exe/gh.exe/git.exe без своего окна): ОС отвечает
-// «этот процесс можно завершить только принудительно», причём даже когда
-// цель ещё жива на момент вызова. То есть без `/F` вызов — чистая
-// косметика: создаёт ложное ощущение, что уборка сработала, а внук остаётся
-// висеть точно так же, как и без всякого фикса. `/T` — рекурсивно по всему
-// дереву потомков (лечит проблему (а) в комментарии реестра выше — убивает
-// не только cmd.exe, но и его внука node/gh).
-//
-// Колбэк-заглушка ниже — код возврата/ошибку taskkill сознательно
-// проглатываем: она падает, если процесс уже успел завершиться сам между
-// таймаутом/dispose и этим вызовом (гонка, не баг), и в любом случае это
-// best-effort уборка ПОСЛЕ факта — её неуспех не должен прерывать
-// (ни синхронно бросить, ни залогировать шумно) выход самого приложения.
-function killProcessTree(pid) {
-  if (typeof pid !== 'number') return;
-  execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, () => {});
-}
-
-// Убивает дерево ПО ТАЙМАУТУ (err.killed — execFile сам взвёл SIGTERM/kill,
-// потому что процесс не уложился в options.timeout): по обычному коду
-// завершения (в т.ч. code!=0) дерево трогать не нужно — процесс и так уже
-// закончился сам, taskkill там был бы просто лишним no-op вызовом.
-// ВАЖНО (найдено живой проверкой задачи 5, после перехода на /F): это
-// ВТОРИЧНЫЙ, подстраховочный вызов — к моменту, когда колбэк execFile вообще
-// срабатывает с err.killed:true, Node УЖЕ дождался смерти child (это и есть
-// смысл колбэка — «процесс завершился»), то есть child.pid к этому моменту
-// как правило МЁРТВ, и taskkill /PID <мёртвый pid> /T /F не находит его,
-// чтобы пройтись по /T («не удалось найти этот процесс» — воспроизведено
-// эмпирически). Основную работу по факту делает armKillWatchdog() ниже —
-// он бьёт по дереву, ПОКА родитель ещё жив, ДО того как это увидит Node.
-function killTreeOnTimeout(err, child) {
-  if (err && err.killed) killProcessTree(child.pid);
-}
-
-// Запас времени, на который наш собственный вотчдог должен сработать РАНЬШЕ,
-// чем options.timeout самого execFile.
-const KILL_WATCHDOG_GUARD_MS = 500;
-
-// Проактивный вотчдог: форсит ДЕРЕВО по child.pid чуть РАНЬШЕ, чем истечёт
-// options.timeout execFile. Причина существования этой функции — тот же
-// вывод живой проверки, что и в комментарии killTreeOnTimeout выше: если
-// положиться ИСКЛЮЧИТЕЛЬНО на err.killed постфактум (внутри колбэка), к
-// этому моменту Node уже сам дождался смерти child и вызвал колбэк — то
-// есть pid уже мёртв, и taskkill (что с /F, что без) физически не может его
-// найти, чтобы пройтись по /T, а обречённый внук (node/gh) остаётся жить.
-// Вотчдог с ЧУТЬ меньшей задержкой (`timeoutMs - KILL_WATCHDOG_GUARD_MS`)
-// форсит дерево, ПОКА и cmd.exe/git/gh, и его потомки ЕЩЁ живы — это и есть
-// сценарий, который живая проверка подтвердила рабочим (taskkill /T /F
-// реально убивает всё дерево целиком, если процесс ещё существует на
-// момент вызова). Сам options.timeout execFile остаётся как страховочный
-// бэкстоп на случай, если наш вотчдог почему-то не сработал вовремя —
-// двойной защиты не бывает лишней, а повторный/поздний killProcessTree на
-// уже мёртвый pid безвреден (см. killProcessTree — ошибку глотаем).
-// .unref() — вотчдог не должен сам по себе держать процесс живым, если всё
-// остальное уже завершилось (симметрично stuckTimer/usageMonitorTimer ниже
-// по файлу).
-function armKillWatchdog(child, timeoutMs) {
-  const delay = Math.max(0, timeoutMs - KILL_WATCHDOG_GUARD_MS);
-  const timer = setTimeout(() => killProcessTree(child.pid), delay);
-  timer.unref?.();
-  return timer;
-}
-
-// Версия ccusage запинена сознательно (не @latest): скорость (npx не лезет
-// в реестр проверять свежую версию при КАЖДОМ вызове — a это на счету у
-// каждого usage:get/usage:refresh), предсказуемость (один и тот же формат
-// JSON-вывода тут и у клиента, а не «что там лежит в реестре сегодня») и
-// меньше supply-chain-поверхности (обновление версии — осознанный шаг в
-// коде, а не молчаливая подмена пакета выше по цепочке между двумя запусками).
-// Как обновлять: проверить changelog ccusage на breaking changes в формате
-// вывода `claude daily/session --json` (см. test/usage-ccusage.test.js —
-// normalize() читает конкретные поля), прогнать тесты на реальном выводе
-// новой версии, и только потом поднять номер здесь одной строкой.
-const CCUSAGE_PACKAGE = 'ccusage@20.0.19';
-
-// run(args) для ccusage: execFile('npx', ...) БЕЗ shell:true падает на Windows
-// с ENOENT (npx — это .cmd-шим, не бинарник); execFile('npx.cmd', ...) БЕЗ
-// shell:true падает с ENOENT/EINVAL — известная особенность обработки .cmd в
-// child_process на Windows (проверено фактически на этой машине: npx.cmd без
-// shell → 'spawn EINVAL'). Рабочий вариант — execFile('npx', args, {shell:true})
-// (проверено: реальный вызов `ccusage claude daily --json` вернулся за ~1.5с
-// с валидным JSON). args — фиксированные литералы вида ['claude','daily','--json'],
-// без пользовательского ввода — риск инъекции через DEP0190 (аргументы не
-// экранируются под shell:true) отсутствует.
-function runCcusage(args) {
-  return new Promise((resolve) => {
-    const TIMEOUT_MS = 60000;
-    const child = execFile('npx', ['--yes', CCUSAGE_PACKAGE, ...args], {
-      timeout: TIMEOUT_MS,
-      windowsHide: true,
-      shell: true,
-      maxBuffer: 16 * 1024 * 1024,
-    }, (err, stdout, stderr) => {
-      clearTimeout(watchdog);
-      killTreeOnTimeout(err, child);
-      resolve({ code: err ? (err.code || 1) : 0, stdout: stdout || '', stderr: stderr || '' });
-    });
-    trackChild(child);
-    const watchdog = armKillWatchdog(child, TIMEOUT_MS);
-  });
-}
-
-// run(args, cwd) для git-info.js (Task 2 фазы 6, панель диффа): контракт
-// модуля — resolve({code, stdout, stderr}) на ЛЮБОЙ обычный запуск (в т.ч.
-// code!=0 — например "not a git repository", это git-info.js сам разбирает
-// по stderr), и REJECT только когда бинарника нет вовсе (ENOENT), чтобы
-// isGitMissingError() в git-info.js отличил «git не установлен» от «git
-// сказал code!=0». maxBuffer 10 МБ (а не дефолтный 1 МБ execFile) — диффы
-// больших коммитов легко превышают мегабайт. timeout 15с — тот же порядок,
-// что usageHttpGet (20с), git локальный и обычно быстрее сети.
-function gitRun(args, cwd) {
-  return new Promise((resolve, reject) => {
-    const TIMEOUT_MS = 15000;
-    const child = execFile('git', args, {
-      cwd, windowsHide: true, timeout: TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024,
-    }, (err, stdout, stderr) => {
-      // Задача 5 фазы 6: та же осторожность по таймауту, что и у runCcusage
-      // выше (реестр/killProcessTree/armKillWatchdog в начале этого файла) —
-      // здесь без shell:true child и есть сам git.exe (не обёрнут в cmd.exe),
-      // но унификация раннеров важнее: killProcessTree(pid, /T /F) безвредна
-      // и для «бездетного» процесса, а если git когда-нибудь всё же породит
-      // потомка (hook, pager), дерево уберётся тоже.
-      clearTimeout(watchdog);
-      killTreeOnTimeout(err, child);
-      if (err && err.code === 'ENOENT') {
-        reject(err);
-        return;
-      }
-      // err.code здесь — код завершения процесса (число) при code!=0, ЛИБО
-      // строка вроде 'ETIMEDOUT'/сигнал при убийстве по timeout — в обоих
-      // случаях, кроме ENOENT (отсечён выше), это НЕ git-missing: коду 1
-      // хватает, чтобы git-info.js посчитал это либо "not-a-repo" (по
-      // тексту stderr), либо общим 'failed'.
-      const code = err ? (typeof err.code === 'number' ? err.code : 1) : 0;
-      resolve({ code, stdout: stdout || '', stderr: stderr || '' });
-    });
-    trackChild(child);
-    const watchdog = armKillWatchdog(child, TIMEOUT_MS);
-  });
-}
-
-// run(args, cwd) для gh-info.js (Task 4 фазы 6, панель GitHub): тот же контракт,
-// что и gitRun выше — resolve({code, stdout, stderr}) на любой обычный запуск
-// (gh-info.js сам разбирает 'auth'/'no-remote' по stderr), reject ТОЛЬКО когда
-// бинарника нет вовсе (ENOENT), чтобы isGhMissingError() в gh-info.js отличил
-// «gh не установлен» от «gh сказал code!=0». shell:true ОБЯЗАТЕЛЕН на Windows —
-// без него execFile('gh', ...) падает с ENOENT, если gh.exe обёрнут батником/
-// шимом (тот же приём, что и для npx в runCcusage выше — тот же класс проблемы
-// на этой платформе). cwd — не всегда нужен вызывающему коду (getGlobal() зовёт
-// execGh без cwd вовсе, см. gh-info.js) — execFile с cwd:undefined просто
-// использует cwd текущего процесса, это безопасно для команд типа `gh search`/
-// `gh api`, которые не привязаны к конкретному репозиторию. timeout 30с —
-// дольше, чем у gitRun (15с): search/api — сетевые вызовы, а не локальный git.
-// maxBuffer 5 МБ — с запасом под JSON-ответы gh (бриф).
-function ghRun(args, cwd) {
-  return new Promise((resolve, reject) => {
-    const TIMEOUT_MS = 30000;
-    const child = execFile('gh', args, {
-      cwd, windowsHide: true, timeout: TIMEOUT_MS, maxBuffer: 5 * 1024 * 1024, shell: true,
-    }, (err, stdout, stderr) => {
-      // Задача 5 фазы 6: shell:true здесь — тот же класс проблемы, что и у
-      // runCcusage (реестр/killProcessTree/armKillWatchdog выше) — child при
-      // таймауте нужно добивать деревом ПРОАКТИВНО (см. armKillWatchdog),
-      // а не просто оставлять cmd.exe/gh.exe висеть.
-      clearTimeout(watchdog);
-      killTreeOnTimeout(err, child);
-      if (err && err.code === 'ENOENT') {
-        reject(err);
-        return;
-      }
-      const code = err ? (typeof err.code === 'number' ? err.code : 1) : 0;
-      resolve({ code, stdout: stdout || '', stderr: stderr || '' });
-    });
-    trackChild(child);
-    const watchdog = armKillWatchdog(child, TIMEOUT_MS);
-  });
-}
+// Раннеры внешних CLI (npx/git/gh) + реестр процессов + watchdog принудительной
+// уборки дерева (runCcusage/gitRun/ghRun/killProcessTree/armKillWatchdog) —
+// вынесены в runners.js (Task 5 carryover фазы 6, задача 5 фазы 7): execFile
+// там инжектируется, что впервые даёт покрыть реестр/killProcessTree/
+// armKillWatchdog тестами (test/runners.test.js) — раньше эта логика жила
+// прямо здесь вперемешку с require('electron'), а ipc.js целиком не
+// тестируется. Инстанс создаётся ниже, в registerIpc() (runners = createRunners({execFile})),
+// тем же приёмом, что gitInfo/ghInfo — конструктор безопасно создавать
+// безусловно, I/O он сам по себе не делает.
 
 // --- Task 3 фазы 7 (глобальный поиск истории): реальные зависимости для
 // createHistoryIndex (history-index.js, Task 2, чистое ядро — listProjects/
@@ -504,6 +296,46 @@ function usageBroadcastKey(snap) {
   return `${snap.fetchedAt}|${snap.stale}|${snap.error}`;
 }
 
+// Task 5 carryover фазы 6 (задача 5 фазы 7, п.4 брифа): смоук-гейт git:get/
+// gh:repo/gh:global вынесен в отдельные функции с явными зависимостями.
+// ПРИЧИНА: ipc.js целиком не тестируется — модуль на верхнем уровне зовёт
+// require('electron'), который вне настоящего Electron-рантайма отдаёт не
+// объект, а строку пути к бинарнику (ipcMain/app/dialog там undefined), так
+// что registerIpc() нельзя вызвать под node --test. Раньше это означало, что
+// удаление `if (smoke) return null;` внутри ipcMain.handle прошло бы зелёным —
+// ни один тест бы не заметил (находка 3, ревью carryover фазы 6). Экспортируем
+// эти три функции (см. module.exports внизу файла) — test/ipc-smoke-gate.test.js
+// зовёт их напрямую с фейковым gitInfo/ghInfo, минуя Electron целиком; это
+// ТА ЖЕ логика, что реально исполняется в проде (registerIpc() ниже просто
+// прокидывает сюда своё замыкание), а не отдельная параллельная реализация.
+function gitGetHandler({
+  smoke, tabId, opts, tabCwd, gitInfo,
+}) {
+  if (smoke) return null;
+  if (typeof tabId !== 'string') return null;
+  const cwd = tabCwd(tabId);
+  if (!cwd) return null;
+  const force = !!(opts && opts.force);
+  return gitInfo.get(cwd, { force });
+}
+
+function ghRepoHandler({
+  smoke, tabId, opts, tabCwd, ghInfo,
+}) {
+  if (smoke) return null;
+  if (typeof tabId !== 'string') return null;
+  const cwd = tabCwd(tabId);
+  if (!cwd) return null;
+  const force = !!(opts && opts.force);
+  return ghInfo.getRepo(cwd, { force });
+}
+
+function ghGlobalHandler({ smoke, opts, ghInfo }) {
+  if (smoke) return null;
+  const force = !!(opts && opts.force);
+  return ghInfo.getGlobal({ force });
+}
+
 function registerIpc(win, opts = {}) {
   const { smoke = false, attention = null, toaster = null } = opts;
 
@@ -516,20 +348,26 @@ function registerIpc(win, opts = {}) {
     cache: createJsonFileCache(usageOauthCacheFile()),
     log: (msg) => console.warn(msg),
   });
+  // Task 5 carryover фазы 6 (задача 5 фазы 7): runners.js — реестр процессов
+  // + раннеры npx/git/gh, execFile — реальный child_process.execFile (см.
+  // require в шапке файла). Конструктор не делает I/O сам по себе — безопасно
+  // создавать безусловно, даже в smoke (сами runCcusage/gitRun/ghRun ничего
+  // не запускают, пока их не позовут IPC-хендлеры ниже, а те в smoke этого не делают).
+  runners = createRunners({ execFile });
   ccusage = createCcusage({
-    run: runCcusage,
+    run: runners.runCcusage,
     cache: createJsonFileCache(usageCcusageCacheFile()),
   });
   // Task 2 фазы 6 (панель диффа): gitInfo — чистое ядро (git-info.js) +
-  // реальный run() (execFile выше). Конструктор не делает I/O сам по себе —
+  // реальный run() (runners.gitRun). Конструктор не делает I/O сам по себе —
   // безопасно создавать безусловно, даже в smoke (сам IPC-хендлер ниже
   // просто не зовёт .get() в smoke — см. 'git:get').
-  gitInfo = createGitInfo({ run: gitRun });
+  gitInfo = createGitInfo({ run: runners.gitRun });
   // Task 4 фазы 6 (панель GitHub): ghInfo — чистое ядро (gh-info.js) + реальный
-  // run() (ghRun выше). Тот же приём, что gitInfo прямо над этим — конструктор
+  // run() (runners.ghRun). Тот же приём, что gitInfo прямо над этим — конструктор
   // не делает I/O сам по себе, безопасно создавать безусловно даже в smoke (сам
   // IPC-хендлер ниже просто не зовёт .getRepo()/.getGlobal() в smoke).
-  ghInfo = createGhInfo({ run: ghRun });
+  ghInfo = createGhInfo({ run: runners.ghRun });
   // Task 3 фазы 7 (глобальный поиск истории): historyIndex — чистое ядро
   // (history-index.js) + реальные зависимости выше (обход ~/.claude/projects,
   // потоковое чтение JSONL, fs.stat, JSON-кэш в userData). Конструктор не
@@ -948,36 +786,26 @@ function registerIpc(win, opts = {}) {
   // прогон не должен спавнить внешние процессы сверх PTY_OK-смоука (см.
   // task-2-brief.md, шаг 3: «в smoke НЕ вызывать»). force — явный ручной
   // повтор (кнопка «Обновить» панели), опрокидывает TTL-кэш gitInfo.
-  ipcMain.handle('git:get', async (_e, tabId, opts) => {
-    if (smoke) return null;
-    if (typeof tabId !== 'string') return null;
-    const cwd = tabCwd(tabId);
-    if (!cwd) return null;
-    const force = !!(opts && opts.force);
-    return gitInfo.get(cwd, { force });
-  });
+  // Сама логика — в gitGetHandler() (см. выше по файлу, п.4 брифа задачи 5
+  // фазы 7): вынесена, чтобы смоук-гейт был протестирован без Electron.
+  ipcMain.handle('git:get', async (_e, tabId, opts) => gitGetHandler({
+    smoke, tabId, opts, tabCwd, gitInfo,
+  }));
 
   // Task 4 фазы 6 (панель GitHub): cwd вкладки — тот же tabCwd(), что и git:get
   // выше. smoke: НЕ дёргаем gh вообще — headless-прогон не должен спавнить
   // внешние процессы сверх PTY_OK-смоука. force — ручной повтор, опрокидывает
-  // TTL-кэш ghInfo.
-  ipcMain.handle('gh:repo', async (_e, tabId, opts) => {
-    if (smoke) return null;
-    if (typeof tabId !== 'string') return null;
-    const cwd = tabCwd(tabId);
-    if (!cwd) return null;
-    const force = !!(opts && opts.force);
-    return ghInfo.getRepo(cwd, { force });
-  });
+  // TTL-кэш ghInfo. Логика — в ghRepoHandler() выше по файлу (та же причина,
+  // что у git:get).
+  ipcMain.handle('gh:repo', async (_e, tabId, opts) => ghRepoHandler({
+    smoke, tabId, opts, tabCwd, ghInfo,
+  }));
 
   // gh:global — сводка по ВСЕМ открытым PR/issues пользователя + число
   // непрочитанных уведомлений, без привязки к конкретной вкладке (дашборд,
-  // Task 4 фазы 6). smoke — тот же гейт, что и gh:repo выше.
-  ipcMain.handle('gh:global', async (_e, opts) => {
-    if (smoke) return null;
-    const force = !!(opts && opts.force);
-    return ghInfo.getGlobal({ force });
-  });
+  // Task 4 фазы 6). smoke — тот же гейт, что и gh:repo выше. Логика —
+  // в ghGlobalHandler() выше по файлу.
+  ipcMain.handle('gh:global', async (_e, opts) => ghGlobalHandler({ smoke, opts, ghInfo }));
 
   // Task 3 фазы 7 (глобальный поиск истории, Ctrl+Shift+H): смотри search.js
   // (renderer) — оверлей с дебаунсом/отменой устаревших запросов, здесь только
@@ -1216,18 +1044,17 @@ function disposeSessions() {
   stopBridge();
   if (manager) manager.disposeAll();
   // Задача 5 фазы 6 (carryover): если приложение закрывается, пока
-  // runCcusage/gitRun/ghRun ещё выполняются (npx/git/gh), реестр liveChildren
-  // (см. выше) всё ещё держит их — добиваем ДЕРЕВО принудительно (/T /F, см.
-  // killProcessTree и уточнённое правило про /F там же — это headless-
-  // помощники без состояния, не сам кокпит) для каждого. Снимок ключей в
-  // массив ДО цикла: сам taskkill асинхронный, но 'exit' на child может
-  // сработать синхронно в тестовых дублёрах — итерация по живой Map во время
-  // её же мутации недетерминирована.
-  for (const pid of [...liveChildren.keys()]) {
-    killProcessTree(pid);
-  }
+  // runCcusage/gitRun/ghRun ещё выполняются (npx/git/gh), реестр процессов
+  // runners.js всё ещё держит их — killAllTracked() добивает ДЕРЕВО
+  // принудительно (/T /F — headless-помощники без состояния, не сам кокпит;
+  // подробное обоснование /F и снимка ключей в массив ДО цикла — в runners.js).
+  if (runners) runners.killAllTracked();
 }
 
 module.exports = {
   registerIpc, disposeSessions, stopBridge, getSmokeOutput, flushWorkspace, getActiveTabId,
+  // Экспортированы ТОЛЬКО ради test/ipc-smoke-gate.test.js (п.4 брифа задачи 5
+  // фазы 7, см. комментарий у их определения выше) — не часть публичного API
+  // модуля для остального кода.
+  gitGetHandler, ghRepoHandler, ghGlobalHandler,
 };

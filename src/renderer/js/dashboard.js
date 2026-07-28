@@ -62,9 +62,14 @@ function formatTime(ms) {
 
 // Коды ошибок ghInfo.getRepo/getGlobal ('no-gh'|'auth'|'failed') → человеко-
 // читаемая причина для пустых состояний раздела GitHub (бриф §Task 4 фазы 6).
+// Находка 4 (carryover ревью фазы 6, задача 5 фазы 7): без ключа 'failed'
+// фолбэк ниже (ghErrorText) отдавал общий текст «GitHub недоступен» — тот же
+// класс находки, что уже чинили у LIMITS_ERROR_TEXT выше, только для другой
+// карты (gh-info.js, а не usage-oauth.js).
 const GH_ERROR_TEXT = {
   'no-gh': 'gh не установлен',
   auth: 'gh не авторизован',
+  failed: 'не удалось получить данные — попробуйте «Обновить»',
 };
 
 function ghErrorText(error) {

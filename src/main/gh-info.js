@@ -145,7 +145,18 @@ function classifyChecks(rollup) {
   let hasPending = false;
   for (const item of rollup) {
     if (!item) continue;
-    const isStatusContext = item.status === undefined && typeof item.state === 'string';
+    // Различаем CheckRun/StatusContext по __typename — полю, которое --json
+    // statusCheckRollup отдаёт ВСЕГДА (см. шапку файла), а не по отсутствию
+    // поля status, как было раньше (находка 2, ревью carryover фазы 6):
+    // прежняя эвристика ошибочно доверяла форме объекта. Если бы
+    // StatusContext когда-нибудь тоже нёс поле status (документацией это не
+    // исключено), старая проверка молча приняла бы его за CheckRun и
+    // проигнорировала бы провал (conclusion для StatusContext всегда
+    // undefined, не входит в FAILING_CONCLUSIONS). __typename — явный
+    // дискриминатор API, ему доверяем безусловно; незнакомый/отсутствующий
+    // __typename (другая версия gh) — трактуем как CheckRun, самый частый и
+    // документированный случай, не бросаем и не роняем всю классификацию.
+    const isStatusContext = item.__typename === 'StatusContext';
     if (isStatusContext) {
       if (FAILING_STATES.has(item.state)) return 'failing';
       if (PENDING_STATES.has(item.state)) hasPending = true;
