@@ -342,6 +342,13 @@ export function createDashboard({
       return;
     }
     const maxCost = slice.reduce((m, d) => Math.max(m, d.costUsd), 0);
+    // Живая приёмка фазы 7: высота столбиков ничего не говорила — ни единиц,
+    // ни масштаба. Подписываем ЗНАЧЕНИЕ над столбиком-максимумом (он задаёт
+    // масштаб всей сетки: остальные — доли от него); каждое из 30 значений
+    // не подписать — 10px-цифры слипнутся, для точечных цифр остаётся title.
+    // При нескольких равных максимумах подписываем первый — остальные видны
+    // по одинаковой высоте.
+    const maxIdx = slice.findIndex((d) => d.costUsd === maxCost);
     slice.forEach((d, i) => {
       const bar = document.createElement('div');
       bar.className = 'chart-bar';
@@ -350,6 +357,12 @@ export function createDashboard({
       const h = maxCost > 0 ? Math.max(2, Math.round((d.costUsd / maxCost) * 100)) : 2;
       bar.style.height = `${h}%`;
       bar.title = `${formatShortDate(d.date)}: ${formatUsd(d.costUsd)}, ${formatTokens(d.tokens)} токенов`;
+      if (i === maxIdx && maxCost > 0) {
+        const value = document.createElement('span');
+        value.className = 'chart-bar-value';
+        value.textContent = formatUsd(d.costUsd);
+        bar.appendChild(value);
+      }
       // Подпись даты под каждым 5-м баром (бриф), считая от начала видимого среза.
       if (i % 5 === 0) {
         const label = document.createElement('span');
@@ -371,6 +384,13 @@ export function createDashboard({
     title.className = 'dashboard-section-title';
     title.textContent = 'Расход по дням';
     header.appendChild(title);
+    // Живая приёмка фазы 7: без пояснения единиц было «непонятно, что
+    // конкретно показывают столбики». $ — данные ccusage (те же, что карточка
+    // «Расход» выше); наведение даёт точные цифры дня.
+    const hint = document.createElement('span');
+    hint.className = 'dashboard-chart-hint';
+    hint.textContent = '$ за день · курсор на столбик — детали';
+    header.appendChild(hint);
 
     const presets = document.createElement('div');
     presets.className = 'dashboard-chart-presets';

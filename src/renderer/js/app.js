@@ -11,6 +11,7 @@ import { renderRings } from './rings.js';
 import { createDiffPanel } from './diffpanel.js';
 import { createSearch } from './search.js';
 import { createRecipeForm } from './recipe-form.js';
+import { createHotkeysOverlay } from './hotkeys.js';
 import { pluralTabs } from './format.js';
 
 const $ = (id) => document.getElementById(id);
@@ -38,6 +39,7 @@ let historySearch = null;
 // здесь только ссылка для взаимного исключения с прочими оверлеями (тот же
 // приём, что historySearch/dashboard/palette выше).
 let recipeForm = null;
+let hotkeysOverlay = null; // шпаргалка клавиш (живая приёмка фазы 7) — участник overlayFlags()
 // Локальные зеркала server-side библиотек (main/recipes.js) — тот же приём,
 // что queueByTab/lastUsage/lastGh ниже: buildPaletteActions() должна быть
 // СИНХРОННОЙ (palette.js зовёт getActions() без await, см. palette.js/open()),
@@ -184,6 +186,18 @@ function renderActionBar() {
   diffBtn.addEventListener('mousedown', (e) => e.preventDefault());
   diffBtn.addEventListener('click', () => toggleDiffPanel());
   host.appendChild(diffBtn);
+  // Живая приёмка фазы 7: кнопка ⌨ — шпаргалка горячих клавиш. Тот же
+  // паттерн, что 📊/± выше (пересборка на renderActionBar, mousedown-
+  // preventDefault против кражи фокуса у терминала).
+  const keysBtn = document.createElement('button');
+  keysBtn.type = 'button';
+  keysBtn.id = 'btn-hotkeys';
+  keysBtn.className = 'action-btn';
+  keysBtn.textContent = '⌨';
+  keysBtn.title = 'Горячие клавиши';
+  keysBtn.addEventListener('mousedown', (e) => e.preventDefault());
+  keysBtn.addEventListener('click', () => toggleHotkeys());
+  host.appendChild(keysBtn);
   // deepMerge (config.js) при частичном оверрайде массива объектом даёт
   // {0:…,1:…} вместо массива — Array.isArray отсекает такой и любой другой
   // некорректный actionBar.commands, чтобы не уронить boot() на итерации.
@@ -422,6 +436,7 @@ function toggleDashboard() {
   // Task 4 фазы 7: та же логика — мини-форма рецепта/воркспейса тоже не
   // должна остаться висеть «за спиной» (close() — no-op, если форма закрыта).
   recipeForm?.close();
+  hotkeysOverlay?.close(); // живая приёмка фазы 7: шпаргалка — такой же слой 60
   if (dashboard.isOpen()) dashboard.close();
   else dashboard.open();
 }
@@ -435,8 +450,21 @@ function toggleHistorySearch() {
   dashboard?.close();
   // Task 4 фазы 7: та же логика, что toggleDashboard() выше.
   recipeForm?.close();
+  hotkeysOverlay?.close(); // живая приёмка фазы 7: шпаргалка — такой же слой 60
   if (historySearch.isOpen()) historySearch.close();
   else historySearch.open(views.get(tabStore.activeId)?.view);
+}
+
+// Живая приёмка фазы 7: тумблер шпаргалки клавиш (кнопка ⌨/действие палитры) —
+// тот же паттерн взаимного исключения, что toggleDashboard()/toggleHistory-
+// Search() выше: оба слоя z-60, стопка запрещена реестром overlayFlags.
+function toggleHotkeys() {
+  peek?.hide();
+  if (palette.isOpen()) palette.close();
+  dashboard?.close();
+  if (historySearch?.isOpen()) historySearch.close();
+  recipeForm?.close();
+  hotkeysOverlay?.toggle();
 }
 
 // Task 2 фазы 6: тумблер панели диффа (Ctrl+G/кнопка «±» панели действий) —
@@ -983,6 +1011,15 @@ function buildPaletteActions() {
     run: () => toggleHistorySearch(),
   });
 
+  // Живая приёмка фазы 7: шпаргалка клавиш — доступна и из палитры, и
+  // кнопкой ⌨ на панели действий (renderActionBar).
+  actions.push({
+    id: 'hotkeys',
+    title: 'Горячие клавиши',
+    hint: 'шпаргалка',
+    run: () => toggleHotkeys(),
+  });
+
   // Task 4 фазы 7 (библиотека рецептов промптов): по одному действию на
   // рецепт из recipesCache (см. refreshRecipesCache — заполняется при boot()).
   // hint показывает имена плейсхолдеров, если они есть, — то же, зачем
@@ -1089,6 +1126,7 @@ function overlayFlags() {
     peek: !!peek?.isOpen(),
     historySearch: !!historySearch?.isOpen(),
     recipeForm: !!recipeForm?.isOpen(),
+    hotkeys: !!hotkeysOverlay?.isOpen(),
     queue: queueInputOpen,
     // restoreOverlaySkip не null ровно пока оверлей restore на экране и
     // решение по восстановлению ещё не принято (см. showRestoreOverlay).
@@ -1127,6 +1165,8 @@ function bindHotkeys() {
       // Task 4 фазы 7: та же логика — мини-форма рецепта/воркспейса тоже не
       // должна остаться висеть «за спиной».
       recipeForm?.close();
+      // Живая приёмка фазы 7: шпаргалка клавиш — такой же слой 60.
+      hotkeysOverlay?.close();
       // Fix round 1 (ревью): peek?.hide() выше уже мог схлопнуть
       // document.activeElement на <body> (см. подробный разбор в palette.js/
       // open) — передаём терминал активной вкладки как fallback НА СЛУЧАЙ
@@ -1547,6 +1587,7 @@ async function boot() {
   // просто увидит пустой список до разрешения промиса (getActions() зовётся
   // заново при каждом открытии, см. palette.js).
   recipeForm = createRecipeForm({ root: $('recipe-form-root') });
+  hotkeysOverlay = createHotkeysOverlay({ host: $('hotkeys-root') });
   refreshRecipesCache();
   refreshWorkspacesCache();
 

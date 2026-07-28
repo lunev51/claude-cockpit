@@ -1362,3 +1362,76 @@ html, body {
 .toast-warn { border-color: var(--warn); }
 .toast-error { border-color: var(--err); }
 .toast-info { border-color: var(--accent); }
+
+/* --- Шпаргалка горячих клавиш (живая приёмка фазы 7) ---
+   Тот же слой, что палитра/поиск (60): взаимно исключаются через реестр
+   overlayFlags в app.js, стопка исключена, поэтому общий z-index честен. */
+.hotkeys-overlay {
+  position: fixed;
+  inset: 0;
+  background: color-mix(in srgb, var(--bg-window) 55%, transparent);
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 64px;
+  z-index: 60;
+}
+.hotkeys-panel {
+  width: 520px;
+  max-width: 90%;
+  max-height: 78vh;
+  overflow-y: auto;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-l);
+  padding: 16px 20px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+.hotkeys-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 8px;
+}
+.hotkeys-group-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  margin: 12px 0 4px;
+}
+.hotkeys-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 3px 0;
+}
+.hotkeys-combo {
+  flex: 0 0 220px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-primary);
+}
+.hotkeys-desc {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* Подписи значений на графике расхода (живая приёмка фазы 7: высота столбиков
+   ничего не говорила — ни единицы, ни масштаба). Значение — над столбиком
+   максимума; пояснение единиц — в заголовке секции. */
+.chart-bar-value {
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  margin-bottom: 2px;
+  font-size: 10px;
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+.dashboard-chart-hint {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-left: 8px;
+}
