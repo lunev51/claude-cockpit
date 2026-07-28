@@ -42,12 +42,15 @@ let ghInfo = null;       // Task 4 фазы 6 (панель GitHub): gh-info.js,
 let runners = null;      // Task 5 carryover фазы 6 (задача 5 фазы 7): runners.js, реестр процессов + раннеры npx/git/gh
 let recipeStore = null;       // Task 4 фазы 7 (рецепты + именованные воркспейсы): recipes.js, чистое ядро + реальные пути в userData
 let historyIndex = null;      // Task 3 фазы 7 (поиск истории): history-index.js, чистое ядро + реальные зависимости
-let historyIndexBuilt = false; // индекс уже собран хотя бы раз ЛЕНИВО (см. 'history:search' ниже) — не на старте
-let historyIndexSize = 0;      // число сессий последнего refresh() — уходит в ответ history:search как indexSize
-                                // (см. src/renderer/js/search.js — единственный способ отличить «ничего не
-                                // нашлось» от «в истории вообще нет сессий» без отдельного дорогого запроса)
-let historyIndexBuildInFlight = null; // Promise текущей ЛЕНИВОЙ сборки индекса, если уже выполняется
-                                       // (single-flight, ревью Task 3 — см. подробности у 'history:search' ниже)
+// I5 (ревью финальной волны фазы 7): состояние ленивого индекса истории —
+// единый мутируемый объект (createHistoryIndexState(), см. ниже) вместо
+// россыпи независимых let-переменных. builtAt (было historyIndexBuilt —
+// boolean, взводимый РОВНО ОДИН РАЗ за жизнь окна) заменён на timestamp: 0 —
+// «индекс ещё ни разу не строился», иначе — момент последнего успешного
+// refresh(). Кокпит держат открытым сутками (обычный день, не край) — сессии,
+// созданные ПОСЛЕ первого поиска, не искались до перезапуска кокпита вовсе.
+// Подробности TTL — у HISTORY_INDEX_TTL_MS/historySearchHandler() ниже.
+let historyIndexState = null;
 let usageMonitorTimer = null; // лёгкий сторож (только snapshot(), без сети) — рассылает usage:update
 let lastBroadcastKey = null;    // `fetchedAt|stale|error` последнего разосланного usage:update — см. usageBroadcastKey()
 let lastCcusageResult = null;   // последний известный ответ ccusage.get() — уходит и в usage:get/usage:refresh, и в usage:update
@@ -336,6 +339,138 @@ function ghGlobalHandler({ smoke, opts, ghInfo }) {
   return ghInfo.getGlobal({ force });
 }
 
+// I5 (ревью финальной волны фазы 7): раньше индекс истории собирался лениво
+// РОВНО ОДИН РАЗ за жизнь окна (historyIndexBuilt — boolean, взводился и
+// больше никогда не сбрасывался) — сессии, созданные ПОСЛЕ первого поиска,
+// не попадали в индекс до перезапуска кокпита вообще. Кокпит держат открытым
+// сутками — это обычный рабочий день, не крайний случай (сценарий ревью:
+// кокпит открыт с 9:00, новая вкладка в 11:00, первый поиск в 12:00, повторный
+// поиск в 17:00 — «ничего не найдено», хотя строка есть в транскрипте).
+//
+// Фикс — TTL, а не «refresh при каждом открытии оверлея поиска» (тоже
+// предлагался): поиск — редкое, ручное действие (Ctrl+Shift+H от случая к
+// случаю), а historyIndex.refresh() БЕЗ force уже сам инкрементален
+// (history-index.js перечитывает содержимое ТОЛЬКО файлов, чьи mtime/size
+// изменились) — но даже так стоит заметное время (1.5-2.2с на 47 сессиях этой
+// машины, задача 2 фазы 7): перечисление ~/.claude/projects целиком и
+// stat() КАЖДОГО файла — не бесплатны сами по себе, даже без единого чтения
+// содержимого. search.js дебаунсит ввод на 350мс, но пользователь может
+// уточнять запрос НЕСКОЛЬКО раз подряд, продолжая печатать, — TTL короче,
+// чем «кокпит открыт весь рабочий день» (часы), но заметно ДОЛЬШЕ типичной
+// паузы между такими уточнениями (секунды-десятки секунд), чтобы каждое
+// уточнение одного запроса не било повторным refresh(). 5 минут:
+// гарантированно ловит сценарий ревью (любой разрыв между поисками дольше
+// пяти минут — а час между 11:00 и 12:00 кратно больше — форсирует
+// пересбор), и с большим запасом переживает типичную серию правок одного
+// запроса в открытом оверлее.
+const HISTORY_INDEX_TTL_MS = 5 * 60 * 1000;
+
+// builtAt: 0 — индекс ещё ни разу не строился, иначе — now() на момент
+// последнего успешного refresh(). buildInFlight — Promise текущей сборки,
+// если уже выполняется (single-flight, см. historySearchHandler ниже).
+function createHistoryIndexState() {
+  return { builtAt: 0, size: 0, buildInFlight: null };
+}
+
+// Task 3 фазы 7 (глобальный поиск истории): смотри search.js (renderer) —
+// оверлей с дебаунсом/отменой устаревших запросов, эта функция — только
+// проводка + ленивая сборка индекса. Вынесена в отдельную функцию с явными
+// зависимостями по ТОЙ ЖЕ причине, что gitGetHandler/ghRepoHandler/
+// ghGlobalHandler выше (см. комментарий там) — ipc.js целиком не
+// тестируется, а history:search добавлен в ЭТОЙ ЖЕ ветке фазы 7 с тем же
+// классом гейта, но без единого теста на него (находка «дыра тестов №1»,
+// ревью финальной волны).
+//
+// state — createHistoryIndexState() (mutable, по ссылке — см. регистрацию в
+// registerIpc()); historyIndex — createHistoryIndex() (history-index.js);
+// now — инжектируемый клок, тестам нужен управляемый (TTL иначе нельзя было
+// бы проверить без реального ожидания 5 минут).
+//
+// FINDING (ревью Task 3, Important, всё ещё в силе): ipcMain.handle НЕ
+// сериализует параллельные invoke одного канала, а дебаунс в renderer
+// (search.js) отменяет только ЕЩЁ НЕ ОТПРАВЛЕННЫЙ таймер — уже улетевший
+// запрос летит независимо от следующего. Single-flight по тому же образцу,
+// что manualRefreshInFlight у usage:refresh: пока сборка не разрешилась, все
+// параллельные вызовы ждут ОДИН и тот же промис, второго refresh() не
+// запускается вовсе — TTL (I5) лишь РАСШИРЯЕТ множество случаев, когда мы
+// решаем «пересбор нужен», сам механизм single-flight не тронут ни строкой.
+async function historySearchHandler({
+  smoke, query, opts, state, historyIndex, now = Date.now,
+}) {
+  if (smoke) return null;
+  const stale = state.builtAt === 0 || (now() - state.builtAt) > HISTORY_INDEX_TTL_MS;
+  if (stale) {
+    if (!state.buildInFlight) {
+      state.buildInFlight = (async () => {
+        const entries = await historyIndex.refresh({});
+        state.builtAt = now();
+        state.size = entries.length;
+      })();
+    }
+    try {
+      await state.buildInFlight;
+    } finally {
+      state.buildInFlight = null;
+    }
+  }
+  const o = opts && typeof opts === 'object' ? opts : {};
+  const results = await historyIndex.search(query, o);
+  return { results, indexSize: state.size };
+}
+
+// Явный пересбор индекса ({force:true} игнорирует mtime/size-эвристику
+// history-index.js целиком). Канал существует по брифу задачи 3 — текущий
+// UI (search.js) им не пользуется напрямую (полагается на встроенный
+// ленивый пересбор внутри historySearchHandler выше), задел на будущую
+// кнопку «Обновить индекс». Вынесена по той же причине, что historySearchHandler.
+async function historyRefreshHandler({
+  smoke, opts, state, historyIndex, now = Date.now,
+}) {
+  if (smoke) return null;
+  const force = !!(opts && opts.force);
+  const entries = await historyIndex.refresh({ force });
+  state.builtAt = now();
+  state.size = entries.length;
+  return entries;
+}
+
+// Дыра тестов №1 (ревью финальной волны фазы 7): recipes:* добавлены в ЭТОЙ
+// ЖЕ ветке (Task 4 фазы 7) с тем же классом смоук-гейта, что git:get/gh:repo/
+// gh:global, но остались без единого теста на него. Вынесены по тому же
+// приёму — явные зависимости, экспорт только ради теста (см. module.exports
+// внизу файла), registerIpc() ниже просто прокидывает реальные замыкания.
+function recipesListHandler({ smoke, recipeStore }) {
+  if (smoke) return [];
+  return recipeStore.listPrompts().map((p) => ({ ...p, placeholders: extractPlaceholders(p.text) }));
+}
+
+function recipesSavePromptHandler({ smoke, recipe, recipeStore }) {
+  if (smoke) return null;
+  return recipeStore.savePrompt(recipe);
+}
+
+function recipesDeletePromptHandler({ smoke, id, recipeStore }) {
+  if (smoke) return;
+  if (typeof id === 'string') recipeStore.deletePrompt(id);
+}
+
+function recipesListWorkspacesHandler({ smoke, recipeStore }) {
+  if (smoke) return [];
+  return recipeStore.listWorkspaces();
+}
+
+function recipesSaveWorkspaceHandler({
+  smoke, name, tabs, recipeStore,
+}) {
+  if (smoke) return null;
+  return recipeStore.saveWorkspace(name, tabs);
+}
+
+function recipesDeleteWorkspaceHandler({ smoke, id, recipeStore }) {
+  if (smoke) return;
+  if (typeof id === 'string') recipeStore.deleteWorkspace(id);
+}
+
 function registerIpc(win, opts = {}) {
   const { smoke = false, attention = null, toaster = null } = opts;
 
@@ -381,9 +516,7 @@ function registerIpc(win, opts = {}) {
     stat: statHistoryFile,
     cache: createJsonFileCache(historyIndexCacheFile()),
   });
-  historyIndexBuilt = false;
-  historyIndexSize = 0;
-  historyIndexBuildInFlight = null;
+  historyIndexState = createHistoryIndexState();
   lastBroadcastKey = null;
   lastCcusageResult = null;
   manualRefreshInFlight = null;
@@ -807,67 +940,19 @@ function registerIpc(win, opts = {}) {
   // в ghGlobalHandler() выше по файлу.
   ipcMain.handle('gh:global', async (_e, opts) => ghGlobalHandler({ smoke, opts, ghInfo }));
 
-  // Task 3 фазы 7 (глобальный поиск истории, Ctrl+Shift+H): смотри search.js
-  // (renderer) — оверлей с дебаунсом/отменой устаревших запросов, здесь только
-  // проводка. Индекс собирается ЛЕНИВО: если ещё ни разу не собран за жизнь
-  // этого окна (historyIndexBuilt) — СНАЧАЛА historyIndex.refresh() (полный
-  // обход ~/.claude/projects + инкрементальное чтение), и только ПОТОМ
-  // historyIndex.search() — не на старте приложения (registerIpc() выше
-  // только конструирует historyIndex, без единого I/O). indexSize — снимок
-  // числа сессий из ПОСЛЕДНЕГО refresh() (не пересчитывается на каждый поиск —
-  // сам поиск и так не дешёвый, см. review задачи 2: 1.5-2.2с на 47 сессиях)
-  // — единственный способ renderer'у отличить «ничего не найдено» от «в
-  // истории вообще нет сессий» без отдельного дорогого запроса.
-  // smoke — БЕЗ единого обращения к диску, тот же гейт, что gh:global выше.
-  //
-  // FINDING (ревью Task 3, Important): ipcMain.handle НЕ сериализует
-  // параллельные invoke одного канала, а дебаунс в renderer (search.js)
-  // отменяет только ЕЩЁ НЕ ОТПРАВЛЕННЫЙ таймер — уже улетевший запрос летит
-  // независимо от следующего. Самый обычный сценарий — пользователь дописывает
-  // запрос, пока предыдущий поиск ещё не разрешился (заявлено 1.5-2.2с на
-  // поиск, ревью Task 2) — раньше отправлял ВТОРОЙ history:search раньше, чем
-  // historyIndexBuilt успевал стать true, и оба параллельно гнали полный
-  // historyIndex.refresh({}) — повторный обход ~/.claude/projects и повторное
-  // потоковое чтение всех файлов сессий. Данные от этого не портятся (refresh()
-  // идемпотентен), но это ровно тот лишний ввод-вывод, ради экономии которого
-  // и заведена ленивая сборка. Single-flight по тому же образцу, что
-  // manualRefreshInFlight у usage:refresh выше: пока сборка не разрешилась,
-  // все параллельные вызовы ждут ОДИН и тот же промис, второго refresh() не
-  // запускается вовсе; сбрасываем в finally, как только сборка завершится.
-  ipcMain.handle('history:search', async (_e, query, opts) => {
-    if (smoke) return null;
-    if (!historyIndexBuilt) {
-      if (!historyIndexBuildInFlight) {
-        historyIndexBuildInFlight = (async () => {
-          const entries = await historyIndex.refresh({});
-          historyIndexBuilt = true;
-          historyIndexSize = entries.length;
-        })();
-      }
-      try {
-        await historyIndexBuildInFlight;
-      } finally {
-        historyIndexBuildInFlight = null;
-      }
-    }
-    const o = opts && typeof opts === 'object' ? opts : {};
-    const results = await historyIndex.search(query, o);
-    return { results, indexSize: historyIndexSize };
-  });
+  // Task 3 фазы 7 (глобальный поиск истории, Ctrl+Shift+H) + I5 (ревью
+  // финальной волны, TTL индекса): смотри search.js (renderer) — оверлей с
+  // дебаунсом/отменой устаревших запросов, здесь только проводка. Логика —
+  // в historySearchHandler()/historyRefreshHandler() выше по файлу (вынесены
+  // ради тестируемости смоук-гейта — «дыра тестов №1», ревью финальной
+  // волны — и TTL-фикса I5, см. подробные комментарии там).
+  ipcMain.handle('history:search', async (_e, query, opts) => historySearchHandler({
+    smoke, query, opts, state: historyIndexState, historyIndex,
+  }));
 
-  // Явный пересбор индекса ({force:true} игнорирует mtime/size-эвристику
-  // history-index.js целиком). Канал существует по брифу задачи 3 —
-  // текущий UI (search.js) им не пользуется напрямую (полагается на
-  // встроенный ленивый пересбор внутри history:search выше), задел на
-  // будущую кнопку «Обновить индекс». smoke — тот же гейт.
-  ipcMain.handle('history:refresh', async (_e, opts) => {
-    if (smoke) return null;
-    const force = !!(opts && opts.force);
-    const entries = await historyIndex.refresh({ force });
-    historyIndexBuilt = true;
-    historyIndexSize = entries.length;
-    return entries;
-  });
+  ipcMain.handle('history:refresh', async (_e, opts) => historyRefreshHandler({
+    smoke, opts, state: historyIndexState, historyIndex,
+  }));
 
   // Task 4 фазы 7 (библиотека рецептов промптов): recipes:list отдаёт КАЖДЫЙ
   // рецепт УЖЕ с посчитанными placeholders (extractPlaceholders — чистая
@@ -876,24 +961,20 @@ function registerIpc(win, opts = {}) {
   // полю, не таща отдельно текст плейсхолдера через второй IPC-вызов на
   // каждый рецепт. smoke: не читаем userData вовсе — тот же гейт, что history/
   // usage/gh выше.
-  ipcMain.handle('recipes:list', () => {
-    if (smoke) return [];
-    return recipeStore.listPrompts().map((p) => ({ ...p, placeholders: extractPlaceholders(p.text) }));
-  });
+  // Дыра тестов №1 (ревью финальной волны): логика — в recipesListHandler()
+  // выше по файлу (та же причина, что historySearchHandler/gitGetHandler —
+  // ipc.js целиком не тестируется, а этот канал добавлен в ЭТОЙ ЖЕ ветке
+  // фазы 7 с тем же классом смоук-гейта, но остался без единого теста).
+  ipcMain.handle('recipes:list', () => recipesListHandler({ smoke, recipeStore }));
 
   // Сохранение/удаление рецепта — CRUD-контракт recipes.js целиком (бриф),
   // текущий UI (палитра) сам новые рецепты не создаёт и не удаляет (только
   // читает дефолты + то, что уже лежит в prompts.json) — задел на будущую
   // форму редактирования библиотеки, тот же приём, что history:refresh выше.
-  ipcMain.handle('recipes:savePrompt', (_e, p) => {
-    if (smoke) return null;
-    return recipeStore.savePrompt(p);
-  });
+  // Логика — в recipesSavePromptHandler()/recipesDeletePromptHandler() выше.
+  ipcMain.handle('recipes:savePrompt', (_e, p) => recipesSavePromptHandler({ smoke, recipe: p, recipeStore }));
 
-  ipcMain.handle('recipes:deletePrompt', (_e, id) => {
-    if (smoke) return;
-    if (typeof id === 'string') recipeStore.deletePrompt(id);
-  });
+  ipcMain.handle('recipes:deletePrompt', (_e, id) => recipesDeletePromptHandler({ smoke, id, recipeStore }));
 
   // fillPrompt — чистая текстовая подстановка без единого обращения к диску,
   // смысла гейтить smoke'ом нет (тот же довод, что config:get/shell.openExternal
@@ -913,20 +994,16 @@ function registerIpc(win, opts = {}) {
   // Minor 6) — теперь тоже за действием палитры «Удалить воркспейс: <name>»
   // (без него накопленный дублями/устаревший мусор в workspaces-library.json
   // можно было почистить только руками через файл).
-  ipcMain.handle('recipes:listWorkspaces', () => {
-    if (smoke) return [];
-    return recipeStore.listWorkspaces();
-  });
+  // Дыра тестов №1 (ревью финальной волны): логика — в
+  // recipesListWorkspacesHandler()/recipesSaveWorkspaceHandler()/
+  // recipesDeleteWorkspaceHandler() выше по файлу (та же причина).
+  ipcMain.handle('recipes:listWorkspaces', () => recipesListWorkspacesHandler({ smoke, recipeStore }));
 
-  ipcMain.handle('recipes:saveWorkspace', (_e, name, tabs) => {
-    if (smoke) return null;
-    return recipeStore.saveWorkspace(name, tabs);
-  });
+  ipcMain.handle('recipes:saveWorkspace', (_e, name, tabs) => recipesSaveWorkspaceHandler({
+    smoke, name, tabs, recipeStore,
+  }));
 
-  ipcMain.handle('recipes:deleteWorkspace', (_e, id) => {
-    if (smoke) return;
-    if (typeof id === 'string') recipeStore.deleteWorkspace(id);
-  });
+  ipcMain.handle('recipes:deleteWorkspace', (_e, id) => recipesDeleteWorkspaceHandler({ smoke, id, recipeStore }));
 
   // Task 4 фазы 4 (вставка скриншотов): cwd вкладки резолвим тем же путём,
   // что project:connect/status — tabCwd (manager.list()). saveClipboardImage —
@@ -1054,7 +1131,10 @@ function disposeSessions() {
 module.exports = {
   registerIpc, disposeSessions, stopBridge, getSmokeOutput, flushWorkspace, getActiveTabId,
   // Экспортированы ТОЛЬКО ради test/ipc-smoke-gate.test.js (п.4 брифа задачи 5
-  // фазы 7, см. комментарий у их определения выше) — не часть публичного API
-  // модуля для остального кода.
+  // фазы 7 + «дыра тестов №1», ревью финальной волны, см. комментарии у их
+  // определения выше) — не часть публичного API модуля для остального кода.
   gitGetHandler, ghRepoHandler, ghGlobalHandler,
+  historySearchHandler, historyRefreshHandler, createHistoryIndexState, HISTORY_INDEX_TTL_MS,
+  recipesListHandler, recipesSavePromptHandler, recipesDeletePromptHandler,
+  recipesListWorkspacesHandler, recipesSaveWorkspaceHandler, recipesDeleteWorkspaceHandler,
 };
