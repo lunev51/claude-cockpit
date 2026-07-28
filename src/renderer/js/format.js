@@ -37,6 +37,21 @@ function pad2(n) {
   return String(n).padStart(2, '0');
 }
 
+// Русская форма слова «вкладка» для числа n (ре-ревью раунда 1, косметика):
+// раньше в двух местах стояла двоичная развилка «вкладка/вкладок», из-за
+// которой на 2-4 получалось «Текущие 2 вкладок будут закрыты». Правило
+// стандартное: 1, 21, 31… — «вкладка»; 2-4, 22-24… — «вкладки»; всё
+// остальное, включая 11-14, — «вкладок».
+export function pluralTabs(n) {
+  const abs = Math.abs(Math.trunc(Number(n) || 0));
+  const mod100 = abs % 100;
+  if (mod100 >= 11 && mod100 <= 14) return 'вкладок';
+  const mod10 = abs % 10;
+  if (mod10 === 1) return 'вкладка';
+  if (mod10 >= 2 && mod10 <= 4) return 'вкладки';
+  return 'вкладок';
+}
+
 export function formatShortDate(isoOrMs) {
   if (typeof isoOrMs === 'string') {
     const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(isoOrMs);

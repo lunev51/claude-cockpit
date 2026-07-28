@@ -11,6 +11,7 @@ import { renderRings } from './rings.js';
 import { createDiffPanel } from './diffpanel.js';
 import { createSearch } from './search.js';
 import { createRecipeForm } from './recipe-form.js';
+import { pluralTabs } from './format.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -790,18 +791,18 @@ async function openWorkspace(ws) {
   // у объявления workspaceOpenInFlight выше).
   if (workspaceOpenInFlight) return;
 
-  // Important 1 (ревью раунд 1): оверлей restore мог всё ещё быть на экране
-  // (решение не принято, wsync инертен) — палитра рисуется ПОВЕРХ него
-  // (z-index 60 против 30 у restore) и технически доступна раньше решения по
-  // восстановлению. Открытие именованного воркспейса = неявный отказ от
-  // restore (тот же приём, что newProject() выше) — иначе стаггер этой
-  // функции и ПОЗЖЕ принятое «Восстановить всё» доливают вкладки друг на
-  // друга (дубли вкладок И дубли живых сессий Claude в тех же cwd). Инвариант:
-  // пока restoreOverlaySkip не null, tabStore ВСЕГДА пуст (restoreFlow гасит
-  // сам себя первой строкой и обнуляет restoreOverlaySkip ДО открытия хотя бы
-  // одной вкладки) — поэтому currentCount ниже в этом случае всегда 0 и
-  // диалог подтверждения корректно не покажется (спрашивать нечего).
-  if (restoreOverlaySkip) restoreOverlaySkip();
+  // N2 (ре-ревью раунда 1): состав профиля проверяем ДО закрытия чего-либо и
+  // до диалога. Иначе существует путь «закрыли всё, не открыли ничего»:
+  // запись с нулём валидных вкладок (их разрешала сохранять сборка до Minor 6,
+  // и в чужой библиотеке такие остались) убивала бы все живые сессии, а
+  // манифест перезаписывался бы пустым составом. Пустой профиль — не ошибка,
+  // а бесполезное действие: говорим об этом и выходим, ничего не тронув.
+  const tabs = (Array.isArray(ws && ws.tabs) ? ws.tabs : [])
+    .filter((t) => t && typeof t.cwd === 'string' && t.cwd);
+  if (!tabs.length) {
+    showToast(`В воркспейсе «${ws.name}» нет ни одной вкладки`, 'warn');
+    return;
+  }
 
   const currentCount = tabStore.order().length;
   if (currentCount > 0) {
@@ -811,22 +812,39 @@ async function openWorkspace(ws) {
     // (tabs:changed → syncWorkspace), то есть sessionId для --resume из него
     // исчезают безвозвратно. Один Enter не должен уметь это сделать без
     // явного подтверждения. Нулевой текущий состав — спрашивать нечего.
-    const wordTabs = currentCount === 1 ? 'вкладка будет закрыта' : 'вкладок будут закрыты';
+    const phrase = currentCount === 1
+      ? 'Текущая вкладка будет закрыта'
+      : `Текущие ${currentCount} ${pluralTabs(currentCount)} будут закрыты`;
     const confirmed = await recipeForm.open({
-      title: `Открыть воркспейс «${ws.name}»? Текущие ${currentCount} ${wordTabs}`,
+      title: `Открыть воркспейс «${ws.name}»? ${phrase}`,
       fields: [],
     });
     if (!confirmed) return; // Esc/«Отмена»/клик вне — пользователь передумал
   }
 
+  // Important 1 (ревью раунд 1): оверлей restore мог всё ещё быть на экране
+  // (решение не принято, wsync инертен) — палитра рисуется ПОВЕРХ него
+  // (z-index 60 против 30 у restore) и технически доступна раньше решения по
+  // восстановлению. Открытие именованного воркспейса = неявный отказ от
+  // restore (тот же приём, что newProject() выше) — иначе стаггер этой
+  // функции и ПОЗЖЕ принятое «Восстановить всё» доливают вкладки друг на
+  // друга (дубли вкладок И дубли живых сессий Claude в тех же cwd).
+  //
+  // N1 (ре-ревью раунда 1): вызов стоит ПОСЛЕ отменяемого диалога — раньше
+  // он был первой строкой функции, и Esc в диалоге оставлял пользователя с
+  // уже похороненным списком восстановления. Инвариант «пока restoreOverlaySkip
+  // не null, tabStore пуст» НЕ выполняется: результат поиска по истории
+  // (Ctrl+Shift+H) открывает вкладку мимо оверлея, так что диалог выше вполне
+  // может показаться при живом оверлее — и его отмена обязана не иметь
+  // последствий.
+  if (restoreOverlaySkip) restoreOverlaySkip();
+
   workspaceOpenInFlight = true;
   try {
     await closeAllTabs();
-    const tabs = Array.isArray(ws && ws.tabs) ? ws.tabs : [];
     let firstOpened = null;
     for (let idx = 0; idx < tabs.length; idx++) {
       const t = tabs[idx];
-      if (!t || typeof t.cwd !== 'string' || !t.cwd) continue;
       try {
         // Первая успешно поднятая вкладка становится видимой сразу — та же
         // причина, что в restoreFlow (иначе пользователь смотрит в пустой
@@ -854,11 +872,20 @@ async function openWorkspace(ws) {
 // Действие палитры «Удалить воркспейс: <name>» (Minor 6, ревью раунд 1): без
 // него дубли/устаревшие записи в workspaces-library.json (например, от старой
 // схемы именования до дедупа saveWorkspace по имени) можно было почистить
-// только руками через файл. Низкие ставки по сравнению с «Открыть
-// воркспейс…» (не трогает живые сессии, отменяется повторным сохранением под
-// тем же именем) — отдельного подтверждения не требует.
-async function deleteNamedWorkspace(id) {
-  await window.api.recipes.deleteWorkspace(id);
+// только руками через файл.
+//
+// N3 (ре-ревью раунда 1): подтверждение обязательно. Живые сессии действие не
+// трогает, но состав папок восстановить неоткуда, если этих вкладок сейчас нет
+// на экране, а в палитре строка стоит СРАЗУ под безобидным близнецом «Открыть
+// воркспейс: <name>» и матчится тем же фильтром — промах стрелкой плюс Enter
+// стирал запись молча и безвозвратно.
+async function deleteNamedWorkspace(ws) {
+  const confirmed = await recipeForm.open({
+    title: `Удалить воркспейс «${ws.name}» из библиотеки? Отменить это нельзя`,
+    fields: [],
+  });
+  if (!confirmed) return;
+  await window.api.recipes.deleteWorkspace(ws.id);
   await refreshWorkspacesCache();
 }
 
@@ -943,7 +970,7 @@ function buildPaletteActions() {
     actions.push({
       id: `workspace:${w.id}`,
       title: `Открыть воркспейс: ${w.name}`,
-      hint: `${n} ${n === 1 ? 'вкладка' : 'вкладок'}`,
+      hint: `${n} ${pluralTabs(n)}`,
       run: () => openWorkspace(w),
     });
     // Minor 6 (ревью раунд 1): «Удалить воркспейс: <name>» — без него
@@ -953,7 +980,7 @@ function buildPaletteActions() {
       id: `workspace-delete:${w.id}`,
       title: `Удалить воркспейс: ${w.name}`,
       hint: 'из библиотеки, не трогает открытые вкладки',
-      run: () => deleteNamedWorkspace(w.id),
+      run: () => deleteNamedWorkspace(w),
     });
   }
 

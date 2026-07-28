@@ -83,3 +83,36 @@ test('formatShortDate: мусор (null/undefined/битая строка/NaN) �
   assert.strictEqual(formatShortDate('не дата'), '—');
   assert.strictEqual(formatShortDate(NaN), '—');
 });
+
+// pluralTabs (ре-ревью Task 4 раунда 1): двоичная развилка «вкладка/вкладок»
+// давала «2 вкладок». Проверяем все три формы и оба исключения (11-14 и
+// вторая сотня, где правило повторяется).
+test('pluralTabs: единственное число на 1, 21, 101', async () => {
+  const { pluralTabs } = await import('../src/renderer/js/format.js');
+  assert.strictEqual(pluralTabs(1), 'вкладка');
+  assert.strictEqual(pluralTabs(21), 'вкладка');
+  assert.strictEqual(pluralTabs(101), 'вкладка');
+});
+
+test('pluralTabs: форма «вкладки» на 2-4 и 22-24', async () => {
+  const { pluralTabs } = await import('../src/renderer/js/format.js');
+  assert.strictEqual(pluralTabs(2), 'вкладки');
+  assert.strictEqual(pluralTabs(4), 'вкладки');
+  assert.strictEqual(pluralTabs(23), 'вкладки');
+});
+
+test('pluralTabs: форма «вкладок» на 0, 5-20 и 111-114', async () => {
+  const { pluralTabs } = await import('../src/renderer/js/format.js');
+  assert.strictEqual(pluralTabs(0), 'вкладок');
+  assert.strictEqual(pluralTabs(5), 'вкладок');
+  assert.strictEqual(pluralTabs(11), 'вкладок');
+  assert.strictEqual(pluralTabs(14), 'вкладок');
+  assert.strictEqual(pluralTabs(112), 'вкладок');
+});
+
+test('pluralTabs: мусор на входе не роняет — трактуется как 0', async () => {
+  const { pluralTabs } = await import('../src/renderer/js/format.js');
+  assert.strictEqual(pluralTabs(undefined), 'вкладок');
+  assert.strictEqual(pluralTabs(NaN), 'вкладок');
+  assert.strictEqual(pluralTabs('3'), 'вкладки');
+});
