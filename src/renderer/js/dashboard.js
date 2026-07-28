@@ -51,7 +51,7 @@ export function createDashboard({
 
   // --- Построение секций контента ---
 
-  function buildLimitBar(label, percent, resetsAt, ok, now) {
+  function buildLimitBar(label, part, ok, now) {
     const row = document.createElement('div');
     row.className = 'limit-bar-row';
 
@@ -64,26 +64,37 @@ export function createDashboard({
     track.className = 'limit-bar-track';
     const fill = document.createElement('div');
     fill.className = 'limit-bar-fill';
-    const pct = ok ? Math.max(0, Math.min(100, Math.round(percent))) : 0;
+    // Защитная проверка типа — тот же приём, что rings.js/buildRing для той же
+    // формы данных (fiveHour/sevenDay): percent может отсутствовать или быть
+    // не-числом (неполные/битые данные слоя A) даже когда ok:true — без этой
+    // проверки Math.round(undefined) даёт NaN, и пользователь увидел бы полосу
+    // «NaN%» вместо аккуратного прочерка.
+    const hasPercent = ok && !!part && typeof part.percent === 'number';
+    const pct = hasPercent ? Math.max(0, Math.min(100, Math.round(part.percent))) : 0;
     fill.style.width = `${pct}%`;
-    fill.style.background = ok ? colorFor(pct) : 'var(--text-dim)';
+    fill.style.background = hasPercent ? colorFor(pct) : 'var(--text-dim)';
     track.appendChild(fill);
     row.appendChild(track);
 
     const pctEl = document.createElement('div');
     pctEl.className = 'limit-bar-pct';
-    pctEl.textContent = ok ? `${pct}%` : '—';
+    pctEl.textContent = hasPercent ? `${pct}%` : '—';
     row.appendChild(pctEl);
 
     const resetEl = document.createElement('div');
     resetEl.className = 'limit-bar-reset';
-    resetEl.textContent = ok ? `сброс через ${formatCountdown(resetsAt, now)}` : '—';
+    resetEl.textContent = hasPercent ? `сброс через ${formatCountdown(part.resetsAt, now)}` : '—';
     row.appendChild(resetEl);
 
     return row;
   }
 
-  function buildLimitsSection(limits, now) {
+  // buildLimitsSection(limits, stale, now): stale — вычислен ОДИН РАЗ в
+  // render() (см. комментарий там) и рисуется здесь БЕЗУСЛОВНО, независимо от
+  // ok/scoped/ошибок — секция лимитов единственное место дашборда, которое
+  // гарантированно строится при каждом render(), поэтому пометка «устарело»
+  // живёт именно тут, а не в блоке расходов (см. buildSpendMeta).
+  function buildLimitsSection(limits, stale, now) {
     const section = document.createElement('div');
     section.className = 'dashboard-section dashboard-limits';
 
@@ -96,20 +107,24 @@ export function createDashboard({
     const fiveHour = (limits && limits.fiveHour) || null;
     const sevenDay = (limits && limits.sevenDay) || null;
 
-    section.appendChild(buildLimitBar(
-      '5-часовое окно',
-      fiveHour ? fiveHour.percent : 0,
-      fiveHour && fiveHour.resetsAt,
-      ok,
-      now,
-    ));
-    section.appendChild(buildLimitBar(
-      'Неделя',
-      sevenDay ? sevenDay.percent : 0,
-      sevenDay && sevenDay.resetsAt,
-      ok,
-      now,
-    ));
+    section.appendChild(buildLimitBar('5-часовое окно', fiveHour, ok, now));
+    section.appendChild(buildLimitBar('Неделя', sevenDay, ok, now));
+
+    if (stale) {
+      // Fix ревью: раньше пометка «данные устарели» рисовалась ИСКЛЮЧИТЕЛЬНО
+      // внутри buildSpendMeta() (блок расходов) — при недоступных расходах
+      // (!spend || !spendOk) render() выходил ДО вызова buildSpendMeta(), и
+      // пользователь видел аккуратные проценты лимитов и обратный отсчёт БЕЗ
+      // единой пометки, что данные (слой A — лимиты, ИЛИ слой B — расходы)
+      // на самом деле устарели (реалистичный сценарий: сеть моргнула/токен
+      // протух → 15-минутный бэкофф лимитов, а ccusage при этом не запустился).
+      // Интерфейс молча врал — теперь пометка привязана к секции лимитов и
+      // рисуется независимо от того, отрисовались ли расходы вообще.
+      const staleEl = document.createElement('div');
+      staleEl.className = 'dashboard-badge-stale dashboard-limits-stale';
+      staleEl.textContent = 'данные устарели';
+      section.appendChild(staleEl);
+    }
 
     if (!ok) {
       // Пустое состояние лимитов (бриф §4): прочерки уже нарисованы полосами
@@ -126,7 +141,10 @@ export function createDashboard({
         const scopedWrap = document.createElement('div');
         scopedWrap.className = 'dashboard-scoped';
         for (const s of scoped) {
-          scopedWrap.appendChild(buildLimitBar(s.label, s.percent, s.resetsAt, true, now));
+          // s уже прошёл фильтр percent > 0 выше — hasPercent внутри
+          // buildLimitBar тем не менее сам проверит typeof на случай будущих
+          // некорректных данных, а не только сам факт > 0.
+          scopedWrap.appendChild(buildLimitBar(s.label, s, true, now));
         }
         section.appendChild(scopedWrap);
       }
@@ -135,7 +153,11 @@ export function createDashboard({
     return section;
   }
 
-  function buildSpendMeta(limits, spend) {
+  // buildSpendMeta(): только маркер «оценка» — пометку «данные устарели»
+  // отсюда убрали (fix ревью, см. buildLimitsSection/render): она рисуется
+  // безусловно у секции лимитов, а не только когда блок расходов вообще
+  // успел отрисоваться.
+  function buildSpendMeta() {
     const meta = document.createElement('div');
     meta.className = 'dashboard-spend-meta';
 
@@ -147,13 +169,6 @@ export function createDashboard({
     badge.textContent = 'оценка';
     meta.appendChild(badge);
 
-    const stale = !!(limits && limits.stale) || !!(spend && spend.stale);
-    if (stale) {
-      const staleEl = document.createElement('span');
-      staleEl.className = 'dashboard-badge-stale';
-      staleEl.textContent = 'данные устарели';
-      meta.appendChild(staleEl);
-    }
     return meta;
   }
 
@@ -326,10 +341,20 @@ export function createDashboard({
     const limits = data && data.limits;
     const spend = data && data.spend;
 
+    // Fix ревью (баг): вычисляем «данные устарели» ОДИН РАЗ здесь, а не
+    // только внутри buildSpendMeta() — реалистичное сочетание: слой лимитов
+    // отдал кэш со stale:true (сеть моргнула/токен протух → 15-минутный
+    // бэкофф), а ccusage не смог запуститься (ok:false). Раньше в этом случае
+    // render() делал return ДО вызова buildSpendMeta() (см. ветку !spendOk
+    // ниже), и пользователь видел проценты лимитов и обратный отсчёт БЕЗ
+    // единой пометки, что они несвежие — интерфейс молча врал. Теперь stale
+    // передаётся в buildLimitsSection и рисуется там БЕЗУСЛОВНО.
+    const stale = !!(limits && limits.stale) || !!(spend && spend.stale);
+
     bodyEl.textContent = '';
     // Лимиты показываются ВСЕГДА, даже если слой B (расходы) недоступен —
     // бриф §4: «оверлей при этом всё равно открывается и лимиты показывает».
-    bodyEl.appendChild(buildLimitsSection(limits, now));
+    bodyEl.appendChild(buildLimitsSection(limits, stale, now));
 
     const spendOk = !!(spend && spend.ok);
     if (!spend || !spendOk) {
@@ -340,7 +365,7 @@ export function createDashboard({
       return;
     }
 
-    bodyEl.appendChild(buildSpendMeta(limits, spend));
+    bodyEl.appendChild(buildSpendMeta());
     bodyEl.appendChild(buildCardsSection(spend));
     bodyEl.appendChild(buildTableSection(spend));
     bodyEl.appendChild(buildChartSection(spend));
