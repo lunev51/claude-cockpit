@@ -40,6 +40,8 @@ let historyIndexBuilt = false; // индекс уже собран хотя бы
 let historyIndexSize = 0;      // число сессий последнего refresh() — уходит в ответ history:search как indexSize
                                 // (см. src/renderer/js/search.js — единственный способ отличить «ничего не
                                 // нашлось» от «в истории вообще нет сессий» без отдельного дорогого запроса)
+let historyIndexBuildInFlight = null; // Promise текущей ЛЕНИВОЙ сборки индекса, если уже выполняется
+                                       // (single-flight, ревью Task 3 — см. подробности у 'history:search' ниже)
 let usageMonitorTimer = null; // лёгкий сторож (только snapshot(), без сети) — рассылает usage:update
 let lastBroadcastKey = null;    // `fetchedAt|stale|error` последнего разосланного usage:update — см. usageBroadcastKey()
 let lastCcusageResult = null;   // последний известный ответ ccusage.get() — уходит и в usage:get/usage:refresh, и в usage:update
@@ -525,6 +527,7 @@ function registerIpc(win, opts = {}) {
   });
   historyIndexBuilt = false;
   historyIndexSize = 0;
+  historyIndexBuildInFlight = null;
   lastBroadcastKey = null;
   lastCcusageResult = null;
   manualRefreshInFlight = null;
@@ -958,12 +961,36 @@ function registerIpc(win, opts = {}) {
   // — единственный способ renderer'у отличить «ничего не найдено» от «в
   // истории вообще нет сессий» без отдельного дорогого запроса.
   // smoke — БЕЗ единого обращения к диску, тот же гейт, что gh:global выше.
+  //
+  // FINDING (ревью Task 3, Important): ipcMain.handle НЕ сериализует
+  // параллельные invoke одного канала, а дебаунс в renderer (search.js)
+  // отменяет только ЕЩЁ НЕ ОТПРАВЛЕННЫЙ таймер — уже улетевший запрос летит
+  // независимо от следующего. Самый обычный сценарий — пользователь дописывает
+  // запрос, пока предыдущий поиск ещё не разрешился (заявлено 1.5-2.2с на
+  // поиск, ревью Task 2) — раньше отправлял ВТОРОЙ history:search раньше, чем
+  // historyIndexBuilt успевал стать true, и оба параллельно гнали полный
+  // historyIndex.refresh({}) — повторный обход ~/.claude/projects и повторное
+  // потоковое чтение всех файлов сессий. Данные от этого не портятся (refresh()
+  // идемпотентен), но это ровно тот лишний ввод-вывод, ради экономии которого
+  // и заведена ленивая сборка. Single-flight по тому же образцу, что
+  // manualRefreshInFlight у usage:refresh выше: пока сборка не разрешилась,
+  // все параллельные вызовы ждут ОДИН и тот же промис, второго refresh() не
+  // запускается вовсе; сбрасываем в finally, как только сборка завершится.
   ipcMain.handle('history:search', async (_e, query, opts) => {
     if (smoke) return null;
     if (!historyIndexBuilt) {
-      const entries = await historyIndex.refresh({});
-      historyIndexBuilt = true;
-      historyIndexSize = entries.length;
+      if (!historyIndexBuildInFlight) {
+        historyIndexBuildInFlight = (async () => {
+          const entries = await historyIndex.refresh({});
+          historyIndexBuilt = true;
+          historyIndexSize = entries.length;
+        })();
+      }
+      try {
+        await historyIndexBuildInFlight;
+      } finally {
+        historyIndexBuildInFlight = null;
+      }
     }
     const o = opts && typeof opts === 'object' ? opts : {};
     const results = await historyIndex.search(query, o);
