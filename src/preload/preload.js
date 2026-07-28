@@ -64,4 +64,16 @@ contextBridge.exposeInMainWorld('api', {
     // обмена или нет (main/screenshot.js) — возвращает {path} или null.
     paste: (tabId) => ipcRenderer.invoke('screenshot:paste', tabId),
   },
+  usage: {
+    // Task 3 фазы 5 (кольца лимитов): {limits, spend} — снапшот слоя A
+    // (usage-oauth.js) и последний известный ответ слоя B (usage-ccusage.js,
+    // спрошенный лениво и не чаще TTL внутри самого модуля) или null.
+    get: () => ipcRenderer.invoke('usage:get'),
+    // Принудительное обновление ОБОИХ слоёв (клик по кольцам, кнопка «Обновить»
+    // на дашборде Task 4) — возвращает тот же {limits, spend}, свежий.
+    refresh: () => ipcRenderer.invoke('usage:refresh'),
+    // main шлёт это после каждого успешно обнаруженного refresh поллера
+    // (см. usageMonitorTimer в main/ipc.js) — payload той же формы {limits, spend}.
+    onUpdate: (cb) => ipcRenderer.on('usage:update', (_e, p) => cb(p)),
+  },
 });

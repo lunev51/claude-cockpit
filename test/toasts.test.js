@@ -222,6 +222,45 @@ test('клик по тосту вызывает focusTab с верным tabId',
   assert.deepStrictEqual(h.focusCalls, ['t1']);
 });
 
+test('forget(tabId): done сразу после forget без предшествующего working ведёт себя как для новой вкладки', () => {
+  const h = makeToaster();
+  h.setClock(0);
+  h.toaster.onStatus({
+    tabId: 't1', tabName: 'proj', status: 'working', waitingText: '',
+  });
+  h.setClock(1000);
+  h.toaster.forget('t1');
+  h.setClock(1500); // всего 500мс после forget — без чистки elapsed был бы 1500мс от working (≤30с → тишина)
+  h.toaster.onStatus({
+    tabId: 't1', tabName: 'proj', status: 'done', waitingText: '',
+  });
+  // После forget() workingSince для t1 нет → elapsed=Infinity → порог
+  // пройден, тост показывается, как для вкладки, которую видим впервые.
+  assert.strictEqual(h.notifications.length, 1);
+  assert.strictEqual(h.notifications[0].title, 'proj: готово');
+});
+
+test('forget(tabId) сбрасывает и lastStatus — working после forget считается НОВЫМ переходом, а не повторным пингом', () => {
+  const h = makeToaster();
+  h.setClock(0);
+  h.toaster.onStatus({
+    tabId: 't1', tabName: 'proj', status: 'working', waitingText: '',
+  });
+  h.toaster.forget('t1');
+  h.setClock(100000);
+  // Без сброса lastStatus этот working считался бы повторным пингом того же
+  // хода (prevStatus==='working') и НЕ сдвинул бы workingSince — тогда done
+  // ниже мерил бы время от t=0, а не от t=100000.
+  h.toaster.onStatus({
+    tabId: 't1', tabName: 'proj', status: 'working', waitingText: '',
+  });
+  h.setClock(100000 + 20000); // 20с от НОВОЙ базы — порог 30с не пройден
+  h.toaster.onStatus({
+    tabId: 't1', tabName: 'proj', status: 'done', waitingText: '',
+  });
+  assert.strictEqual(h.notifications.length, 0);
+});
+
 test('неизвестный статус не показывает тост и не падает', () => {
   const h = makeToaster();
   assert.doesNotThrow(() => {

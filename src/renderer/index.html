@@ -38,6 +38,10 @@
         <div class="group-body" data-body="trouble"></div>
       </div>
       <div class="sidebar-footer">
+        <!-- Task 3 фазы 5: кольца лимитов (5ч/неделя) — renderRings (rings.js)
+             сама наполняет #limits при каждом usage:get/usage:update; клик по
+             блоку пока просто форсит usage:refresh() (дашборд — Task 4). -->
+        <div id="limits" tabindex="0" role="button" aria-label="Лимиты Claude — обновить"></div>
         <button class="sidebar-btn" id="btn-new-tab">+ Проект</button>
       </div>
     </div>
@@ -59,6 +63,13 @@
           </div>
         </div>
       </div>
+      <!-- Task 4 фазы 5 (дашборд лимитов и расходов): корень оверлея — внутри
+           #main (position:relative), как #restore-overlay, а не прямой ребёнок
+           <body> (в отличие от peek-root/palette-root) — дашборд накрывает
+           именно терминальную область, а не окно целиком. Пустой div сам по
+           себе ничего не занимает — createDashboard() наполняет/чистит его
+           только на время открытия (см. src/renderer/js/dashboard.js). -->
+      <div id="dashboard-root"></div>
     </div>
   </div>
   <!-- Task 3 фазы 4 (peek): корень поповера — вне #sidebar/#main нарочно,

@@ -127,7 +127,75 @@ function createWindow() {
       // (мусор перед курсором Claude Code), а не только открывает окно.
       e.preventDefault();
       win.webContents.toggleDevTools();
+      return;
     }
+
+    // FIX 3 (ревью, phase5 final wave): ЗДЕСЬ РАНЬШЕ был гард, глушивший
+    // голый Ctrl+R и F5 через preventDefault на before-input-event — якобы
+    // против reload'а renderer'а поверх живых вкладок, когда открыт DevTools
+    // (carryover task 5 фазы 5). Гард убран целиком по итогам живой проверки
+    // ниже — он не решал заявленную проблему и ломал реальную.
+    //
+    // Что было не так:
+    //  1. Гард висел на `win.webContents.on('before-input-event', ...)` и
+    //     проверял `win.webContents.isDevToolsOpened()` — но `before-input-
+    //     event` есть событие именно ЭТОГО webContents (страницы Cockpit), а
+    //     не webContents самой панели DevTools (Electron: `contents.
+    //     devToolsWebContents` — ОТДЕЛЬНый инстанс). preventDefault здесь
+    //     вообще не даёт renderer'у увидеть keydown (документация Electron:
+    //     «Calling event.preventDefault will prevent the page keydown/keyup
+    //     events from being emitted»), поэтому он гасил Ctrl+R/F5 для нашей
+    //     страницы — но был бессилен ровно в том случае, ради которого его
+    //     писали: когда фокус клавиатуры реально находится ВНУТРИ панели
+    //     DevTools, и клавиша рождается в её собственном webContents.
+    //  2. Изначально (до этой правки) гард вообще не проверял DevTools —
+    //     глушил Ctrl+R/F5 БЕЗУСЛОВНО. Во вкладках работает Claude Code, где
+    //     Ctrl+R — рабочий хоткей (reverse history search и т.п.), а F5
+    //     нужен любому TUI внутри pty — оба НИКОГДА не доходили ни до
+    //     renderer, ни тем более до pty активной вкладки, даже когда DevTools
+    //     вообще не был открыт. Промежуточная правка этой волны добавила
+    //     `isDevToolsOpened()` — но живая проверка ниже показала, что
+    //     условие излишне: тот путь, ради которого его писали, гард закрыть
+    //     не может (см. пункт 1), а без DevTools он и не требовался никогда.
+    //
+    // Живая проверка (CDP, --user-data-dir изолирован от прод-профиля,
+    // терминал подменён на PowerShell-эхо сырых клавиш вместо claude, гард
+    // временно отключён совсем — `if (false && ...)` — чтобы проверить факт,
+    // а не мнение):
+    //   (A) DevTools ЗАКРЫТ, Ctrl+R, БЕЗ всякого гарда → «KEY=R MOD=Control»
+    //       появилась в логе эха (клавиша дошла до pty), window.
+    //       __cockpitTestMarker пережил нажатие (страница не
+    //       перезагрузилась). Голый Ctrl+R/F5 не перезагружает окно сам по
+    //       себе — акселератора на них давно нет (Menu.setApplicationMenu(null)
+    //       ниже), так что гард здесь никогда и не требовался.
+    //   (B) DevTools ОТКРЫТ (F12), клавиша отправлена в webContents ГЛАВНОЙ
+    //       страницы (фокус не переводился вручную в панель DevTools — после
+    //       открытия DevTools фокус либо остаётся в textarea терминала, либо
+    //       уходит на случайный элемент страницы, но НЕ в DevTools), БЕЗ
+    //       гарда → та же картина: клавиша дошла до pty, маркер пережил
+    //       нажатие, reload НЕ случился. То есть открытие DevTools само по
+    //       себе никогда не приводило к перезагрузке через ЭТОТ путь —
+    //       ни разу, ни с гардом, ни без него.
+    //   (C) Ctrl+R отправлен НАПРЯМУЮ в собственный CDP-таргет DevTools
+    //       (devtools://devtools/bundled/devtools_app.html — он реально
+    //       существует как отдельный inspectable target, `Target.getTargets`
+    //       это подтвердил) — вот тут window.__cockpitTestMarker стал
+    //       undefined: страница ДЕЙСТВИТЕЛЬНО перезагрузилась. Это и есть
+    //       настоящий источник бага из carryover-заметки — reload происходит,
+    //       только когда клавиша рождается в собственном документе DevTools
+    //       (пользователь кликнул туда мышью), и `before-input-event` на
+    //       `win.webContents` этот путь принципиально не видит — ни с
+    //       гардом, ни с каким угодно другим условием внутри него.
+    //
+    // Итог: гард (в любом виде — безусловный или условный на
+    // isDevToolsOpened()) не закрывает реальный путь reload'а (C) и ломает
+    // Ctrl+R/F5 в терминале без всякой пользы. Убран целиком. Если сценарий
+    // (C) когда-нибудь станет реальной жалобой пользователя — решать его
+    // придётся на уровне `contents.on('will-navigate'|'did-start-navigation')`
+    // самого DevTools webContents (доступен как `win.webContents.
+    // devToolsWebContents` в новых Electron) или явным запретом через
+    // `win.webContents.setDevToolsWebContents`/аналог, а не через
+    // `before-input-event` окна — здесь это тупик.
   });
 
   win.loadFile(path.join(__dirname, '../renderer/index.html'));
