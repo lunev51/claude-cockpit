@@ -1218,6 +1218,68 @@ html, body {
   padding: 0 1px;
 }
 
+/* --- Мини-форма ввода (Task 4 фазы 7): плейсхолдеры рецепта / имя воркспейса.
+   Тот же скелет вёрстки, что палитра/поиск (.palette-*/.search-*) выше —
+   центр окна, тот же z-index (60), т.к. открывается ИЗ уже закрытой палитры
+   (взаимно с ней не пересекается на практике) и взаимно исключается с
+   дашбордом/поиском по истории (см. app.js/toggleDashboard, toggleHistorySearch,
+   bindHotkeys). Корень #recipe-form-root — прямой ребёнок <body> (см.
+   index.html), тот же приём, что palette-root/search-root. --- */
+.recipe-form-overlay {
+  position: fixed;
+  inset: 0;
+  background: color-mix(in srgb, var(--bg-window) 55%, transparent);
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 96px;
+  z-index: 60;
+}
+.recipe-form-panel {
+  width: 420px;
+  max-width: 90%;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-l);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+.recipe-form-title {
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+}
+.recipe-form-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.recipe-form-label {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.recipe-form-input {
+  background: var(--bg-window);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  padding: 7px 9px;
+}
+.recipe-form-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.recipe-form-hint {
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
 /* --- Тосты (находка 4б, ревью фазы 6): app:notice (main/notify.js) — раньше
    долетал до renderer, но показывался ТОЛЬКО console.warn'ом, без единого
    визуального следа (см. app.js/showToast). Корень — прямой ребёнок <body>

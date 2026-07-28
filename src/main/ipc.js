@@ -23,6 +23,7 @@ const { createCcusage } = require('./usage-ccusage');
 const { createGitInfo } = require('./git-info');
 const { createGhInfo } = require('./gh-info');
 const { createHistoryIndex } = require('./history-index');
+const { createRecipeStore, extractPlaceholders, fillPrompt } = require('./recipes');
 
 let manager = null;
 let smokeOutput = '';
@@ -35,6 +36,7 @@ let usagePoller = null;  // поллер официальных лимитов (
 let ccusage = null;      // слой расходов ccusage (usage-ccusage.js) — слой B
 let gitInfo = null;      // Task 2 фазы 6 (панель диффа): git-info.js, чистое ядро + реальный run()
 let ghInfo = null;       // Task 4 фазы 6 (панель GitHub): gh-info.js, чистое ядро + реальный run()
+let recipeStore = null;       // Task 4 фазы 7 (рецепты + именованные воркспейсы): recipes.js, чистое ядро + реальные пути в userData
 let historyIndex = null;      // Task 3 фазы 7 (поиск истории): history-index.js, чистое ядро + реальные зависимости
 let historyIndexBuilt = false; // индекс уже собран хотя бы раз ЛЕНИВО (см. 'history:search' ниже) — не на старте
 let historyIndexSize = 0;      // число сессий последнего refresh() — уходит в ответ history:search как indexSize
@@ -123,6 +125,20 @@ function usageCcusageCacheFile() {
 // createJsonFileCache ниже используется третий раз, каждый со своим путём.
 function historyIndexCacheFile() {
   return path.join(app.getPath('userData'), 'history-index.json');
+}
+
+// Task 4 фазы 7 (рецепты + именованные воркспейсы): два независимых файла в
+// userData — recipes.js сам про app.getPath() ничего не знает (чистое ядро),
+// пути резолвит только этот файл, тот же приём, что historyIndexCacheFile выше.
+function promptsFile() {
+  return path.join(app.getPath('userData'), 'prompts.json');
+}
+
+function workspacesLibraryFile() {
+  // Имя НЕ workspace.json — тот файл уже занят манифестом текущего состава
+  // вкладок (workspace.js/createWorkspaceStore, переменная store выше); это
+  // отдельная библиотека ИМЕНОВАННЫХ, явно сохранённых пользователем профилей.
+  return path.join(app.getPath('userData'), 'workspaces-library.json');
 }
 
 // JSON-файл кэша: read/write в try/catch (битый/отсутствующий файл → null,
@@ -532,6 +548,18 @@ function registerIpc(win, opts = {}) {
   lastCcusageResult = null;
   manualRefreshInFlight = null;
   lastManualRefreshAt = 0;
+
+  // Task 4 фазы 7 (рецепты + именованные воркспейсы): recipeStore — чистое
+  // ядро (recipes.js) + реальные пути в userData выше. Конструктор не делает
+  // I/O сам по себе (тот же приём, что historyIndex/gitInfo/ghInfo выше) —
+  // безопасно создавать всегда, даже в smoke. Дефолтные рецепты первого
+  // запуска (бриф) сеются здесь, но ТОЛЬКО не в smoke — headless-прогон не
+  // должен писать в userData ничего нового при каждом запуске.
+  recipeStore = createRecipeStore({
+    promptsFile: promptsFile(),
+    workspacesFile: workspacesLibraryFile(),
+  });
+  if (!smoke) recipeStore.ensureDefaultPrompts();
 
   // Стор манифеста создаётся один раз на регистрацию — независимо от smoke,
   // чтобы workspace:get всегда мог отдать хоть что-то (в smoke он просто
@@ -1009,6 +1037,57 @@ function registerIpc(win, opts = {}) {
     historyIndexBuilt = true;
     historyIndexSize = entries.length;
     return entries;
+  });
+
+  // Task 4 фазы 7 (библиотека рецептов промптов): recipes:list отдаёт КАЖДЫЙ
+  // рецепт УЖЕ с посчитанными placeholders (extractPlaceholders — чистая
+  // функция recipes.js, здесь вызывается один раз на рецепт) — renderer
+  // (app.js/buildPaletteActions) решает, показывать ли мини-форму, ПО этому
+  // полю, не таща отдельно текст плейсхолдера через второй IPC-вызов на
+  // каждый рецепт. smoke: не читаем userData вовсе — тот же гейт, что history/
+  // usage/gh выше.
+  ipcMain.handle('recipes:list', () => {
+    if (smoke) return [];
+    return recipeStore.listPrompts().map((p) => ({ ...p, placeholders: extractPlaceholders(p.text) }));
+  });
+
+  // Сохранение/удаление рецепта — CRUD-контракт recipes.js целиком (бриф),
+  // текущий UI (палитра) сам новые рецепты не создаёт и не удаляет (только
+  // читает дефолты + то, что уже лежит в prompts.json) — задел на будущую
+  // форму редактирования библиотеки, тот же приём, что history:refresh выше.
+  ipcMain.handle('recipes:savePrompt', (_e, p) => {
+    if (smoke) return null;
+    return recipeStore.savePrompt(p);
+  });
+
+  ipcMain.handle('recipes:deletePrompt', (_e, id) => {
+    if (smoke) return;
+    if (typeof id === 'string') recipeStore.deletePrompt(id);
+  });
+
+  // fillPrompt — чистая текстовая подстановка без единого обращения к диску,
+  // смысла гейтить smoke'ом нет (тот же довод, что config:get/shell.openExternal
+  // выше по файлу не гейтятся) — просто безвредный no-op на пустых values.
+  ipcMain.handle('recipes:fillPrompt', (_e, text, values) => fillPrompt(text, values));
+
+  // Именованные воркспейсы (Task 4 фазы 7): listWorkspaces/saveWorkspace —
+  // палитра читает и пишет их напрямую (действия «Открыть воркспейс: <name>»/
+  // «Сохранить воркспейс…», см. app.js). deleteWorkspace пока без UI-действия
+  // (бриф явно требует только сохранение/открытие) — тот же задел на будущее,
+  // что recipes:deletePrompt выше.
+  ipcMain.handle('recipes:listWorkspaces', () => {
+    if (smoke) return [];
+    return recipeStore.listWorkspaces();
+  });
+
+  ipcMain.handle('recipes:saveWorkspace', (_e, name, tabs) => {
+    if (smoke) return null;
+    return recipeStore.saveWorkspace(name, tabs);
+  });
+
+  ipcMain.handle('recipes:deleteWorkspace', (_e, id) => {
+    if (smoke) return;
+    if (typeof id === 'string') recipeStore.deleteWorkspace(id);
   });
 
   // Task 4 фазы 4 (вставка скриншотов): cwd вкладки резолвим тем же путём,

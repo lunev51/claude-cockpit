@@ -10,6 +10,7 @@ import { createDashboard } from './dashboard.js';
 import { renderRings } from './rings.js';
 import { createDiffPanel } from './diffpanel.js';
 import { createSearch } from './search.js';
+import { createRecipeForm } from './recipe-form.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -31,6 +32,19 @@ let diffPanel = null;
 // createSearch сама владеет своим DOM (см. search.js), здесь только ссылка
 // для bindHotkeys/взаимного исключения с palette/dashboard/peek.
 let historySearch = null;
+// Task 4 фазы 7 (рецепты промптов + именованные воркспейсы): createRecipeForm
+// сама владеет своим DOM-оверлеем (мини-форма ввода, см. recipe-form.js) —
+// здесь только ссылка для взаимного исключения с прочими оверлеями (тот же
+// приём, что historySearch/dashboard/palette выше).
+let recipeForm = null;
+// Локальные зеркала server-side библиотек (main/recipes.js) — тот же приём,
+// что queueByTab/lastUsage/lastGh ниже: buildPaletteActions() должна быть
+// СИНХРОННОЙ (palette.js зовёт getActions() без await, см. palette.js/open()),
+// а recipes:list/recipes:listWorkspaces — асинхронные IPC-вызовы. Кэш
+// заполняется при boot() и обновляется сразу после «Сохранить воркспейс…»
+// (см. saveCurrentWorkspace) — палитра не отстаёт больше чем на один клик.
+let recipesCache = [];
+let workspacesCache = [];
 // Task 3 фазы 4 (peek): tabId, для которого сейчас открыт поповер (или null).
 // Нужен, чтобы обработчик tab:status закрывал peek ТОЛЬКО когда статус меняет
 // именно ту вкладку, что сейчас показана в поповере — peek.hide() идемпотентна,
@@ -392,6 +406,9 @@ function toggleDashboard() {
   // Task 3 фазы 7: та же логика — оверлей поиска не должен остаться висеть
   // «за спиной» открывающегося дашборда.
   if (historySearch?.isOpen()) historySearch.close();
+  // Task 4 фазы 7: та же логика — мини-форма рецепта/воркспейса тоже не
+  // должна остаться висеть «за спиной» (close() — no-op, если форма закрыта).
+  recipeForm?.close();
   if (dashboard.isOpen()) dashboard.close();
   else dashboard.open();
 }
@@ -403,6 +420,8 @@ function toggleHistorySearch() {
   peek?.hide();
   if (palette.isOpen()) palette.close();
   dashboard?.close();
+  // Task 4 фазы 7: та же логика, что toggleDashboard() выше.
+  recipeForm?.close();
   if (historySearch.isOpen()) historySearch.close();
   else historySearch.open(views.get(tabStore.activeId)?.view);
 }
@@ -488,6 +507,10 @@ function activateTab(tabId) {
   // openTab({sessionId}) → activateTab — оверлей к этому моменту уже закрыт
   // самим search.js/openAt, но close() идемпотентна, повторный вызов безвреден).
   historySearch?.close();
+  // Task 4 фазы 7: та же логика — переключение вкладки (в т.ч. Ctrl+1..9/
+  // Ctrl+Tab, минуя визуальную блокировку оверлея) не должно оставить мини-
+  // форму рецепта/воркспейса висеть «за спиной» с чужим недописанным вводом.
+  recipeForm?.close();
   // Task 1 фазы 7: очередь — ввод для КОНКРЕТНОЙ сессии; поле ввода, открытое
   // для одной вкладки, не должно молча остаться висеть (и слать текст уже не
   // в ту вкладку) после переключения на другую.
@@ -655,6 +678,117 @@ async function newProject() {
   }
 }
 
+// Task 4 фазы 7 (библиотека рецептов промптов): перечитать recipesCache из
+// main. Fire-and-forget, тот же приём, что usage.get()/gh.global() в boot() —
+// список рецептов не меняется в этой задаче в обход самого файла на диске
+// (палитра только читает), так что одного обновления при старте достаточно.
+async function refreshRecipesCache() {
+  try {
+    recipesCache = await window.api.recipes.list();
+  } catch (err) {
+    console.warn('[recipes] recipes:list не удался:', err);
+    recipesCache = [];
+  }
+}
+
+async function refreshWorkspacesCache() {
+  try {
+    workspacesCache = await window.api.recipes.listWorkspaces();
+  } catch (err) {
+    console.warn('[recipes] recipes:listWorkspaces не удался:', err);
+    workspacesCache = [];
+  }
+}
+
+// Действие палитры «Рецепт: <title>» (Task 4 фазы 7): при наличии
+// плейсхолдеров — сперва мини-форма ввода (recipeForm), затем подстановка
+// (main/recipes.js:fillPrompt, единственный источник истины для этой логики —
+// не дублируем regex здесь) и запись в pty АКТИВНОЙ на момент запуска действия
+// вкладки. tabId резолвим ДО возможного await формы — так что запись уйдёт
+// именно туда, где пользователь фактически выбрал действие, даже если он
+// успеет переключиться на другую вкладку, пока форма ещё на экране.
+async function runRecipe(recipe) {
+  const tabId = tabStore.activeId;
+  if (!tabId) return; // нет ни одной вкладки — писать некуда
+  let text = recipe.text;
+  const placeholders = Array.isArray(recipe.placeholders) ? recipe.placeholders : [];
+  if (placeholders.length) {
+    const fields = placeholders.map((name) => ({ key: name, label: name }));
+    const values = await recipeForm.open({ title: recipe.title, fields });
+    if (!values) return; // Esc/клик вне формы — пользователь отменил
+    text = await window.api.recipes.fillPrompt(recipe.text, values);
+  }
+  // Ловушка из брифа: пустой/пробельный текст — НЕ отправляем голый '\r' в pty
+  // (для диалога разрешения Claude Code это молчаливое согласие с вариантом
+  // по умолчанию) — тот же guard, что peek.js/send().
+  if (!text || !text.trim()) return;
+  window.api.term.write(tabId, `${text}\r`);
+  views.get(tabId)?.view.focus();
+}
+
+// Действие палитры «Сохранить воркспейс…» (Task 4 фазы 7): спросить имя через
+// ту же мини-форму (одно поле), взять ТЕКУЩИЙ состав вкладок из tabStore
+// (cwd+name — то же, что переживает restart/restore, см. tabs.js/peekInfo) и
+// отдать main на запись. workspacesCache обновляется сразу же — следующее же
+// открытие палитры увидит «Открыть воркспейс: <имя>» без перезапуска кокпита.
+async function saveCurrentWorkspace() {
+  const values = await recipeForm.open({
+    title: 'Сохранить воркспейс',
+    fields: [{ key: 'name', label: 'Имя воркспейса' }],
+  });
+  if (!values) return; // отменено
+  const tabs = tabStore.order().map((tabId) => {
+    const info = tabStore.peekInfo(tabId);
+    return { cwd: info ? info.cwd : '', name: info ? info.name : '' };
+  }).filter((t) => t.cwd);
+  const saved = await window.api.recipes.saveWorkspace(values.name, tabs);
+  if (saved) await refreshWorkspacesCache(); // пустое/пробельное имя → saved:null, кэш не трогаем
+}
+
+// Действие палитры «Открыть воркспейс: <name>» (Task 4 фазы 7): закрыть ВСЕ
+// текущие вкладки, затем поднять состав именованного воркспейса со стаггером
+// 1500мс между вкладками — тот же интервал и тот же повод (Claude CLI должен
+// успеть прочитать хуки/сессию, прежде чем поднимется следующая вкладка), что
+// и restoreFlow() выше, но написан ОТДЕЛЬНО от неё: restoreFlow заточена под
+// восстановление манифеста при старте (ghost-буферы, sessionId резюма,
+// activeIndex, сигнал workspace.ready() наружу) — эти сущности здесь не при
+// делах (именованный воркспейс хранит только {cwd, name}, без сессии), а
+// трогать уже несколько раз отревьюженный restoreFlow ради нового сценария
+// рискованнее, чем повторить сам стаггер-цикл в компактном виде.
+async function closeAllTabs() {
+  // Последовательно — closeTab мутирует общий tabStore/views, параллельный
+  // close() нескольких вкладок сразу рискует гонкой (neighborOf/activateTab
+  // внутри closeTab читают tabStore, который в этот же момент меняет другой
+  // параллельный вызов).
+  for (const tabId of tabStore.order()) {
+    await closeTab(tabId);
+  }
+}
+
+async function openWorkspace(ws) {
+  await closeAllTabs();
+  const tabs = Array.isArray(ws && ws.tabs) ? ws.tabs : [];
+  let firstOpened = null;
+  for (let idx = 0; idx < tabs.length; idx++) {
+    const t = tabs[idx];
+    if (!t || typeof t.cwd !== 'string' || !t.cwd) continue;
+    try {
+      // Первая успешно поднятая вкладка становится видимой сразу — та же
+      // причина, что в restoreFlow (иначе пользователь смотрит в пустой
+      // терминал весь стаггер).
+      const tab = await openTab(t.cwd, { activate: !firstOpened });
+      if (tab && !firstOpened) firstOpened = tab;
+    } catch (err) {
+      // Одна неоткрывшаяся вкладка не должна обрывать открытие остальных —
+      // та же логика, что finding 2a у restoreFlow.
+      console.warn(`[workspace] не удалось открыть вкладку ${t.cwd}:`, err);
+    }
+    if (idx < tabs.length - 1) {
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  }
+}
+
 // Task 4 фазы 4 (палитра команд): полный список действий, собирается заново
 // при КАЖДОМ открытии палитры (palette.js зовёт getActions() внутри open()) —
 // состав вкладок мог измениться с прошлого раза. Действия над «активной»
@@ -697,6 +831,41 @@ function buildPaletteActions() {
     hint: 'Ctrl+Shift+H',
     run: () => toggleHistorySearch(),
   });
+
+  // Task 4 фазы 7 (библиотека рецептов промптов): по одному действию на
+  // рецепт из recipesCache (см. refreshRecipesCache — заполняется при boot()).
+  // hint показывает имена плейсхолдеров, если они есть, — то же, зачем
+  // мини-форма вообще понадобится при запуске (runRecipe).
+  for (const r of recipesCache) {
+    const placeholders = Array.isArray(r.placeholders) ? r.placeholders : [];
+    actions.push({
+      id: `recipe:${r.id}`,
+      title: `Рецепт: ${r.title}`,
+      hint: placeholders.length ? `{{${placeholders.join('}}, {{')}}}` : '',
+      run: () => runRecipe(r),
+    });
+  }
+
+  // «Сохранить воркспейс…» — не привязано к активной вкладке, доступно
+  // всегда (берёт ВЕСЬ текущий состав вкладок, а не только активную).
+  actions.push({
+    id: 'save-workspace',
+    title: 'Сохранить воркспейс…',
+    hint: 'текущий состав вкладок',
+    run: () => saveCurrentWorkspace(),
+  });
+
+  // По одному действию «Открыть воркспейс: <name>» на сохранённый профиль
+  // (см. refreshWorkspacesCache).
+  for (const w of workspacesCache) {
+    const n = Array.isArray(w.tabs) ? w.tabs.length : 0;
+    actions.push({
+      id: `workspace:${w.id}`,
+      title: `Открыть воркспейс: ${w.name}`,
+      hint: `${n} ${n === 1 ? 'вкладка' : 'вкладок'}`,
+      run: () => openWorkspace(w),
+    });
+  }
 
   const activeId = tabStore.activeId;
   if (activeId) {
@@ -754,6 +923,9 @@ function bindHotkeys() {
       // Task 3 фазы 7: та же логика — оверлей поиска истории тоже не должен
       // остаться висеть «за спиной» открывшейся палитры.
       if (historySearch?.isOpen()) historySearch.close();
+      // Task 4 фазы 7: та же логика — мини-форма рецепта/воркспейса тоже не
+      // должна остаться висеть «за спиной».
+      recipeForm?.close();
       // Fix round 1 (ревью): peek?.hide() выше уже мог схлопнуть
       // document.activeElement на <body> (см. подробный разбор в palette.js/
       // open) — передаём терминал активной вкладки как fallback НА СЛУЧАЙ
@@ -793,7 +965,7 @@ function bindHotkeys() {
       // оверлей. Без гарда пользователь переключал (и сохранял в конфиг)
       // панель, невидимую под оверлеем — интерфейс молча менял состояние,
       // не показывая результат.
-      if (dashboard?.isOpen() || palette?.isOpen() || historySearch?.isOpen()) return;
+      if (dashboard?.isOpen() || palette?.isOpen() || historySearch?.isOpen() || recipeForm?.isOpen()) return;
       toggleDiffPanel();
       return;
     }
@@ -807,7 +979,7 @@ function bindHotkeys() {
         && (ev.key === 'q' || ev.key === 'Q' || ev.code === 'KeyQ')) {
       ev.preventDefault();
       ev.stopPropagation();
-      if (dashboard?.isOpen() || palette?.isOpen() || historySearch?.isOpen()) return;
+      if (dashboard?.isOpen() || palette?.isOpen() || historySearch?.isOpen() || recipeForm?.isOpen()) return;
       if (queueInputOpen) closeQueueInput();
       else openQueueInput();
       return;
@@ -1026,7 +1198,8 @@ function showRestoreOverlay(manifest) {
   // тому, кто ЕГО реально должен обработать (единый стек оверлеев — задача
   // следующей фазы, здесь достаточно точечной проверки).
   function otherOverlayOpen() {
-    return !!(dashboard?.isOpen() || palette?.isOpen() || peek?.isOpen() || historySearch?.isOpen());
+    return !!(dashboard?.isOpen() || palette?.isOpen() || peek?.isOpen() || historySearch?.isOpen()
+      || recipeForm?.isOpen());
   }
 
   function onKey(ev) {
@@ -1129,6 +1302,16 @@ async function boot() {
     api: window.api,
     onOpenResult: (cwd, sessionId) => openTab(cwd, { sessionId }),
   });
+
+  // Task 4 фазы 7 (рецепты промптов + именованные воркспейсы): мини-форма
+  // ввода — единственный владелец своего DOM (см. recipe-form.js). Кэши
+  // рецептов/воркспейсов — НЕ await, тот же приём, что usage.get() ниже: не
+  // задерживаем остальной boot() ради пары дешёвых чтений с диска; палитра
+  // просто увидит пустой список до разрешения промиса (getActions() зовётся
+  // заново при каждом открытии, см. palette.js).
+  recipeForm = createRecipeForm({ root: $('recipe-form-root') });
+  refreshRecipesCache();
+  refreshWorkspacesCache();
 
   renderActionBar();
 
