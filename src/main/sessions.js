@@ -24,6 +24,30 @@ const STATUSES = ['working', 'waiting', 'done', 'stuck', 'dead'];
 // процесс был живым и умер сам по себе; авто-восстановление не триггерим.
 const AUTO_RECOVER_MAX_LIFETIME_MS = 15000;
 
+// C1 (Critical, ревью финальной волны фазы 8): Claude Code шлёт хук
+// Notification НЕ только на permission_prompt («нужно разрешение на
+// инструмент»), но и на idle_prompt («жду вашего ввода» — раз в ~60с, пока
+// терминал не в фокусе; режим 1004 у нас реально включён, см. terminal.js/
+// hasRealUserInput выше по фазе). connector.js регистрирует Notification БЕЗ
+// matcher'а (EVENTS без разбивки на подтипы) — оба вида хука приходят как
+// ОДНО и то же событие, различать приходится по содержимому message.
+//
+// Без этой классификации ночная смена ломается НАВСЕГДА в основном сценарии:
+// 23:00 лимит → детект; 23:01 idle_prompt (терминал не в фокусе всю ночь) →
+// статус 'waiting'; 03:01 пробуждение → NO_RESUME_STATUSES считает ЛЮБОЙ
+// 'waiting' непродолжаемым → «пропущена: ждёт ответа на диалог» — хотя ждать
+// там было нечего, кроме собственного idle-пинга CLI.
+//
+// НЕИЗВЕСТНЫЙ текст (кастомный prompt инструмента, будущая версия CLI,
+// локализация) → консервативно 'permission': пропуск резюма безопаснее
+// случайного Enter в диалог подтверждения (той же осторожности требует и
+// брифом заказанная трактовка usage-error/no-usage-data в night-watch.js).
+function classifyNotification(message) {
+  const text = String(message || '').toLowerCase();
+  if (text.includes('waiting for your input')) return 'idle';
+  return 'permission';
+}
+
 // Выпиливает унаследованные маркеры родительского Claude Code из process.env
 // (Task 6). Если кокпит запущен из-под ДРУГОГО Claude Code (например, так
 // делают тестовые прогоны), переменные вроде CLAUDE_CODE_CHILD_SESSION /
@@ -100,6 +124,11 @@ function createSessionManager({
       resumeOnFirstSpawn: !!sessionId, // одноразовый флаг: спавн #1 добавит --resume <id>
       sessionBound: false,     // true, только когда SessionStart реально привязал сессию (bindSession)
       status: null, subtitle: '', waitingText: '',
+      // C1 (ревью финальной волны фазы 8): вид последнего Notification —
+      // 'idle'|'permission'|'' (ещё не было ни одного). Проставляется в
+      // applyHookEvent/case 'Notification' (classifyNotification выше),
+      // чистится вместе с waitingText при уходе из 'waiting' (см. setStatus).
+      waitingKind: '',
       lastOutputAt: now(),
       // Очередь промптов (Task 1 фазы 7): ввод для КОНКРЕТНОЙ сессии этой
       // вкладки — переживает обычное переключение вкладок, но НЕ переживает
@@ -131,7 +160,10 @@ function createSessionManager({
   function setStatus(tab, status, subtitle, extra) {
     tab.status = status;
     if (typeof subtitle === 'string') tab.subtitle = subtitle;
-    if (status !== 'waiting') tab.waitingText = '';
+    // C1: waitingKind — та же судьба, что waitingText (оба относятся к
+    // ПОСЛЕДНЕМУ Notification; уход из 'waiting' в ЛЮБОЙ другой статус
+    // делает их прошлым состоянием, а не текущим).
+    if (status !== 'waiting') { tab.waitingText = ''; tab.waitingKind = ''; }
     onEvent('tab:status', {
       tabId: tab.tabId, status, subtitle: tab.subtitle, waitingText: tab.waitingText,
       ...(extra || {}),
@@ -551,6 +583,9 @@ function createSessionManager({
         break;
       case 'Notification':
         tab.waitingText = String(data.message || '');
+        // C1 (Critical, ревью финальной волны): idle_prompt vs
+        // permission_prompt — см. classifyNotification() выше по файлу.
+        tab.waitingKind = classifyNotification(tab.waitingText);
         tab.status = 'waiting';
         tab.subtitle = tab.waitingText.slice(0, 120);
         onEvent('tab:status', {
@@ -609,8 +644,14 @@ function createSessionManager({
   }
 
   function list() {
-    return [...tabs.values()].map(({ tabId, cwd, name, alive, status, subtitle, sessionId, ghostId }) => (
-      { tabId, cwd, name, alive, status, subtitle, sessionId, ghostId }
+    // waitingKind (C1) — нужен обвязке ipc.js, чтобы отличить резюмируемый
+    // idle_prompt от блокирующего permission_prompt (resumableTabStatus).
+    return [...tabs.values()].map(({
+      tabId, cwd, name, alive, status, subtitle, sessionId, ghostId, waitingKind,
+    }) => (
+      {
+        tabId, cwd, name, alive, status, subtitle, sessionId, ghostId, waitingKind,
+      }
     ));
   }
 

@@ -19,6 +19,7 @@ const {
   recipesListHandler, recipesSavePromptHandler, recipesDeletePromptHandler,
   recipesListWorkspacesHandler, recipesSaveWorkspaceHandler, recipesDeleteWorkspaceHandler,
   nightToggleHandler, nightGetHandler, hasRealUserInput,
+  shouldDetectLimitStop, resumableTabStatus,
 } = require('../src/main/ipc');
 
 // gitInfo/ghInfo-заглушки, которые ПАДАЮТ, если их дёрнули: смоук-гейт по
@@ -449,4 +450,66 @@ test('hasRealUserInput: автоответ + реальная клавиша в 
 
 test('hasRealUserInput: пустая строка → false', () => {
   assert.strictEqual(hasRealUserInput(''), false);
+});
+
+// ------------------------------------------------------------- shouldDetectLimitStop --
+// M4 финального ревью (обязательно): детект-замыкание onEvent, вынесенное в
+// чистую функцию — prev/payload буквально те же значения, что обвязка читает
+// из lastStatusByTab/событие 'tab:status'.
+
+test('shouldDetectLimitStop: prev=working, status=done, genProven=true → true', () => {
+  assert.strictEqual(shouldDetectLimitStop('working', { status: 'done', genProven: true }), true);
+});
+
+test('shouldDetectLimitStop: prev=stuck (Minor 1), status=done, genProven=true → true (симметрично working)', () => {
+  assert.strictEqual(shouldDetectLimitStop('stuck', { status: 'done', genProven: true }), true);
+});
+
+test('shouldDetectLimitStop: genProven=false (Important 1) → false, даже если prev=working и status=done', () => {
+  assert.strictEqual(shouldDetectLimitStop('working', { status: 'done', genProven: false }), false);
+});
+
+test('shouldDetectLimitStop: genProven отсутствует вовсе (undefined) → false', () => {
+  assert.strictEqual(shouldDetectLimitStop('working', { status: 'done' }), false);
+});
+
+test('shouldDetectLimitStop: status !== done (например waiting) → false, независимо от prev/genProven', () => {
+  assert.strictEqual(shouldDetectLimitStop('working', { status: 'waiting', genProven: true }), false);
+});
+
+test('shouldDetectLimitStop: prev не working и не stuck (например done/waiting/null) → false', () => {
+  assert.strictEqual(shouldDetectLimitStop('done', { status: 'done', genProven: true }), false);
+  assert.strictEqual(shouldDetectLimitStop('waiting', { status: 'done', genProven: true }), false);
+  assert.strictEqual(shouldDetectLimitStop(null, { status: 'done', genProven: true }), false);
+  assert.strictEqual(shouldDetectLimitStop(undefined, { status: 'done', genProven: true }), false);
+});
+
+test('shouldDetectLimitStop: payload отсутствует вовсе → false, не бросает', () => {
+  assert.strictEqual(shouldDetectLimitStop('working', null), false);
+  assert.strictEqual(shouldDetectLimitStop('working', undefined), false);
+});
+
+// ------------------------------------------------------------- resumableTabStatus --
+// C1 (Critical, ревью финальной волны): idle_prompt vs permission_prompt.
+
+test('resumableTabStatus: waiting + idle → done (резюмируемо)', () => {
+  assert.strictEqual(resumableTabStatus('waiting', 'idle'), 'done');
+});
+
+test('resumableTabStatus: waiting + permission → остаётся waiting (непродолжаемо)', () => {
+  assert.strictEqual(resumableTabStatus('waiting', 'permission'), 'waiting');
+});
+
+test('resumableTabStatus: waiting + пустой/неизвестный waitingKind → остаётся waiting (консервативно)', () => {
+  assert.strictEqual(resumableTabStatus('waiting', ''), 'waiting');
+  assert.strictEqual(resumableTabStatus('waiting', undefined), 'waiting');
+  assert.strictEqual(resumableTabStatus('waiting', 'что-то-незнакомое'), 'waiting');
+});
+
+test('resumableTabStatus: любой НЕ-waiting статус проходит насквозь без изменений, даже с waitingKind:"idle"', () => {
+  assert.strictEqual(resumableTabStatus('working', 'idle'), 'working');
+  assert.strictEqual(resumableTabStatus('done', 'idle'), 'done');
+  assert.strictEqual(resumableTabStatus('stuck', 'idle'), 'stuck');
+  assert.strictEqual(resumableTabStatus('dead', 'idle'), 'dead');
+  assert.strictEqual(resumableTabStatus(null, 'idle'), null);
 });

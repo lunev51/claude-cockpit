@@ -258,6 +258,59 @@ test('переходы: PreToolUse→working с tool_name, Notification→waitin
   assert.strictEqual(st.status, 'done');
 });
 
+// ---------- C1 (Critical, ревью финальной волны фазы 8): классификация Notification ----------
+// Claude Code шлёт хук Notification и на idle_prompt («жду вашего ввода» —
+// раз в ~60с без фокуса терминала), и на permission_prompt («нужно
+// разрешение») — connector.js регистрирует ОБА как одно и то же событие без
+// matcher'а. tab.waitingKind различает их по содержимому message; list()
+// отдаёт его наружу для обвязки ipc.js (resumableTabStatus).
+
+test('Notification с idle-текстом ("waiting for your input") → waitingKind "idle"', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'Notification', { message: 'Claude is waiting for your input' });
+  const tab = mgr.list().find((t) => t.tabId === a.tabId);
+  assert.strictEqual(tab.status, 'waiting');
+  assert.strictEqual(tab.waitingKind, 'idle');
+});
+
+test('Notification с permission-текстом ("needs your permission") → waitingKind "permission"', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'Notification', { message: 'Claude needs your permission to use Bash' });
+  const tab = mgr.list().find((t) => t.tabId === a.tabId);
+  assert.strictEqual(tab.waitingKind, 'permission');
+});
+
+test('Notification с мусорным/неизвестным текстом → waitingKind "permission" (консервативный дефолт)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'Notification', { message: 'Разрешить запуск npm install?' });
+  const tab = mgr.list().find((t) => t.tabId === a.tabId);
+  assert.strictEqual(tab.waitingKind, 'permission');
+});
+
+test('waitingKind чистится вместе с waitingText при уходе из waiting (UserPromptSubmit после Notification)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'Notification', { message: 'Claude is waiting for your input' });
+  assert.strictEqual(mgr.list().find((t) => t.tabId === a.tabId).waitingKind, 'idle');
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', {});
+  // list() не отдаёт waitingText вовсе (никогда не отдавал, это не регрессия
+  // этого фикса) — проверяем его через emitted 'tab:status' (statusOf), тот
+  // же приём, что остальные тесты этого файла.
+  assert.strictEqual(statusOf(events, a.tabId).waitingText, '');
+  assert.strictEqual(mgr.list().find((t) => t.tabId === a.tabId).waitingKind, '');
+});
+
 // ---------- Task 2 фазы 6: PostToolUse → git:changed, статус не трогает ----------
 
 test('applyHookEvent: PostToolUse НЕ меняет статус вкладки, но эмитит git:changed с tabId', () => {

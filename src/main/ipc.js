@@ -240,6 +240,50 @@ function hasRealUserInput(data) {
   return withoutReports.length > 0;
 }
 
+// M4 финального ревью (обязательно, п.3 брифа этой волны): детект-замыкание
+// в onEvent — раньше жило прямо инлайном внутри createSessionManager({onEvent})
+// и было непокрыто тестами (ipc.js целиком не тестируется). Вынесено в чистую
+// функцию с явными параметрами: prev — значение ИЗ КАРТЫ lastStatusByTab ДО
+// её обновления (см. комментарий у объявления карты выше), payload — объект
+// события 'tab:status' целиком (несёт status и genProven, см. sessions.js/
+// applyHookEvent/case 'Stop').
+//
+// Minor 1 (ревью фикс-раунда 1): 'stuck' считается наравне с 'working' — ядро
+// (night-watch.js/NO_RESUME_STATUSES) уже трактует 'stuck' как полностью
+// резюмируемый статус на пробуждении, детект обязан быть симметричен:
+// вкладку могло пометить checkStuck() (>5 мин без вывода — типичная картина,
+// пока Claude висит на исчерпанном лимите) НЕПОСРЕДСТВЕННО перед самим
+// Stop-хуком, она всё ещё реально «работала».
+//
+// Important 1 (ревью фикс-раунда 1): genProven===true — единственное
+// доказательство, что working→done принадлежит СВОЕЙ (кокпитной) сессии, а
+// не стороннему процессу той же сессии вне кокпита (маршрутизация по
+// session_id без COCKPIT_TAB_GEN, заявленная фича port-file — см. I4 фазы 7).
+function shouldDetectLimitStop(prev, payload) {
+  if (!payload || payload.status !== 'done') return false;
+  if (payload.genProven !== true) return false;
+  return prev === 'working' || prev === 'stuck';
+}
+
+// C1 (Critical, ревью финальной волны фазы 8): getTabStatus-адаптер для
+// createNightWatch({getTabStatus}) — маппинг «сырого» пятистатусного статуса
+// sessions.js в то, что ядро понимает как «резюмируемо». Claude Code шлёт хук
+// Notification и на idle_prompt («жду вашего ввода», раз в ~60с без фокуса
+// терминала), и на permission_prompt («нужно разрешение») — ОБА приходят как
+// статус 'waiting' (sessions.js их не различал вовсе до этого фикса, см.
+// classifyNotification() в sessions.js). Без различения ЛЮБОЙ 'waiting' на
+// пробуждении считался бы непродолжаемым диалогом (NO_RESUME_STATUSES
+// ядра) — вкладка, простоявшая ночь в idle_prompt (терминал не в фокусе),
+// НИКОГДА не продолжилась бы, хотя ждать там было нечего, кроме
+// собственного idle-пинга CLI. waitingKind==='idle' → мапим в 'done'
+// (резюмируемый статус, симметричный обычному завершению задачи); permission
+// (или что угодно иное) — статус остаётся как есть, 'waiting' по-прежнему в
+// NO_RESUME_STATUSES ядра.
+function resumableTabStatus(rawStatus, waitingKind) {
+  if (rawStatus === 'waiting' && waitingKind === 'idle') return 'done';
+  return rawStatus;
+}
+
 // HH:MM из ms-таймстампа (локальное время) — брифом заказан именно этот
 // формат для тоста «Лимит: продолжу в HH:MM». Нечисловой/некорректный вход
 // (защита от неожиданной формы entry.detail) → '?', тост всё равно не падает.
@@ -805,26 +849,10 @@ function registerIpc(win, opts = {}) {
       if (channel === 'tab:status') {
         const prev = lastStatusByTab.get(payload.tabId);
         lastStatusByTab.set(payload.tabId, payload.status);
-        // Minor 1 (ревью фикс-раунд 1): ядро (night-watch.js/processResumeTab,
-        // NO_RESUME_STATUSES) считает 'stuck' ПОЛНОСТЬЮ резюмируемым статусом
-        // на пробуждении — детект должен быть симметричен: вкладку могло
-        // пометить checkStuck() (>5 мин без вывода — типичная картина, пока
-        // Claude висит на исчерпанном лимите) НЕПОСРЕДСТВЕННО перед самим
-        // Stop-хуком, она всё ещё реально «работала». night-watch.js/onTabStop
-        // (уже отревьюженное ядро Task 1) требует ЛИТЕРАЛЬНО prevStatus==='working'
-        // (спека) — не трогаем ядро, нормализуем здесь, в обвязке, которая и
-        // владеет знанием о пятистатусной модели статусов sessions.js.
-        const wasWorking = prev === 'working' || prev === 'stuck';
-        // Important 1 (ревью фикс-раунд 1): детект теперь ТАКЖЕ требует
-        // ДОКАЗАННОГО поколения (payload.genProven, см. sessions.js/applyHookEvent,
-        // ветка 'Stop') — без этого гарда сторонний процесс ТОЙ ЖЕ сессии вне
-        // кокпита (маршрутизация по session_id, gen:null — заявленная фича
-        // port-file, см. I4 фазы 7) мог бы завершить СВОЮ задачу и подложить
-        // working→done вкладке кокпита, которая в это время реально работала
-        // над своей — ночная смена восприняла бы это как остановку по лимиту
-        // и позже вбросила бы «продолжай» в живой ввод чужой (в смысле не
-        // связанной с этим событием) сессии.
-        if (nightWatch && payload.status === 'done' && wasWorking && payload.genProven === true) {
+        // M4 финального ревью: логика вынесена в shouldDetectLimitStop()
+        // (чистая функция выше по файлу) — см. её комментарий за подробным
+        // обоснованием Minor 1 (stuck) и Important 1 (genProven).
+        if (nightWatch && shouldDetectLimitStop(prev, payload)) {
           nightWatch.onTabStop(payload.tabId, 'working');
         }
       }
@@ -883,9 +911,14 @@ function registerIpc(win, opts = {}) {
     },
     clearTimer: (id) => clearTimeout(id),
     refreshUsage,
+    // C1 (Critical, ревью финальной волны): resumableTabStatus() (см. выше по
+    // файлу) маппит idle_prompt ('waiting'+waitingKind:'idle') в 'done' —
+    // без этого маппинга вкладка, простоявшая ночь в idle_prompt (терминал
+    // не в фокусе), никогда не продолжилась бы: ЛЮБОЙ 'waiting' считался бы
+    // непродолжаемым диалогом (NO_RESUME_STATUSES ядра).
     getTabStatus: (tabId) => {
       const tab = manager.list().find((t) => t.tabId === tabId);
-      return tab ? tab.status : null;
+      return tab ? resumableTabStatus(tab.status, tab.waitingKind) : null;
     },
     // Гард непустого текста + '\r' (бриф) — тот же приём, что normalizeForPty/
     // injectQueuedOnStop, только текст здесь всегда буквальное «продолжай»
@@ -1467,4 +1500,8 @@ module.exports = {
   // Electron — экспортирована ради собственного юнит-теста (см. комментарий
   // у определения выше).
   hasRealUserInput,
+  // M4 финального ревью (обязательно) + C1 (Critical) — чистые функции без
+  // Electron, экспортированы ради собственных юнит-тестов (см. комментарии
+  // у их определения выше).
+  shouldDetectLimitStop, resumableTabStatus,
 };
