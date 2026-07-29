@@ -1400,3 +1400,57 @@ test('spawn: env несёт COCKPIT_TAB_GEN как строку текущего
   assert.ok(Number.isInteger(gen1) && gen1 > 0);
   assert.ok(Number.isInteger(gen2) && gen2 > gen1, 'поколение второго спавна должно быть строго больше первого');
 });
+
+// ---------- N2 (ре-ревью финальной волны): notification_type первым сигналом + липкий permission ----------
+
+test('N2: notification_type "idle_prompt" даёт idle даже при НЕЗНАКОМОМ тексте (локализация не ломает C1)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'Notification', {
+    message: 'Клод ждёт вашего ввода', notification_type: 'idle_prompt',
+  });
+  const tab = mgr.list().find((t) => t.tabId === a.tabId);
+  assert.strictEqual(tab.waitingKind, 'idle');
+});
+
+test('N2: notification_type "permission_prompt" побеждает idle-похожий текст', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'Notification', {
+    message: 'waiting for your input to approve Bash', notification_type: 'permission_prompt',
+  });
+  const tab = mgr.list().find((t) => t.tabId === a.tabId);
+  assert.strictEqual(tab.waitingKind, 'permission');
+});
+
+test('N2: липкий permission — idle-пинг ПОВЕРХ открытого диалога не понижает waitingKind', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'Notification', { message: 'Claude needs your permission to use Bash' });
+  // Диалог всё ещё открыт (статус waiting), прилетает idle-пинг:
+  mgr.applyHookEvent(a.tabId, 'Notification', {
+    message: 'Claude is waiting for your input', notification_type: 'idle_prompt',
+  });
+  const tab = mgr.list().find((t) => t.tabId === a.tabId);
+  assert.strictEqual(tab.waitingKind, 'permission', 'ночное «продолжай» не должно уметь попасть в диалог');
+});
+
+test('N2: после ВЫХОДА из waiting понижение разрешено — новый idle после working даёт idle', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'Notification', { message: 'Claude needs your permission to use Bash' });
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', {}); // пользователь ответил, вкладка снова работает
+  mgr.applyHookEvent(a.tabId, 'Notification', {
+    message: 'Claude is waiting for your input', notification_type: 'idle_prompt',
+  });
+  const tab = mgr.list().find((t) => t.tabId === a.tabId);
+  assert.strictEqual(tab.waitingKind, 'idle');
+});

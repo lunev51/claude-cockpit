@@ -502,6 +502,20 @@ function createNightWatch({
       const windowReset = !!(usage && usage.ok && !usage.stale
         && usage.fiveHour && usage.fiveHour.percent < cfg.fiveHourThreshold);
 
+      // N1 (ре-ревью финальной волны): forget() мог опустошить pending, пока
+      // мы висели на await refreshUsage (пользователь закрыл последнюю
+      // ждущую вкладку ровно во время сетевого запроса). Без этого гарда
+      // ретрай-ветка ниже крутила бы фантомные повторы при пустом pending, а
+      // ветка сброса — сожгла бы слот maxResets на «wake-complete: 0 of 0».
+      // Тот же фантом, что чинил N3 раунда 1, — forget() открыл ему второй
+      // вход.
+      if (pending.length === 0) {
+        stopWaitTimer();
+        updateBlocker();
+        emitChange();
+        return;
+      }
+
       if (windowReset) {
         // N3 (ре-ревью раунда 1): конкурентный детект, дорезолвившийся во
         // время НАШЕГО await выше, мог успеть добавиться в pending И

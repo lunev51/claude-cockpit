@@ -1295,3 +1295,43 @@ test('N3: windowReset снимает будильник конкурентног
   assert.strictEqual(wakeCompletes.length, 1, 'ровно одно настоящее пробуждение');
   assert.strictEqual(ctx.nw.snapshot().resetsHandled, 1, 'фантом не сжёг слот maxResets');
 });
+
+// N1 (ре-ревью финальной волны): forget() опустошает pending, пока doWake
+// висит на await refreshUsage (пользователь закрыл последнюю ждущую вкладку
+// во время сетевого запроса) — ни ретраев при пустом pending, ни сожжённого
+// слота maxResets, будильник и блокер сняты.
+test('N1: forget последней pending-вкладки во время await пробуждения → ни ретрая, ни слота, таймер снят', async () => {
+  const clock = makeClock(0);
+  const timers = fakeTimers();
+  const statuses = new Map([['a', 'done']]);
+  let phase = 'limit';
+  let releaseWake = null;
+  const refreshUsage = () => {
+    if (phase === 'limit') return Promise.resolve(usageOk({ fiveHourPercent: 96, resetsAt: 5000 }));
+    return new Promise((resolve) => {
+      releaseWake = () => resolve(usageOk({ fiveHourPercent: 10 }));
+    });
+  };
+  const ctx = setup({ clock, timers, statuses, refreshUsage });
+  ctx.nw.arm();
+
+  await ctx.nw.onTabStop('a', 'working');
+  assert.strictEqual(ctx.nw.snapshot().pendingCount, 1);
+
+  phase = 'reset';
+  clock.set(66000);
+  const wakePromise = ctx.timers.fire(ctx.timers.lastId()); // doWake повис на refreshUsage
+
+  ctx.nw.forget('a'); // закрытие последней ждущей вкладки
+  releaseWake();
+  await wakePromise;
+
+  const snap = ctx.nw.snapshot();
+  assert.strictEqual(snap.resetsHandled, 0, 'слот maxResets не сожжён');
+  assert.strictEqual(snap.wakeAt, null, 'фантомный будильник не запланирован');
+  assert.strictEqual(ctx.timers.liveCount(), 0, 'живых таймеров нет');
+  const types = ctx.journal.entries.map((e) => e.type);
+  assert.ok(!types.includes('retry'), 'ретраев при пустом pending нет');
+  assert.ok(!types.includes('wake-complete'), 'фантомного пробуждения нет');
+  assert.strictEqual(ctx.blocker.startCount, ctx.blocker.stopCount, 'блокер снят');
+});

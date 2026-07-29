@@ -42,7 +42,16 @@ const AUTO_RECOVER_MAX_LIFETIME_MS = 15000;
 // локализация) → консервативно 'permission': пропуск резюма безопаснее
 // случайного Enter в диалог подтверждения (той же осторожности требует и
 // брифом заказанная трактовка usage-error/no-usage-data в night-watch.js).
-function classifyNotification(message) {
+//
+// N2 (ре-ревью финальной волны): payload хука несёт ТОЧНОЕ поле
+// notification_type ('idle_prompt'/'permission_prompt' — сверено с бинарём
+// CLI 2.1.220), cockpit-hook.js прокидывает stdin-JSON целиком. Оно —
+// первый сигнал; подстрока message — фолбэк для старых/изменённых версий,
+// где поля нет. Смена английского текста при живом поле больше не уводит
+// фичу обратно в C1.
+function classifyNotification(message, notificationType) {
+  if (notificationType === 'idle_prompt') return 'idle';
+  if (notificationType === 'permission_prompt') return 'permission';
   const text = String(message || '').toLowerCase();
   if (text.includes('waiting for your input')) return 'idle';
   return 'permission';
@@ -586,17 +595,28 @@ function createSessionManager({
       case 'PreToolUse':
         setStatus(tab, 'working', data.tool_name ? `${data.tool_name}…` : 'работает…');
         break;
-      case 'Notification':
+      case 'Notification': {
         tab.waitingText = String(data.message || '');
         // C1 (Critical, ревью финальной волны): idle_prompt vs
         // permission_prompt — см. classifyNotification() выше по файлу.
-        tab.waitingKind = classifyNotification(tab.waitingText);
+        //
+        // N2 (ре-ревью финальной волны), «липкий permission»: если вкладка
+        // УЖЕ ждёт диалога разрешения, поздний idle-пинг поверх открытого
+        // диалога НЕ понижает permission → idle — иначе ночное «продолжай\r»
+        // ушло бы прямо в диалог и подтвердило подсвеченный вариант.
+        // Понижение возможно только после выхода из 'waiting' (setStatus
+        // чистит waitingKind при любом другом статусе).
+        const kind = classifyNotification(tab.waitingText, data.notification_type);
+        if (!(tab.status === 'waiting' && tab.waitingKind === 'permission' && kind === 'idle')) {
+          tab.waitingKind = kind;
+        }
         tab.status = 'waiting';
         tab.subtitle = tab.waitingText.slice(0, 120);
         onEvent('tab:status', {
           tabId: tab.tabId, status: 'waiting', subtitle: tab.subtitle, waitingText: tab.waitingText,
         });
         break;
+      }
       case 'Stop':
         // Important 1 (ревью Task 2 фазы 8, «Ночная смена»): night-watch.js
         // детектит остановку по лимиту через working→done на 'tab:status', а
