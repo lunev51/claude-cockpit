@@ -19,7 +19,7 @@ const {
   recipesListHandler, recipesSavePromptHandler, recipesDeletePromptHandler,
   recipesListWorkspacesHandler, recipesSaveWorkspaceHandler, recipesDeleteWorkspaceHandler,
   nightToggleHandler, nightGetHandler, hasRealUserInput,
-  shouldDetectLimitStop, resumableTabStatus,
+  shouldDetectLimitStop, resumableTabStatus, isSnapshotFreshEnough, USAGE_SNAPSHOT_FRESH_MS,
 } = require('../src/main/ipc');
 
 // gitInfo/ghInfo-заглушки, которые ПАДАЮТ, если их дёрнули: смоук-гейт по
@@ -512,4 +512,48 @@ test('resumableTabStatus: любой НЕ-waiting статус проходит 
   assert.strictEqual(resumableTabStatus('stuck', 'idle'), 'stuck');
   assert.strictEqual(resumableTabStatus('dead', 'idle'), 'dead');
   assert.strictEqual(resumableTabStatus(null, 'idle'), null);
+});
+
+// ------------------------------------------------------------- isSnapshotFreshEnough --
+// I2 (ревью финальной волны): троттлинг refreshUsage — свежий снапшот отдаём
+// без сети, устаревший/битый/протухший — нет (та же консервативная логика,
+// что Critical 2 у night-watch.js про usage.stale).
+
+test('isSnapshotFreshEnough: ok:true, stale:false, fetchedAt только что → true', () => {
+  const now = 1000000;
+  assert.strictEqual(isSnapshotFreshEnough({ ok: true, stale: false, fetchedAt: now - 1000 }, now), true);
+});
+
+test('isSnapshotFreshEnough: fetchedAt РОВНО на границе USAGE_SNAPSHOT_FRESH_MS → false (граница НЕ включена)', () => {
+  const now = 1000000;
+  assert.strictEqual(
+    isSnapshotFreshEnough({ ok: true, stale: false, fetchedAt: now - USAGE_SNAPSHOT_FRESH_MS }, now),
+    false,
+  );
+});
+
+test('isSnapshotFreshEnough: fetchedAt на 1мс моложе границы → true', () => {
+  const now = 1000000;
+  assert.strictEqual(
+    isSnapshotFreshEnough({ ok: true, stale: false, fetchedAt: now - USAGE_SNAPSHOT_FRESH_MS + 1 }, now),
+    true,
+  );
+});
+
+test('isSnapshotFreshEnough: ok:false → false, даже если fetchedAt свежий', () => {
+  assert.strictEqual(isSnapshotFreshEnough({ ok: false, stale: false, fetchedAt: 999999 }, 1000000), false);
+});
+
+test('isSnapshotFreshEnough: stale:true → false, даже если ok:true и fetchedAt свежий (Critical 2 night-watch.js: та же осторожность)', () => {
+  assert.strictEqual(isSnapshotFreshEnough({ ok: true, stale: true, fetchedAt: 999999 }, 1000000), false);
+});
+
+test('isSnapshotFreshEnough: fetchedAt отсутствует/не число → false', () => {
+  assert.strictEqual(isSnapshotFreshEnough({ ok: true, stale: false }, 1000000), false);
+  assert.strictEqual(isSnapshotFreshEnough({ ok: true, stale: false, fetchedAt: '1000' }, 1000000), false);
+});
+
+test('isSnapshotFreshEnough: snapshot отсутствует вовсе → false, не бросает', () => {
+  assert.strictEqual(isSnapshotFreshEnough(null, 1000000), false);
+  assert.strictEqual(isSnapshotFreshEnough(undefined, 1000000), false);
 });

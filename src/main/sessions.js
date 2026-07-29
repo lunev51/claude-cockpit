@@ -71,6 +71,10 @@ function sanitizedProcessEnv() {
 // getTermConfig() → config.terminal; onEvent(channel, payload) → webContents.send.
 // now() — клок (тестам нужен управляемый); stuckAfterMs — порог зависания;
 // getExtraEnv() — доп. env для pty (порт hook-bridge, Task 2).
+// holdQueueFor(tabId) — I3 (ревью финальной волны фазы 8): НЕОБЯЗАТЕЛЬНАЯ
+// зависимость, (tabId) => bool. Если передана и вернула true на Stop — очередь
+// НЕ вбрасывается (элемент остаётся ждать следующего живого Stop). Без неё
+// (default null) поведение прежнее — Stop всегда вбрасывает, как раньше.
 function createSessionManager({
   ptyFactory,
   getTermConfig,
@@ -78,6 +82,7 @@ function createSessionManager({
   now = Date.now,
   stuckAfterMs = 5 * 60 * 1000,
   getExtraEnv = () => ({}),
+  holdQueueFor = null,
 }) {
   const tabs = new Map();
   // Global-счётчик поколений (Important 1, ревью раунд 1 задачи 5 фазы 7):
@@ -614,7 +619,19 @@ function createSessionManager({
         // очередь непуста) — внутри injectQueuedOnStop(). I4 (ревью финальной
         // волны): плюс гард ДОКАЗАННОГО поколения здесь же — недоказанное
         // (gen:null, сторонний процесс) не даёт права писать в pty.
-        if (genProven) injectQueuedOnStop(tab);
+        //
+        // I3 (ревью финальной волны фазы 8, шов с фазой 7): вкладка, которая
+        // сейчас в pending ночной смены (встала по лимиту, ждёт сброса окна),
+        // НЕ должна получать очередной элемент очереди на каждый Stop — CLI
+        // на исчерпанном лимите отбивает вброс мгновенно, следующий Stop
+        // вбрасывает СЛЕДУЮЩИЙ элемент, и вся очередь Ctrl+Q сгорает в стену
+        // за секунды, задолго до самого пробуждения (первый элемент, ушедший
+        // ДО детекта, этим не спасти — см. отчёт). holdQueueFor — НЕОБЯЗАТЕЛЬНАЯ
+        // зависимость (по умолчанию null): без неё — поведение прежнее.
+        if (genProven) {
+          const held = typeof holdQueueFor === 'function' && holdQueueFor(tab.tabId);
+          if (!held) injectQueuedOnStop(tab);
+        }
         break;
       case 'PostToolUse':
         // Task 2 фазы 6 (панель диффа): PostToolUse — не сигнал ожидания и не
@@ -646,11 +663,15 @@ function createSessionManager({
   function list() {
     // waitingKind (C1) — нужен обвязке ipc.js, чтобы отличить резюмируемый
     // idle_prompt от блокирующего permission_prompt (resumableTabStatus).
+    // gen (M2) — текущее поколение pty вкладки; обвязка передаёт его снимок
+    // в nightWatch.onTabStop() на момент детекта, ядро сверяет его же на
+    // пробуждении через getTabGen — pty мог смениться (авто-респавн/ручной
+    // рестарт в интерактивный пикер сессий) между детектом и пробуждением.
     return [...tabs.values()].map(({
-      tabId, cwd, name, alive, status, subtitle, sessionId, ghostId, waitingKind,
+      tabId, cwd, name, alive, status, subtitle, sessionId, ghostId, waitingKind, gen,
     }) => (
       {
-        tabId, cwd, name, alive, status, subtitle, sessionId, ghostId, waitingKind,
+        tabId, cwd, name, alive, status, subtitle, sessionId, ghostId, waitingKind, gen,
       }
     ));
   }

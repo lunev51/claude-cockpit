@@ -18,11 +18,24 @@
 const nodeFs = require('fs');
 const nodePath = require('path');
 
+// I1(а) (ревью финальной волны фазы 8): журнал раньше рос неограниченно —
+// append() перечитывал/переписывал ФАЙЛ ЦЕЛИКОМ на каждую запись (O(n) на
+// запись, O(n²) за ночь), а snapshot() ядра (night-watch.js) кладёт ВЕСЬ
+// журнал в КАЖДЫЙ 'night:changed' — проба ревьюера: 200 Stop подряд (пачка
+// вкладок, взведённый днём режим) → 201 запись, каждая следующая переписывает
+// файл длиннее предыдущей, и 201 IPC-событие с всё более толстым payload.
+// Кольцевой потолок — последние MAX_ENTRIES записей, отрезаем СТАРЫЕ (в
+// начале массива, append — в конец) при каждой записи, ПОСЛЕ push. 200 —
+// с большим запасом покрывает «ночь физически вмещает 2-3 сброса» (спека) —
+// даже спам-сценарий ревьюера деградирует до постоянного объёма, а не растёт
+// безгранично.
+const MAX_ENTRIES = 200;
+
 function isValidList(v) {
   return Array.isArray(v);
 }
 
-function createNightJournal({ file, fs = nodeFs, path = nodePath }) {
+function createNightJournal({ file, fs = nodeFs, path = nodePath, maxEntries = MAX_ENTRIES }) {
   function readRaw() {
     return fs.readFileSync(file, 'utf8');
   }
@@ -81,7 +94,11 @@ function createNightJournal({ file, fs = nodeFs, path = nodePath }) {
     try {
       const list = readAll();
       list.push(entry);
-      writeList(list);
+      // I1(а): кольцевой потолок — отрезаем СТАРЫЕ записи (в начале массива),
+      // храним только последние maxEntries. slice(-N) на массиве короче N
+      // возвращает массив как есть — безопасно и при list.length<=maxEntries.
+      const capped = list.length > maxEntries ? list.slice(-maxEntries) : list;
+      writeList(capped);
     } catch {
       // readAll()/writeList() уже не бросают сами по себе, но на всякий
       // случай (например, path.basename выше бросит на совсем экзотическом
@@ -96,4 +113,4 @@ function createNightJournal({ file, fs = nodeFs, path = nodePath }) {
   return { append, readAll, reset };
 }
 
-module.exports = { createNightJournal };
+module.exports = { createNightJournal, NIGHT_JOURNAL_MAX_ENTRIES: MAX_ENTRIES };

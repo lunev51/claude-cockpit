@@ -1036,6 +1036,78 @@ test('Stop вбрасывает ПЕРВЫЙ элемент очереди в pt
   assert.strictEqual(statusOf(events, a.tabId).status, 'done');
 });
 
+// ---------- I3 (ревью финальной волны фазы 8, шов с фазой 7): holdQueueFor ----------
+// Вкладка, которая ждёт сброса ночного лимита (в pending night-watch.js), не
+// должна получать очередной элемент очереди на КАЖДЫЙ Stop — CLI на
+// исчерпанном лимите отбивает вброс мгновенно, следующий Stop вбрасывает
+// СЛЕДУЮЩИЙ элемент, и вся очередь сгорает в стену за секунды до самого
+// пробуждения.
+
+test('holdQueueFor(tabId)===true → Stop НЕ вбрасывает элемент очереди, очередь остаётся цела', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory, { holdQueueFor: () => true });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  const gen = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  mgr.enqueue(a.tabId, 'первый');
+  mgr.enqueue(a.tabId, 'второй');
+
+  const queueChangedBeforeStop = queueChangedFor(events, a.tabId).length; // 2 — по одному на каждый enqueue()
+
+  mgr.applyHookEvent(a.tabId, 'Stop', {}, gen);
+
+  assert.deepStrictEqual(factory.spawned[0].written, [], 'вброс НЕ должен был произойти — вкладка удержана предикатом');
+  const changed = queueChangedFor(events, a.tabId);
+  assert.strictEqual(changed.length, queueChangedBeforeStop, 'Stop не должен был эмитить ЕЩЁ queue:changed — вброса не было вовсе');
+  assert.deepStrictEqual(changed[changed.length - 1].queue, ['первый', 'второй'], 'очередь цела — ни один элемент не снят');
+  // Статус ВСЁ РАВНО двигается в 'done' — held гейтит только вброс очереди,
+  // не сам переход статуса (тот же принцип, что genProven чуть выше).
+  assert.strictEqual(statusOf(events, a.tabId).status, 'done');
+});
+
+test('holdQueueFor(tabId)===false → Stop вбрасывает как обычно (предикат передан, но не удерживает)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory, { holdQueueFor: () => false });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  const gen = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  mgr.enqueue(a.tabId, 'первый');
+
+  mgr.applyHookEvent(a.tabId, 'Stop', {}, gen);
+
+  assert.deepStrictEqual(factory.spawned[0].written, ['первый\r']);
+  assert.deepStrictEqual(queueChangedFor(events, a.tabId).pop().queue, []);
+});
+
+test('holdQueueFor не передан (по умолчанию null) — поведение прежнее, вброс происходит', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory); // без holdQueueFor вовсе
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  const gen = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  mgr.enqueue(a.tabId, 'первый');
+
+  mgr.applyHookEvent(a.tabId, 'Stop', {}, gen);
+
+  assert.deepStrictEqual(factory.spawned[0].written, ['первый\r']);
+  assert.deepStrictEqual(queueChangedFor(events, a.tabId).pop().queue, []);
+});
+
+test('holdQueueFor(tabId)===true, но genProven===false (недоказанное поколение) — предикат вообще не должен вызываться, вброса и так не было бы', () => {
+  const factory = makeFakePtyFactory();
+  let calls = 0;
+  const { mgr, events } = makeManager(factory, { holdQueueFor: () => { calls += 1; return true; } });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.enqueue(a.tabId, 'первый');
+
+  mgr.applyHookEvent(a.tabId, 'Stop', {}); // gen не передан — недоказанное поколение
+
+  assert.strictEqual(calls, 0, 'holdQueueFor не должен зваться, если genProven уже false');
+  assert.deepStrictEqual(factory.spawned[0].written, []);
+  assert.strictEqual(statusOf(events, a.tabId).status, 'done');
+});
+
 test('Stop при пустой очереди ничего не пишет в pty и не эмитит queue:changed', () => {
   const factory = makeFakePtyFactory();
   const { mgr, events } = makeManager(factory);

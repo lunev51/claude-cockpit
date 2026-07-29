@@ -85,6 +85,7 @@ function createNightWatch({
   powerBlocker,
   journal,
   config,
+  getTabGen, // M2 (ревью финальной волны): (tabId) => текущее поколение pty вкладки — НЕОБЯЗАТЕЛЬНАЯ зависимость, см. processResumeTab
 }) {
   // Переданный config мержится ПОВЕРХ дефолтов — так же, как config.js
   // мержит оверлей поверх DEFAULTS: пользовательские значения (какие есть)
@@ -94,7 +95,13 @@ function createNightWatch({
   let armed = false;
   let generation = 0; // см. блок комментариев выше — бьётся в arm()/disarm()/dispose()
   let resetsHandled = 0; // счётчик ПРОБУЖДЕНИЙ за текущий взвод (не вкладок) — потолок maxResets
-  let pending = []; // [{ tabId, detectedAt, resetsAt }] — вкладки, встали по лимиту, ждут сброса
+  // I1(б) (ревью финальной волны): 'cap-reached' — РОВНО ОДНА запись за взвод.
+  // Потолок maxResets — норма за ночь (2-3 сброса), а не аномалия: КАЖДЫЙ Stop
+  // ЛЮБОЙ вкладки после исчерпания потолка (проба ревьюера — 200 Stop подряд)
+  // писал бы отдельную запись+emit(night:changed С ВЕСЬ ЖУРНАЛОМ) без этого
+  // флага. Сбрасывается в arm() — новый взвод снова может залогировать потолок.
+  let capReachedLogged = false;
+  let pending = []; // [{ tabId, detectedAt, resetsAt, gen }] — вкладки, встали по лимиту, ждут сброса; gen — M2 ниже
   const lastInputAt = new Map(); // tabId → now() последнего onUserInput (живёт дольше одного взвода — безвредно, время монотонно растёт)
 
   let waitTimer = null; // таймер «когда в следующий раз проверить сброс» (ожидание ИЛИ ретрай) — ровно один активный
@@ -169,6 +176,7 @@ function createNightWatch({
       armed = true;
       generation += 1; // новый взвод обесценивает всё, что осталось от предыдущего
       resetsHandled = 0;
+      capReachedLogged = false; // I1(б): новый взвод — потолок можно залогировать заново
       pending = [];
       retries = 0;
       wakePassInFlight = false;
@@ -219,15 +227,28 @@ function createNightWatch({
 
   // === детект остановки по лимиту ===
 
-  async function onTabStop(tabId, prevStatus) {
+  // ptyGen (M2, ревью финальной волны) — поколение pty вкладки НА МОМЕНТ
+  // детекта, для последующего сравнения с текущим на пробуждении (см.
+  // processResumeTab/getTabGen). ВАЖНО: названо НЕ `gen` — ниже по функции
+  // уже есть `const gen = generation` (поколение ВЗВОДА, Critical 1,
+  // отревьюженный в Task 1 приём анти-гонки disarm/arm) в отдельном блоке
+  // `try{}` — те же имена в разных блок-скоупах JS МОЛЧА разрешил бы затенение
+  // без единой синтаксической ошибки, и pending получил бы номер поколения
+  // ВЗВОДА вместо поколения PTY (найдено живым прогоном тестов при разработке
+  // этого фикса — история сохранена как урок, не гипотеза).
+  async function onTabStop(tabId, prevStatus, ptyGen) {
     try {
       // Гарды по порядку (буквально из брифа) — первый несовпавший тихо
       // выходит, кроме явно указанных случаев с записью в журнал.
       if (!armed) return;
       if (prevStatus !== 'working') return;
       if (resetsHandled >= cfg.maxResets) {
-        appendJournal({ type: 'cap-reached', tabId });
-        emitChange();
+        // I1(б): один раз за взвод — см. объявление capReachedLogged выше.
+        if (!capReachedLogged) {
+          capReachedLogged = true;
+          appendJournal({ type: 'cap-reached', tabId });
+          emitChange();
+        }
         return;
       }
       if (pending.some((p) => p.tabId === tabId)) return; // уже ждём эту же вкладку — не плодим дубль (быстрый путь, без похода в refreshUsage)
@@ -308,7 +329,17 @@ function createNightWatch({
       // цикл ожидания, старые ретраи прошлого (уже завершившегося) цикла в
       // счёт не идут.
       if (pending.length === 0) retries = 0;
-      pending.push({ tabId, detectedAt: now(), resetsAt: usage.fiveHour.resetsAt });
+      // M2 (ревью финальной волны): pending.gen — поколение PTY вкладки НА
+      // МОМЕНТ детекта (может быть undefined — вызывающий код необязан его
+      // передавать, тогда gen-проверка на пробуждении просто пропускается,
+      // см. processResumeTab). Явно `gen: ptyGen`, а НЕ shorthand `{ptyGen}` —
+      // имя поля в pending исторически `gen` (читается в processResumeTab как
+      // entry.gen), а параметр функции переименован в ptyGen ИМЕННО чтобы не
+      // затереть локальный `const gen = generation` (взвод) чуть выше по
+      // этому же try-блоку — см. комментарий у сигнатуры onTabStop.
+      pending.push({
+        tabId, detectedAt: now(), resetsAt: usage.fiveHour.resetsAt, gen: ptyGen,
+      });
       appendJournal({ type: 'limit-stop', tabId, detail: String(usage.fiveHour.resetsAt) });
 
       // Один таймер на максимум resetsAt среди ВСЕХ pending (окно общее) + запас.
@@ -339,6 +370,22 @@ function createNightWatch({
   // Обрабатывает ОДНУ вкладку стаггер-прохода и возвращает true, если в неё
   // реально ушло «продолжай» (для счётчика «N of M» в wake-complete).
   function processResumeTab(entry) {
+    // M2 (ревью финальной волны): между детектом и пробуждением pty вкладки
+    // мог смениться — авто-респавн (провал резюма, sessions.js) поднимает
+    // НОВУЮ, контекстно ПУСТУЮ сессию; ручной Ctrl+Shift+R без известного
+    // sessionId открывает интерактивный ПИКЕР сессий Claude Code, где голый
+    // Enter (наше «продолжай\r») выбирает ПРОИЗВОЛЬНУЮ строку меню — резюм в
+    // такую вкладку хуже пропущенного. getTabGen — НЕОБЯЗАТЕЛЬНАЯ зависимость
+    // (нет её вовсе, либо entry.gen не был передан в onTabStop() вызывающим
+    // кодом, — gen:undefined) → проверка просто пропускается, поведение
+    // прежнее (бэкомпат с уже отревьюженным Task 1).
+    if (typeof getTabGen === 'function' && entry.gen !== undefined) {
+      const currentGen = getTabGen(entry.tabId);
+      if (currentGen !== entry.gen) {
+        appendJournal({ type: 'skipped', tabId: entry.tabId, detail: 'pty-restarted' });
+        return false;
+      }
+    }
     const status = getTabStatus(entry.tabId);
     if (status == null || NO_RESUME_STATUSES.has(status)) {
       appendJournal({ type: 'skipped', tabId: entry.tabId, detail: `status:${status}` });
@@ -494,6 +541,51 @@ function createNightWatch({
     }
   }
 
+  // I3 (ревью финальной волны): синхронный предикат «вкладка сейчас ждёт
+  // сброса окна» — sessions.js прокидывает его как необязательную
+  // holdQueueFor(tabId), чтобы НЕ вбрасывать элемент очереди Ctrl+Q в
+  // вкладку, встретившую Stop на исчерпанном лимите (CLI отбивает вброс
+  // мгновенно — вся очередь сгорела бы за секунды до самого пробуждения).
+  // Никогда не бросает и не пишет в журнал — чистый читающий запрос, не
+  // событие; вызывается потенциально на КАЖДОМ Stop любой вкладки.
+  function isPending(tabId) {
+    try {
+      return pending.some((p) => p.tabId === tabId);
+    } catch {
+      return false;
+    }
+  }
+
+  // M1+M3 (ревью финальной волны): закрытие вкладки, которая ждёт сброса —
+  // резюм в закрытую вкладку (writeToTab на несуществующий pty) бесполезен, а
+  // будильник/блокер, ждущие ТОЛЬКО эту вкладку, не должны продолжать ждать
+  // впустую до конца цикла ретраев. Вызывается из ipc.js на 'tabs:close',
+  // рядом с lastStatusByTab.delete(tabId). No-op (без журнала/emit), если
+  // вкладка вообще не была в pending, — иначе КАЖДОЕ обычное закрытие любой
+  // вкладки штамповало бы запись в журнал ночной смены, даже когда режим и
+  // не думал об этой вкладке.
+  function forget(tabId) {
+    try {
+      lastInputAt.delete(tabId); // история ввода закрытой вкладки больше не нужна никогда
+      const wasPending = pending.some((p) => p.tabId === tabId);
+      if (!wasPending) return;
+      pending = pending.filter((p) => p.tabId !== tabId);
+      appendJournal({ type: 'tab-closed', tabId });
+      if (pending.length === 0) {
+        // Нечего больше ждать — снимаем таймер ожидания/ретрая (stopWaitTimer
+        // безопасен и когда waitTimer уже null, например во время
+        // стаггер-прохода — тогда wakePassInFlight держит блокер сам по себе).
+        stopWaitTimer();
+        retries = 0;
+      }
+      updateBlocker();
+      emitChange();
+    } catch (err) {
+      appendJournal({ type: 'internal-error', detail: err && err.message });
+      emitChange();
+    }
+  }
+
   // === снимок и завершение ===
 
   function snapshot() {
@@ -552,7 +644,7 @@ function createNightWatch({
   }
 
   return {
-    arm, disarm, isArmed, onTabStop, onUserInput, snapshot, dispose,
+    arm, disarm, isArmed, onTabStop, onUserInput, snapshot, dispose, isPending, forget,
   };
 }
 

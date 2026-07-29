@@ -116,6 +116,10 @@ function setup(overrides = {}) {
     || ((tabId) => (statuses.has(tabId) ? statuses.get(tabId) : null));
   const refreshUsage = overrides.refreshUsage || (async () => usageOk());
   const config = overrides.config || {};
+  // M2 (ревью финальной волны): getTabGen — НЕОБЯЗАТЕЛЬНАЯ зависимость, по
+  // умолчанию не передаётся вовсе (undefined) — тесты, которым gen-проверка
+  // не нужна, ведут себя ровно как раньше (Task 1/раунд 1), не зная об M2.
+  const getTabGen = overrides.getTabGen;
 
   const nw = createNightWatch({
     now: clock.now,
@@ -128,6 +132,7 @@ function setup(overrides = {}) {
     powerBlocker: blocker,
     journal,
     config,
+    getTabGen,
   });
 
   return {
@@ -752,6 +757,76 @@ test('потолок maxResets: после исчерпания пробужде
   assert.strictEqual(ctx.nw.snapshot().pendingCount, 0);
 });
 
+// I1(б) (ревью финальной волны): 'cap-reached' пишется РОВНО ОДИН РАЗ за
+// взвод — проба ревьюера (200 Stop подряд после исчерпания потолка) не
+// должна штамповать 200 отдельных записей+emit.
+test('I1(б): cap-reached логируется ОДИН раз за взвод — второй/третий детект после потолка молчат', async () => {
+  const resetsAt = 1000;
+  const toggle = makeUsageToggle({ resetsAt });
+  const ctx = setup({ config: { maxResets: 1 }, refreshUsage: toggle });
+  ctx.statuses.set('tab1', 'working');
+  ctx.nw.arm();
+  await ctx.nw.onTabStop('tab1', 'working');
+  toggle.markReset();
+  ctx.clock.set(resetsAt + 60000);
+  await ctx.timers.fire(ctx.timers.lastId()); // resetsHandled=1=maxResets
+
+  const lenAfterFirstCap = ctx.journal.entries.length;
+  await ctx.nw.onTabStop('tab2', 'working'); // первый детект после потолка → cap-reached
+  const capEntries1 = ctx.journal.entries.filter((e) => e.type === 'cap-reached').length;
+  assert.strictEqual(capEntries1, 1);
+  assert.ok(ctx.journal.entries.length > lenAfterFirstCap);
+
+  const lenAfterSecondAttempt = ctx.journal.entries.length;
+  await ctx.nw.onTabStop('tab3', 'working'); // второй детект после потолка → МОЛЧА
+  await ctx.nw.onTabStop('tab4', 'working'); // третий — тоже молча
+  assert.strictEqual(ctx.journal.entries.length, lenAfterSecondAttempt, 'после первого cap-reached журнал больше не растёт на повторных детектах');
+  const capEntriesTotal = ctx.journal.entries.filter((e) => e.type === 'cap-reached').length;
+  assert.strictEqual(capEntriesTotal, 1, 'за весь взвод — ровно одна запись cap-reached');
+});
+
+test('I1(б): новый взвод (arm() после disarm()) снова может залогировать cap-reached', async () => {
+  // Фаза-переключатель вручную (а не makeUsageToggle — её markReset()
+  // необратим, а этому тесту нужно ДВА независимых цикла лимит→сброс подряд,
+  // один на взвод) — тот же приём, что N1/N3 тесты выше по файлу.
+  let phase = 'limit';
+  let resetsAtRef = 1000;
+  const refreshUsage = async () => (phase === 'limit'
+    ? usageOk({ fiveHourPercent: 96, resetsAt: resetsAtRef })
+    : usageOk({ fiveHourPercent: 10 }));
+  const ctx = setup({ config: { maxResets: 1 }, refreshUsage });
+
+  // Взвод №1: исчерпываем потолок, получаем ровно одну cap-reached запись.
+  ctx.statuses.set('tab1', 'working');
+  ctx.nw.arm();
+  await ctx.nw.onTabStop('tab1', 'working');
+  phase = 'reset';
+  ctx.clock.set(resetsAtRef + 60000);
+  await ctx.timers.fire(ctx.timers.lastId()); // resetsHandled=1=maxResets
+  phase = 'limit';
+  await ctx.nw.onTabStop('tab2', 'working'); // cap-reached #1 взвода №1
+  assert.strictEqual(ctx.journal.entries.filter((e) => e.type === 'cap-reached').length, 1);
+
+  // Новый взвод: arm() сбрасывает journal.reset() (журнал пуст) И
+  // capReachedLogged — потолок ЭТОГО взвода должен снова залогироваться
+  // один раз, независимо от прошлого взвода.
+  ctx.nw.disarm();
+  ctx.nw.arm();
+  ctx.statuses.set('tab3', 'working');
+  resetsAtRef = 2000;
+  await ctx.nw.onTabStop('tab3', 'working');
+  phase = 'reset';
+  ctx.clock.set(resetsAtRef + 60000);
+  await ctx.timers.fire(ctx.timers.lastId()); // resetsHandled=1=maxResets взвода №2
+  phase = 'limit';
+  await ctx.nw.onTabStop('tab4', 'working'); // cap-reached #1 взвода №2
+  await ctx.nw.onTabStop('tab5', 'working'); // повтор — молча, как и в первом взводе
+
+  const capEntries = ctx.journal.entries.filter((e) => e.type === 'cap-reached');
+  assert.strictEqual(capEntries.length, 1, 'journal.reset() в arm() уже очистил журнал прошлого взвода — здесь только записи НОВОГО взвода');
+  assert.strictEqual(capEntries[0].tabId, 'tab4');
+});
+
 // === power-blocker (инвариант) ===
 
 test('power-blocker: start() при первом pending, stop() после wake-complete, идемпотентно', async () => {
@@ -799,6 +874,172 @@ test('power-blocker: stop() после gave-up', async () => {
   await ctx.timers.fire(ctx.timers.lastId()); // maxRetries=0 → сразу gave-up
 
   assert.strictEqual(ctx.blocker.stopCount, 1);
+});
+
+// === I3 (ревью финальной волны): isPending() — синхронный предикат ===
+// sessions.js прокидывает его как holdQueueFor(tabId) — Stop на вкладке,
+// которая ждёт сброса окна, не должен вбрасывать элемент очереди Ctrl+Q
+// (CLI на исчерпанном лимите отбивает вброс мгновенно, и вся очередь сгорела
+// бы за секунды до самого пробуждения).
+
+test('isPending: true для вкладки в pending, false для любой другой и для несуществующей', async () => {
+  const ctx = setup({ refreshUsage: async () => usageOk({ fiveHourPercent: 95, resetsAt: 1000 }) });
+  ctx.nw.arm();
+  assert.strictEqual(ctx.nw.isPending('tab1'), false, 'до детекта — ещё не pending');
+
+  await ctx.nw.onTabStop('tab1', 'working');
+
+  assert.strictEqual(ctx.nw.isPending('tab1'), true);
+  assert.strictEqual(ctx.nw.isPending('tab2'), false, 'другая вкладка не в pending');
+  assert.strictEqual(ctx.nw.isPending('ghost'), false, 'несуществующий tabId — false, не бросает');
+});
+
+test('isPending: не armed вовсе — всегда false (pending пуст по построению)', () => {
+  const ctx = setup({});
+  assert.strictEqual(ctx.nw.isPending('tab1'), false);
+});
+
+// === M1+M3 (ревью финальной волны): forget(tabId) — уборка при закрытии вкладки ===
+
+test('forget: закрытие ЕДИНСТВЕННОЙ pending-вкладки снимает блокер и таймер ожидания, пишет tab-closed', async () => {
+  const ctx = setup({ refreshUsage: async () => usageOk({ fiveHourPercent: 95, resetsAt: 1000 }) });
+  ctx.nw.arm();
+  await ctx.nw.onTabStop('tab1', 'working');
+  assert.strictEqual(ctx.blocker.startCount, 1);
+  assert.strictEqual(ctx.timers.liveCount(), 1, 'таймер ожидания сброса запланирован');
+
+  ctx.nw.forget('tab1');
+
+  const snap = ctx.nw.snapshot();
+  assert.strictEqual(snap.pendingCount, 0);
+  assert.strictEqual(snap.wakeAt, null, 'будильник снят — ждать больше нечего');
+  assert.strictEqual(ctx.timers.liveCount(), 0, 'таймер ожидания снят');
+  assert.strictEqual(ctx.blocker.stopCount, 1, 'блокер снят — pending опустел');
+  assert.strictEqual(lastEntry(ctx).type, 'tab-closed');
+  assert.strictEqual(lastEntry(ctx).tabId, 'tab1');
+});
+
+test('forget: закрытие ОДНОЙ из ДВУХ pending-вкладок НЕ снимает блокер/таймер — вторая всё ещё ждёт', async () => {
+  const ctx = setup({ refreshUsage: async () => usageOk({ fiveHourPercent: 95, resetsAt: 1000 }) });
+  ctx.nw.arm();
+  await ctx.nw.onTabStop('tab1', 'working');
+  await ctx.nw.onTabStop('tab2', 'working');
+  assert.strictEqual(ctx.nw.snapshot().pendingCount, 2);
+  const liveBefore = ctx.timers.liveCount();
+
+  ctx.nw.forget('tab1');
+
+  const snap = ctx.nw.snapshot();
+  assert.strictEqual(snap.pendingCount, 1, 'осталась вторая вкладка');
+  assert.strictEqual(ctx.nw.isPending('tab2'), true);
+  assert.strictEqual(ctx.nw.isPending('tab1'), false);
+  assert.strictEqual(ctx.blocker.stopCount, 0, 'блокер НЕ снят — вторая вкладка ещё ждёт');
+  assert.strictEqual(ctx.timers.liveCount(), liveBefore, 'таймер ожидания (общий на все pending) не тронут');
+  assert.strictEqual(lastEntry(ctx).type, 'tab-closed');
+  assert.strictEqual(lastEntry(ctx).tabId, 'tab1');
+});
+
+test('forget: вкладка НЕ в pending — no-op, журнал/блокер не трогаются', async () => {
+  const ctx = setup({ refreshUsage: async () => usageOk({ fiveHourPercent: 95, resetsAt: 1000 }) });
+  ctx.nw.arm();
+  await ctx.nw.onTabStop('tab1', 'working');
+  const lenBefore = ctx.journal.entries.length;
+  const emitCallsBefore = ctx.emit.calls.length;
+
+  ctx.nw.forget('unrelated-tab'); // никогда не была в pending
+
+  assert.strictEqual(ctx.journal.entries.length, lenBefore, 'no-op не пишет в журнал');
+  assert.strictEqual(ctx.emit.calls.length, emitCallsBefore, 'no-op не эмитит night:changed');
+  assert.strictEqual(ctx.nw.snapshot().pendingCount, 1, 'реальный pending не тронут');
+});
+
+test('forget: не armed вовсе, pending пуст — не бросает', () => {
+  const ctx = setup({});
+  assert.doesNotThrow(() => ctx.nw.forget('tab1'));
+});
+
+// === M2 (ревью финальной волны): getTabGen — pty вкладки мог смениться между детектом и пробуждением ===
+// Авто-респавн (провал резюма) или ручной Ctrl+Shift+R без sessionId
+// (интерактивный ПИКЕР сессий, где голый Enter выбирает произвольную строку)
+// — резюм в НЕ ТУ сессию хуже пропущенного.
+
+test('M2: getTabGen не передан вовсе (зависимость не инжектирована) — поведение прежнее, резюм проходит даже если вызывающий передал gen', async () => {
+  const statuses = new Map([['tab1', 'done']]);
+  const refreshUsage = makeUsageToggle({ resetsAt: 1000 });
+  const ctx = setup({ statuses, refreshUsage }); // getTabGen не передан в setup() — undefined
+  ctx.nw.arm();
+  await ctx.nw.onTabStop('tab1', 'working', 7); // gen=7 от вызывающего, но проверять его нечем без getTabGen
+  refreshUsage.markReset();
+  ctx.clock.set(1000 + 60000);
+  await ctx.timers.fire(ctx.timers.lastId());
+
+  assert.deepStrictEqual(ctx.write.calls, [{ tabId: 'tab1', text: 'продолжай' }]);
+});
+
+test('M2: getTabGen передан, entry.gen совпадает с текущим (pty не менялся) → резюм проходит как обычно', async () => {
+  const statuses = new Map([['tab1', 'done']]);
+  const tabGens = new Map([['tab1', 7]]);
+  const getTabGen = (tabId) => tabGens.get(tabId);
+  const refreshUsage = makeUsageToggle({ resetsAt: 1000 });
+  const ctx = setup({
+    statuses, getTabGen, refreshUsage,
+  });
+  ctx.nw.arm();
+  await ctx.nw.onTabStop('tab1', 'working', 7); // gen на момент детекта — 7, совпадает
+  refreshUsage.markReset();
+  ctx.clock.set(1000 + 60000);
+  await ctx.timers.fire(ctx.timers.lastId());
+
+  assert.deepStrictEqual(ctx.write.calls, [{ tabId: 'tab1', text: 'продолжай' }]);
+  assert.strictEqual(lastEntry(ctx).type, 'wake-complete');
+});
+
+test('M2: getTabGen передан, entry.gen НЕ совпадает с текущим (pty перезапущен между детектом и пробуждением) → skipped pty-restarted, "продолжай" не уходит', async () => {
+  const statuses = new Map([['tab1', 'done']]); // формально резюмируемый статус — но gen решает раньше
+  const tabGens = new Map([['tab1', 7]]);
+  const getTabGen = (tabId) => tabGens.get(tabId);
+  const refreshUsage = makeUsageToggle({ resetsAt: 1000 });
+  const ctx = setup({
+    statuses, getTabGen, refreshUsage,
+  });
+  ctx.nw.arm();
+  await ctx.nw.onTabStop('tab1', 'working', 7); // gen детекта — 7
+
+  // Между детектом и пробуждением вкладка перезапустилась (авто-респавн
+  // провала резюма ИЛИ ручной Ctrl+Shift+R) — текущий gen стал другим.
+  tabGens.set('tab1', 8);
+
+  refreshUsage.markReset();
+  ctx.clock.set(1000 + 60000);
+  await ctx.timers.fire(ctx.timers.lastId());
+
+  assert.deepStrictEqual(ctx.write.calls, [], '"продолжай" НЕ должен был уйти — pty уже другой сессии/ПИКЕРА');
+  // lastEntry() здесь — 'wake-complete' (единственная вкладка в стаггере,
+  // 'wake-complete' пишется СРАЗУ следом за 'skipped' — тот же порядок, что и
+  // у остальных skip-сценариев в этом файле, см. тест «waiting/dead/
+  // несуществующая вкладка» выше): ищем именно 'skipped' в журнале явно.
+  const skipped = ctx.journal.entries.filter((e) => e.type === 'skipped');
+  assert.strictEqual(skipped.length, 1);
+  assert.strictEqual(skipped[0].tabId, 'tab1');
+  assert.strictEqual(skipped[0].detail, 'pty-restarted');
+  assert.strictEqual(lastEntry(ctx).type, 'wake-complete');
+  assert.strictEqual(lastEntry(ctx).detail, '0 of 1');
+});
+
+test('M2: onTabStop без gen (entry.gen===undefined), но getTabGen ИНЖЕКТИРОВАН — проверка пропускается (нечего сравнивать), резюм проходит', async () => {
+  const statuses = new Map([['tab1', 'done']]);
+  const getTabGen = () => { throw new Error('getTabGen не должен был вызваться — entry.gen===undefined'); };
+  const refreshUsage = makeUsageToggle({ resetsAt: 1000 });
+  const ctx = setup({
+    statuses, getTabGen, refreshUsage,
+  });
+  ctx.nw.arm();
+  await ctx.nw.onTabStop('tab1', 'working'); // gen не передан — third arg отсутствует
+  refreshUsage.markReset();
+  ctx.clock.set(1000 + 60000);
+  await ctx.timers.fire(ctx.timers.lastId());
+
+  assert.deepStrictEqual(ctx.write.calls, [{ tabId: 'tab1', text: 'продолжай' }]);
 });
 
 // === dispose() (Important 3, ревью раунд 1 — до этого раунда не покрыт вообще) ===

@@ -17,7 +17,7 @@ const { createHookBridge } = require('./hook-bridge');
 const { connectProject, isConnected } = require('./connector');
 const { notify } = require('./notify');
 const { createNightWatch } = require('./night-watch');
-const { createNightJournal } = require('./night-journal');
+const { createNightJournal, NIGHT_JOURNAL_MAX_ENTRIES } = require('./night-journal');
 const { createWorkspaceStore } = require('./workspace');
 const { createWorkspaceSync } = require('./workspace-sync');
 const { saveClipboardImage } = require('./screenshot');
@@ -109,6 +109,30 @@ const GHOST_MAX_BYTES = 512 * 1024;
 // #limits не должен бомбить сеть/npx на каждое срабатывание (в пределе —
 // поймать настоящий 429 от Anthropic, который сам себя гасит на 10 минут).
 const MANUAL_REFRESH_MIN_INTERVAL_MS = 10000;
+
+// I2 (ревью финальной волны фазы 8): взведённый ДНЁМ режим ночной смены —
+// пачка Stop'ов (200+ ходов за рабочий день) звала бы usagePoller.refresh()
+// на КАЖДЫЙ, мимо уже существующей MANUAL_REFRESH_MIN_INTERVAL_MS (та
+// защищает только ручной IPC-путь 'usage:refresh') — риск 429 → 10-минутный
+// stale-бэкофф поллера → настоящий лимит-стоп посреди ночи получает
+// no-usage-data и не продолжается. 60с — заметно короче, чем «пользователь
+// упирается в лимит снова» (обычно часы), но с запасом переживает несколько
+// Stop подряд за секунды (типичная работа нескольких вкладок).
+const USAGE_SNAPSHOT_FRESH_MS = 60000;
+
+// Решает, можно ли обойтись уже имеющимся снапшотом поллера вместо похода в
+// сеть — чистая функция ради тестируемости (ipc.js целиком не тестируется).
+// Свежий снапшот — это ok:true, НЕ stale, и не старше USAGE_SNAPSHOT_FRESH_MS
+// (fetchedAt). Критичный момент (тот же довод, что Critical 2 у night-watch.js
+// про stale:true): протухший/битый снапшот НИКОГДА не считается «достаточно
+// свежим», даже если formально не старше по времени, — иначе консервативный
+// принцип «ложное продолжай хуже пропущенного» получил бы дыру именно там,
+// где его больше всего ждут (детект лимита).
+function isSnapshotFreshEnough(snapshot, nowMs) {
+  return !!snapshot && snapshot.ok === true && snapshot.stale !== true
+    && typeof snapshot.fetchedAt === 'number'
+    && (nowMs - snapshot.fetchedAt) < USAGE_SNAPSHOT_FRESH_MS;
+}
 
 // Стартует мост на сконфигурированном порту; если порт занят (EADDRINUSE
 // или что угодно другое) — пересоздаёт мост с эфемерным портом (0).
@@ -211,10 +235,18 @@ function createNoopPowerBlocker() {
 // In-memory фейк журнала для smoke (бриф): append/readAll/reset на простом
 // массиве в памяти процесса — headless-прогон не должен писать в userData
 // ничего нового, но ядру (night-watch.js) всё равно нужен рабочий journal.
+// I1(а) (ревью финальной волны фазы 8): тот же кольцевой потолок, что у
+// реального night-journal.js (NIGHT_JOURNAL_MAX_ENTRIES) — арминг в smoke
+// вообще недостижим (nightToggleHandler гейтит `if (smoke) return null;`
+// раньше, чем коснётся nightWatch), но нет смысла заводить ДВА разных
+// поведения на случай, если это когда-нибудь изменится.
 function createInMemoryNightJournal() {
   let entries = [];
   return {
-    append(e) { entries.push(e); },
+    append(e) {
+      entries.push(e);
+      if (entries.length > NIGHT_JOURNAL_MAX_ENTRIES) entries = entries.slice(-NIGHT_JOURNAL_MAX_ENTRIES);
+    },
     readAll() { return entries; },
     reset() { entries = []; },
   };
@@ -838,6 +870,16 @@ function registerIpc(win, opts = {}) {
     // слушает (start() кикнут чуть ниже), а если ещё нет — просто без env,
     // хук-скрипт тогда шлёт события мимо (см. cockpit-hook.js, Task 3).
     getExtraEnv: () => (bridge && bridge.port() ? { COCKPIT_BRIDGE_PORT: String(bridge.port()) } : {}),
+    // I3 (ревью финальной волны фазы 8, шов с фазой 7): вкладка, ждущая
+    // сброса ночного лимита (в pending night-watch.js), не должна получать
+    // очередной элемент очереди Ctrl+Q на каждый Stop — иначе вся очередь
+    // сгорает в стену за секунды (CLI на исчерпанном лимите отбивает вброс
+    // мгновенно, следующий Stop вбрасывает следующий элемент). nightWatch
+    // здесь — та же модульная let-переменная, что и everywhere в файле:
+    // на момент ЭТОГО замыкания (создание manager, до создания nightWatch
+    // чуть ниже) она ещё null, но вызывается это замыкание не раньше первого
+    // реального Stop-хука — то есть уже после того, как nightWatch присвоен.
+    holdQueueFor: (tabId) => !!(nightWatch && nightWatch.isPending(tabId)),
     onEvent: (channel, payload) => {
       if (smoke && channel === 'term:data') smokeOutput += payload.data;
       if (channel === 'tabs:changed') syncWorkspace();
@@ -853,7 +895,13 @@ function registerIpc(win, opts = {}) {
         // (чистая функция выше по файлу) — см. её комментарий за подробным
         // обоснованием Minor 1 (stuck) и Important 1 (genProven).
         if (nightWatch && shouldDetectLimitStop(prev, payload)) {
-          nightWatch.onTabStop(payload.tabId, 'working');
+          // M2 (ревью финальной волны): текущее поколение pty вкладки НА
+          // МОМЕНТ детекта — ядро сравнит его с актуальным на пробуждении
+          // (getTabGen ниже), чтобы не резюмить в pty, который успел
+          // смениться (авто-респавн/ручной рестарт в пикер сессий) между
+          // детектом и пробуждением.
+          const tab = manager.list().find((t) => t.tabId === payload.tabId);
+          nightWatch.onTabStop(payload.tabId, 'working', tab ? tab.gen : undefined);
         }
       }
       // Task 2 фазы 4: тот же поток, что шлёт tab:status в renderer, — тостер
@@ -887,18 +935,26 @@ function registerIpc(win, opts = {}) {
   // TypeError'ом на старте всего приложения — ядро свой config гардит
   // спредом, а вот чтение wakeMarginMs для тостов ниже не гардил никто.
   const nightCfg = getConfig().nightWatch || {};
-  // Minor 5 (ревью фикс-раунд 1): пачка Stop'ов в разных вкладках (окно
-  // общее на аккаунт — вполне реалистично, если несколько сессий упёрлись в
-  // лимит примерно одновременно) звала бы usagePoller.refresh() параллельно,
-  // мимо уже существующей single-flight защиты manualRefreshInFlight (та
-  // покрывает только IPC-путь 'usage:refresh') — риск словить 429 от
-  // Anthropic и уйти в 10-минутный stale-бэкофф поллера, из-за которого
-  // СЛЕДУЮЩИЙ настоящий лимит-стоп получил бы no-usage-data и не продолжился
-  // бы ночью вовсе. Конкурентные детекты теперь делят ОДИН сетевой запрос.
+  // Minor 5 (ревью фикс-раунд 1) + I2 (ревью финальной волны): пачка Stop'ов
+  // в разных вкладках (окно общее на аккаунт — вполне реалистично, если
+  // несколько сессий упёрлись в лимит примерно одновременно, или взведённый
+  // ДНЁМ режим — 200+ обычных Stop за рабочий день) звала бы
+  // usagePoller.refresh() на КАЖДЫЙ, мимо уже существующей single-flight
+  // защиты manualRefreshInFlight (та покрывает только IPC-путь
+  // 'usage:refresh') — риск словить 429 от Anthropic и уйти в 10-минутный
+  // stale-бэкофф поллера, из-за которого СЛЕДУЮЩИЙ настоящий лимит-стоп
+  // получил бы no-usage-data и не продолжился бы ночью вовсе. Два независимых
+  // барьера теперь: (I2) если snapshot() уже свежий (ok, не stale, младше
+  // USAGE_SNAPSHOT_FRESH_MS) — отдаём его синхронно, БЕЗ похода в сеть вовсе;
+  // (Minor 5) иначе — single-flight, конкурентные детекты делят ОДИН запрос.
   let usageRefreshInFlight = null;
-  const refreshUsage = () => usageRefreshInFlight
-    || (usageRefreshInFlight = Promise.resolve(usagePoller.refresh())
-      .finally(() => { usageRefreshInFlight = null; }));
+  const refreshUsage = () => {
+    const snap = usagePoller.snapshot();
+    if (isSnapshotFreshEnough(snap, Date.now())) return Promise.resolve(snap);
+    return usageRefreshInFlight
+      || (usageRefreshInFlight = Promise.resolve(usagePoller.refresh())
+        .finally(() => { usageRefreshInFlight = null; }));
+  };
   nightWatch = createNightWatch({
     now: Date.now,
     // unref — так же, как stuckTimer/usageMonitorTimer ниже: таймеры ночной
@@ -919,6 +975,14 @@ function registerIpc(win, opts = {}) {
     getTabStatus: (tabId) => {
       const tab = manager.list().find((t) => t.tabId === tabId);
       return tab ? resumableTabStatus(tab.status, tab.waitingKind) : null;
+    },
+    // M2 (ревью финальной волны): текущее поколение pty вкладки — ядро
+    // сравнивает его с тем, что было зафиксировано в момент детекта (см.
+    // onTabStop(tabId, prevStatus, gen) в onEvent выше), чтобы не резюмить в
+    // pty, который успел смениться между детектом и пробуждением.
+    getTabGen: (tabId) => {
+      const tab = manager.list().find((t) => t.tabId === tabId);
+      return tab ? tab.gen : undefined;
     },
     // Гард непустого текста + '\r' (бриф) — тот же приём, что normalizeForPty/
     // injectQueuedOnStop, только текст здесь всегда буквальное «продолжай»
@@ -1124,6 +1188,12 @@ function registerIpc(win, opts = {}) {
     // смены (lastStatusByTab) больше никому не нужна и не должна копиться в
     // памяти навсегда, тот же приём, что toaster.forget()/ghost-файл выше.
     lastStatusByTab.delete(tabId);
+    // M1+M3 (ревью финальной волны): если вкладка ждала сброса ночного лимита
+    // (в pending night-watch.js), закрытие должно освободить будильник/блокер
+    // немедленно, а не после впустую потраченного цикла ретраев — nightWatch.
+    // forget() сама решает, было ли что забывать (no-op, если вкладка не
+    // была в pending — не спамим журнал на КАЖДОЕ обычное закрытие).
+    if (nightWatch) nightWatch.forget(tabId);
     if (!smoke && tab && tab.ghostId) {
       try {
         fs.unlinkSync(ghostFile(tab.ghostId));
@@ -1500,8 +1570,8 @@ module.exports = {
   // Electron — экспортирована ради собственного юнит-теста (см. комментарий
   // у определения выше).
   hasRealUserInput,
-  // M4 финального ревью (обязательно) + C1 (Critical) — чистые функции без
-  // Electron, экспортированы ради собственных юнит-тестов (см. комментарии
+  // M4 финального ревью (обязательно) + C1 (Critical) + I2 — чистые функции
+  // без Electron, экспортированы ради собственных юнит-тестов (см. комментарии
   // у их определения выше).
-  shouldDetectLimitStop, resumableTabStatus,
+  shouldDetectLimitStop, resumableTabStatus, isSnapshotFreshEnough, USAGE_SNAPSHOT_FRESH_MS,
 };

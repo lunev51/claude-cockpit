@@ -9,7 +9,7 @@ const assert = require('node:assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { createNightJournal } = require('../src/main/night-journal');
+const { createNightJournal, NIGHT_JOURNAL_MAX_ENTRIES } = require('../src/main/night-journal');
 
 function tmpFile() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cockpit-night-journal-'));
@@ -48,6 +48,43 @@ test('append переживает перезапуск: новый инстан�
   createNightJournal({ file }).append({ ts: 1, type: 'armed' });
   const reopened = createNightJournal({ file });
   assert.deepStrictEqual(reopened.readAll(), [{ ts: 1, type: 'armed' }]);
+});
+
+// --- I1(а) (ревью финальной волны фазы 8): кольцевой потолок ---
+// Проба ревьюера: 200 Stop подряд (взведённый днём режим, несколько вкладок)
+// не должны разрастить журнал безгранично — append() отрезает СТАРЫЕ записи,
+// оставляя только последние maxEntries (дефолт 200, экспортирован как
+// NIGHT_JOURNAL_MAX_ENTRIES ради этого же теста и переиспользования в ipc.js
+// для in-memory фейка smoke-режима).
+
+test('кольцевой потолок: NIGHT_JOURNAL_MAX_ENTRIES+50 записей → readAll() отдаёт РОВНО NIGHT_JOURNAL_MAX_ENTRIES последних, старые отрезаны', () => {
+  const file = tmpFile();
+  const journal = createNightJournal({ file });
+  const total = NIGHT_JOURNAL_MAX_ENTRIES + 50;
+  for (let i = 0; i < total; i += 1) {
+    journal.append({ ts: i, type: 'limit-stop', tabId: `tab${i}` });
+  }
+  const all = journal.readAll();
+  assert.strictEqual(all.length, NIGHT_JOURNAL_MAX_ENTRIES);
+  // Первая уцелевшая запись — та, что была записана 50-й по счёту (индекс 50,
+  // ts:50) — записи 0..49 отрезаны как самые старые.
+  assert.strictEqual(all[0].ts, 50);
+  assert.strictEqual(all[all.length - 1].ts, total - 1);
+});
+
+test('кольцевой потолок: свой maxEntries (инжектируемый параметр) переопределяет дефолт', () => {
+  const file = tmpFile();
+  const journal = createNightJournal({ file, maxEntries: 3 });
+  for (let i = 0; i < 5; i += 1) journal.append({ ts: i, type: 'armed' });
+  assert.deepStrictEqual(journal.readAll().map((e) => e.ts), [2, 3, 4]);
+});
+
+test('кольцевой потолок: ровно maxEntries записей — ни одна не отрезается', () => {
+  const file = tmpFile();
+  const journal = createNightJournal({ file, maxEntries: 5 });
+  for (let i = 0; i < 5; i += 1) journal.append({ ts: i, type: 'armed' });
+  assert.strictEqual(journal.readAll().length, 5);
+  assert.strictEqual(journal.readAll()[0].ts, 0);
 });
 
 // --- reset ---

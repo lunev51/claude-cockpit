@@ -64,6 +64,22 @@ test('journalEntryText: skipped — словарь detail (Important 3, ревь
     journalEntryText({ type: 'skipped', detail: 'user-took-over' }),
     'пропущена: перехвачена тобой',
   );
+  // M2 (ревью финальной волны фазы 8): pty вкладки сменился между детектом и
+  // пробуждением (авто-респавн/ручной рестарт в пикер сессий) — resumeм
+  // отменён как небезопасный.
+  assert.strictEqual(
+    journalEntryText({ type: 'skipped', detail: 'pty-restarted' }),
+    'пропущена: вкладка перезапущена — резюм отменён',
+  );
+});
+
+test('journalEntryText: tab-closed (M1+M3, ревью финальной волны фазы 8) — вкладка закрыта до пробуждения', async () => {
+  const { journalEntryText } = await import('../src/renderer/js/night-format.js');
+  assert.strictEqual(journalEntryText({ type: 'tab-closed' }), 'закрыта до пробуждения');
+  assert.strictEqual(
+    journalEntryText({ type: 'tab-closed', tabId: 'tab-1' }, (id) => (id === 'tab-1' ? 'cockpit' : null)),
+    'cockpit закрыта до пробуждения',
+  );
 });
 
 test('journalEntryText: skipped с неизвестным detail — сырой текст (защитный фолбэк)', async () => {
