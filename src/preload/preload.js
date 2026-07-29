@@ -126,6 +126,16 @@ contextBridge.exposeInMainWorld('api', {
     saveWorkspace: (name, tabs) => ipcRenderer.invoke('recipes:saveWorkspace', name, tabs),
     deleteWorkspace: (id) => ipcRenderer.invoke('recipes:deleteWorkspace', id),
   },
+  night: {
+    // Task 2 фазы 8 («Ночная смена»): toggle() переключает armed и
+    // возвращает снапшот ПОСЛЕ переключения; get() — снапшот по запросу
+    // (дашборд при открытии); onChanged — push от ядра (main/ipc.js)
+    // на КАЖДОЕ изменение состояния (арминг/детект/пробуждение/дизарм и т.п.),
+    // тот же стиль, что queue.onChanged/tab.onStatus выше.
+    toggle: () => ipcRenderer.invoke('night:toggle'),
+    get: () => ipcRenderer.invoke('night:get'),
+    onChanged: (cb) => ipcRenderer.on('night:changed', (_e, p) => cb(p)),
+  },
   usage: {
     // Task 3 фазы 5 (кольца лимитов): {limits, spend} — снапшот слоя A
     // (usage-oauth.js) и последний известный ответ слоя B (usage-ccusage.js,

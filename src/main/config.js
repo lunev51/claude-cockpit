@@ -32,6 +32,18 @@ const DEFAULTS = {
       { label: '/usage', command: '/usage' },
     ],
   },
+  // Task 2 фазы 8 («Ночная смена»): дефолты ядра night-watch.js (спека
+  // docs/superpowers/specs/2026-07-29-night-watch-design.md) — мержатся
+  // с пользовательским оверлеем тем же deepMerge, что и остальные секции
+  // ниже; ipc.js передаёт getConfig().nightWatch в createNightWatch({config}).
+  nightWatch: {
+    fiveHourThreshold: 95,
+    wakeMarginMs: 60000,
+    staggerMs: 10000,
+    maxResets: 4,
+    retryMs: 300000,
+    maxRetries: 3,
+  },
 };
 
 let cached = null;

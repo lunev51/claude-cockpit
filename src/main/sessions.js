@@ -24,6 +24,39 @@ const STATUSES = ['working', 'waiting', 'done', 'stuck', 'dead'];
 // процесс был живым и умер сам по себе; авто-восстановление не триггерим.
 const AUTO_RECOVER_MAX_LIFETIME_MS = 15000;
 
+// C1 (Critical, ревью финальной волны фазы 8): Claude Code шлёт хук
+// Notification НЕ только на permission_prompt («нужно разрешение на
+// инструмент»), но и на idle_prompt («жду вашего ввода» — раз в ~60с, пока
+// терминал не в фокусе; режим 1004 у нас реально включён, см. terminal.js/
+// hasRealUserInput выше по фазе). connector.js регистрирует Notification БЕЗ
+// matcher'а (EVENTS без разбивки на подтипы) — оба вида хука приходят как
+// ОДНО и то же событие, различать приходится по содержимому message.
+//
+// Без этой классификации ночная смена ломается НАВСЕГДА в основном сценарии:
+// 23:00 лимит → детект; 23:01 idle_prompt (терминал не в фокусе всю ночь) →
+// статус 'waiting'; 03:01 пробуждение → NO_RESUME_STATUSES считает ЛЮБОЙ
+// 'waiting' непродолжаемым → «пропущена: ждёт ответа на диалог» — хотя ждать
+// там было нечего, кроме собственного idle-пинга CLI.
+//
+// НЕИЗВЕСТНЫЙ текст (кастомный prompt инструмента, будущая версия CLI,
+// локализация) → консервативно 'permission': пропуск резюма безопаснее
+// случайного Enter в диалог подтверждения (той же осторожности требует и
+// брифом заказанная трактовка usage-error/no-usage-data в night-watch.js).
+//
+// N2 (ре-ревью финальной волны): payload хука несёт ТОЧНОЕ поле
+// notification_type ('idle_prompt'/'permission_prompt' — сверено с бинарём
+// CLI 2.1.220), cockpit-hook.js прокидывает stdin-JSON целиком. Оно —
+// первый сигнал; подстрока message — фолбэк для старых/изменённых версий,
+// где поля нет. Смена английского текста при живом поле больше не уводит
+// фичу обратно в C1.
+function classifyNotification(message, notificationType) {
+  if (notificationType === 'idle_prompt') return 'idle';
+  if (notificationType === 'permission_prompt') return 'permission';
+  const text = String(message || '').toLowerCase();
+  if (text.includes('waiting for your input')) return 'idle';
+  return 'permission';
+}
+
 // Выпиливает унаследованные маркеры родительского Claude Code из process.env
 // (Task 6). Если кокпит запущен из-под ДРУГОГО Claude Code (например, так
 // делают тестовые прогоны), переменные вроде CLAUDE_CODE_CHILD_SESSION /
@@ -47,6 +80,10 @@ function sanitizedProcessEnv() {
 // getTermConfig() → config.terminal; onEvent(channel, payload) → webContents.send.
 // now() — клок (тестам нужен управляемый); stuckAfterMs — порог зависания;
 // getExtraEnv() — доп. env для pty (порт hook-bridge, Task 2).
+// holdQueueFor(tabId) — I3 (ревью финальной волны фазы 8): НЕОБЯЗАТЕЛЬНАЯ
+// зависимость, (tabId) => bool. Если передана и вернула true на Stop — очередь
+// НЕ вбрасывается (элемент остаётся ждать следующего живого Stop). Без неё
+// (default null) поведение прежнее — Stop всегда вбрасывает, как раньше.
 function createSessionManager({
   ptyFactory,
   getTermConfig,
@@ -54,6 +91,7 @@ function createSessionManager({
   now = Date.now,
   stuckAfterMs = 5 * 60 * 1000,
   getExtraEnv = () => ({}),
+  holdQueueFor = null,
 }) {
   const tabs = new Map();
   // Global-счётчик поколений (Important 1, ревью раунд 1 задачи 5 фазы 7):
@@ -100,6 +138,11 @@ function createSessionManager({
       resumeOnFirstSpawn: !!sessionId, // одноразовый флаг: спавн #1 добавит --resume <id>
       sessionBound: false,     // true, только когда SessionStart реально привязал сессию (bindSession)
       status: null, subtitle: '', waitingText: '',
+      // C1 (ревью финальной волны фазы 8): вид последнего Notification —
+      // 'idle'|'permission'|'' (ещё не было ни одного). Проставляется в
+      // applyHookEvent/case 'Notification' (classifyNotification выше),
+      // чистится вместе с waitingText при уходе из 'waiting' (см. setStatus).
+      waitingKind: '',
       lastOutputAt: now(),
       // Очередь промптов (Task 1 фазы 7): ввод для КОНКРЕТНОЙ сессии этой
       // вкладки — переживает обычное переключение вкладок, но НЕ переживает
@@ -122,12 +165,22 @@ function createSessionManager({
     return { tabId, cwd, name };
   }
 
-  function setStatus(tab, status, subtitle) {
+  // extra (Important 1, ревью Task 2 фазы 8) — необязательный объект,
+  // домешиваемый в payload 'tab:status' ПОВЕРХ обычных полей. Единственный
+  // вызывающий, который его передаёт, — ветка 'Stop' в applyHookEvent ниже
+  // (поле genProven — см. подробный комментарий там). Остальные вызовы
+  // setStatus() не передают extra вовсе, так что их payload не меняется НИ
+  // НА БАЙТ — `...(extra || {})` от undefined добавляет пустой объект.
+  function setStatus(tab, status, subtitle, extra) {
     tab.status = status;
     if (typeof subtitle === 'string') tab.subtitle = subtitle;
-    if (status !== 'waiting') tab.waitingText = '';
+    // C1: waitingKind — та же судьба, что waitingText (оба относятся к
+    // ПОСЛЕДНЕМУ Notification; уход из 'waiting' в ЛЮБОЙ другой статус
+    // делает их прошлым состоянием, а не текущим).
+    if (status !== 'waiting') { tab.waitingText = ''; tab.waitingKind = ''; }
     onEvent('tab:status', {
       tabId: tab.tabId, status, subtitle: tab.subtitle, waitingText: tab.waitingText,
+      ...(extra || {}),
     });
   }
 
@@ -542,22 +595,63 @@ function createSessionManager({
       case 'PreToolUse':
         setStatus(tab, 'working', data.tool_name ? `${data.tool_name}…` : 'работает…');
         break;
-      case 'Notification':
+      case 'Notification': {
         tab.waitingText = String(data.message || '');
+        // C1 (Critical, ревью финальной волны): idle_prompt vs
+        // permission_prompt — см. classifyNotification() выше по файлу.
+        //
+        // N2 (ре-ревью финальной волны), «липкий permission»: если вкладка
+        // УЖЕ ждёт диалога разрешения, поздний idle-пинг поверх открытого
+        // диалога НЕ понижает permission → idle — иначе ночное «продолжай\r»
+        // ушло бы прямо в диалог и подтвердило подсвеченный вариант.
+        // Понижение возможно только после выхода из 'waiting' (setStatus
+        // чистит waitingKind при любом другом статусе).
+        const kind = classifyNotification(tab.waitingText, data.notification_type);
+        if (!(tab.status === 'waiting' && tab.waitingKind === 'permission' && kind === 'idle')) {
+          tab.waitingKind = kind;
+        }
         tab.status = 'waiting';
         tab.subtitle = tab.waitingText.slice(0, 120);
         onEvent('tab:status', {
           tabId: tab.tabId, status: 'waiting', subtitle: tab.subtitle, waitingText: tab.waitingText,
         });
         break;
+      }
       case 'Stop':
-        setStatus(tab, 'done', '');
+        // Important 1 (ревью Task 2 фазы 8, «Ночная смена»): night-watch.js
+        // детектит остановку по лимиту через working→done на 'tab:status', а
+        // не через собственный гард поколения — до этого фикса он доверял
+        // ЛЮБОМУ working→done, включая пришедший от СТОРОННЕГО процесса той
+        // же сессии (маршрутизация по session_id, gen:null — заявленная
+        // фича port-file, см. I4 выше). Сценарий отказа: сессия S открыта во
+        // вкладке B кокпита И в обычном терминале снаружи; внешний процесс
+        // завершает СВОЮ задачу и шлёт Stop без COCKPIT_TAB_GEN → статус B
+        // уезжает в 'done', хотя B всё это время реально работала над своей —
+        // ночная смена посчитала бы это остановкой по лимиту и позже вбросила
+        // бы «продолжай» в живой ввод B. genProven здесь — ТОТ ЖЕ флаг, что
+        // уже гейтит injectQueuedOnStop чуть ниже (см. его определение выше
+        // по функции) — прокидываем его же в payload 'tab:status', чтобы
+        // обвязка ipc.js могла потребовать ДОКАЗАННОЕ поколение и для детекта
+        // ночной смены, тем же приёмом, что уже защищает вброс очереди.
+        setStatus(tab, 'done', '', { genProven });
         // Task 1 фазы 7 (очередь промптов): вбрасываем СТРОГО один элемент
         // очереди на этот Stop — не всю очередь разом. Гарды (pty жив,
         // очередь непуста) — внутри injectQueuedOnStop(). I4 (ревью финальной
         // волны): плюс гард ДОКАЗАННОГО поколения здесь же — недоказанное
         // (gen:null, сторонний процесс) не даёт права писать в pty.
-        if (genProven) injectQueuedOnStop(tab);
+        //
+        // I3 (ревью финальной волны фазы 8, шов с фазой 7): вкладка, которая
+        // сейчас в pending ночной смены (встала по лимиту, ждёт сброса окна),
+        // НЕ должна получать очередной элемент очереди на каждый Stop — CLI
+        // на исчерпанном лимите отбивает вброс мгновенно, следующий Stop
+        // вбрасывает СЛЕДУЮЩИЙ элемент, и вся очередь Ctrl+Q сгорает в стену
+        // за секунды, задолго до самого пробуждения (первый элемент, ушедший
+        // ДО детекта, этим не спасти — см. отчёт). holdQueueFor — НЕОБЯЗАТЕЛЬНАЯ
+        // зависимость (по умолчанию null): без неё — поведение прежнее.
+        if (genProven) {
+          const held = typeof holdQueueFor === 'function' && holdQueueFor(tab.tabId);
+          if (!held) injectQueuedOnStop(tab);
+        }
         break;
       case 'PostToolUse':
         // Task 2 фазы 6 (панель диффа): PostToolUse — не сигнал ожидания и не
@@ -587,8 +681,18 @@ function createSessionManager({
   }
 
   function list() {
-    return [...tabs.values()].map(({ tabId, cwd, name, alive, status, subtitle, sessionId, ghostId }) => (
-      { tabId, cwd, name, alive, status, subtitle, sessionId, ghostId }
+    // waitingKind (C1) — нужен обвязке ipc.js, чтобы отличить резюмируемый
+    // idle_prompt от блокирующего permission_prompt (resumableTabStatus).
+    // gen (M2) — текущее поколение pty вкладки; обвязка передаёт его снимок
+    // в nightWatch.onTabStop() на момент детекта, ядро сверяет его же на
+    // пробуждении через getTabGen — pty мог смениться (авто-респавн/ручной
+    // рестарт в интерактивный пикер сессий) между детектом и пробуждением.
+    return [...tabs.values()].map(({
+      tabId, cwd, name, alive, status, subtitle, sessionId, ghostId, waitingKind, gen,
+    }) => (
+      {
+        tabId, cwd, name, alive, status, subtitle, sessionId, ghostId, waitingKind, gen,
+      }
     ));
   }
 

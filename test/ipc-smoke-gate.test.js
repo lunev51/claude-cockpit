@@ -18,6 +18,8 @@ const {
   historySearchHandler, historyRefreshHandler, createHistoryIndexState, HISTORY_INDEX_TTL_MS,
   recipesListHandler, recipesSavePromptHandler, recipesDeletePromptHandler,
   recipesListWorkspacesHandler, recipesSaveWorkspaceHandler, recipesDeleteWorkspaceHandler,
+  nightToggleHandler, nightGetHandler, hasRealUserInput,
+  shouldDetectLimitStop, resumableTabStatus, isSnapshotFreshEnough, USAGE_SNAPSHOT_FRESH_MS,
 } = require('../src/main/ipc');
 
 // gitInfo/ghInfo-заглушки, которые ПАДАЮТ, если их дёрнули: смоук-гейт по
@@ -333,4 +335,225 @@ test('recipesDeleteWorkspaceHandler: smoke:false, валидный id → зов
   const recipeStore = { deleteWorkspace: (id) => calls.push(id) };
   recipesDeleteWorkspaceHandler({ smoke: false, id: '1', recipeStore });
   assert.deepStrictEqual(calls, ['1']);
+});
+
+// -------------------------------------------------- night:toggle/night:get --
+// Task 2 фазы 8 («Ночная смена»): nightToggleHandler/nightGetHandler
+// добавлены в ЭТОЙ ЖЕ ветке с тем же классом смоук-гейта, что git:get/
+// gh:repo/recipes:* выше — тот же приём (заглушка nightWatch, которая ПАДАЕТ
+// при вызове ЛЮБОГО метода, делает регрессию «забыли `if (smoke) return null`»
+// красной, а не просто «вернула не то значение»). Брифом отдельно подчёркнуто:
+// в smoke журнал ядра (даже in-memory) не должен получать новых записей и
+// powerBlocker не должен звать — гейт здесь ДО обращения к nightWatch вообще
+// это гарантирует безусловно, вне зависимости от того, какие именно
+// зависимости (реальные/in-memory/no-op) собраны внутри самого nightWatch.
+
+function throwingNightWatch() {
+  const boom = (name) => () => { throw new Error(`nightWatch.${name} НЕ должен был вызваться в smoke`); };
+  return {
+    isArmed: boom('isArmed'),
+    arm: boom('arm'),
+    disarm: boom('disarm'),
+    snapshot: boom('snapshot'),
+  };
+}
+
+test('nightToggleHandler: smoke:true → null, nightWatch НИКОГДА не вызывается', () => {
+  const res = nightToggleHandler({ smoke: true, nightWatch: throwingNightWatch() });
+  assert.strictEqual(res, null);
+});
+
+test('nightToggleHandler: smoke:false, не взведён → зовёт arm(), отдаёт snapshot() ПОСЛЕ переключения', () => {
+  const calls = [];
+  const nightWatch = {
+    isArmed: () => false,
+    arm: () => calls.push('arm'),
+    disarm: () => calls.push('disarm'),
+    snapshot: () => ({ armed: true }),
+  };
+  const res = nightToggleHandler({ smoke: false, nightWatch });
+  assert.deepStrictEqual(calls, ['arm']);
+  assert.deepStrictEqual(res, { armed: true });
+});
+
+test('nightToggleHandler: smoke:false, уже взведён → зовёт disarm(), а не arm()', () => {
+  const calls = [];
+  const nightWatch = {
+    isArmed: () => true,
+    arm: () => calls.push('arm'),
+    disarm: () => calls.push('disarm'),
+    snapshot: () => ({ armed: false }),
+  };
+  const res = nightToggleHandler({ smoke: false, nightWatch });
+  assert.deepStrictEqual(calls, ['disarm']);
+  assert.deepStrictEqual(res, { armed: false });
+});
+
+test('nightGetHandler: smoke:true → null, nightWatch.snapshot НИКОГДА не вызывается', () => {
+  const res = nightGetHandler({ smoke: true, nightWatch: throwingNightWatch() });
+  assert.strictEqual(res, null);
+});
+
+test('nightGetHandler: smoke:false → отдаёт nightWatch.snapshot() как есть', () => {
+  const nightWatch = { snapshot: () => ({ armed: true, pendingCount: 2 }) };
+  const res = nightGetHandler({ smoke: false, nightWatch });
+  assert.deepStrictEqual(res, { armed: true, pendingCount: 2 });
+});
+
+// ------------------------------------------------------------ hasRealUserInput --
+// Important 2 (ревью фикс-раунд 1, Task 2 фазы 8): term:write несёт не
+// только клавиши пользователя, но и автоответы эмулятора xterm.js (focus
+// 1004 in/out, ответ на DSR, ответ на DA) — без фильтра они засчитывались бы
+// как «пользователь перехватил вкладку» и молча гасили продолжение ночной
+// смены. Стрелки/Esc/Enter обязаны ПРОЙТИ фильтр как настоящий ввод.
+
+test('hasRealUserInput: обычный текст/буквы → true', () => {
+  assert.strictEqual(hasRealUserInput('привет'), true);
+  assert.strictEqual(hasRealUserInput('a'), true);
+});
+
+test('hasRealUserInput: Enter (\\r) → true', () => {
+  assert.strictEqual(hasRealUserInput('\r'), true);
+});
+
+test('hasRealUserInput: голый Esc (без хвоста) → true', () => {
+  assert.strictEqual(hasRealUserInput('\x1b'), true);
+});
+
+test('hasRealUserInput: стрелки (\\x1b[A..D) → true, НЕ вырезаются регэкспом', () => {
+  assert.strictEqual(hasRealUserInput('\x1b[A'), true); // вверх
+  assert.strictEqual(hasRealUserInput('\x1b[B'), true); // вниз
+  assert.strictEqual(hasRealUserInput('\x1b[C'), true); // вправо
+  assert.strictEqual(hasRealUserInput('\x1b[D'), true); // влево
+});
+
+test('hasRealUserInput: чистый focus-репорт (\\x1b[I / \\x1b[O, режим 1004) → false', () => {
+  assert.strictEqual(hasRealUserInput('\x1b[I'), false);
+  assert.strictEqual(hasRealUserInput('\x1b[O'), false);
+});
+
+test('hasRealUserInput: чистый ответ на DSR (\\x1b[24;80R) → false', () => {
+  assert.strictEqual(hasRealUserInput('\x1b[24;80R'), false);
+});
+
+test('hasRealUserInput: чистый ответ на DA (\\x1b[?1;2c) → false', () => {
+  assert.strictEqual(hasRealUserInput('\x1b[?1;2c'), false);
+});
+
+test('hasRealUserInput: несколько автоответов подряд, ничего кроме них → false', () => {
+  assert.strictEqual(hasRealUserInput('\x1b[I\x1b[24;80R\x1b[O'), false);
+});
+
+test('hasRealUserInput: автоответ + реальная клавиша в одном батче → true (реальный ввод остаётся после вырезания репорта)', () => {
+  assert.strictEqual(hasRealUserInput('\x1b[Ia'), true);
+});
+
+test('hasRealUserInput: пустая строка → false', () => {
+  assert.strictEqual(hasRealUserInput(''), false);
+});
+
+// ------------------------------------------------------------- shouldDetectLimitStop --
+// M4 финального ревью (обязательно): детект-замыкание onEvent, вынесенное в
+// чистую функцию — prev/payload буквально те же значения, что обвязка читает
+// из lastStatusByTab/событие 'tab:status'.
+
+test('shouldDetectLimitStop: prev=working, status=done, genProven=true → true', () => {
+  assert.strictEqual(shouldDetectLimitStop('working', { status: 'done', genProven: true }), true);
+});
+
+test('shouldDetectLimitStop: prev=stuck (Minor 1), status=done, genProven=true → true (симметрично working)', () => {
+  assert.strictEqual(shouldDetectLimitStop('stuck', { status: 'done', genProven: true }), true);
+});
+
+test('shouldDetectLimitStop: genProven=false (Important 1) → false, даже если prev=working и status=done', () => {
+  assert.strictEqual(shouldDetectLimitStop('working', { status: 'done', genProven: false }), false);
+});
+
+test('shouldDetectLimitStop: genProven отсутствует вовсе (undefined) → false', () => {
+  assert.strictEqual(shouldDetectLimitStop('working', { status: 'done' }), false);
+});
+
+test('shouldDetectLimitStop: status !== done (например waiting) → false, независимо от prev/genProven', () => {
+  assert.strictEqual(shouldDetectLimitStop('working', { status: 'waiting', genProven: true }), false);
+});
+
+test('shouldDetectLimitStop: prev не working и не stuck (например done/waiting/null) → false', () => {
+  assert.strictEqual(shouldDetectLimitStop('done', { status: 'done', genProven: true }), false);
+  assert.strictEqual(shouldDetectLimitStop('waiting', { status: 'done', genProven: true }), false);
+  assert.strictEqual(shouldDetectLimitStop(null, { status: 'done', genProven: true }), false);
+  assert.strictEqual(shouldDetectLimitStop(undefined, { status: 'done', genProven: true }), false);
+});
+
+test('shouldDetectLimitStop: payload отсутствует вовсе → false, не бросает', () => {
+  assert.strictEqual(shouldDetectLimitStop('working', null), false);
+  assert.strictEqual(shouldDetectLimitStop('working', undefined), false);
+});
+
+// ------------------------------------------------------------- resumableTabStatus --
+// C1 (Critical, ревью финальной волны): idle_prompt vs permission_prompt.
+
+test('resumableTabStatus: waiting + idle → done (резюмируемо)', () => {
+  assert.strictEqual(resumableTabStatus('waiting', 'idle'), 'done');
+});
+
+test('resumableTabStatus: waiting + permission → остаётся waiting (непродолжаемо)', () => {
+  assert.strictEqual(resumableTabStatus('waiting', 'permission'), 'waiting');
+});
+
+test('resumableTabStatus: waiting + пустой/неизвестный waitingKind → остаётся waiting (консервативно)', () => {
+  assert.strictEqual(resumableTabStatus('waiting', ''), 'waiting');
+  assert.strictEqual(resumableTabStatus('waiting', undefined), 'waiting');
+  assert.strictEqual(resumableTabStatus('waiting', 'что-то-незнакомое'), 'waiting');
+});
+
+test('resumableTabStatus: любой НЕ-waiting статус проходит насквозь без изменений, даже с waitingKind:"idle"', () => {
+  assert.strictEqual(resumableTabStatus('working', 'idle'), 'working');
+  assert.strictEqual(resumableTabStatus('done', 'idle'), 'done');
+  assert.strictEqual(resumableTabStatus('stuck', 'idle'), 'stuck');
+  assert.strictEqual(resumableTabStatus('dead', 'idle'), 'dead');
+  assert.strictEqual(resumableTabStatus(null, 'idle'), null);
+});
+
+// ------------------------------------------------------------- isSnapshotFreshEnough --
+// I2 (ревью финальной волны): троттлинг refreshUsage — свежий снапшот отдаём
+// без сети, устаревший/битый/протухший — нет (та же консервативная логика,
+// что Critical 2 у night-watch.js про usage.stale).
+
+test('isSnapshotFreshEnough: ok:true, stale:false, fetchedAt только что → true', () => {
+  const now = 1000000;
+  assert.strictEqual(isSnapshotFreshEnough({ ok: true, stale: false, fetchedAt: now - 1000 }, now), true);
+});
+
+test('isSnapshotFreshEnough: fetchedAt РОВНО на границе USAGE_SNAPSHOT_FRESH_MS → false (граница НЕ включена)', () => {
+  const now = 1000000;
+  assert.strictEqual(
+    isSnapshotFreshEnough({ ok: true, stale: false, fetchedAt: now - USAGE_SNAPSHOT_FRESH_MS }, now),
+    false,
+  );
+});
+
+test('isSnapshotFreshEnough: fetchedAt на 1мс моложе границы → true', () => {
+  const now = 1000000;
+  assert.strictEqual(
+    isSnapshotFreshEnough({ ok: true, stale: false, fetchedAt: now - USAGE_SNAPSHOT_FRESH_MS + 1 }, now),
+    true,
+  );
+});
+
+test('isSnapshotFreshEnough: ok:false → false, даже если fetchedAt свежий', () => {
+  assert.strictEqual(isSnapshotFreshEnough({ ok: false, stale: false, fetchedAt: 999999 }, 1000000), false);
+});
+
+test('isSnapshotFreshEnough: stale:true → false, даже если ok:true и fetchedAt свежий (Critical 2 night-watch.js: та же осторожность)', () => {
+  assert.strictEqual(isSnapshotFreshEnough({ ok: true, stale: true, fetchedAt: 999999 }, 1000000), false);
+});
+
+test('isSnapshotFreshEnough: fetchedAt отсутствует/не число → false', () => {
+  assert.strictEqual(isSnapshotFreshEnough({ ok: true, stale: false }, 1000000), false);
+  assert.strictEqual(isSnapshotFreshEnough({ ok: true, stale: false, fetchedAt: '1000' }, 1000000), false);
+});
+
+test('isSnapshotFreshEnough: snapshot отсутствует вовсе → false, не бросает', () => {
+  assert.strictEqual(isSnapshotFreshEnough(null, 1000000), false);
+  assert.strictEqual(isSnapshotFreshEnough(undefined, 1000000), false);
 });

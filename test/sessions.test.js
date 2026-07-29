@@ -258,6 +258,59 @@ test('переходы: PreToolUse→working с tool_name, Notification→waitin
   assert.strictEqual(st.status, 'done');
 });
 
+// ---------- C1 (Critical, ревью финальной волны фазы 8): классификация Notification ----------
+// Claude Code шлёт хук Notification и на idle_prompt («жду вашего ввода» —
+// раз в ~60с без фокуса терминала), и на permission_prompt («нужно
+// разрешение») — connector.js регистрирует ОБА как одно и то же событие без
+// matcher'а. tab.waitingKind различает их по содержимому message; list()
+// отдаёт его наружу для обвязки ipc.js (resumableTabStatus).
+
+test('Notification с idle-текстом ("waiting for your input") → waitingKind "idle"', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'Notification', { message: 'Claude is waiting for your input' });
+  const tab = mgr.list().find((t) => t.tabId === a.tabId);
+  assert.strictEqual(tab.status, 'waiting');
+  assert.strictEqual(tab.waitingKind, 'idle');
+});
+
+test('Notification с permission-текстом ("needs your permission") → waitingKind "permission"', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'Notification', { message: 'Claude needs your permission to use Bash' });
+  const tab = mgr.list().find((t) => t.tabId === a.tabId);
+  assert.strictEqual(tab.waitingKind, 'permission');
+});
+
+test('Notification с мусорным/неизвестным текстом → waitingKind "permission" (консервативный дефолт)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'Notification', { message: 'Разрешить запуск npm install?' });
+  const tab = mgr.list().find((t) => t.tabId === a.tabId);
+  assert.strictEqual(tab.waitingKind, 'permission');
+});
+
+test('waitingKind чистится вместе с waitingText при уходе из waiting (UserPromptSubmit после Notification)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'Notification', { message: 'Claude is waiting for your input' });
+  assert.strictEqual(mgr.list().find((t) => t.tabId === a.tabId).waitingKind, 'idle');
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', {});
+  // list() не отдаёт waitingText вовсе (никогда не отдавал, это не регрессия
+  // этого фикса) — проверяем его через emitted 'tab:status' (statusOf), тот
+  // же приём, что остальные тесты этого файла.
+  assert.strictEqual(statusOf(events, a.tabId).waitingText, '');
+  assert.strictEqual(mgr.list().find((t) => t.tabId === a.tabId).waitingKind, '');
+});
+
 // ---------- Task 2 фазы 6: PostToolUse → git:changed, статус не трогает ----------
 
 test('applyHookEvent: PostToolUse НЕ меняет статус вкладки, но эмитит git:changed с tabId', () => {
@@ -983,6 +1036,78 @@ test('Stop вбрасывает ПЕРВЫЙ элемент очереди в pt
   assert.strictEqual(statusOf(events, a.tabId).status, 'done');
 });
 
+// ---------- I3 (ревью финальной волны фазы 8, шов с фазой 7): holdQueueFor ----------
+// Вкладка, которая ждёт сброса ночного лимита (в pending night-watch.js), не
+// должна получать очередной элемент очереди на КАЖДЫЙ Stop — CLI на
+// исчерпанном лимите отбивает вброс мгновенно, следующий Stop вбрасывает
+// СЛЕДУЮЩИЙ элемент, и вся очередь сгорает в стену за секунды до самого
+// пробуждения.
+
+test('holdQueueFor(tabId)===true → Stop НЕ вбрасывает элемент очереди, очередь остаётся цела', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory, { holdQueueFor: () => true });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  const gen = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  mgr.enqueue(a.tabId, 'первый');
+  mgr.enqueue(a.tabId, 'второй');
+
+  const queueChangedBeforeStop = queueChangedFor(events, a.tabId).length; // 2 — по одному на каждый enqueue()
+
+  mgr.applyHookEvent(a.tabId, 'Stop', {}, gen);
+
+  assert.deepStrictEqual(factory.spawned[0].written, [], 'вброс НЕ должен был произойти — вкладка удержана предикатом');
+  const changed = queueChangedFor(events, a.tabId);
+  assert.strictEqual(changed.length, queueChangedBeforeStop, 'Stop не должен был эмитить ЕЩЁ queue:changed — вброса не было вовсе');
+  assert.deepStrictEqual(changed[changed.length - 1].queue, ['первый', 'второй'], 'очередь цела — ни один элемент не снят');
+  // Статус ВСЁ РАВНО двигается в 'done' — held гейтит только вброс очереди,
+  // не сам переход статуса (тот же принцип, что genProven чуть выше).
+  assert.strictEqual(statusOf(events, a.tabId).status, 'done');
+});
+
+test('holdQueueFor(tabId)===false → Stop вбрасывает как обычно (предикат передан, но не удерживает)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory, { holdQueueFor: () => false });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  const gen = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  mgr.enqueue(a.tabId, 'первый');
+
+  mgr.applyHookEvent(a.tabId, 'Stop', {}, gen);
+
+  assert.deepStrictEqual(factory.spawned[0].written, ['первый\r']);
+  assert.deepStrictEqual(queueChangedFor(events, a.tabId).pop().queue, []);
+});
+
+test('holdQueueFor не передан (по умолчанию null) — поведение прежнее, вброс происходит', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory); // без holdQueueFor вовсе
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  const gen = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  mgr.enqueue(a.tabId, 'первый');
+
+  mgr.applyHookEvent(a.tabId, 'Stop', {}, gen);
+
+  assert.deepStrictEqual(factory.spawned[0].written, ['первый\r']);
+  assert.deepStrictEqual(queueChangedFor(events, a.tabId).pop().queue, []);
+});
+
+test('holdQueueFor(tabId)===true, но genProven===false (недоказанное поколение) — предикат вообще не должен вызываться, вброса и так не было бы', () => {
+  const factory = makeFakePtyFactory();
+  let calls = 0;
+  const { mgr, events } = makeManager(factory, { holdQueueFor: () => { calls += 1; return true; } });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.enqueue(a.tabId, 'первый');
+
+  mgr.applyHookEvent(a.tabId, 'Stop', {}); // gen не передан — недоказанное поколение
+
+  assert.strictEqual(calls, 0, 'holdQueueFor не должен зваться, если genProven уже false');
+  assert.deepStrictEqual(factory.spawned[0].written, []);
+  assert.strictEqual(statusOf(events, a.tabId).status, 'done');
+});
+
 test('Stop при пустой очереди ничего не пишет в pty и не эмитит queue:changed', () => {
   const factory = makeFakePtyFactory();
   const { mgr, events } = makeManager(factory);
@@ -1131,6 +1256,64 @@ test('applyHookEvent: gen не передан (I4 — сторонняя сес�
   assert.deepStrictEqual(changed[changed.length - 1].queue, ['текст']);
 });
 
+// ---------- Important 1 (ревью Task 2 фазы 8, «Ночная смена»): genProven в payload 'tab:status' ----------
+// Ночная смена (main/ipc.js) детектит остановку по лимиту на переходе
+// working→done, беря сигнал из 'tab:status' — она НЕ имеет доступа к
+// gen/tab.gen напрямую (это внутреннее состояние sessions.js). Без genProven
+// в payload обвязка не могла бы отличить «наша собственная вкладка
+// действительно встала» от «сторонний процесс той же сессии просто закончил
+// СВОЮ задачу» (I4 — маршрутизация по session_id без COCKPIT_TAB_GEN,
+// заявленная фича port-file). genProven — тот же флаг, что уже гейтит
+// injectQueuedOnStop, теперь виден и снаружи функции.
+
+test('Stop с ДОКАЗАННЫМ (текущим) поколением → tab:status несёт genProven:true', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  const gen = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  mgr.applyHookEvent(a.tabId, 'Stop', {}, gen);
+  const st = statusOf(events, a.tabId);
+  assert.strictEqual(st.status, 'done');
+  assert.strictEqual(st.genProven, true);
+});
+
+test('Stop от session_id-маршрута БЕЗ доказанного поколения (I4 — сторонний процесс) → статус двигается, но genProven:false', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'Stop', {}); // gen не передан вовсе — недоказанное поколение
+  const st = statusOf(events, a.tabId);
+  assert.strictEqual(st.status, 'done', 'статус ДОЛЖЕН двигаться — заявленная фича port-file');
+  assert.strictEqual(st.genProven, false, 'но флаг доказанности обязан быть ложным — ночная смена не должна детектить это как «свою» остановку');
+});
+
+test('Stop с УСТАРЕВШИМ (не текущим) поколением → событие отбрасывается ЦЕЛИКОМ, genProven не при чём (событие не приходит вовсе)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  const staleGen = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  mgr.restart(a.tabId);
+  const before = statusOf(events, a.tabId);
+  mgr.applyHookEvent(a.tabId, 'Stop', {}, staleGen); // чужое (устаревшее) поколение — гард отсекает ВСЁ событие
+  assert.deepStrictEqual(statusOf(events, a.tabId), before, 'устаревшее поколение не должно было произвести вообще никакого tab:status');
+});
+
+test('остальные ветки applyHookEvent (SessionStart/PreToolUse/UserPromptSubmit) НЕ получают genProven в payload — форма события не изменилась', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'sess-1' });
+  assert.ok(!Object.prototype.hasOwnProperty.call(statusOf(events, a.tabId), 'genProven'));
+  mgr.applyHookEvent(a.tabId, 'PreToolUse', { tool_name: 'Bash' });
+  assert.ok(!Object.prototype.hasOwnProperty.call(statusOf(events, a.tabId), 'genProven'));
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', {});
+  assert.ok(!Object.prototype.hasOwnProperty.call(statusOf(events, a.tabId), 'genProven'));
+});
+
 // ---------- Important 1 (ревью раунд 1, обязательная правка): gen должен быть глобальным, а не по вкладке ----------
 
 test('genSeq глобален: первые спавны РАЗНЫХ вкладок получают РАЗНЫЕ поколения, а не одинаковый gen:1 у каждой', () => {
@@ -1216,4 +1399,58 @@ test('spawn: env несёт COCKPIT_TAB_GEN как строку текущего
   const gen2 = Number(factory.spawned[1].opts.env.COCKPIT_TAB_GEN);
   assert.ok(Number.isInteger(gen1) && gen1 > 0);
   assert.ok(Number.isInteger(gen2) && gen2 > gen1, 'поколение второго спавна должно быть строго больше первого');
+});
+
+// ---------- N2 (ре-ревью финальной волны): notification_type первым сигналом + липкий permission ----------
+
+test('N2: notification_type "idle_prompt" даёт idle даже при НЕЗНАКОМОМ тексте (локализация не ломает C1)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'Notification', {
+    message: 'Клод ждёт вашего ввода', notification_type: 'idle_prompt',
+  });
+  const tab = mgr.list().find((t) => t.tabId === a.tabId);
+  assert.strictEqual(tab.waitingKind, 'idle');
+});
+
+test('N2: notification_type "permission_prompt" побеждает idle-похожий текст', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'Notification', {
+    message: 'waiting for your input to approve Bash', notification_type: 'permission_prompt',
+  });
+  const tab = mgr.list().find((t) => t.tabId === a.tabId);
+  assert.strictEqual(tab.waitingKind, 'permission');
+});
+
+test('N2: липкий permission — idle-пинг ПОВЕРХ открытого диалога не понижает waitingKind', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'Notification', { message: 'Claude needs your permission to use Bash' });
+  // Диалог всё ещё открыт (статус waiting), прилетает idle-пинг:
+  mgr.applyHookEvent(a.tabId, 'Notification', {
+    message: 'Claude is waiting for your input', notification_type: 'idle_prompt',
+  });
+  const tab = mgr.list().find((t) => t.tabId === a.tabId);
+  assert.strictEqual(tab.waitingKind, 'permission', 'ночное «продолжай» не должно уметь попасть в диалог');
+});
+
+test('N2: после ВЫХОДА из waiting понижение разрешено — новый idle после working даёт idle', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'Notification', { message: 'Claude needs your permission to use Bash' });
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', {}); // пользователь ответил, вкладка снова работает
+  mgr.applyHookEvent(a.tabId, 'Notification', {
+    message: 'Claude is waiting for your input', notification_type: 'idle_prompt',
+  });
+  const tab = mgr.list().find((t) => t.tabId === a.tabId);
+  assert.strictEqual(tab.waitingKind, 'idle');
 });

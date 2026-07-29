@@ -5,21 +5,33 @@
 // строится в open() и разбирается в close() (тот же приём, что палитра —
 // palette.js/build()+close() — а не статическая разметка + toggle .hidden,
 // как у restore-overlay, который показывается ровно один раз за старт).
-// Модуль ничего не знает о usage-oauth.js/usage-ccusage.js/gh-info.js напрямую —
-// только про формы снапшотов {limits, spend, gh}, которые приносит инжектированный
-// getData(); сеть/повторный запрос — исключительно через onRefresh() (ручное
-// «Обновить», форсирует реальный npx для usage; раздел GitHub эта кнопка не
-// трогает — см. app.js/refreshUsage) и onOpen() (FIX 2 ревью: тихий вызов
-// при каждом open(), уважает TTL слоя ccusage сам; Task 4 фазы 6 — тем же
-// вызовом лениво тянет и gh:global, см. app.js/fetchUsageOnDashboardOpen).
+// Модуль ничего не знает о usage-oauth.js/usage-ccusage.js/gh-info.js/
+// night-watch.js напрямую — только про формы снапшотов {limits, spend, gh,
+// night}, которые приносит инжектированный getData(); сеть/повторный запрос —
+// исключительно через onRefresh() (ручное «Обновить», форсирует реальный npx
+// для usage; раздел GitHub эта кнопка не трогает — см. app.js/refreshUsage) и
+// onOpen() (FIX 2 ревью: тихий вызов при каждом open(), уважает TTL слоя
+// ccusage сам; Task 4 фазы 6 — тем же вызовом лениво тянет и gh:global, см.
+// app.js/fetchUsageOnDashboardOpen). Task 3 фазы 8 («Ночная смена»): .night —
+// снапшот night:get, обновляемый ЖИВЬЁМ через push night:changed (app.js
+// держит его в модульном кэше nightState всегда, не только при открытии
+// дашборда, — не нужен отдельный ленивый onOpen-запрос, в отличие от gh).
 // api (Task 4 фазы 6) — инжектированный window.api целиком (тот же приём, что
 // diffpanel.js) — используется только для api.shell.openExternal() при клике
-// по строке раздела GitHub.
+// по строке раздела GitHub. resolveTabName (Task 3 фазы 8, Important 2 ревью
+// раунда 1) — необязательная функция tabId→имя для журнала ночной секции, см.
+// createDashboard ниже.
 
 import { formatCountdown } from './countdown.js';
 import {
   formatTokens, formatUsd, formatShortDate,
 } from './format.js';
+// Task 3 фазы 8 («Ночная смена»): секция дашборда — чистый маппинг журнала/
+// строки состояния вынесен в night-format.js (см. там же, покрыт тестом через
+// динамический import()), здесь только сборка DOM (buildNightSection ниже).
+import {
+  nightStatusLine, recentJournalEntries, formatJournalLine,
+} from './night-format.js';
 
 const CHART_PRESETS = [7, 30];
 const DEFAULT_CHART_PRESET = 7;
@@ -76,8 +88,13 @@ function ghErrorText(error) {
   return GH_ERROR_TEXT[error] || 'GitHub недоступен';
 }
 
+// resolveTabName (Task 3 фазы 8, Important 2 ревью раунда 1) — необязательная
+// функция tabId→имя, инжектированная app.js (tabStore.peekInfo(tabId)?.name),
+// прокидывается насквозь в night-format.js/journalEntryText (см.
+// buildNightSection ниже) — без неё журнал ночной секции неотличим по
+// вкладкам («какая именно пропущена»).
 export function createDashboard({
-  root, getData, onRefresh, onOpen, fallbackFocus, api,
+  root, getData, onRefresh, onOpen, fallbackFocus, api, resolveTabName,
 }) {
   let isOpenFlag = false;
   let overlayEl = null;
@@ -574,6 +591,55 @@ export function createDashboard({
     return section;
   }
 
+  // buildNightSection(night): night — снапшот night:get/night:toggle/
+  // night:changed ({armed, pendingCount, wakeAt, resetsHandled, journal}) или
+  // null (ещё не пришёл первый ответ night:get в app.js — тот же приём, что gh
+  // выше, см. buildGithubSection). Task 3 фазы 8 («Ночная смена»): секция
+  // ПОСЛЕ раздела GitHub (бриф). Журнал — последние 20 записей, новые сверху,
+  // «HH:MM — текст» (см. night-format.js); пустой журнал → «журнал пуст».
+  function buildNightSection(night) {
+    const section = document.createElement('div');
+    section.className = 'dashboard-section dashboard-night';
+
+    const title = document.createElement('div');
+    title.className = 'dashboard-section-title';
+    title.textContent = 'Ночная смена';
+    section.appendChild(title);
+
+    if (!night) {
+      const loading = document.createElement('div');
+      loading.className = 'dashboard-night-loading';
+      loading.textContent = 'загружаю…';
+      section.appendChild(loading);
+      return section;
+    }
+
+    const status = document.createElement('div');
+    status.className = 'dashboard-night-status';
+    status.textContent = nightStatusLine(night);
+    section.appendChild(status);
+
+    const journalHost = document.createElement('div');
+    journalHost.className = 'dashboard-night-journal';
+    const entries = recentJournalEntries(night.journal);
+    if (!entries.length) {
+      const empty = document.createElement('div');
+      empty.className = 'dashboard-night-journal-empty';
+      empty.textContent = 'журнал пуст';
+      journalHost.appendChild(empty);
+    } else {
+      for (const entry of entries) {
+        const row = document.createElement('div');
+        row.className = 'dashboard-night-journal-row';
+        row.textContent = formatJournalLine(entry, resolveTabName);
+        journalHost.appendChild(row);
+      }
+    }
+    section.appendChild(journalHost);
+
+    return section;
+  }
+
   // render(data, now): data — {limits, spend} (форма usage:get/usage:refresh/
   // usage:update). Идемпотентная полная перерисовка bodyEl — вызывается и из
   // open(), и повторно извне (см. app.js) при каждом usage:update/локальном
@@ -619,6 +685,10 @@ export function createDashboard({
     // логика, что и у buildLimitsSection — ошибка одного источника данных не
     // должна прятать другой).
     bodyEl.appendChild(buildGithubSection(gh));
+
+    // Task 3 фазы 8 («Ночная смена»): секция — ПОСЛЕ GitHub (бриф), та же
+    // безусловная сборка независимо от прочих секций.
+    bodyEl.appendChild(buildNightSection(data && data.night));
   }
 
   // --- Оверлей: открытие/закрытие (тот же паттерн, что palette.js) ---
