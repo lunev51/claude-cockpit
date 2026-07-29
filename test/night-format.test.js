@@ -213,3 +213,37 @@ test('nightStatusLine: ждёт сброса (wakeAt непуст) — согл�
     'ждёт сброса: 5 вкладок, продолжу в 03:15',
   );
 });
+
+// === ниты ре-ревью раунда 1 (N1/N2) ===
+
+test('N1: UUID-tabId без резолвера обрезается до 8 символов — журнал прошлой ночи читаем', async () => {
+  const { journalEntryText } = await import('../src/renderer/js/night-format.js');
+  assert.strictEqual(
+    journalEntryText({ type: 'resumed', tabId: '0f8b7c2a-1d34-4e56-9abc-def012345678' }),
+    '0f8b7c2a продолжена',
+  );
+});
+
+test('N2: no-resets-at различает «нет времени» и «время в прошлом»', async () => {
+  const { journalEntryText } = await import('../src/renderer/js/night-format.js');
+  assert.strictEqual(
+    journalEntryText({ type: 'no-resets-at' }),
+    'нет времени сброса',
+  );
+  assert.strictEqual(
+    journalEntryText({ type: 'no-resets-at', detail: 'resets-at-in-past' }),
+    'время сброса уже в прошлом',
+  );
+});
+
+test('N2: internal-error показывает err.message из detail', async () => {
+  const { journalEntryText } = await import('../src/renderer/js/night-format.js');
+  assert.strictEqual(
+    journalEntryText({ type: 'internal-error', detail: 'boom' }),
+    'внутренняя ошибка: boom',
+  );
+  assert.strictEqual(
+    journalEntryText({ type: 'internal-error' }),
+    'внутренняя ошибка',
+  );
+});

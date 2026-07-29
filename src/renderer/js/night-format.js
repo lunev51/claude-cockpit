@@ -53,7 +53,11 @@ function resolveName(tabId, resolveTabName) {
       // резолвер чужой (tabStore.peekInfo) — сбой не должен ронять рендер журнала
     }
   }
-  return tabId;
+  // N1 (ре-ревью раунда 1): tabId — 36-символьный UUID; после перезапуска
+  // приложения журнал прошлой ночи резолвера не находит (вкладок уже нет), и
+  // полный UUID-префикс на каждой строке переносил бы 11px-моно на две
+  // строки. Первых 8 символов достаточно, чтобы различить вкладки между собой.
+  return String(tabId).slice(0, 8);
 }
 
 export function journalEntryText(entry, resolveTabName) {
@@ -75,9 +79,17 @@ export function journalEntryText(entry, resolveTabName) {
     // английский токен) — теперь у каждого явный русский текст.
     case 'usage-error': text = 'сбой опроса лимитов'; break;
     case 'no-usage-data': text = 'нет данных о лимитах'; break;
-    case 'no-resets-at': text = 'нет времени сброса'; break;
+    // N2 (ре-ревью раунда 1): у ядра ДВА случая no-resets-at — «времени
+    // сброса нет вовсе» и «время сброса уже в прошлом» (detail
+    // 'resets-at-in-past', протухший кэш/часы) — различаем их, диагностика
+    // утром важнее краткости.
+    case 'no-resets-at':
+      text = detail === 'resets-at-in-past'
+        ? 'время сброса уже в прошлом' : 'нет времени сброса';
+      break;
     case 'cap-reached': text = 'потолок пробуждений исчерпан'; break;
-    case 'internal-error': text = 'внутренняя ошибка'; break;
+    // N2: detail здесь — err.message, прятать его значит утром гадать.
+    case 'internal-error': text = detail ? `внутренняя ошибка: ${detail}` : 'внутренняя ошибка'; break;
     case 'aborted': text = 'прервано выключением'; break;
     // default остаётся защитным рубежом на случай БУДУЩЕГО типа ядра, ещё не
     // добавленного сюда, — «не бросать наружу» важнее полноты в этот момент.
