@@ -83,6 +83,14 @@ let lastUsage = null;
 // (gh-info.js, не usage-oauth/ccusage), но передаётся в dashboard.render()
 // вместе с ним как поле .gh (см. redrawUsageViews/getData ниже).
 let lastGh = null;
+// Task 3 фазы 8 («Ночная смена»): последний известный снапшот night:get/
+// night:toggle/night:changed — {armed, pendingCount, wakeAt, resetsHandled,
+// journal} или null до первого разрешившегося night.get() (см. boot()).
+// В отличие от lastGh, обновляется НЕ только лениво при открытии дашборда —
+// push night:changed (main/night-watch.js/emitChange) держит кэш живым
+// постоянно (кнопка 🌙/заголовок действия палитры должны быть верны в любой
+// момент, не только пока открыт дашборд) — см. applyNightState.
+let nightState = null;
 // FINDING 2 (ревью, fix round 1): пока предыдущий usage:refresh не разрешился,
 // повторный клик/автоповтор Enter-Space по #limits не должен запускать
 // параллельный ещё один — main и сам защищён (single-flight + троттлинг, см.
@@ -198,6 +206,20 @@ function renderActionBar() {
   keysBtn.addEventListener('mousedown', (e) => e.preventDefault());
   keysBtn.addEventListener('click', () => toggleHotkeys());
   host.appendChild(keysBtn);
+  // Task 3 фазы 8 («Ночная смена»): кнопка 🌙 — ПОСЛЕ ⌨ (бриф), тот же
+  // паттерн (пересборка на renderActionBar, mousedown-preventDefault). Класс
+  // .armed/title обновляются ИСКЛЮЧИТЕЛЬНО из applyNightState (см. выше) —
+  // здесь только дефолтный «выключено» вид на момент создания кнопки, ДО
+  // первого night:get (см. boot()).
+  const nightBtn = document.createElement('button');
+  nightBtn.type = 'button';
+  nightBtn.id = 'btn-night';
+  nightBtn.className = 'action-btn';
+  nightBtn.textContent = '🌙';
+  nightBtn.title = 'Ночная смена: выкл';
+  nightBtn.addEventListener('mousedown', (e) => e.preventDefault());
+  nightBtn.addEventListener('click', () => toggleNight());
+  host.appendChild(nightBtn);
   // deepMerge (config.js) при частичном оверрайде массива объектом даёт
   // {0:…,1:…} вместо массива — Array.isArray отсекает такой и любой другой
   // некорректный actionBar.commands, чтобы не уронить boot() на итерации.
@@ -325,8 +347,10 @@ function redrawLimits(now = Date.now()) {
 // плюс отдельно подтянутое поле .gh (lastGh, null до первого открытия
 // дашборда) — см. fetchUsageOnDashboardOpen. dashboard.js/render() и getData()
 // (см. createDashboard ниже) используют ровно эту же форму.
+// Task 3 фазы 8: .night — nightState целиком (уже актуален, см. applyNightState) —
+// в отличие от .gh, отдельного ленивого запроса при открытии дашборда не нужно.
 function dashboardSnapshot() {
-  return { ...(lastUsage || {}), gh: lastGh };
+  return { ...(lastUsage || {}), gh: lastGh, night: nightState };
 }
 
 function redrawUsageViews(now = Date.now()) {
@@ -475,6 +499,39 @@ function toggleHotkeys() {
 function toggleDiffPanel() {
   diffPanel?.toggle();
   window.api.config.set({ ui: { diffPanelOpen: !!diffPanel?.isOpen() } });
+}
+
+// Task 3 фазы 8 («Ночная смена»): применяет свежий снапшот night:get/
+// night:toggle/night:changed к модульному кэшу nightState И к кнопке 🌙
+// панели действий — ЕДИНСТВЕННАЯ точка, которая их трогает (правило брифа:
+// состояние обновляется ТОЛЬКО из ответа/события, кнопка НИКОГДА не
+// переключает свой класс сама — рассинхрон с реальным armed опаснее лишнего
+// тика задержки). snapshot может быть null (smoke-гейт main, см. ipc.js/
+// nightGetHandler/nightToggleHandler — headless-прогон не создаёт nightWatch
+// вовсе) — трактуем как «выключена», кнопка остаётся в дефолтном виде.
+// Дашборд перерисовывается, только если сейчас открыт (тот же приём, что
+// redrawUsageViews выше) — секция «Ночная смена» не должна отставать от
+// детекта/пробуждения, пока пользователь на неё смотрит.
+function applyNightState(snapshot) {
+  nightState = snapshot || null;
+  const btn = $('btn-night');
+  if (btn) {
+    const armed = !!(nightState && nightState.armed);
+    btn.classList.toggle('armed', armed);
+    btn.title = armed
+      ? 'Ночная смена: вооружена — продолжу вкладки после сброса лимита'
+      : 'Ночная смена: выкл';
+  }
+  if (dashboard?.isOpen()) dashboard.render(dashboardSnapshot(), Date.now());
+}
+
+// Тумблер armed — общий для кнопки 🌙 панели действий (renderActionBar) и
+// одноимённого действия палитры (buildPaletteActions) — обе точки входа
+// зовут ТОЛЬКО api.night.toggle(), никогда не решая за main состояние сами.
+function toggleNight() {
+  window.api.night.toggle().then(applyNightState).catch((err) => {
+    console.warn('[night] night:toggle не удался:', err);
+  });
 }
 
 // Создать вкладку: контейнер + xterm + запись в стор. activate — переключиться сразу.
@@ -1018,6 +1075,16 @@ function buildPaletteActions() {
     title: 'Горячие клавиши',
     hint: 'шпаргалка',
     run: () => toggleHotkeys(),
+  });
+
+  // Task 3 фазы 8 («Ночная смена»): заголовок зависит от ТЕКУЩЕГО состояния
+  // кэша nightState (обновляется исключительно из ответа toggle()/
+  // night:changed — см. applyNightState), не от локального предположения.
+  actions.push({
+    id: 'night',
+    title: nightState?.armed ? 'Ночная смена: выключить' : 'Ночная смена: включить',
+    hint: '🌙',
+    run: () => toggleNight(),
   });
 
   // Task 4 фазы 7 (библиотека рецептов промптов): по одному действию на
@@ -1602,6 +1669,16 @@ async function boot() {
     lastUsage = payload;
     redrawUsageViews();
   }).catch((err) => console.warn('[usage] usage:get не удался:', err));
+
+  // Task 3 фазы 8 («Ночная смена»): первичный снимок armed/pending/журнала —
+  // тот же fire-and-forget приём, что usage.get() выше — кнопка 🌙/палитра
+  // просто остаются в дефолтном «выключено» виде, пока промис не разрешится.
+  // onChanged — push на КАЖДОЕ последующее изменение (арминг, детект,
+  // пробуждение, дизарм — main/night-watch.js зовёт emit() после любого из
+  // них) — единственный источник истины после первого снимка.
+  window.api.night.get().then(applyNightState)
+    .catch((err) => console.warn('[night] night:get не удался:', err));
+  window.api.night.onChanged(applyNightState);
 
   // main шлёт это после каждого успешно обнаруженного refresh поллера (см.
   // usageMonitorTimer в main/ipc.js) — payload той же формы {limits, spend}.

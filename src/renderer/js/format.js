@@ -52,6 +52,19 @@ export function pluralTabs(n) {
   return 'вкладок';
 }
 
+// formatClock(ms) → «HH:MM» / null для мусора (не число/NaN/<=0) — Task 3
+// фазы 8 («Ночная смена»): секция дашборда форматирует так wakeAt (момент
+// запланированного пробуждения) и ts записей журнала. Тот же паттерн, что уже
+// была приватная formatTime() внутри dashboard.js (fetchedAt лимитов/расходов,
+// см. там же) — вынесена сюда экспортом специально для ночной секции, вторая
+// приватная копия внутри dashboard.js не трогается (не входит в эту задачу).
+export function formatClock(ms) {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return null;
+  const d = new Date(ms);
+  if (Number.isNaN(d.getTime())) return null;
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
 export function formatShortDate(isoOrMs) {
   if (typeof isoOrMs === 'string') {
     const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(isoOrMs);
