@@ -1022,10 +1022,20 @@ html, body {
   cursor: pointer;
 }
 .action-btn:hover { background: var(--bg-hover); color: var(--text); }
-.action-btn:active { background: var(--accent); color: var(--bg-window); border-color: var(--accent); }
 /* Task 3 фазы 8 («Ночная смена»): вооружённый режим виден издалека (решение
-   спеки — выключение только вручную, компенсатор — заметность кнопки 🌙). */
-.action-btn.armed { color: var(--accent); }
+   спеки — выключение только вручную, компенсатор — заметность кнопки 🌙).
+   Important 1 (ревью раунда 1): 🌙 (U+1F319) — Emoji_Presentation=Yes,
+   рендерится цветным COLR-шрифтом (Segoe UI Emoji на Windows) НЕЗАВИСИМО от
+   --font-mono — CSS color на глиф эмодзи не действует, поэтому одного color
+   было бы недостаточно (кнопка выглядела бы неотличимо от невзведённой).
+   border-color+box-shadow не зависят от шрифта глифа. Правило объявлено ДО
+   .action-btn:active (при равной специфичности позже объявленное правило
+   выигрывает конфликт свойств) — короткое нажатие на взведённую кнопку
+   по-прежнему получает штатный «нажатый» вид :active, а не перекрывается
+   .armed (иначе color:accent поверх background:accent из :active дал бы
+   нечитаемый текст на время нажатия). */
+.action-btn.armed { color: var(--accent); border-color: var(--accent); box-shadow: 0 0 6px var(--accent); }
+.action-btn:active { background: var(--accent); color: var(--bg-window); border-color: var(--accent); }
 #action-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
 /* Виджет лимита пока не наполняется (дашборд — следующая фаза) — скрыт, пока пуст. */
 #limit-5h:empty { display: none; }

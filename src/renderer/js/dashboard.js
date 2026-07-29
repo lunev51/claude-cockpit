@@ -18,7 +18,9 @@
 // дашборда, — не нужен отдельный ленивый onOpen-запрос, в отличие от gh).
 // api (Task 4 фазы 6) — инжектированный window.api целиком (тот же приём, что
 // diffpanel.js) — используется только для api.shell.openExternal() при клике
-// по строке раздела GitHub.
+// по строке раздела GitHub. resolveTabName (Task 3 фазы 8, Important 2 ревью
+// раунда 1) — необязательная функция tabId→имя для журнала ночной секции, см.
+// createDashboard ниже.
 
 import { formatCountdown } from './countdown.js';
 import {
@@ -86,8 +88,13 @@ function ghErrorText(error) {
   return GH_ERROR_TEXT[error] || 'GitHub недоступен';
 }
 
+// resolveTabName (Task 3 фазы 8, Important 2 ревью раунда 1) — необязательная
+// функция tabId→имя, инжектированная app.js (tabStore.peekInfo(tabId)?.name),
+// прокидывается насквозь в night-format.js/journalEntryText (см.
+// buildNightSection ниже) — без неё журнал ночной секции неотличим по
+// вкладкам («какая именно пропущена»).
 export function createDashboard({
-  root, getData, onRefresh, onOpen, fallbackFocus, api,
+  root, getData, onRefresh, onOpen, fallbackFocus, api, resolveTabName,
 }) {
   let isOpenFlag = false;
   let overlayEl = null;
@@ -624,7 +631,7 @@ export function createDashboard({
       for (const entry of entries) {
         const row = document.createElement('div');
         row.className = 'dashboard-night-journal-row';
-        row.textContent = formatJournalLine(entry);
+        row.textContent = formatJournalLine(entry, resolveTabName);
         journalHost.appendChild(row);
       }
     }

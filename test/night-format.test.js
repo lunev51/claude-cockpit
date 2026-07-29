@@ -3,18 +3,20 @@
 // живут в src/renderer/js/night-format.js как ESM-модуль (renderer использует
 // import), тест — CommonJS (node --test) с динамическим import() внутри
 // async-теста, тот же мост, что test/format.test.js/test/countdown.test.js.
+//
+// Ревью раунда 1 (fix round 1): journalEntryText/formatJournalLine получили
+// второй необязательный аргумент resolveTabName (Important 2) — тесты ниже
+// покрывают ОБА случая (с резолвером и без, включая фолбэк на сырой tabId).
+// detail записи 'skipped' теперь переводится словарём (Important 3), 6 ранее
+// «сырых» типов получили русский текст (Minor 4), nightStatusLine согласует
+// число вкладок через pluralTabs (Minor 5), recentJournalEntries(j, 0) → []
+// (Nit).
 
 const test = require('node:test');
 const assert = require('node:assert');
 
-test('journalEntryText: маппинг типов на человеческий текст (дословно из брифа)', async () => {
+test('journalEntryText: маппинг типов без tabId на человеческий текст (дословно из брифа)', async () => {
   const { journalEntryText } = await import('../src/renderer/js/night-format.js');
-  assert.strictEqual(journalEntryText({ type: 'limit-stop' }), 'встала по лимиту');
-  assert.strictEqual(journalEntryText({ type: 'resumed' }), 'продолжена');
-  assert.strictEqual(
-    journalEntryText({ type: 'skipped', detail: 'status:waiting' }),
-    'пропущена: status:waiting',
-  );
   assert.strictEqual(journalEntryText({ type: 'weekly-limit' }), 'недельный лимит');
   assert.strictEqual(
     journalEntryText({ type: 'wake-complete', detail: '3 of 4' }),
@@ -29,11 +31,47 @@ test('journalEntryText: маппинг типов на человеческий 
   );
 });
 
-test('journalEntryText: прочие типы показываются как есть (сырой type)', async () => {
+test('journalEntryText: 6 типов, ранее падавших в «как есть» (Minor 4, ревью раунда 1) — теперь русский текст', async () => {
   const { journalEntryText } = await import('../src/renderer/js/night-format.js');
-  for (const type of ['usage-error', 'no-usage-data', 'no-resets-at', 'cap-reached', 'internal-error', 'aborted']) {
-    assert.strictEqual(journalEntryText({ type }), type);
-  }
+  assert.strictEqual(journalEntryText({ type: 'usage-error' }), 'сбой опроса лимитов');
+  assert.strictEqual(journalEntryText({ type: 'no-usage-data' }), 'нет данных о лимитах');
+  assert.strictEqual(journalEntryText({ type: 'no-resets-at' }), 'нет времени сброса');
+  assert.strictEqual(journalEntryText({ type: 'cap-reached' }), 'потолок пробуждений исчерпан');
+  assert.strictEqual(journalEntryText({ type: 'internal-error' }), 'внутренняя ошибка');
+  assert.strictEqual(journalEntryText({ type: 'aborted' }), 'прервано выключением');
+});
+
+test('journalEntryText: НЕИЗВЕСТНЫЙ (будущий) тип по-прежнему показывается как есть — защитный рубеж', async () => {
+  const { journalEntryText } = await import('../src/renderer/js/night-format.js');
+  assert.strictEqual(journalEntryText({ type: 'some-future-type' }), 'some-future-type');
+});
+
+test('journalEntryText: skipped — словарь detail (Important 3, ревью раунда 1)', async () => {
+  const { journalEntryText } = await import('../src/renderer/js/night-format.js');
+  assert.strictEqual(
+    journalEntryText({ type: 'skipped', detail: 'status:waiting' }),
+    'пропущена: ждёт ответа на диалог',
+  );
+  assert.strictEqual(
+    journalEntryText({ type: 'skipped', detail: 'status:dead' }),
+    'пропущена: вкладка умерла',
+  );
+  assert.strictEqual(
+    journalEntryText({ type: 'skipped', detail: 'status:null' }),
+    'пропущена: вкладки больше нет',
+  );
+  assert.strictEqual(
+    journalEntryText({ type: 'skipped', detail: 'user-took-over' }),
+    'пропущена: перехвачена тобой',
+  );
+});
+
+test('journalEntryText: skipped с неизвестным detail — сырой текст (защитный фолбэк)', async () => {
+  const { journalEntryText } = await import('../src/renderer/js/night-format.js');
+  assert.strictEqual(
+    journalEntryText({ type: 'skipped', detail: 'status:weird' }),
+    'пропущена: status:weird',
+  );
 });
 
 test('journalEntryText: мусор на входе не бросает', async () => {
@@ -43,10 +81,65 @@ test('journalEntryText: мусор на входе не бросает', async (
   assert.strictEqual(journalEntryText({}), '');
 });
 
-test('formatJournalLine: «HH:MM — текст»', async () => {
+// --- Important 2 (ревью раунда 1): resolveTabName ---
+
+test('journalEntryText: с резолвером — имя вкладки подставляется перед текстом', async () => {
+  const { journalEntryText } = await import('../src/renderer/js/night-format.js');
+  const resolveTabName = (tabId) => ({ 'tab-1': 'cockpit', 'tab-2': 'helper' }[tabId] || null);
+  assert.strictEqual(
+    journalEntryText({ type: 'limit-stop', tabId: 'tab-1' }, resolveTabName),
+    'cockpit встала по лимиту',
+  );
+  assert.strictEqual(
+    journalEntryText({ type: 'skipped', tabId: 'tab-2', detail: 'status:waiting' }, resolveTabName),
+    'helper пропущена: ждёт ответа на диалог',
+  );
+});
+
+test('journalEntryText: без резолвера (или резолвер не знает tabId) — фолбэк на сырой tabId', async () => {
+  const { journalEntryText } = await import('../src/renderer/js/night-format.js');
+  assert.strictEqual(
+    journalEntryText({ type: 'resumed', tabId: 'tab-9' }),
+    'tab-9 продолжена',
+  );
+  const resolveTabName = () => null; // закрытая вкладка — резолвер не знает её
+  assert.strictEqual(
+    journalEntryText({ type: 'resumed', tabId: 'tab-9' }, resolveTabName),
+    'tab-9 продолжена',
+  );
+});
+
+test('journalEntryText: резолвер бросает исключение — не роняет функцию, фолбэк на tabId', async () => {
+  const { journalEntryText } = await import('../src/renderer/js/night-format.js');
+  const throwing = () => { throw new Error('boom'); };
+  assert.strictEqual(
+    journalEntryText({ type: 'cap-reached', tabId: 'tab-1' }, throwing),
+    'tab-1 потолок пробуждений исчерпан',
+  );
+});
+
+test('journalEntryText: без tabId (armed/disarmed/wake-complete/gave-up/retry) — резолвер не влияет', async () => {
+  const { journalEntryText } = await import('../src/renderer/js/night-format.js');
+  const resolveTabName = () => 'should-not-appear';
+  assert.strictEqual(journalEntryText({ type: 'armed' }, resolveTabName), 'включена');
+});
+
+test('formatJournalLine: «HH:MM — текст», без tabId', async () => {
   const { formatJournalLine } = await import('../src/renderer/js/night-format.js');
   const ts = new Date(2026, 6, 28, 2, 47, 0).getTime();
   assert.strictEqual(formatJournalLine({ ts, type: 'resumed' }), '02:47 — продолжена');
+});
+
+test('formatJournalLine: резолвер прокидывается насквозь (Important 2)', async () => {
+  const { formatJournalLine } = await import('../src/renderer/js/night-format.js');
+  const ts = new Date(2026, 6, 28, 2, 47, 0).getTime();
+  const resolveTabName = () => 'cockpit';
+  assert.strictEqual(
+    formatJournalLine({
+      ts, type: 'limit-stop', tabId: 'tab-1',
+    }, resolveTabName),
+    '02:47 — cockpit встала по лимиту',
+  );
 });
 
 test('formatJournalLine: битый ts → «—:—»', async () => {
@@ -74,6 +167,14 @@ test('recentJournalEntries: мусор/пусто на входе → []', async
   assert.deepStrictEqual(recentJournalEntries([]), []);
 });
 
+test('recentJournalEntries: limit 0/отрицательный/не число → [] (Nit, ревью раунда 1)', async () => {
+  const { recentJournalEntries } = await import('../src/renderer/js/night-format.js');
+  const journal = [{ ts: 1, type: 'armed' }, { ts: 2, type: 'resumed' }];
+  assert.deepStrictEqual(recentJournalEntries(journal, 0), []);
+  assert.deepStrictEqual(recentJournalEntries(journal, -1), []);
+  assert.deepStrictEqual(recentJournalEntries(journal, NaN), []);
+});
+
 test('nightStatusLine: выключена', async () => {
   const { nightStatusLine } = await import('../src/renderer/js/night-format.js');
   assert.strictEqual(nightStatusLine({ armed: false }), 'выключена');
@@ -90,13 +191,25 @@ test('nightStatusLine: вооружена без ожидания', async () => 
   );
 });
 
-test('nightStatusLine: ждёт сброса (wakeAt непуст)', async () => {
+test('nightStatusLine: ждёт сброса (wakeAt непуст) — согласование числа вкладок (Minor 5, ревью раунда 1)', async () => {
   const { nightStatusLine } = await import('../src/renderer/js/night-format.js');
   const wakeAt = new Date(2026, 6, 28, 3, 15, 0).getTime();
   assert.strictEqual(
     nightStatusLine({
+      armed: true, wakeAt, pendingCount: 1, resetsHandled: 0,
+    }),
+    'ждёт сброса: 1 вкладка, продолжу в 03:15',
+  );
+  assert.strictEqual(
+    nightStatusLine({
       armed: true, wakeAt, pendingCount: 3, resetsHandled: 1,
     }),
-    'ждёт сброса: 3 вкладок, продолжу в 03:15',
+    'ждёт сброса: 3 вкладки, продолжу в 03:15',
+  );
+  assert.strictEqual(
+    nightStatusLine({
+      armed: true, wakeAt, pendingCount: 5, resetsHandled: 1,
+    }),
+    'ждёт сброса: 5 вкладок, продолжу в 03:15',
   );
 });

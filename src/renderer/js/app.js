@@ -1610,6 +1610,11 @@ async function boot() {
     // тот же приём, что и api в createTabStore выше (diffpanel.js тоже так
     // получает api целиком, а не по колбэку на каждое действие).
     api: window.api,
+    // Task 3 фазы 8 («Ночная смена»), Important 2 ревью раунда 1: резолвер
+    // tabId→имя для журнала секции — tabStore.peekInfo(tabId) уже отдаёт null
+    // для закрытой/неизвестной вкладки, night-format.js сам фолбэкается на
+    // сырой tabId в этом случае (см. resolveName там же).
+    resolveTabName: (tabId) => tabStore.peekInfo(tabId)?.name || null,
   });
 
   // Task 2 фазы 6 (панель диффа): состояние открыта/закрыта переживает
