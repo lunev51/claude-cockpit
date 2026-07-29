@@ -850,7 +850,11 @@ function registerIpc(win, opts = {}) {
   // безвреден и в smoke (арминг там всё равно недостижим — см. nightToggleHandler
   // с гейтом `if (smoke) return null;` до обращения к nightWatch вообще).
   lastStatusByTab = new Map();
-  const nightCfg = getConfig().nightWatch;
+  // `|| {}` (нит ре-ревью фикс-раунда 1): пользовательский `"nightWatch": null`
+  // в config.json пережил бы deepMerge как null и уронил бы registerIpc()
+  // TypeError'ом на старте всего приложения — ядро свой config гардит
+  // спредом, а вот чтение wakeMarginMs для тостов ниже не гардил никто.
+  const nightCfg = getConfig().nightWatch || {};
   // Minor 5 (ревью фикс-раунд 1): пачка Stop'ов в разных вкладках (окно
   // общее на аккаунт — вполне реалистично, если несколько сессий упёрлись в
   // лимит примерно одновременно) звала бы usagePoller.refresh() параллельно,
