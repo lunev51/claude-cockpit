@@ -896,7 +896,11 @@ function registerIpc(win, opts = {}) {
     powerBlocker: smoke ? createNoopPowerBlocker() : createRealPowerBlocker(),
     journal: withNightToasts(
       smoke ? createInMemoryNightJournal() : createNightJournal({ file: nightJournalFile() }),
-      nightCfg.wakeMarginMs,
+      // Дефолт дублируется здесь осознанно (тот же нит, что `|| {}` выше):
+      // при nightWatch:null у пользователя nightCfg пуст, и без запаски время
+      // в тосте стало бы «NaN:NaN» — ядро свои дефолты спредит само, а тост
+      // считает время сам по себе.
+      typeof nightCfg.wakeMarginMs === 'number' ? nightCfg.wakeMarginMs : 60000,
     ),
     config: nightCfg,
   });
