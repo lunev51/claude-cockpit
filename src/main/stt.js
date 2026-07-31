@@ -1,11 +1,12 @@
 'use strict';
-// Распознавание речи через whisper.cpp (Фаза 9, Task 1) — порт рабочего
-// src/main/stt.js из claude-companion (299 строк, читать целиком —
-// C:\Users\Lunev\AssistClaude\claude-companion\src\main\stt.js) на конвенцию
-// кокпита: чистая фабрика, ВСЕ внешние эффекты (спавн процесса, HTTP, fs,
-// часы, таймеры, реестр процессов, лог) инжектируются — ни Electron, ни
-// child_process, ни http внутри модуля нет. Тесты (node --test) дёргают
-// фейковые таймеры руками, без единой секунды реального ожидания.
+// Распознавание речи через whisper.cpp (Фаза 9, Task 1, фикс-раунд 1 после
+// ревью) — порт рабочего src/main/stt.js из claude-companion (299 строк,
+// читать целиком — C:\Users\Lunev\AssistClaude\claude-companion\src\main\
+// stt.js) на конвенцию кокпита: чистая фабрика, ВСЕ внешние эффекты (спавн
+// процесса, HTTP, fs, часы, таймеры, реестр процессов, лог) инжектируются —
+// ни Electron, ни child_process, ни http внутри модуля нет. Тесты
+// (node --test) дёргают фейковые таймеры руками, без единой секунды
+// реального ожидания.
 //
 // Основной путь — долгоживущий whisper-server.exe (модель грузится один раз,
 // остаётся тёплой), запросы идут HTTP POST /inference (multipart, собранный
@@ -15,23 +16,33 @@
 // зафиксированы как причина не трогать этот путь вообще.
 //
 // Логика перебора бекендов/ready-поллинга/multipart/killProc сохранена 1-в-1
-// с Companion. ЕДИНСТВЕННОЕ функциональное отличие (см. спеку, раздел
+// с Companion, ВКЛЮЧАЯ сериализацию конкурентных transcribeWav() цепочкой
+// промисов (Companion :288-292, chain) — ревью раунда 1 (B1) указало, что моя
+// первоначальная попытка это осознанно выпилить была НЕВЕРНОЙ: push-to-talk
+// на renderer-стороне (Task 3) запрещает две ЗАПИСИ одновременно, но НЕ
+// запрещает повторное нажатие Shift, пока идёт РАСПОЗНАВАНИЕ предыдущей
+// (бейдж «🎤 …») — то есть конкурентные вызовы transcribeWav() ДОСТИЖИМЫ, и
+// без сериализации второй вызов бьёт по серверу, который killProc первого
+// вызова как раз убивает под ретрай (потеря диктовки + лишние спавны сервера
+// с загрузкой модели ~1ГБ каждый). См. `chain`/`transcribeWavImpl` ниже.
+//
+// ЕДИНСТВЕННОЕ функциональное отличие от Companion (см. спеку, раздел
 // «Технические контракты»): выбор КОРНЯ стека — Companion использует
 // фиксированный appRoot(), кокпит перебирает config.stackRoots и берёт
 // первый корень, где есть И хотя бы один vendor/whisper*/whisper-server.exe,
 // И models/whisper/ggml-<model>.bin.
-//
-// Сериализация конкурентных transcribeWav() (у Companion — цепочка промисов
-// chain, т.к. whisper-server однопоточный) НЕ портирована: контракт push-to-
-// talk (спека) гарантирует не более одной активной записи одновременно —
-// реальных конкурентных вызовов не бывает, а тащить лишний стейт без сценария
-// его проявления — не 1-в-1 порт, а самостоятельное усложнение.
 
 const path = require('path');
 
 // Кандидаты каталогов с бинарями whisper внутри выбранного корня, в порядке
 // предпочтения. vendor/whisper-cuda — CUDA-сборка (cuBLAS), vendor/whisper —
 // CPU-сборка (фоллбэк). При провале старта одного пробуем следующий.
+//
+// Minor-2 (ревью раунд 1): «vendor/whisper*/» в брифе — это ГЛОБ-ФОРМА
+// записи, а не намёк на произвольный набор каталогов; фактических кандидатов
+// РОВНО два, буквально как в эталоне Companion (тот же массив BACKENDS) — ни
+// один другой каталог, начинающийся на whisper*, этим модулем не
+// подхватывается и не должен.
 //
 // ВАЖНО (Pascal / GTX 10xx, compute 6.1, снято с рабочего Companion): CUDA-
 // бинарь заводится, но flash-attention на Pascal не имеет оптимизированных
@@ -49,17 +60,58 @@ const POLL_INTERVAL_MS = 300;
 const INFER_TIMEOUT_MS = 60000;
 const PING_TIMEOUT_MS = 1000; // таймаут ОДНОГО GET / внутри поллинга готовности, не деталь READY_TIMEOUT_MS
 
+// === Контракты инжектируемых эффектов (Important-3, ревью раунд 1) ===
+// Раньше контракт httpGet был размазан по комментарию внутри waitReady, а
+// httpPost не описан нигде — здесь ОДНО место правды для Task 2 (реализация
+// эффектов) и для ревью (что именно спрашивать со сторонней реализации).
+//
+// spawnProc(exe, args) → {pid, on(event,cb), removeListener?(event,cb),
+//   removeAllListeners(event), kill()} — child-подобный объект. Сам spawnProc
+//   НЕ бросает синхронно (сбой запуска — дело вызывающего кода дальше по
+//   цепочке, этот модуль 'error' не слушает). ОБЯЗАН не оставлять
+//   непрочитанных пайпов: stdio:'ignore' (предпочтительно) либо дренаж ОБОИХ
+//   потоков (stdout/stderr) — иначе при дефолтном stdio:'pipe' буфер ~64КБ
+//   переполнится через сотни запросов и whisper-server зависнет посреди
+//   инференса (Important-2, ревью раунд 1: в эталоне Companion этот дренаж
+//   был — `proc.stdout.on('data', () => {})` — но там был РЕАЛЬНЫЙ
+//   child_process; здесь spawnProc чужой, и ответственность на нём).
+// httpGet(port, path, timeoutMs) → Promise<{status}> — РЕЗОЛВ на ЛЮБОЙ
+//   завершённый HTTP-ответ (даже 404/500 — критерий готовности «порт
+//   слушает», а не «ответил 200»), REJECT ТОЛЬКО на сетевой сбой/таймаут.
+//   Important-3 (ревью раунд 1): если реализация вместо этого реджектит на
+//   не-200, ready-поллинг НИКОГДА не увидит готовность на сборках, где
+//   whisper-server отвечает не-200 на голый GET / — «оба бекенда не
+//   поднялись» на полностью исправном стеке.
+// httpPost(port, path, headers, bodyBuffer, timeoutMs) → Promise<{status,
+//   body: Buffer}> — тот же принцип: резолв на ЛЮБОЙ код (код разбирает сам
+//   stt.js, см. postInference), reject только на сетевой сбой/таймаут.
+// fs.existsSync(path) → boolean, синхронно, не бросает.
+// now() → number (мс, монотонно не обязателен, но не убывает в рамках
+//   одного прогона). setTimer(fn, ms) → id. clearTimer(id) — безопасен на
+//   уже сработавший/несуществующий id (как обычный clearTimeout).
+// registerProcess(child) — регистрация в реестре runners.js (Task 2):
+//   РЕАЛИЗАЦИЯ ВПРАВЕ повесить СВОЙ 'exit'-слушатель на child (как
+//   trackChild в runners.js) — killProc ОБЯЗАН пережить его: снимает ТОЛЬКО
+//   свой собственный обработчик, не все листенеры события 'exit' целиком
+//   (B3, ревью раунд 1 — см. killProc ниже). НЕ зовётся для служебного
+//   spawnProc('taskkill', ...) — тот сам себе уборщик и живёт доли секунды.
+// log(msg) — не бросает (или бросок безопасно проглатывается вызывающей
+//   стороной) — этот модуль сам никогда не даёт логированию уронить себя.
+
 function createStt({
   spawnProc, httpGet, httpPost, fs, now, setTimer, clearTimer, registerProcess, config, log = () => {},
 }) {
   const cfg = config || {};
 
   let proc = null; // живой child-подобный объект текущего сервера
+  let exitHandler = null; // ИМЕННО наш обработчик 'exit' текущего proc — B3: снимается точечно, не всей пачкой
   let serverPort = 0; // порт текущего сервера
   let readyPromise = null; // ожидание готовности сервера (in-flight или уже готовый)
   let activeBackendDir = null; // 'whisper-cuda' | 'whisper' | null — на чём поднят/поднимается текущий сервер
   let warm = false; // сервер прошёл ready-поллинг и (предположительно) ещё жив
   let pollTimerId = null; // текущий таймер poll-цикла waitReady — снимается в dispose()
+  let pendingReject = null; // reject ТЕКУЩЕГО waitReady (если есть) — Important-1(C): dispose() будит его напрямую
+  let disposed = false; // Important-1: терминальный флаг — после dispose() модуль больше не спавнит
 
   // Список доступных бекендов (существующих каталогов с whisper-server.exe)
   // ВНУТРИ заданного корня.
@@ -75,24 +127,57 @@ function createStt({
   // Выбор корня стека (НОВОЕ относительно Companion — см. шапку файла):
   // первый root из cfg.stackRoots, где есть И хотя бы один
   // vendor/whisper*/whisper-server.exe, И models/whisper/ggml-<model>.bin.
-  // Ни одного подходящего root → null (ensureServer/status() трактуют как
-  // «стек не найден»).
+  //
+  // Возвращает {ok:true, root, backs, modelPath} либо {ok:false, diag} —
+  // Minor-1 (ревью раунд 1): diag — по строке НА КАЖДЫЙ проверенный корень с
+  // тем, чего именно в нём не хватило, чтобы отказ ensureServer() был
+  // диагностируем без похода в код (раньше сообщение просто называло модель
+  // и молчало, ГДЕ конкретно искали).
+  //
+  // Minor-3 (ревью раунд 1): cfg.model ниже используется БЕЗ фоллбэка — в
+  // отличие от cfg.threads/cfg.language/cfg.serverPort (у которых инлайновый
+  // дефолт есть, см. ensureServer). Это НАМЕРЕННАЯ асимметрия, 1-в-1 с
+  // эталоном Companion (тот же `ggml-${cfg.model}.bin` без fallback): модель
+  // — единственный параметр, для которого дефолт ('large-v3-turbo-q5_0')
+  // назначает НЕ этот модуль, а config.js (Task 2, DEFAULTS.stt по спеке) —
+  // владелец дефолта модели ровно один, и это конфиг-слой, а не ядро.
   function resolveRoot() {
     const roots = Array.isArray(cfg.stackRoots) ? cfg.stackRoots : [];
+    const diag = [];
     for (const root of roots) {
       const backs = availableBackendsAt(root);
-      if (backs.length === 0) continue; // ни одного бекенда в этом корне — пробуем следующий
+      if (backs.length === 0) {
+        diag.push(`${root}: нет ни одного vendor/whisper*/whisper-server.exe`);
+        continue;
+      }
       const modelPath = path.join(root, 'models', 'whisper', `ggml-${cfg.model}.bin`);
-      if (!fs.existsSync(modelPath)) continue; // бекенд есть, а модели нет — этот корень не годится
-      return { root, backs, modelPath };
+      if (!fs.existsSync(modelPath)) {
+        diag.push(`${root}: бекенд(ы) [${backs.map((b) => b.dir).join(', ')}] есть, но нет модели ${modelPath}`);
+        continue;
+      }
+      return {
+        ok: true, root, backs, modelPath,
+      };
     }
-    return null;
+    if (roots.length === 0) diag.push('config.stt.stackRoots пуст');
+    return { ok: false, diag };
   }
 
   // Убивает текущий серверный процесс. ПОРЯДОК КРИТИЧЕН (тонкость 1 брифа):
   // снимаем exit-хендлер ДО kill() — иначе его отложенное срабатывание
   // затирает состояние УЖЕ НОВОГО сервера (proc/serverPort/readyPromise),
   // если respawn успел произойти раньше, чем event loop доставил старый exit.
+  //
+  // B3 (ревью раунд 1): снимаем ТОЛЬКО НАШ exitHandler (proc.removeListener),
+  // а не removeAllListeners('exit') — registerProcess() (runners.js,
+  // Task 2) вешает на этот же child СВОЙ once('exit') для чистки реестра
+  // liveChildren; removeAllListeners() сносил бы и его тоже, оставляя мёртвый
+  // pid в реестре навсегда → killAllTracked на выходе бил бы taskkill по уже
+  // не существующему pid, который Windows успела переиспользовать под
+  // посторонний процесс. removeListener — не универсальный метод (не все
+  // EventEmitter-подобные реализации его гарантируют) — фоллбэк на
+  // removeAllListeners, если его нет.
+  //
   // Контрольный taskkill — как в src/main/tts/silero.js у Companion: kill()
   // на Windows может не добить процесс с загруженной моделью. taskkill —
   // отдельный процесс-уборщик, НЕ регистрируем его через registerProcess
@@ -102,11 +187,19 @@ function createStt({
   function killProc() {
     if (proc) {
       const pid = proc.pid;
-      try { proc.removeAllListeners('exit'); } catch { /* фейковый/чужой child может не поддержать — не критично */ }
+      const handler = exitHandler;
+      try {
+        if (handler && typeof proc.removeListener === 'function') {
+          proc.removeListener('exit', handler);
+        } else {
+          proc.removeAllListeners('exit');
+        }
+      } catch { /* фейковый/чужой child может не поддержать — не критично */ }
       try { proc.kill(); } catch { /* процесс мог уже умереть сам */ }
       try { spawnProc('taskkill', ['/PID', String(pid), '/T', '/F']); } catch { /* best-effort уборка */ }
     }
     proc = null;
+    exitHandler = null;
     serverPort = 0;
     readyPromise = null;
     activeBackendDir = null;
@@ -115,19 +208,38 @@ function createStt({
 
   // Поллинг GET / раз в POLL_INTERVAL_MS до готовности или дедлайна.
   // httpGet резолвится ЛЮБЫМ завершённым ответом (сервер слушает — значит
-  // готов, статус не важен) и реджектится на сетевой сбой/таймаут — тот же
-  // контракт, что был у ping() в Companion, только эффект инжектирован.
+  // готов, статус не важен) и реджектится на сетевой сбой/таймаут — см.
+  // блок контрактов выше.
+  //
+  // Important-1 (ревью раунд 1): pendingReject хранит reject ЭТОГО ожидания,
+  // чтобы dispose() мог разбудить его напрямую (зонд C — иначе
+  // transcribeWav/ensureServer висят PENDING навсегда после teardown); флаг
+  // disposed проверяется В КАЖДОЙ continuation ПЕРЕД планированием нового
+  // таймера (зонд B — иначе уже запущенный, но ещё не отработавший httpGet
+  // планирует таймер УЖЕ ПОСЛЕ dispose(), и поллинг переживает teardown).
   function waitReady(port, deadline) {
     return new Promise((resolve, reject) => {
+      pendingReject = reject;
       function attempt() {
         httpGet(port, '/', PING_TIMEOUT_MS).then(
-          () => { pollTimerId = null; resolve(); },
           () => {
+            if (pendingReject === reject) pendingReject = null;
+            pollTimerId = null;
+            resolve();
+          },
+          () => {
+            if (pendingReject === reject) pendingReject = null;
+            if (disposed) {
+              pollTimerId = null;
+              reject(new Error('stt: dispose() во время ready-поллинга'));
+              return;
+            }
             if (now() > deadline) {
               pollTimerId = null;
               reject(new Error('whisper-server: таймаут готовности (20с)'));
               return;
             }
+            pendingReject = reject; // ждём следующего тика — восстанавливаем ссылку для dispose()
             pollTimerId = setTimer(attempt, POLL_INTERVAL_MS);
           },
         );
@@ -147,7 +259,15 @@ function createStt({
   // ПОСЛЕ killProc(), чтобы параллельные вызовы ensureServer(), случившиеся
   // ПОКА мы перебираем бекенды, дожидались ЭТОГО ЖЕ перебора, а не запускали
   // свой собственный второй сервер.
+  //
+  // Important-1: если модуль уже disposed — отказываем СРАЗУ, ни одного
+  // spawnProc. Это не только следствие teardown, но и то, что закрывает
+  // потенциальную дыру «retry внутри transcribeWav оживляет новый сервер
+  // сразу после dispose()» — см. transcribeWavImpl ниже.
   function ensureServer() {
+    if (disposed) {
+      return Promise.reject(new Error('stt: dispose() уже вызван — модуль больше не используется'));
+    }
     if (readyPromise) return readyPromise;
 
     let resolved;
@@ -156,11 +276,9 @@ function createStt({
     } catch (err) {
       return Promise.reject(err);
     }
-    if (!resolved) {
-      return Promise.reject(new Error(
-        'Голосовой стек не найден: ни в одном из stt.stackRoots нет vendor/whisper*/whisper-server.exe '
-        + `+ models/whisper/ggml-${cfg.model}.bin`,
-      ));
+    if (!resolved.ok) {
+      const detail = resolved.diag.length ? resolved.diag.join('; ') : '(нет данных)';
+      return Promise.reject(new Error(`Голосовой стек не найден. Проверено: ${detail}`));
     }
 
     const port = Number(cfg.serverPort) || DEFAULT_PORT;
@@ -189,14 +307,24 @@ function createStt({
         warm = false;
         registerProcess(child); // КАЖДЫЙ spawnProc сервера — включая повторные попытки/ретраи
 
-        child.on('exit', () => {
-          // Упавший сервер обнуляет состояние — следующий вызов стартует заново.
+        // Именованный хендлер + сохранённая ссылка (exitHandler) — killProc
+        // снимает ИМЕННО его через removeListener, не трогая чужие 'exit'-
+        // слушатели (B3). Guard `proc !== child` — защита на случай, если
+        // хендлер всё же переживёт killProc (нестандартный child без
+        // removeListener и без стандартного removeAllListeners): не даём
+        // ЧУЖОМУ, уже неактуальному событию затереть состояние уже нового
+        // сервера.
+        const onExit = () => {
+          if (proc !== child) return;
           proc = null;
+          exitHandler = null;
           serverPort = 0;
           readyPromise = null;
           activeBackendDir = null;
           warm = false;
-        });
+        };
+        child.on('exit', onExit);
+        exitHandler = onExit;
 
         const deadline = now() + READY_TIMEOUT_MS;
         try {
@@ -207,10 +335,23 @@ function createStt({
         } catch (err) {
           lastErr = err;
           log(`[stt] бекенд ${backend.dir} не поднялся (${err.message})`);
-          killProc(); // снимает exit-хендлер, добивает процесс, обнуляет readyPromise
+          killProc(); // снимает НАШ exit-хендлер, добивает процесс, обнуляет readyPromise
+          if (disposed) throw err; // Important-1: teardown посреди перебора — не продолжаем со следующим бекендом
           readyPromise = self; // восстанавливаем in-flight промис для следующей итерации/параллельных вызовов
         }
       }
+      // B2 (ревью раунд 1, Critical): ПЕРЕД финальным throw обязаны обнулить
+      // readyPromise, если он всё ещё указывает на self — иначе он навсегда
+      // остаётся УЖЕ РЕДЖЕКТНУТЫМ промисом (readyPromise, будучи truthy,
+      // короткозамыкает верхнюю проверку `if (readyPromise) return
+      // readyPromise;` у ЛЮБОГО следующего ensureServer()), и модуль
+      // отравлен до перезапуска кокпита одним моргнувшим драйвером при
+      // прогреве. У Companion это было замаскировано приватностью модуля:
+      // startServer() дергался только из transcribeWavImpl, который сам,
+      // поймав ошибку, звал killProc() СНАРУЖИ — здесь же readyPromise
+      // публично «залипает» между вызовами ensureServer(), поэтому чинить
+      // нужно ВНУТРИ, а не полагаться на вызывающий код.
+      if (readyPromise === self) readyPromise = null;
       throw lastErr || new Error('whisper-server: не удалось запустить ни один бекенд');
     })();
 
@@ -270,11 +411,13 @@ function createStt({
     return (json.text || '').trim();
   }
 
-  // transcribeWav(buffer) → Promise<string>. buffer — WAV (whisper.cpp сам
-  // ресемплит). Тонкость 7 брифа: не-200/таймаут /inference → ОДИН ретрай
-  // (killProc → ensureServer → повторный POST); второй провал — reject
-  // (никакого CLI-фоллбэка, см. шапку файла).
-  async function transcribeWav(buffer) {
+  // transcribeWavImpl(buffer) → Promise<string> — фактическая логика одного
+  // распознавания (buffer — WAV, whisper.cpp сам ресемплит). Тонкость 7
+  // брифа: не-200/таймаут /inference → ОДИН ретрай (killProc → ensureServer
+  // → повторный POST); второй провал — reject (никакого CLI-фоллбэка, см.
+  // шапку файла). Вызывать НАПРЯМУЮ нельзя — только через transcribeWav()
+  // ниже (сериализация, B1).
+  async function transcribeWavImpl(buffer) {
     try {
       await ensureServer();
       return await postInference(buffer);
@@ -292,16 +435,36 @@ function createStt({
     }
   }
 
+  // B1 (Critical, ревью раунд 1) — сериализация конкурентных transcribeWav()
+  // цепочкой промисов, портировано из эталона Companion (:288-292, `chain`)
+  // буквально: whisper-server ОДНОПОТОЧНЫЙ, а push-to-talk на renderer-
+  // стороне (Task 3) запрещает только две одновременные ЗАПИСИ — но НЕ
+  // повторное нажатие Shift, пока идёт РАСПОЗНАВАНИЕ предыдущей (индикатор
+  // «🎤 …», спека). Без сериализации: конкурентный вызов №1 (POST вернул 500)
+  // и вызов №2 (висит на POST к ТОМУ ЖЕ серверу) гонятся друг за другом —
+  // killProc ретрая №1 убивает сервер, на котором висит POST №2 → тот тоже
+  // проваливается → его СОБСТВЕННЫЙ ретрай убивает уже НОВЫЙ (только что
+  // поднятый вызовом №1) сервер → как минимум одна диктовка теряется, а
+  // моделей (~1ГБ каждая) грузится втрое больше нужного. Цепочка гарантирует
+  // строго последовательное выполнение — второй вызов даже не начинает свой
+  // POST, пока не осядет (успехом или неудачей) первый целиком, включая его
+  // собственный ретрай.
+  let chain = Promise.resolve();
+  function transcribeWav(buffer) {
+    chain = chain.catch(() => {}).then(() => transcribeWavImpl(buffer));
+    return chain;
+  }
+
   // {available, backend, warm}. available — найден ли стек ХОТЯ БЫ где-то
   // (не зависит от того, запущен ли сейчас сервер); backend/warm — про
   // ТЕКУЩИЙ живой процесс, если он есть.
   function status() {
     try {
-      let resolved = null;
+      let resolved = { ok: false };
       try {
         resolved = resolveRoot();
       } catch { /* битый fs/config — трактуем как «не найден», не бросаем */ }
-      return { available: !!resolved, backend: activeBackendDir, warm };
+      return { available: !!resolved.ok, backend: activeBackendDir, warm };
     } catch {
       return { available: false, backend: null, warm: false };
     }
@@ -309,11 +472,24 @@ function createStt({
 
   // Убить серверный процесс и снять все таймеры (teardown приложения —
   // рядом с nightWatch.dispose()). Никогда не бросает наружу.
+  //
+  // Important-1 (ревью раунд 1): помимо снятия pollTimerId (уже было),
+  // ставим терминальный disposed=true (см. ensureServer()/waitReady выше —
+  // блокирует и новые спавны, и планирование новых таймеров в continuation
+  // уже летящих httpGet) И явно будим pendingReject, если ensureServer()
+  // сейчас висит в ожидании готовности — иначе вызывающий (transcribeWav)
+  // остаётся PENDING навсегда, а renderer — в «🎤 …» до ручной перезагрузки.
   function dispose() {
     try {
+      disposed = true;
       if (pollTimerId !== null) {
         clearTimer(pollTimerId);
         pollTimerId = null;
+      }
+      if (pendingReject) {
+        const reject = pendingReject;
+        pendingReject = null;
+        reject(new Error('stt: dispose() вызван во время ожидания готовности сервера'));
       }
       killProc();
     } catch (err) {

@@ -56,8 +56,8 @@
 ## Архитектура
 
 **`src/main/stt.js`** — порт Companion-модуля, переведённый на конвенцию
-кокпита: фабрика `createStt({ spawnProc, httpRequest, fs, now, setTimer,
-registerProcess, config, log })` → `{ transcribeWav(wavBuffer) →
+кокпита: фабрика `createStt({ spawnProc, httpGet, httpPost, fs, now, setTimer,
+clearTimer, registerProcess, config, log })` → `{ transcribeWav(wavBuffer) →
 Promise<string>, ensureServer(), dispose(), status() }`. Вся логика
 (перебор бекендов, ready-поллинг, multipart, восстановление readyPromise
 между итерациями) сохраняется 1-в-1, меняется только способ получения
@@ -112,10 +112,11 @@ holdKey: 'ShiftRight', minHoldMs: 300 }`.
 
 `test/stt.test.js`, `node --test`, все эффекты фейковые: выбор стека по
 кандидатам (первый валидный; ни одного → отказ); перебор бекендов CUDA→CPU
-при провале старта; ready-поллинг с дедлайном; multipart-тело (границы,
-UTF-8 кириллица в prompt-части НЕ через argv); один ретрай после перезапуска;
-dispose снимает exit-хендлер до kill; smoke-гейты. Renderer (recorder,
-Shift-обработка) — живая приёмка.
+при провале старта; ready-поллинг с дедлайном; multipart-тело (границы, части
+file/response_format, WAV байт-в-байт, кириллица UTF-8 в ответе — НЕ через
+argv, прежде всего потому что в этом порте никакого argv-пути для текста
+вообще нет); один ретрай после перезапуска; dispose снимает exit-хендлер до
+kill; smoke-гейты. Renderer (recorder, Shift-обработка) — живая приёмка.
 
 ## Приёмка (руками)
 

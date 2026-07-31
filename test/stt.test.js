@@ -36,6 +36,9 @@ function fakeTimers() {
     lastId() {
       return log.length ? log[log.length - 1].id : null;
     },
+    lastMs() {
+      return log.length ? log[log.length - 1].ms : null;
+    },
     liveCount() {
       return live.size;
     },
@@ -47,9 +50,12 @@ function fakeFs(existing = []) {
   return { existsSync: (p) => set.has(p) };
 }
 
-// Фейковый child: {pid, on, removeAllListeners, kill} + журнал вызовов (для
-// теста «killProc снимает exit-хендлер до kill») и emit() для симуляции
-// реального выхода процесса.
+// Фейковый child: {pid, on, removeListener, removeAllListeners, kill} +
+// журнал вызовов (для теста «killProc снимает exit-хендлер до kill» и B3 —
+// «killProc снимает ИМЕННО свой хендлер, не все») и emit() для симуляции
+// реального выхода процесса. removeListener поддерживает НЕСКОЛЬКО
+// слушателей одного события — снимает только переданную функцию, остальные
+// (например, «чужой» once от registerProcess) остаются жить.
 function fakeChild(pid) {
   const listeners = {};
   const calls = [];
@@ -59,6 +65,11 @@ function fakeChild(pid) {
     on(event, cb) {
       (listeners[event] = listeners[event] || []).push(cb);
       calls.push({ op: 'on', event });
+      return child;
+    },
+    removeListener(event, cb) {
+      if (listeners[event]) listeners[event] = listeners[event].filter((f) => f !== cb);
+      calls.push({ op: 'removeListener', event });
       return child;
     },
     removeAllListeners(event) {
@@ -248,12 +259,21 @@ test('выбор корня: root1 без модели, root2 валиден →
 });
 
 test('выбор корня: ни одного валидного root → ensureServer() реджектит, status().available=false, spawnProc не вызван', async () => {
-  const fs = fakeFs([serverExePath(ROOT1(), 'whisper')]); // модели нигде нет
-  const { stt, spawnProc } = setup({ fs });
+  const fs = fakeFs([serverExePath(ROOT1(), 'whisper')]); // бекенд в root1 есть, модели нигде нет
+  const { stt, spawnProc } = setup({ fs }); // baseConfig(): stackRoots = [ROOT1(), ROOT2()]
 
-  await assert.rejects(() => stt.ensureServer());
+  let rejection = null;
+  await stt.ensureServer().catch((e) => { rejection = e; });
+  assert.ok(rejection);
   assert.strictEqual(spawnProc.calls.length, 0);
   assert.deepStrictEqual(stt.status(), { available: false, backend: null, warm: false });
+
+  // Minor-1 (ревью раунд 1): сообщение обязано называть ОБА проверенных
+  // корня и то, чего именно в каждом не хватило — не просто «не найдено».
+  assert.ok(rejection.message.includes(ROOT1()), 'сообщение должно упоминать root1');
+  assert.ok(rejection.message.includes(ROOT2()), 'сообщение должно упоминать root2');
+  assert.match(rejection.message, /нет модели/, 'root1: бекенд есть, модели нет — должно быть явно сказано');
+  assert.match(rejection.message, /нет ни одного.*whisper-server\.exe/, 'root2: бекенда нет вовсе — должно быть явно сказано');
 });
 
 // ==================================================== перебор бекендов/аргументы =====
@@ -506,6 +526,120 @@ test('transcribeWav: двойной провал POST → reject (без CLI-ф�
   assert.strictEqual(serverSpawns(spawnProc).length, 2, 'ожидались попытка + один ретрай = два серверных spawnProc');
 });
 
+test('transcribeWav: невалидный JSON от /inference → reject с понятным сообщением, тоже вызывает ретрай', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([serverExePath(root, 'whisper'), modelPathFor(root, MODEL)]);
+  const httpGet = () => Promise.resolve({ status: 200 });
+  const httpPost = () => Promise.resolve({ status: 200, body: Buffer.from('не-json{', 'utf8') });
+  const { stt, spawnProc } = setup({ fs, httpGet, httpPost, config: baseConfig({ stackRoots: [root] }) });
+
+  await assert.rejects(() => stt.transcribeWav(Buffer.from('a')), /невалидный JSON/);
+  assert.strictEqual(serverSpawns(spawnProc).length, 2, 'невалидный JSON — тоже сбой, тоже один ретрай, как любой другой');
+});
+
+test('transcribeWav: стек не найден нигде → reject сразу, ни одного spawnProc', async () => {
+  const fs = fakeFs([]); // ничего нет ни в одном stackRoot
+  const { stt, spawnProc } = setup({ fs });
+
+  await assert.rejects(() => stt.transcribeWav(Buffer.from('a')), /Голосовой стек не найден/);
+  assert.strictEqual(spawnProc.calls.length, 0);
+});
+
+// ============================================================ B1: сериализация =====
+// Ревью раунд 1, Critical: без сериализации конкурентный вызов №2 бьёт по
+// серверу, который ретрай вызова №1 как раз убивает — теряет диктовку и
+// плодит лишние спавны (каждый грузит модель ~1ГБ). Портированная из
+// Companion цепочка промисов (`chain`) должна гарантировать строго
+// последовательное выполнение.
+
+test('B1: два конкурентных transcribeWav сериализуются — POST-запросы идут строго по очереди, обе диктовки доезжают', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([serverExePath(root, 'whisper'), modelPathFor(root, MODEL)]);
+  const httpGet = () => Promise.resolve({ status: 200 });
+  const postLog = [];
+  let postCalls = 0;
+  const httpPost = () => {
+    postCalls += 1;
+    const call = postCalls;
+    postLog.push(`start#${call}`);
+    if (call === 1) {
+      // Первый POST вызова №1 — проваливается, вызывает ретрай.
+      return Promise.resolve({ status: 500, body: Buffer.from('boom', 'utf8') });
+    }
+    return Promise.resolve({ status: 200, body: Buffer.from(`{"text":"text#${call}"}`, 'utf8') });
+  };
+  const spawnProc = fakeSpawn([]);
+  const { stt } = setup({ fs, httpGet, httpPost, spawnProc, config: baseConfig({ stackRoots: [root] }) });
+
+  const p1 = stt.transcribeWav(Buffer.from('a')); // диктовка №1
+  const p2 = stt.transcribeWav(Buffer.from('b')); // диктовка №2, запущена КОНКУРЕНТНО (сервер ещё грузится/не готов к P2)
+
+  const [r1, r2] = await Promise.all([p1, p2]);
+
+  // Без сериализации call2 стартовал бы своим POST, пока висит ретрай call1,
+  // и порядок/число вызовов было бы недетерминированным. С сериализацией —
+  // строго 1 (провал call1), 2 (ретрай call1, успех), 3 (call2, успех).
+  assert.deepStrictEqual(postLog, ['start#1', 'start#2', 'start#3']);
+  assert.strictEqual(r1, 'text#2', 'диктовка №1 должна была доехать (после своего ретрая)');
+  assert.strictEqual(r2, 'text#3', 'диктовка №2 должна была доехать, а не потеряться');
+  assert.strictEqual(
+    serverSpawns(spawnProc).length,
+    2,
+    'ровно один спавн + один ретрай ИЗ-ЗА 500 у call1 — БЕЗ третьего спавна от call2 (это и есть регрессия B1)',
+  );
+});
+
+test('B1: сериализация не роняет второй вызов, если первый успешен с первой попытки', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([serverExePath(root, 'whisper'), modelPathFor(root, MODEL)]);
+  const httpGet = () => Promise.resolve({ status: 200 });
+  let postCalls = 0;
+  const httpPost = () => {
+    postCalls += 1;
+    return Promise.resolve({ status: 200, body: Buffer.from(`{"text":"t${postCalls}"}`, 'utf8') });
+  };
+  const { stt, spawnProc } = setup({ fs, httpGet, httpPost, config: baseConfig({ stackRoots: [root] }) });
+
+  const [r1, r2] = await Promise.all([stt.transcribeWav(Buffer.from('a')), stt.transcribeWav(Buffer.from('b'))]);
+
+  assert.strictEqual(r1, 't1');
+  assert.strictEqual(r2, 't2');
+  assert.strictEqual(serverSpawns(spawnProc).length, 1, 'один сервер на оба вызова — второй ensureServer() дождался уже поднятого');
+});
+
+// ================================================================== B2: живучесть =====
+// Ревью раунд 1, Critical: после провала ВСЕГО перебора бекендов
+// readyPromise раньше оставался уже РЕДЖЕКТНУТЫМ промисом навсегда —
+// следующий ensureServer()/transcribeWav() мгновенно получал СТАРУЮ ошибку,
+// ни одного нового spawnProc. Один моргнувший драйвер при прогреве убивал
+// голос до перезапуска кокпита.
+
+test('B2: провал полного перебора не отравляет модуль — второй ensureServer() делает НОВЫЕ спавны', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([serverExePath(root, 'whisper'), modelPathFor(root, MODEL)]);
+  const httpGet = () => Promise.reject(new Error('econnrefused'));
+  const timers = fakeTimers();
+  const clock = makeClock(0);
+  const { stt, spawnProc } = setup({
+    fs, httpGet, timers, clock, config: baseConfig({ stackRoots: [root] }),
+  });
+
+  const p1 = stt.ensureServer();
+  await driveUntilSettled(p1, timers, clock);
+  await assert.rejects(p1, /таймаут готовности/);
+  assert.strictEqual(serverSpawns(spawnProc).length, 1);
+
+  const p2 = stt.ensureServer();
+  assert.notStrictEqual(p1, p2, 'второй ensureServer() не должен возвращать ту же (уже реджектнутую) ссылку на промис');
+  await driveUntilSettled(p2, timers, clock);
+  await assert.rejects(p2, /таймаут готовности/);
+  assert.strictEqual(
+    serverSpawns(spawnProc).length,
+    2,
+    'второй вызов должен был сделать НОВЫЙ спавн, а не мгновенно вернуть старую ошибку без единой попытки',
+  );
+});
+
 test('exit сервера → следующий вызов transcribeWav спавнит заново', async () => {
   const root = ROOT1();
   const fs = fakeFs([serverExePath(root, 'whisper'), modelPathFor(root, MODEL)]);
@@ -541,19 +675,86 @@ test('killProc: снимает exit-хендлер ДО kill() — фейков�
     return Promise.resolve({ status: 200, body: Buffer.from('{"text":"ok"}', 'utf8') });
   };
   const first = fakeChild(111);
-  const second = fakeChild(222);
-  const spawnProc = fakeSpawn([first, second]);
+  // Тест-хвост ревью раунда 1: этот второй фейковый child достаётся вызову
+  // spawnProc('taskkill', ...) из killProc (НЕ второму серверу-ретраю — тот
+  // получает уже дефолтный fakeChild из fakeSpawn) — назван по факту, а не
+  // "second", чтобы имя не намекало на несуществующий второй сервер.
+  const taskkillChild = fakeChild(222);
+  const spawnProc = fakeSpawn([first, taskkillChild]);
   const { stt } = setup({
     fs, httpGet, httpPost, spawnProc, config: baseConfig({ stackRoots: [root] }),
   });
 
   await stt.transcribeWav(Buffer.from('a')); // вызывает ретрай → killProc() над first
 
-  const ops = first.calls.map((c) => c.op).filter((op) => op === 'removeAllListeners' || op === 'kill');
-  const removeIdx = ops.indexOf('removeAllListeners');
+  // fakeChild поддерживает removeListener — killProc (B3) снимает ИМЕННО
+  // свой exit-хендлер через него, не через removeAllListeners.
+  const ops = first.calls.map((c) => c.op).filter((op) => op === 'removeListener' || op === 'kill');
+  const removeIdx = ops.indexOf('removeListener');
   const killIdx = ops.indexOf('kill');
   assert.ok(removeIdx >= 0 && killIdx >= 0, 'ожидались оба вызова у первого child');
-  assert.ok(removeIdx < killIdx, `removeAllListeners должен быть ДО kill(), порядок: ${JSON.stringify(ops)}`);
+  assert.ok(removeIdx < killIdx, `removeListener('exit', ...) должен быть ДО kill(), порядок: ${JSON.stringify(ops)}`);
+});
+
+test('B3: killProc снимает ТОЛЬКО свой exit-хендлер — чужой (registerProcess/runners.js) переживает', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([serverExePath(root, 'whisper'), modelPathFor(root, MODEL)]);
+  const httpGet = () => Promise.resolve({ status: 200 });
+  let postCalls = 0;
+  const httpPost = () => {
+    postCalls += 1;
+    if (postCalls === 1) return Promise.resolve({ status: 500, body: Buffer.from('x', 'utf8') });
+    return Promise.resolve({ status: 200, body: Buffer.from('{"text":"ok"}', 'utf8') });
+  };
+  let foreignExitFired = 0;
+  // Симулируем runners.js trackChild: СВОЙ 'exit'-слушатель, повешенный
+  // ВНУТРИ registerProcess (та же точка входа, что и у настоящего реестра).
+  const registerProcess = (child) => {
+    child.on('exit', () => { foreignExitFired += 1; });
+  };
+  const spawnProc = fakeSpawn([]);
+  const { stt } = setup({
+    fs, httpGet, httpPost, spawnProc, registerProcess, config: baseConfig({ stackRoots: [root] }),
+  });
+
+  await stt.transcribeWav(Buffer.from('a')); // 500 → killProc над первым сервером → ретрай
+
+  const firstServer = serverSpawns(spawnProc)[0].child;
+  assert.ok(
+    firstServer.calls.some((c) => c.op === 'removeListener' && c.event === 'exit'),
+    'killProc должен был снять СВОЙ хендлер через removeListener, не removeAllListeners',
+  );
+  assert.ok(
+    !firstServer.calls.some((c) => c.op === 'removeAllListeners'),
+    'removeAllListeners НЕ должен был вызываться, пока у child есть removeListener',
+  );
+
+  // Процесс реально завершается (уже ПОСЛЕ killProc, как в жизни) — чужой
+  // (registerProcess/runners.js) слушатель обязан ЭТО ПОЛУЧИТЬ.
+  firstServer.emit('exit');
+  assert.strictEqual(foreignExitFired, 1, 'чужой exit-листенер должен был пережить killProc');
+});
+
+test('B3 (фоллбэк): child без removeListener — killProc падает обратно на removeAllListeners', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([serverExePath(root, 'whisper'), modelPathFor(root, MODEL)]);
+  const httpGet = () => Promise.resolve({ status: 200 });
+  const child = {
+    pid: 111,
+    calls: [],
+    on(event, cb) { this.calls.push({ op: 'on', event }); return this; },
+    removeAllListeners(event) { this.calls.push({ op: 'removeAllListeners', event }); return this; },
+    kill() { this.calls.push({ op: 'kill' }); },
+    // removeListener СОЗНАТЕЛЬНО отсутствует — проверяем фоллбэк.
+  };
+  const spawnProc = fakeSpawn([child]);
+  const { stt } = setup({ fs, httpGet, spawnProc, config: baseConfig({ stackRoots: [root] }) });
+
+  await stt.ensureServer();
+  stt.dispose(); // dispose() тоже идёт через killProc
+
+  assert.ok(child.calls.some((c) => c.op === 'removeAllListeners' && c.event === 'exit'));
+  assert.ok(child.calls.some((c) => c.op === 'kill'));
 });
 
 test('killProc: контрольный taskkill идёт через spawnProc, но НЕ регистрируется через registerProcess', async () => {
@@ -613,20 +814,22 @@ test('registerProcess: зовётся для КАЖДОГО серверного
 
 // ========================================================================= dispose =====
 
-test('dispose: идемпотентен (двойной вызов не бросает), снимает pending poll-таймер', async () => {
+test('dispose: идемпотентен (двойной вызов не бросает), снимает pending poll-таймер, будит зависший ensureServer()', async () => {
   const root = ROOT1();
   const fs = fakeFs([serverExePath(root, 'whisper'), modelPathFor(root, MODEL)]);
   const httpGet = () => new Promise(() => {}); // никогда не резолвится — сервер вечно "не готов"
   const timers = fakeTimers();
   const { stt } = setup({ fs, httpGet, timers, config: baseConfig({ stackRoots: [root] }) });
 
-  stt.ensureServer(); // запускает poll-цикл, не ждём
+  const p = stt.ensureServer(); // запускает poll-цикл, не ждём
+  p.catch(() => {}); // должен осесть (reject) ПОСЛЕ dispose() — гасим unhandled rejection заранее
   await Promise.resolve();
   await Promise.resolve();
 
   assert.doesNotThrow(() => stt.dispose());
   assert.doesNotThrow(() => stt.dispose());
   assert.strictEqual(timers.liveCount(), 0, 'poll-таймер должен быть снят dispose()');
+  await assert.rejects(p, 'зависший ensureServer() должен был осесть (reject) после dispose(), а не висеть вечно');
 });
 
 test('dispose: убивает текущий процесс (kill вызван), status() после dispose — не warm', async () => {
@@ -642,6 +845,113 @@ test('dispose: убивает текущий процесс (kill вызван),
 
   assert.ok(child.calls.some((c) => c.op === 'kill'));
   assert.deepStrictEqual(stt.status(), { available: true, backend: null, warm: false });
+});
+
+test('dispose: ensureServer()/transcribeWav() после dispose() реджектят СРАЗУ, ни одного нового spawnProc', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([serverExePath(root, 'whisper'), modelPathFor(root, MODEL)]);
+  const httpGet = () => Promise.resolve({ status: 200 });
+  const { stt, spawnProc } = setup({ fs, httpGet, config: baseConfig({ stackRoots: [root] }) });
+
+  await stt.ensureServer();
+  stt.dispose(); // сам dispose() тоже спавнит контрольный taskkill — считаем baseline ПОСЛЕ него
+  const afterDispose = spawnProc.calls.length;
+
+  await assert.rejects(() => stt.ensureServer(), /dispose/i);
+  await assert.rejects(() => stt.transcribeWav(Buffer.from('a')), /dispose/i);
+  assert.strictEqual(spawnProc.calls.length, afterDispose, 'ни ensureServer(), ни transcribeWav() после dispose() не должны спавнить (это и закрывает дыру "retry оживляет сервер после teardown")');
+});
+
+// ---------------------------------------------- Important-1: dispose во время поллинга -----
+// Ревью раунд 1, зонды B и C: (B) continuation уже летящего httpGet
+// планирует НОВЫЙ таймер ПОСЛЕ dispose() — поллинг переживает teardown;
+// (C) отменённый таймер оставляет waitReady неосевшим → ensureServer()/
+// transcribeWav() висят PENDING навсегда, renderer застревает в «🎤 …».
+
+test('Important-1(B): dispose() во время зависшего httpGet-continuation НЕ планирует новый poll-таймер', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([serverExePath(root, 'whisper'), modelPathFor(root, MODEL)]);
+  let rejectHttpGet;
+  const httpGet = () => new Promise((res, rej) => { rejectHttpGet = rej; });
+  const timers = fakeTimers();
+  const { stt } = setup({ fs, httpGet, timers, config: baseConfig({ stackRoots: [root] }) });
+
+  const p = stt.ensureServer();
+  p.catch(() => {});
+  await flush(3); // httpGet уже вызван и висит (continuation ещё не отработала)
+
+  stt.dispose();
+  assert.strictEqual(timers.liveCount(), 0);
+
+  // Теперь "поздно" срабатывает continuation исходного httpGet — сервер так и не ответил.
+  rejectHttpGet(new Error('econnrefused'));
+  await flush(5);
+
+  assert.strictEqual(timers.liveCount(), 0, 'continuation НЕ должна была запланировать новый таймер после dispose()');
+  await assert.rejects(p);
+});
+
+test('Important-1(C): dispose() во время активного poll-таймера — ensureServer() реджектится СРАЗУ, а не висит до дедлайна', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([serverExePath(root, 'whisper'), modelPathFor(root, MODEL)]);
+  const httpGet = () => Promise.reject(new Error('econnrefused')); // никогда не готов, поллинг идёт таймерами
+  const timers = fakeTimers();
+  const clock = makeClock(0);
+  const { stt } = setup({
+    fs, httpGet, timers, clock, config: baseConfig({ stackRoots: [root] }),
+  });
+
+  const p = stt.ensureServer();
+  await flush(5); // первый poll-таймер уже запланирован — ensureServer "висит" в ожидании (до 20000мс дедлайна)
+
+  stt.dispose();
+
+  await assert.rejects(p, /dispose/i);
+});
+
+// -------------------------------------------------- Minor-4: точные числа таймингов -----
+// Регрессия «поллинг раз в 3с вместо 300мс» или «дедлайн 2000мс вместо
+// 20000мс» раньше проходила бы зелёной — ни один тест не смотрел на
+// КОНКРЕТНОЕ число, только на факт «таймер где-то планируется».
+
+test('Minor-4: POLL_INTERVAL_MS===300 — таймер поллинга планируется РОВНО с задержкой 300мс', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([serverExePath(root, 'whisper'), modelPathFor(root, MODEL)]);
+  const httpGet = () => Promise.reject(new Error('econnrefused'));
+  const timers = fakeTimers();
+  const { stt } = setup({ fs, httpGet, timers, config: baseConfig({ stackRoots: [root] }) });
+
+  const p = stt.ensureServer();
+  p.catch(() => {});
+  await flush(5);
+
+  assert.strictEqual(timers.lastMs(), 300);
+});
+
+test('Minor-4: READY_TIMEOUT_MS===20000 — дедлайн срабатывает строго ПОСЛЕ 20000мс (now()===deadline ещё не истёк)', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([serverExePath(root, 'whisper'), modelPathFor(root, MODEL)]);
+  const httpGet = () => Promise.reject(new Error('econnrefused'));
+  const timers = fakeTimers();
+  const clock = makeClock(0);
+  const { stt } = setup({
+    fs, httpGet, timers, clock, config: baseConfig({ stackRoots: [root] }),
+  });
+
+  const p = stt.ensureServer();
+  let settled = false;
+  p.then(() => { settled = true; }, () => { settled = true; });
+
+  await flush(5); // первая попытка сразу реджектится → таймер #1 на 300мс
+
+  clock.set(20000); // РОВНО дедлайн — по контракту (now() > deadline) ЕЩЁ не истёк
+  firePoll(timers);
+  await flush(5);
+  assert.strictEqual(settled, false, 'на now()===deadline (20000) поллинг должен ПРОДОЛЖАТЬСЯ (строгое >)');
+
+  clock.set(20001); // на 1мс больше — теперь истёк
+  firePoll(timers);
+  await assert.rejects(p, /таймаут готовности/);
 });
 
 // ========================================================================= status =====
