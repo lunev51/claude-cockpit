@@ -1002,3 +1002,246 @@ test('B2-хвост: синхронный бросок registerProcess не от
   assert.strictEqual(registered.length, 1, 'второй спавн зарегистрирован в реестре');
   assert.ok(serverSpawns(spawnProc).length >= 2, 'вторая попытка сделала новый спавн');
 });
+
+// ============= боевой инцидент живой приёмки: смерть CUDA на инференсе =============
+// Сервер успешно грузит модель («готов»), но умирает на ПЕРВОМ инференсе
+// (рабочие буферы CUDA не влезли в занятую VRAM). Старый ретрай крутил тот же
+// CUDA-бекенд по кругу — фоллбэк на CPU существовал только для провала СТАРТА.
+
+test('инцидент: сервер умер на инференсе → ретрай уходит на СЛЕДУЮЩИЙ бекенд (CPU)', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([
+    serverExePath(root, 'whisper-cuda'),
+    serverExePath(root, 'whisper'),
+    modelPathFor(root, MODEL),
+  ]);
+  const httpGet = () => Promise.resolve({ status: 200 });
+  const children = [fakeChild(111), fakeChild(222)];
+  const spawnProc = fakeSpawn(children);
+  let postN = 0;
+  const httpPost = () => {
+    postN += 1;
+    if (postN === 1) {
+      // ПРОДОВЫЙ порядок (Critical-1 ревью инцидент-фикса): reject сокета —
+      // микрозадача, приходит ПЕРВЫМ; событие exit на Windows едет через
+      // threadpool и опаздывает ВСЕГДА (20/20 замеров зонда). Эмитим exit
+      // поздним setImmediate — сдвиг обязан сработать по транспортной
+      // метке err.sttTransport, а не по гонке proc===null.
+      setImmediate(() => children[0].emit('exit'));
+      return Promise.reject(new Error('read ECONNRESET'));
+    }
+    return Promise.resolve({ status: 200, body: Buffer.from('{"text":"привет"}', 'utf8') });
+  };
+  const { stt } = setup({
+    fs, httpGet, httpPost, spawnProc, config: baseConfig({ stackRoots: [root] }),
+  });
+
+  const text = await stt.transcribeWav(Buffer.from('wav'));
+  assert.strictEqual(text, 'привет');
+  const spawns = serverSpawns(spawnProc);
+  assert.strictEqual(spawns.length, 2);
+  assert.strictEqual(spawns[0].exe, serverExePath(root, 'whisper-cuda'), 'первая попытка — CUDA');
+  assert.strictEqual(spawns[1].exe, serverExePath(root, 'whisper'), 'ретрай обязан уйти на CPU, а не крутить CUDA');
+});
+
+test('инцидент: после смерти CUDA следующий transcribeWav стартует сразу с CPU (предпочтение закреплено)', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([
+    serverExePath(root, 'whisper-cuda'),
+    serverExePath(root, 'whisper'),
+    modelPathFor(root, MODEL),
+  ]);
+  const httpGet = () => Promise.resolve({ status: 200 });
+  const children = [fakeChild(111), fakeChild(222), fakeChild(333)];
+  const spawnProc = fakeSpawn(children);
+  let postN = 0;
+  const httpPost = () => {
+    postN += 1;
+    if (postN === 1) {
+      setImmediate(() => children[0].emit('exit')); // продовый порядок: reject первым (Critical-1)
+      return Promise.reject(new Error('read ECONNRESET'));
+    }
+    return Promise.resolve({ status: 200, body: Buffer.from('{"text":"ok"}', 'utf8') });
+  };
+  const { stt } = setup({
+    fs, httpGet, httpPost, spawnProc, config: baseConfig({ stackRoots: [root] }),
+  });
+
+  await stt.transcribeWav(Buffer.from('wav1'));
+  // Убьём CPU-сервер штатно (exit), чтобы следующий вызов спавнил заново.
+  // ВАЖНО: адресуемся через serverSpawns().child, НЕ через children[индекс] —
+  // killProc (теперь реально выполняющийся: с продовым порядком exit
+  // опаздывает, proc жив в catch) спавнит taskkill, который СЪЕДАЕТ
+  // очередного ребёнка из массива fakeSpawn, и children[1] оказался бы
+  // taskkill-ребёнком, а не CPU-сервером.
+  serverSpawns(spawnProc)[1].child.emit('exit');
+  await stt.transcribeWav(Buffer.from('wav2'));
+  const spawns = serverSpawns(spawnProc);
+  assert.strictEqual(spawns.length, 3);
+  assert.strictEqual(spawns[2].exe, serverExePath(root, 'whisper'), 'третий спавн — сразу CPU, CUDA больше не пробуем');
+});
+
+test('инцидент: HTTP 500 при ЖИВОМ сервере → ретрай на ТОМ ЖЕ бекенде (бекенд не виноват)', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([
+    serverExePath(root, 'whisper-cuda'),
+    serverExePath(root, 'whisper'),
+    modelPathFor(root, MODEL),
+  ]);
+  const httpGet = () => Promise.resolve({ status: 200 });
+  const spawnProc = fakeSpawn([]);
+  let postN = 0;
+  const httpPost = () => {
+    postN += 1;
+    if (postN === 1) return Promise.resolve({ status: 500, body: Buffer.from('err', 'utf8') });
+    return Promise.resolve({ status: 200, body: Buffer.from('{"text":"ok"}', 'utf8') });
+  };
+  const { stt } = setup({
+    fs, httpGet, httpPost, spawnProc, config: baseConfig({ stackRoots: [root] }),
+  });
+
+  await stt.transcribeWav(Buffer.from('wav'));
+  const spawns = serverSpawns(spawnProc);
+  assert.strictEqual(spawns.length, 2);
+  assert.strictEqual(spawns[0].exe, serverExePath(root, 'whisper-cuda'));
+  assert.strictEqual(spawns[1].exe, serverExePath(root, 'whisper-cuda'), '500 от живого сервера — не повод менять бекенд');
+});
+
+test('инцидент: CPU (последний бекенд) умер на инференсе → предпочтение не сдвигается, обычный ретрай CPU', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([serverExePath(root, 'whisper'), modelPathFor(root, MODEL)]); // только CPU
+  const httpGet = () => Promise.resolve({ status: 200 });
+  const children = [fakeChild(111), fakeChild(222)];
+  const spawnProc = fakeSpawn(children);
+  let postN = 0;
+  const httpPost = () => {
+    postN += 1;
+    if (postN === 1) {
+      setImmediate(() => children[0].emit('exit')); // продовый порядок: reject первым (Critical-1)
+      return Promise.reject(new Error('read ECONNRESET'));
+    }
+    return Promise.resolve({ status: 200, body: Buffer.from('{"text":"ok"}', 'utf8') });
+  };
+  const { stt } = setup({
+    fs, httpGet, httpPost, spawnProc, config: baseConfig({ stackRoots: [root] }),
+  });
+
+  const text = await stt.transcribeWav(Buffer.from('wav'));
+  assert.strictEqual(text, 'ok');
+  const spawns = serverSpawns(spawnProc);
+  assert.strictEqual(spawns[1].exe, serverExePath(root, 'whisper'), 'единственный бекенд ретраится сам');
+});
+
+test('инцидент: порт занят чужим (ready отвечает, но НАШ ребёнок умер) → попытка честно падает, следующий бекенд', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([
+    serverExePath(root, 'whisper-cuda'),
+    serverExePath(root, 'whisper'),
+    modelPathFor(root, MODEL),
+  ]);
+  const children = [fakeChild(111), fakeChild(222)];
+  const spawnProc = fakeSpawn(children);
+  let getN = 0;
+  const httpGet = () => {
+    getN += 1;
+    if (getN === 1) {
+      // Чужой процесс на порту отвечает на пинг — но наш ребёнок №1 уже умер.
+      children[0].emit('exit');
+      return Promise.resolve({ status: 200 });
+    }
+    return Promise.resolve({ status: 200 });
+  };
+  const httpPost = () => Promise.resolve({ status: 200, body: Buffer.from('{"text":"ok"}', 'utf8') });
+  const logs = [];
+  const { stt } = setup({
+    fs, httpGet, httpPost, spawnProc,
+    config: baseConfig({ stackRoots: [root] }),
+    log: (m) => logs.push(m),
+  });
+
+  const text = await stt.transcribeWav(Buffer.from('wav'));
+  assert.strictEqual(text, 'ok');
+  const spawns = serverSpawns(spawnProc);
+  assert.strictEqual(spawns.length, 2, 'первая попытка отвергнута, вторая — следующий бекенд');
+  assert.strictEqual(spawns[1].exe, serverExePath(root, 'whisper'));
+  assert.ok(
+    logs.some((l) => /умер при старте/.test(l)),
+    'лог обязан назвать причину («умер при старте»), а не рапортовать готовность чужака',
+  );
+});
+
+test('Important-1: провал СТАРТА всех бекендов — НЕ демоция; следующий вызов снова начинает с CUDA', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([
+    serverExePath(root, 'whisper-cuda'),
+    serverExePath(root, 'whisper'),
+    modelPathFor(root, MODEL),
+  ]);
+  const timers = fakeTimers();
+  const clock = makeClock(0);
+  let phase = 'down'; // 'down' → ни один бекенд не отвечает; 'up' → всё работает
+  const httpGet = () => (phase === 'down'
+    ? Promise.reject(new Error('econnrefused'))
+    : Promise.resolve({ status: 200 }));
+  const httpPost = () => Promise.resolve({ status: 200, body: Buffer.from('{"text":"ok"}', 'utf8') });
+  const spawnProc = fakeSpawn([]);
+  const logs = [];
+  const { stt } = setup({
+    fs, httpGet, httpPost, spawnProc, timers, clock,
+    config: baseConfig({ stackRoots: [root] }),
+    log: (m) => logs.push(m),
+  });
+
+  const p1 = stt.transcribeWav(Buffer.from('wav'));
+  p1.catch(() => {}); // ожидаемый провал — гасим unhandled
+  // transcribeWav делает ДВА полных перебора бекендов (попытка + ретрай):
+  // 2 × 2 бекенда × ~67 тиков поллинга до дедлайна — дефолтных 200 шагов
+  // драйвера не хватает.
+  await driveUntilSettled(p1, timers, clock, { maxSteps: 600 });
+  await assert.rejects(p1);
+  assert.ok(!logs.some((l) => /умер на инференсе/.test(l)),
+    'провал старта не должен маскироваться под смерть на инференсе');
+
+  phase = 'up';
+  const spawnsBefore = serverSpawns(spawnProc).length;
+  await stt.transcribeWav(Buffer.from('wav2'));
+  const spawns = serverSpawns(spawnProc);
+  assert.strictEqual(spawns[spawnsBefore].exe, serverExePath(root, 'whisper-cuda'),
+    'после провала старта предпочтение НЕ сдвинуто — снова CUDA');
+});
+
+test('Minor-1: демоция не навсегда — холодный старт спустя интервал снова пробует CUDA', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([
+    serverExePath(root, 'whisper-cuda'),
+    serverExePath(root, 'whisper'),
+    modelPathFor(root, MODEL),
+  ]);
+  const clock = makeClock(0);
+  const httpGet = () => Promise.resolve({ status: 200 });
+  const children = [fakeChild(111), fakeChild(222), fakeChild(333)];
+  const spawnProc = fakeSpawn(children);
+  let postN = 0;
+  const httpPost = () => {
+    postN += 1;
+    if (postN === 1) {
+      setImmediate(() => children[0].emit('exit'));
+      return Promise.reject(new Error('read ECONNRESET'));
+    }
+    return Promise.resolve({ status: 200, body: Buffer.from('{"text":"ok"}', 'utf8') });
+  };
+  const { stt } = setup({
+    fs, httpGet, httpPost, spawnProc, clock, config: baseConfig({ stackRoots: [root] }),
+  });
+
+  await stt.transcribeWav(Buffer.from('wav1')); // CUDA умер → CPU
+  // Через serverSpawns().child — killProc-таскилл съедает детей из массива
+  // по порядку вызовов (см. комментарий в тесте «предпочтение закреплено»).
+  serverSpawns(spawnProc)[1].child.emit('exit'); // тёплый CPU умер сам — состояние холодное
+  clock.set(6 * 60000); // интервал ре-пробы вышел
+  await stt.transcribeWav(Buffer.from('wav2'));
+  const spawns = serverSpawns(spawnProc);
+  assert.strictEqual(spawns.length, 3);
+  assert.strictEqual(spawns[2].exe, serverExePath(root, 'whisper-cuda'),
+    'холодный старт после интервала обязан снова попробовать CUDA');
+});
