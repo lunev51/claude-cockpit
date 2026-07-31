@@ -140,6 +140,11 @@ export function createTabStore({
 
     const r = {
       row, dot, sub, connectBtn, name, cwd, status: 'working', waitingText: '',
+      // C2 (Critical, ревью финальной волны фазы 9): waitingKind — та же
+      // судьба, что waitingText (см. setStatus/waitingKindOf ниже) — зеркало
+      // tab.waitingKind из sessions.js, нужное writeCommandToTab (app.js),
+      // чтобы отличить idle_prompt (пишущий статус) от диалога разрешения.
+      waitingKind: '',
       prBadge, prUrl: null,
     };
     rows.set(tabId, r);
@@ -163,7 +168,7 @@ export function createTabStore({
     activeId = tabId;
   }
 
-  function setStatus(tabId, status, subtitle, waitingText) {
+  function setStatus(tabId, status, subtitle, waitingText, waitingKind) {
     const r = rows.get(tabId);
     if (!r) return;
     const regroup = GROUP_OF[r.status] !== GROUP_OF[status];
@@ -181,6 +186,10 @@ export function createTabStore({
     // sessions.js сам чистит его на стороне main, когда статус уходит от
     // waiting (tab.waitingText = ''), так что здесь просто зеркалим payload.
     if (typeof waitingText === 'string') r.waitingText = waitingText;
+    // C2 (Critical, ревью финальной волны фазы 9): та же судьба, что
+    // waitingText выше — sessions.js уже чистит tab.waitingKind на выходе из
+    // 'waiting' (эмитит ''), здесь только зеркалим payload, тем же приёмом.
+    if (typeof waitingKind === 'string') r.waitingKind = waitingKind;
     if (regroup) placeRow(r);
   }
 
@@ -208,6 +217,18 @@ export function createTabStore({
   function statusOf(tabId) {
     const r = rows.get(tabId);
     return r ? r.status : null;
+  }
+
+  // C2 (Critical, ревью финальной волны фазы 9): «какого рода» текущее
+  // waiting — 'idle' (Claude Code простаивает у промпта дольше ~60с без
+  // фокуса, шлёт idle_prompt — ПИШУЩИЙ статус, та же семантика, что уже
+  // признаёт ночная смена, см. main/ipc.js) или 'permission'/'' (реальный
+  // диалог разрешения либо вкладка не в waiting вовсе). app.js использует
+  // это вместе со statusOf() в isTabBlockedByDialog — писать в waiting+idle
+  // безопасно, блокировать нужно только permission.
+  function waitingKindOf(tabId) {
+    const r = rows.get(tabId);
+    return r ? r.waitingKind : '';
   }
 
   function setConnectVisible(tabId, visible) {
@@ -266,6 +287,7 @@ export function createTabStore({
     setActive,
     setStatus,
     statusOf,
+    waitingKindOf,
     setConnectVisible,
     setPr,
     neighborOf,

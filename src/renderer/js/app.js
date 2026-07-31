@@ -822,9 +822,22 @@ function showToast(text, level = 'info') {
 // не даёт голому Enter молча подтвердить дефолт диалога; статус вкладки его
 // не касается, потому что peek и есть штатный способ ответить, пока статус
 // waiting).
+//
+// C2 (Critical, ревью финальной волны фазы 9): 'waiting' САМ ПО СЕБЕ больше
+// не блокирует безусловно — см. isTabBlockedByDialog ниже. Claude Code шлёт
+// idle_prompt (~раз в 60с без фокуса терминала), пока просто простаивает у
+// промпта — это ПИШУЩИЙ статус, та же семантика, что уже применяет ночная
+// смена (main/ipc.js вбрасывает туда «продолжай»), а вовсе не диалог
+// разрешения с вариантами Yes/No. Блокируем ТОЛЬКО waitingKind==='permission'
+// (и неизвестные значения — консервативный дефолт, см. classifyNotification
+// в sessions.js).
+function isTabBlockedByDialog(tabId) {
+  return tabStore.statusOf(tabId) === 'waiting' && tabStore.waitingKindOf(tabId) !== 'idle';
+}
+
 function writeCommandToTab(tabId, command) {
   if (!tabId) return false;
-  if (tabStore.statusOf(tabId) === 'waiting') {
+  if (isTabBlockedByDialog(tabId)) {
     showToast('Вкладка ждёт ответа на диалог — команда не отправлена', 'warn');
     return false;
   }
@@ -941,6 +954,14 @@ function stopVoiceRecording() {
   if (voiceState !== 'starting' && voiceState !== 'recording') return;
   const heldMs = Date.now() - voiceHoldStartedAt;
   const overlayOpenedDuring = Object.values(overlayFlags()).some(Boolean);
+  // C1 (Critical, ревью финальной волны): активная вкладка ИМЕННО СЕЙЧАС, на
+  // момент keyup — а НЕ на момент фактической доставки (после stt:transcribe:
+  // до 2×20с подъёма сервера + 60с инференса, с ретраем до ~200с суммарно).
+  // Тот же принцип, что runRecipe (ниже) резолвит tabId ДО await с явным
+  // комментарием «даже если он успеет переключиться» — без этого пользователь
+  // мог продиктовать в A, переключиться в B (Ctrl+Tab/клик по Windows-тосту),
+  // пока горит «🎤 …», и текст+Enter ушёл бы в ЧУЖОЙ проект.
+  const tabId = tabStore.activeId;
   voiceState = 'stopping';
   updateVoiceIndicator();
   runOnRecorder(() => voiceRecorder.stop()).then((wav) => {
@@ -954,7 +975,7 @@ function stopVoiceRecording() {
     if (wav && heldMs >= minHoldMs && !overlayOpenedDuring) {
       voiceState = 'transcribing';
       updateVoiceIndicator();
-      handleVoiceWav(wav);
+      handleVoiceWav(wav, tabId);
       return;
     }
     voiceState = 'idle'; // короткое нажатие / оверлей открылся во время записи / нечего отправлять — отмена молча
@@ -997,8 +1018,9 @@ function cancelVoiceRecording() {
 // 'transcribing' — эта функция лишь возвращает его в 'idle' по завершении
 // (ре-ревью, сценарий (б): пока voiceState не 'idle', новая запись не
 // начнётся, так что затирать здесь больше нечего — новый цикл просто не мог
-// возникнуть, пока этот не открыл дорогу).
-async function handleVoiceWav(wav) {
+// возникнуть, пока этот не открыл дорогу). tabId — снимок stopVoiceRecording
+// на момент keyup (C1), прокидывается насквозь до самой доставки.
+async function handleVoiceWav(wav, tabId) {
   let result;
   try {
     result = await window.api.stt.transcribe(wav);
@@ -1015,13 +1037,15 @@ async function handleVoiceWav(wav) {
     showToast(decision.message, decision.level);
     return;
   }
-  await deliverVoiceText(decision.text);
+  await deliverVoiceText(tabId, decision.text);
 }
 
 // Доставка распознанного текста — ТОТ ЖЕ путь, что и рецепты (см. runRecipe
 // ниже): normalizeForPty схлопывает внутренние переносы строк в пробел, затем
-// гард статуса вкладки writeCommandToTab (waiting → тост, текст не
-// отправлен) → `текст + \r` в pty активной вкладки.
+// гард статуса вкладки writeCommandToTab (waiting БЕЗ idle → тост, текст не
+// отправлен) → `текст + \r` в pty вкладки, ЗАХВАЧЕННОЙ в stopVoiceRecording
+// на момент keyup (C1) — НЕ tabStore.activeId здесь (та могла уже смениться,
+// пока шло распознавание).
 //
 // Ревью раунда 1, Minor 4: повторной проверки «текст пуст после нормализации»
 // здесь НЕТ — resolveTranscribeResult (voice-guards.js) уже гарантировал, что
@@ -1032,12 +1056,35 @@ async function handleVoiceWav(wav) {
 // строка не может стать пустой на выходе. Второй, всегда ложный источник
 // истины про «Не расслышал» только запутывал бы читателя кода — единственный
 // источник истины теперь ровно один, в voice-guards.js.
-async function deliverVoiceText(rawText) {
-  const tabId = tabStore.activeId;
-  if (!tabId) return; // вкладка закрылась, пока шло распознавание — защитный рубеж
+async function deliverVoiceText(tabId, rawText) {
+  // C1: вкладка могла закрыться, пока шло распознавание, ИЛИ её вообще не
+  // было в момент keyup (statusOf(null) тоже вернёт null) — тост, не отправляем.
+  if (!tabId || tabStore.statusOf(tabId) === null) {
+    showToast('Вкладка закрыта — текст не отправлен', 'warn');
+    return;
+  }
   const text = await window.api.recipes.normalizeForPty(rawText);
-  writeCommandToTab(tabId, text);
-  views.get(tabId)?.view.focus();
+  if (isTabBlockedByDialog(tabId)) {
+    // C2, смягчение (ревью финальной волны): waiting+permission блокирует
+    // обычную доставку — но распознанный текст не должен пропадать
+    // безвозвратно только потому, что вкладка сейчас ждёт ответа человека на
+    // СОВСЕМ ДРУГОЙ вопрос. Буфер обмена — fire-and-forget, без await на
+    // весь показ тоста (навигатор сам управляет своим таймингом).
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast('Вкладка ждёт диалога — текст скопирован в буфер обмена', 'warn');
+    } catch (err) {
+      console.warn('[voice] clipboard.writeText упал:', err);
+      showToast('Вкладка ждёт диалога — команда не отправлена', 'warn');
+    }
+    return;
+  }
+  // M1 (ревью финальной волны): focus() ТОЛЬКО при реально успешной записи —
+  // writeCommandToTab возвращает false и на случай гонки (isTabBlockedByDialog
+  // выше уже сказал «нет», но состояние вкладки успело измениться между этой
+  // проверкой и самой записью) — фокус терминала не должен перескакивать на
+  // вкладку, в которую текст фактически не попал.
+  if (writeCommandToTab(tabId, text)) views.get(tabId)?.view.focus();
 }
 
 // keydown/keyup правого Shift — ОТДЕЛЬНЫЙ обработчик от bindHotkeys() (бриф):
@@ -2108,9 +2155,12 @@ async function boot() {
   // Статусы приходят из хуков Claude Code (sessions.js) — единый источник,
   // term:started/term:exit статус больше не выставляют (был двойной источник).
   window.api.tab.onStatus(({
-    tabId, status, subtitle, waitingText,
+    tabId, status, subtitle, waitingText, waitingKind,
   }) => {
-    tabStore.setStatus(tabId, status, subtitle, waitingText);
+    // C2 (Critical, ревью финальной волны фазы 9): waitingKind зеркалится в
+    // tabStore ровно тем же приёмом, что waitingText — см. tabs.js/setStatus,
+    // app.js/isTabBlockedByDialog (голосовой ввод/writeCommandToTab).
+    tabStore.setStatus(tabId, status, subtitle, waitingText, waitingKind);
     // Ledger-фикс (ревью): текст в поповере — статичный снимок на момент
     // открытия. Если Claude задаёт ВТОРОЙ вопрос той же вкладке, пока
     // поповер всё ещё открыт (статус остаётся waiting), пользователь рискует
