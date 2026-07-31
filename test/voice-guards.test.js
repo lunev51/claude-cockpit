@@ -7,63 +7,56 @@
 const test = require('node:test');
 const assert = require('node:assert');
 
-test('canStartRecording: все условия выполнены → true', async () => {
-  const { canStartRecording } = await import('../src/renderer/js/voice/voice-guards.js');
-  assert.strictEqual(canStartRecording({
-    overlays: { dashboard: false, palette: false, peek: false },
-    hasActiveTab: true,
-    sttAvailable: true,
-  }), true);
+test('resolveStartBlock: всё ок → allowed:true, без причины/тоста', async () => {
+  const { resolveStartBlock } = await import('../src/renderer/js/voice/voice-guards.js');
+  assert.deepStrictEqual(
+    resolveStartBlock({ overlaysOpen: false, hasActiveTab: true, sttAvailable: true }),
+    { allowed: true, reason: null },
+  );
 });
 
-test('canStartRecording: нет активной вкладки → false', async () => {
-  const { canStartRecording } = await import('../src/renderer/js/voice/voice-guards.js');
-  assert.strictEqual(canStartRecording({
-    overlays: {},
-    hasActiveTab: false,
-    sttAvailable: true,
-  }), false);
+test('resolveStartBlock: нет активной вкладки → allowed:false, reason:no-tab, БЕЗ тоста', async () => {
+  const { resolveStartBlock } = await import('../src/renderer/js/voice/voice-guards.js');
+  assert.deepStrictEqual(
+    resolveStartBlock({ overlaysOpen: false, hasActiveTab: false, sttAvailable: true }),
+    { allowed: false, reason: 'no-tab' },
+  );
 });
 
-test('canStartRecording: голосовой стек недоступен → false', async () => {
-  const { canStartRecording } = await import('../src/renderer/js/voice/voice-guards.js');
-  assert.strictEqual(canStartRecording({
-    overlays: {},
-    hasActiveTab: true,
-    sttAvailable: false,
-  }), false);
+test('resolveStartBlock: открыт оверлей → allowed:false, reason:overlay, БЕЗ тоста', async () => {
+  const { resolveStartBlock } = await import('../src/renderer/js/voice/voice-guards.js');
+  assert.deepStrictEqual(
+    resolveStartBlock({ overlaysOpen: true, hasActiveTab: true, sttAvailable: true }),
+    { allowed: false, reason: 'overlay' },
+  );
 });
 
-test('canStartRecording: любой открытый оверлей блокирует запись', async () => {
-  const { canStartRecording } = await import('../src/renderer/js/voice/voice-guards.js');
-  const base = { hasActiveTab: true, sttAvailable: true };
-  assert.strictEqual(canStartRecording({ ...base, overlays: { palette: true } }), false);
-  assert.strictEqual(canStartRecording({ ...base, overlays: { dashboard: true } }), false);
-  assert.strictEqual(canStartRecording({ ...base, overlays: { peek: true } }), false);
-  assert.strictEqual(canStartRecording({ ...base, overlays: { historySearch: true } }), false);
-  assert.strictEqual(canStartRecording({ ...base, overlays: { recipeForm: true } }), false);
-  assert.strictEqual(canStartRecording({ ...base, overlays: { hotkeys: true } }), false);
-  assert.strictEqual(canStartRecording({ ...base, overlays: { queue: true } }), false);
-  assert.strictEqual(canStartRecording({ ...base, overlays: { restore: true } }), false);
-});
-
-test('canStartRecording: несколько флагов сразу, хотя бы один true → false', async () => {
-  const { canStartRecording } = await import('../src/renderer/js/voice/voice-guards.js');
-  assert.strictEqual(canStartRecording({
-    overlays: {
-      dashboard: false, palette: false, peek: false, queue: true,
+test('resolveStartBlock: стек недоступен (вкладка есть, оверлеев нет) → allowed:false, reason:stt-unavailable, тост с текстом', async () => {
+  const { resolveStartBlock } = await import('../src/renderer/js/voice/voice-guards.js');
+  assert.deepStrictEqual(
+    resolveStartBlock({ overlaysOpen: false, hasActiveTab: true, sttAvailable: false }),
+    {
+      allowed: false,
+      reason: 'stt-unavailable',
+      toast: { message: 'Голосовой стек не найден (см. stt.stackRoots в конфиге)', level: 'warn' },
     },
-    hasActiveTab: true,
-    sttAvailable: true,
-  }), false);
+  );
 });
 
-test('canStartRecording: overlays отсутствуют/мусор — не бросает, трактуется как «ничего не открыто»', async () => {
-  const { canStartRecording } = await import('../src/renderer/js/voice/voice-guards.js');
-  const base = { hasActiveTab: true, sttAvailable: true };
-  assert.strictEqual(canStartRecording({ ...base, overlays: null }), true);
-  assert.strictEqual(canStartRecording({ ...base, overlays: undefined }), true);
-  assert.strictEqual(canStartRecording({ ...base }), true);
+test('resolveStartBlock: приоритет причин — нет вкладки ПЕРЕКРЫВАЕТ недоступность стека (Minor 3 ревью раунда 1) — тост про стек не показываем', async () => {
+  const { resolveStartBlock } = await import('../src/renderer/js/voice/voice-guards.js');
+  const result = resolveStartBlock({ overlaysOpen: false, hasActiveTab: false, sttAvailable: false });
+  assert.strictEqual(result.allowed, false);
+  assert.strictEqual(result.reason, 'no-tab');
+  assert.strictEqual(result.toast, undefined);
+});
+
+test('resolveStartBlock: приоритет причин — открытый оверлей ПЕРЕКРЫВАЕТ недоступность стека — тост про стек не показываем', async () => {
+  const { resolveStartBlock } = await import('../src/renderer/js/voice/voice-guards.js');
+  const result = resolveStartBlock({ overlaysOpen: true, hasActiveTab: true, sttAvailable: false });
+  assert.strictEqual(result.allowed, false);
+  assert.strictEqual(result.reason, 'overlay');
+  assert.strictEqual(result.toast, undefined);
 });
 
 test('resolveTranscribeResult: непустой текст → deliver', async () => {

@@ -7,19 +7,38 @@
 // тестом через динамический import() (тот же мост, что night-format.js/
 // format.js, см. test/night-format.test.js).
 
-// «Можно ли начать запись прямо сейчас» — ТРИ независимых условия (бриф,
-// task-3-brief.md): ни один оверлей приложения не открыт (палитра/дашборд/
-// peek/поиск истории/форма рецепта/шпаргалка клавиш/поле очереди/restore —
-// см. app.js/overlayFlags()), есть активная вкладка (некуда писать текст),
-// голосовой стек найден на диске (status().available — НЕ то же самое, что
-// «сервер сейчас поднят», см. src/main/stt.js/status()). Мусорные overlays
-// (null/undefined) трактуются как «ничего не открыто» — защитный рубеж, а не
-// повод бросить исключение из обработчика keydown.
-function canStartRecording({ overlays, hasActiveTab, sttAvailable }) {
-  if (!hasActiveTab) return false;
-  if (!sttAvailable) return false;
-  if (overlays && Object.values(overlays).some(Boolean)) return false;
-  return true;
+// «Можно ли начать запись прямо сейчас, и если нет — нужен ли тост» (ревью
+// раунда 2, Minor 2 — заменяет прежнюю canStartRecording: ТА же проверка трёх
+// условий из брифа, task-3-brief.md, плюс причина отказа и готовый тост,
+// вынесенные из bindVoiceHotkey/app.js, где раньше жили инлайново). Условия
+// (в порядке проверки, порядок ЗНАЧИМ — см. ниже): есть активная вкладка
+// (некуда писать текст) → ни один оверлей приложения не открыт (палитра/
+// дашборд/peek/поиск истории/форма рецепта/шпаргалка клавиш/поле очереди/
+// restore — см. app.js/overlayFlags(), сведены вызывающим кодом в один
+// булев overlaysOpen) → голосовой стек найден на диске (sttAvailable —
+// status().available, НЕ то же самое, что «сервер сейчас поднят», см.
+// src/main/stt.js/status()).
+//
+// Порядок проверки — не только «первая сработавшая причина», но и явное
+// решение «когда НЕ показывать тост про стек»: тост «стек не найден»
+// (одноразовый за сессию, состояние которого хранит вызывающий код) должен
+// гореть ТОЛЬКО когда стек — единственная и реальная блокирующая причина, а
+// не когда отказ вызван ещё и/только отсутствием вкладки или открытым
+// оверлеем (Minor 3 ревью раунда 1: раньше тост про стек мог сгореть
+// впустую, если параллельно не было активной вкладки — теперь reason
+// однозначно называет ПЕРВУЮ применимую причину, и toast присутствует ТОЛЬКО
+// у reason:'stt-unavailable').
+function resolveStartBlock({ overlaysOpen, hasActiveTab, sttAvailable }) {
+  if (!hasActiveTab) return { allowed: false, reason: 'no-tab' };
+  if (overlaysOpen) return { allowed: false, reason: 'overlay' };
+  if (!sttAvailable) {
+    return {
+      allowed: false,
+      reason: 'stt-unavailable',
+      toast: { message: 'Голосовой стек не найден (см. stt.stackRoots в конфиге)', level: 'warn' },
+    };
+  }
+  return { allowed: true, reason: null };
 }
 
 // «Что делать с ответом stt:transcribe(wav)» — {text}|{error} от main (см.
@@ -43,4 +62,4 @@ function resolveTranscribeResult(result) {
   return { action: 'deliver', text };
 }
 
-export { canStartRecording, resolveTranscribeResult };
+export { resolveStartBlock, resolveTranscribeResult };

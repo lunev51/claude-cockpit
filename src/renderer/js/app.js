@@ -19,7 +19,7 @@ import { pluralTabs } from './format.js';
 // структура renderer совпадает 1-в-1). voice-guards.js — чистые гарды,
 // вынесенные отдельно ради node --test (см. test/voice-guards.test.js).
 import { VoiceRecorder } from './voice/recorder.js';
-import { canStartRecording, resolveTranscribeResult } from './voice/voice-guards.js';
+import { resolveStartBlock, resolveTranscribeResult } from './voice/voice-guards.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -119,30 +119,68 @@ let queueInputOpen = false;
 
 // Task 3 фазы 9 (голосовой ввод, push-to-talk): recorder создаётся в boot()
 // (VoiceRecorder — start()/stop() сами открывают/закрывают AudioContext на
-// КАЖДУЮ запись, см. voice/recorder.js). voiceState — единственный источник
-// для индикатора (updateVoiceIndicator) и для гарда «не начинать вторую
-// запись, пока первая ещё стартует/идёт/распознаётся» (bindVoiceHotkey ниже):
-// 'starting' — getUserMedia ещё не резолвился (см. startVoiceRecording),
-// добавлено ревью-раундом 1 (C3) — БЕЗ этого промежуточного состояния второй
-// keydown, пришедший до резолва первого start(), проходил бы idle-гард и
-// плодил бы ВТОРОЙ параллельный getUserMedia на том же инстансе recorder.js
-// (взаимная порча приватных полей #stream/#ctx/#chunks — неснимаемая утечка
-// микрофона). voiceGeneration — счётчик попыток: инкрементируется на КАЖДЫЙ
-// стоп/отмену (keyup/cancelVoiceRecording), чтобы startVoiceRecording после
-// await мог понять, что решение по ЭТОЙ попытке уже принято кем-то другим,
-// пока getUserMedia грузился, и сам закрыть опоздавший поток (та же C3).
+// КАЖДУЮ запись, см. voice/recorder.js). voiceState — конечный автомат,
+// единственный источник и для индикатора (updateVoiceIndicator), и для
+// гарда «не начинать вторую запись, пока предыдущая пара start/stop не
+// осела ПОЛНОСТЬЮ» (bindVoiceHotkey ниже):
+//   idle → starting → recording → stopping → (transcribing → idle | idle)
+// 'starting' (ревью раунда 1, C3) — getUserMedia ещё не резолвился.
+// 'stopping' (ревью раунда 2, N1, критично) — реальный voiceRecorder.stop()
+// запущен, но решение «отправлять или отбросить» ещё не принято. БЕЗ этого
+// промежуточного состояния voiceState синхронно становился 'idle' прямо в
+// keyup-обработчике, ДО того как stop() и решение о доставке фактически
+// завершились — щель, в которую успевал юркнуть второй тап Shift (гард
+// видел 'idle' и пропускал), а более поздний handleVoiceWav ПЕРВОГО тапа
+// затирал voiceState уже НАЧАВШЕГОСЯ второго (ре-ревью, сценарий (б)).
+// Пока voiceState не 'idle' — новая запись НЕ стартует; 'idle' наступает
+// только когда решение по предыдущему циклу принято полностью.
 // sttAvailable — кэш stt:status().available, снятый один раз при boot() и
 // обновляемый лениво: keydown-гард НЕ ходит в IPC на каждое нажатие Shift
 // (латентность старта записи иначе выросла бы на круг до main и обратно) —
 // см. boot()/refreshSttStatus.
 let voiceRecorder = null;
 let voiceIndicatorEl = null;
-let voiceState = 'idle'; // 'idle' | 'starting' | 'recording' | 'transcribing'
-let voiceGeneration = 0;
+let voiceState = 'idle'; // 'idle' | 'starting' | 'recording' | 'stopping' | 'transcribing'
 let voiceHoldStartedAt = 0;
+// M3 (ре-ревью раунда 2, зафиксировано, НЕ чинится): heldMs считается от
+// keydown (voiceHoldStartedAt) до keyup, а НЕ от момента, когда микрофон
+// реально открылся (конец getUserMedia внутри start()). При медленном
+// getUserMedia (первый разрешение-промпт за сессию/машину) удержание может
+// «на часах» выглядеть длинным (>minHoldMs), а реального звука накопиться
+// меньше 0.3с (recorder.js сам отбрасывает такие — см. voice/recorder.js) —
+// тогда voiceRecorder.stop() тихо вернёт null, и пользователь ничего не
+// увидит, даже если формально «держал достаточно долго». Осознанно не
+// правим: усложнение (мерить от факта открытия потока, не от keydown)
+// касается ТОЛЬКО самого первого запроса разрешения за сессию/машину.
 let minHoldMs = 300; // перезаписывается из config.stt.minHoldMs в bindVoiceHotkey()
 let sttAvailable = true;
 let sttUnavailableToastShown = false; // ОДИН тост за сессию, ТОЛЬКО для причины «стек не найден» (спека) — дальше no-op до перезапуска
+// Ревью раунда 2 (N1, критично): recorder.js (Companion, копия как есть) не
+// рассчитан на конкурентные start()/stop() — единственная защита внутри
+// самого класса (`if (this.#recording) return`) работает ТОЛЬКО если вызовы
+// идут строго последовательно, каждый следующий — уже ПОСЛЕ того, как
+// предыдущий полностью осел (все await внутри start()/stop() завершились).
+// voiceChain (через runOnRecorder ниже) сериализует КАЖДОЕ обращение к
+// voiceRecorder.start()/stop() в порядке поступления — тот же приём, что
+// `chain` в src/main/stt.js (Task 1) для конкурентных transcribeWav().
+// ИНВАРИАНТ (обязателен): на recorder в любой момент времени выполняется НЕ
+// БОЛЕЕ ОДНОЙ операции (start ИЛИ stop); вместе с voiceState='stopping'
+// выше это гарантирует, что новая start не начнётся, пока предыдущая пара
+// start/stop не завершилась полностью — ни на уровне бизнес-состояния
+// (voiceState), ни на уровне самого recorder-инстанса (voiceChain).
+let voiceChain = Promise.resolve();
+
+// Прогоняет fn СТРОГО после того, как предыдущая операция на recorder осела
+// (успехом или ошибкой) — возвращает промис именно этого fn (не промис всей
+// цепочки), чтобы вызывающий код мог дождаться результата СВОЕЙ операции, не
+// заботясь о чужих. Ошибка одного звена не должна оборвать очередь для
+// следующих (`voiceChain = result.catch(() => {})` — гасим её ТОЛЬКО в
+// цепочке-хвосте, исходный `result` наружу отдаём как есть, включая reject).
+function runOnRecorder(fn) {
+  const result = voiceChain.then(fn, fn);
+  voiceChain = result.catch(() => {});
+  return result;
+}
 
 // Fix 8 (ревью): точка в титлбаре терракотовая, только пока есть хотя бы одна
 // вкладка в статусе waiting.
@@ -797,14 +835,15 @@ function writeCommandToTab(tabId, command) {
 // --- Task 3 фазы 9: голосовой ввод (push-to-talk по правому Shift) ---
 
 // Индикатор в #action-right: «🎤 запись…» пока идёт запись (в т.ч. пока
-// getUserMedia ещё грузится, состояние 'starting' — пользователю не нужно
-// различать эти два состояния на глаз), «🎤 …» пока распознаётся, скрыт в
-// покое (класс .hidden, см. app.css). Рамка вокруг #action-bar — дешёвый
-// доп.сигнал (бриф), ТОЛЬКО во время самой записи (не во время распознавания
-// после отпускания клавиши).
+// getUserMedia ещё грузится, 'starting', и пока идёт сам стоп, 'stopping', —
+// пользователю не нужно различать эти состояния на глаз, вся троица длится
+// от миллисекунд до долей секунды), «🎤 …» пока распознаётся, скрыт в покое
+// (класс .hidden, см. app.css). Рамка вокруг #action-bar — дешёвый доп.сигнал
+// (бриф), в те же моменты, что и бейдж «запись…».
 function updateVoiceIndicator() {
   if (!voiceIndicatorEl) return;
-  if (voiceState === 'recording' || voiceState === 'starting') {
+  const recordingLike = voiceState === 'starting' || voiceState === 'recording' || voiceState === 'stopping';
+  if (recordingLike) {
     voiceIndicatorEl.textContent = '🎤 запись…';
     voiceIndicatorEl.classList.remove('hidden');
   } else if (voiceState === 'transcribing') {
@@ -813,8 +852,7 @@ function updateVoiceIndicator() {
   } else {
     voiceIndicatorEl.classList.add('hidden');
   }
-  const recordingBorder = voiceState === 'recording' || voiceState === 'starting';
-  $('action-bar')?.classList.toggle('recording', recordingBorder);
+  $('action-bar')?.classList.toggle('recording', recordingLike);
 }
 
 // Бейдж создаётся программно в #action-right (тот же приём, что кнопки
@@ -846,42 +884,31 @@ function refreshSttStatus() {
 // keydown ShiftRight → микрофон → WAV. try/catch вокруг recorder.start():
 // getUserMedia отклоняется, если пользователь/ОС запретили доступ к
 // микрофону или устройства нет вовсе (бриф) — тост, без исключения наружу
-// (обработчик keydown не должен падать).
+// (обработчик keydown не должен падать). voiceRecorder.start() идёт ЧЕРЕЗ
+// runOnRecorder (см. объявление voiceChain выше) — сериализация с любым
+// уже поставленным в очередь stop() того же или предыдущего цикла.
 //
-// Ревью раунда 1 (C3, критично): voiceState — 'starting' (НЕ сразу
-// 'recording') на время await, а myGen=voiceGeneration ловит гонку
-// «keyup/cancelVoiceRecording пришли раньше, чем getUserMedia разрешился».
-// Без этого короткий тап (пункт 2 приёмки!) при латентности getUserMedia
-// 100-300мс оставлял бы поток ГОРЯЧИМ с потухшим индикатором (приватность!),
-// а следующая запись сливала бы в терминал ВСЁ, что микрофон успел накопить
-// с момента залипания. После await ОБЯЗАТЕЛЬНО сверяем поколение — если оно
-// уже другое (кто-то извне решил «эта попытка отменена», пока мы ждали
-// разрешение), поток нужен только затем, чтобы немедленно его закрыть.
+// Ревью раунда 2 (N1, критично, взамен генерации из раунда 1): после await
+// проверяем `voiceState === 'starting'` — если это уже НЕ так (keyup/
+// cancelVoiceRecording успели перевести цикл в 'stopping', пока getUserMedia
+// работал — см. объявление voiceState выше), значит решение по ЭТОЙ попытке
+// уже принято и УЖЕ поставило свой voiceRecorder.stop() в ТУ ЖЕ очередь
+// runOnRecorder — он гарантированно выполнится СРАЗУ ПОСЛЕ этого start()
+// (порядок FIFO) и закроет поток, если тот всё-таки успел открыться. Здесь
+// ничего дополнительно закрывать не нужно и НЕЛЬЗЯ трогать voiceState — она
+// уже принадлежит чужому (более позднему) решению.
 async function startVoiceRecording() {
-  const myGen = ++voiceGeneration;
   voiceState = 'starting';
   voiceHoldStartedAt = Date.now();
   updateVoiceIndicator();
   let started = false;
   try {
-    await voiceRecorder.start();
+    await runOnRecorder(() => voiceRecorder.start());
     started = true;
   } catch (err) {
     console.warn('[voice] getUserMedia упал:', err);
   }
-  if (myGen !== voiceGeneration) {
-    // Решение по ЭТОЙ попытке уже принято (keyup/печать другой клавиши/blur/
-    // скрытие окна — см. stopVoiceRecording/cancelVoiceRecording) — свой тост,
-    // если положен, уже показан ТАМ. Здесь только гасим опоздавший поток.
-    if (started) {
-      try {
-        await voiceRecorder.stop();
-      } catch (err) {
-        console.warn('[voice] recorder.stop() после гонки упал:', err);
-      }
-    }
-    return;
-  }
+  if (voiceState !== 'starting') return;
   if (!started) {
     voiceState = 'idle';
     updateVoiceIndicator();
@@ -895,32 +922,47 @@ async function startVoiceRecording() {
 // keyup ShiftRight — стоп записи (с решением «отправлять или нет»).
 // heldMs/overlayOpenedDuring считаются СИНХРОННО прямо здесь (момент
 // отпускания клавиши), ДО await recorder.stop() — иначе «оверлей открылся во
-// время записи» (спека) проверялся бы уже post-factum, когда решение
-// фактически нужно принять по состоянию НА МОМЕНТ отпускания клавиши, а не по
-// состоянию после закрытия AudioContext. Минор ре-ревью: «оверлей открылся и
-// ЗАКРЫЛСЯ во время записи, ещё до keyup» этой проверкой не ловится (нужен бы
-// был мониторинг на протяжении всей записи, не только в момент keyup) —
-// оставлено осознанно, реальный сценарий требует одновременно держать Shift
-// и управлять оверлеем мышью, цена усложнения (подписка на каждый
-// toggle-оверлея) выше пользы.
+// время записи» (спека) проверялся бы уже post-factum. Минор ре-ревью:
+// «оверлей открылся и ЗАКРЫЛСЯ во время записи, ещё до keyup» этой проверкой
+// не ловится (нужен бы был мониторинг на протяжении всей записи, не только в
+// момент keyup) — оставлено осознанно, реальный сценарий требует одновременно
+// держать Shift и управлять оверлеем мышью, цена усложнения (подписка на
+// каждый toggle-оверлея) выше пользы.
+//
+// Ревью раунда 2 (N1, критично): voiceState → 'stopping' (НЕ сразу 'idle')
+// СИНХРОННО здесь, ДО await voiceRecorder.stop(). Это ключевая половина
+// фикса N1 — пока voiceState не 'idle', keydown-гард в bindVoiceHotkey НЕ
+// пускает новую запись, так что второй тап Shift больше не может начаться,
+// пока решение по первому (реальный stop() + выбор «отправлять/отбросить»)
+// не принято полностью. voiceState становится 'idle' ИЛИ 'transcribing'
+// ТОЛЬКО из `.then`/`.catch` ниже — то есть уже ПОСЛЕ того, как stop()
+// физически завершился.
 function stopVoiceRecording() {
-  if (voiceState === 'idle' || voiceState === 'transcribing') return;
+  if (voiceState !== 'starting' && voiceState !== 'recording') return;
   const heldMs = Date.now() - voiceHoldStartedAt;
   const overlayOpenedDuring = Object.values(overlayFlags()).some(Boolean);
-  voiceState = 'idle';
-  voiceGeneration += 1; // C3: гасит опоздавший resolve start(), см. startVoiceRecording
+  voiceState = 'stopping';
   updateVoiceIndicator();
-  voiceRecorder.stop().then((wav) => {
+  runOnRecorder(() => voiceRecorder.stop()).then((wav) => {
     // recorder.js сам отбрасывает записи короче 0.3с (см. voice/recorder.js) —
     // wav может быть null и по этой внутренней причине тоже, не только из-за
-    // heldMs/overlayOpenedDuring ниже. Если voiceState был 'starting' (мик ещё
-    // не «горячий» внутри recorder.js), stop() здесь безвреден и вернёт null —
-    // реальную остановку опоздавшего потока сделает startVoiceRecording сам.
-    if (!wav) return;
-    if (heldMs < minHoldMs || overlayOpenedDuring) return; // короткое нажатие / оверлей открылся во время записи — отмена молча
-    handleVoiceWav(wav);
+    // heldMs/overlayOpenedDuring ниже. Если voiceState был 'starting' (мик
+    // ещё не «горячий» внутри recorder.js на момент этого keyup), этот stop()
+    // выполнится РЕАЛЬНО чуть позже (после того как start() того же цикла
+    // осядет — порядок гарантирует runOnRecorder), но к результату применяются
+    // ровно те же правила ниже.
+    if (wav && heldMs >= minHoldMs && !overlayOpenedDuring) {
+      voiceState = 'transcribing';
+      updateVoiceIndicator();
+      handleVoiceWav(wav);
+      return;
+    }
+    voiceState = 'idle'; // короткое нажатие / оверлей открылся во время записи / нечего отправлять — отмена молча
+    updateVoiceIndicator();
   }).catch((err) => {
     console.warn('[voice] recorder.stop() упал:', err);
+    voiceState = 'idle';
+    updateVoiceIndicator();
   });
 }
 
@@ -931,23 +973,32 @@ function stopVoiceRecording() {
 // смена раскладки Alt+ShiftRight / Ctrl+Shift-комбинации (C2, эта же функция
 // используется путём отмены при постороннем keydown — см. bindVoiceHotkey),
 // потеря фокуса окна или скрытие вкладки браузера во время записи (C4).
-// Результат ВСЕГДА отбрасывается — heldMs здесь не при чём.
+// Результат ВСЕГДА отбрасывается — heldMs здесь не при чём. Та же
+// 'stopping'-механика раунда 2 (N1), что и в stopVoiceRecording выше —
+// voiceState НЕ 'idle', пока реальный stop() не осел.
 function cancelVoiceRecording() {
-  if (voiceState === 'idle' || voiceState === 'transcribing') return;
-  voiceState = 'idle';
-  voiceGeneration += 1; // тот же C3-механизм, что и в stopVoiceRecording
+  if (voiceState !== 'starting' && voiceState !== 'recording') return;
+  voiceState = 'stopping';
   updateVoiceIndicator();
-  voiceRecorder.stop().catch((err) => {
+  runOnRecorder(() => voiceRecorder.stop()).then(() => {
+    voiceState = 'idle';
+    updateVoiceIndicator();
+  }).catch((err) => {
     console.warn('[voice] recorder.stop() (отмена) упал:', err);
+    voiceState = 'idle';
+    updateVoiceIndicator();
   });
 }
 
 // WAV → main (stt:transcribe) → {text}|{error} → resolveTranscribeResult
 // (voice-guards.js, чистая функция, покрыта test/voice-guards.test.js) решает,
-// что дальше: тост (пусто/ошибка) или доставка распознанного текста.
+// что дальше: тост (пусто/ошибка) или доставка распознанного текста. Вызвана
+// ИСКЛЮЧИТЕЛЬНО из stopVoiceRecording, которая уже перевела voiceState в
+// 'transcribing' — эта функция лишь возвращает его в 'idle' по завершении
+// (ре-ревью, сценарий (б): пока voiceState не 'idle', новая запись не
+// начнётся, так что затирать здесь больше нечего — новый цикл просто не мог
+// возникнуть, пока этот не открыл дорогу).
 async function handleVoiceWav(wav) {
-  voiceState = 'transcribing';
-  updateVoiceIndicator();
   let result;
   try {
     result = await window.api.stt.transcribe(wav);
@@ -995,7 +1046,7 @@ async function deliverVoiceText(rawText) {
 // от Ctrl-комбинаций в bindHotkeys(). capture-фаза — та же, что и там, чтобы
 // открытые оверлеи (которые тоже слушают keydown) не перехватили событие
 // первыми — хотя запись и так не стартует, пока открыт хоть один (см.
-// canStartRecording, voice-guards.js).
+// resolveStartBlock, voice-guards.js).
 //
 // Ревью раунда 1: C2 (Alt+ShiftRight — смена раскладки Windows, Ctrl+Shift+*)
 // и I1 (печать другой клавиши во время удержания — заглавные буквы штатным
@@ -1006,6 +1057,9 @@ async function deliverVoiceText(rawText) {
 // keydown с ev.code, отличным от holdKey, пока идёт запись/старт — тихая
 // отмена (cancelVoiceRecording), это не диктовка. C4 (blur/visibilitychange)
 // — та же cancelVoiceRecording, привязанная отдельными слушателями ниже.
+// `voiceState !== 'idle'` (ревью раунда 2, N1) — единственный гард старта:
+// 'starting'/'recording'/'stopping'/'transcribing' ВСЕ считаются занятыми,
+// новая запись не начинается, пока предыдущий цикл не осел полностью.
 function bindVoiceHotkey() {
   const holdKey = config.stt?.holdKey || 'ShiftRight';
   minHoldMs = Number.isFinite(config.stt?.minHoldMs) ? config.stt.minHoldMs : 300;
@@ -1020,20 +1074,16 @@ function bindVoiceHotkey() {
     }
     if (ev.repeat) return; // авто-повтор зажатой клавиши — не должен перезапускать запись
     if (ev.ctrlKey || ev.altKey || ev.metaKey) return; // C2: Alt+ShiftRight (смена раскладки)/Ctrl+Shift+* — модификатор зажат ДО ShiftRight, это не push-to-talk
-    if (voiceState !== 'idle') return; // уже идёт старт/запись/распознавание
+    if (voiceState !== 'idle') return; // занято: 'starting'/'recording'/'stopping'/'transcribing' — предыдущий цикл ещё не осел (N1)
     const hasActiveTab = !!tabStore.activeId;
-    const overlays = overlayFlags();
-    if (!canStartRecording({ overlays, hasActiveTab, sttAvailable })) {
-      // Minor 3 (ревью): тост «стек не найден» — ТОЛЬКО когда именно стек и
-      // есть блокирующая причина (есть активная вкладка, оверлеев нет, но
-      // sttAvailable=false). Если условия провалились ещё и/только из-за
-      // отсутствия вкладки — тост про стек не показываем и не жжём
-      // одноразовый флаг по «неправильной» причине.
-      if (!sttAvailable) {
+    const overlaysOpen = Object.values(overlayFlags()).some(Boolean);
+    const block = resolveStartBlock({ overlaysOpen, hasActiveTab, sttAvailable });
+    if (!block.allowed) {
+      if (block.reason === 'stt-unavailable') {
         refreshSttStatus(); // Minor 2: лениво подхватить стек, скопированный ПОСЛЕ boot(), без перезапуска приложения
-        if (hasActiveTab && !sttUnavailableToastShown) {
+        if (!sttUnavailableToastShown) {
           sttUnavailableToastShown = true; // ОДИН тост за сессию, ТОЛЬКО для причины «стек не найден» — дальше no-op до перезапуска
-          showToast('Голосовой стек не найден (см. stt.stackRoots в конфиге)', 'warn');
+          showToast(block.toast.message, block.toast.level);
         }
       }
       return;
@@ -1971,7 +2021,7 @@ async function boot() {
   // для читаемости — оба относятся к панели действий).
   voiceRecorder = new VoiceRecorder();
   initVoiceIndicator();
-  // Снимок status().available — см. bindVoiceHotkey/canStartRecording
+  // Снимок status().available — см. bindVoiceHotkey/resolveStartBlock
   // (voice-guards.js). Fire-and-forget (refreshSttStatus, тот же приём, что
   // usage.get()/night.get() ниже) — не задерживаем boot() ради похода в
   // main; keydown-гард просто использует то, что есть на момент первого
