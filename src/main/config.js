@@ -111,6 +111,19 @@ function getConfig() {
   const overlay = readJson(overlayPath());
   cached = deepMerge(deepMerge(DEFAULTS, projectFile), overlay);
   if (!cached.terminal.cwd) cached.terminal.cwd = app.getPath('home');
+  // Minor-4/5 (ревью Task 2 фазы 9): вычисляемые/восстановительные патчи
+  // секции stt ПОСЛЕ merge — тем же приёмом, что terminal.cwd выше.
+  // (5) `"stt": null` у пользователя: deepMerge заменяет секцию целиком —
+  // без восстановления cfg.model стал бы undefined и стек «не находился бы»
+  // на полностью исправной машине (ggml-undefined.bin).
+  if (!cached.stt || typeof cached.stt !== 'object') cached.stt = deepMerge(DEFAULTS.stt, {});
+  // (4) stackRoots — вычисляемый дефолт: appRoot() доступен только в
+  // рантайме. Патч здесь (а не в ipc.js) кладёт ключ в эффективный конфиг —
+  // тост «см. stt.stackRoots в конфиге» ссылается на то, что пользователь
+  // реально может увидеть через config:get.
+  if (!Array.isArray(cached.stt.stackRoots) || !cached.stt.stackRoots.length) {
+    cached.stt.stackRoots = [appRoot(), 'C:\\Users\\Lunev\\AssistClaude\\claude-companion'];
+  }
   return cached;
 }
 

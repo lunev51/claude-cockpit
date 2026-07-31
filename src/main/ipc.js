@@ -779,13 +779,19 @@ function sttSpawnProc(exe, args) {
   } catch (err) {
     // Синхронный бросок — на практике недостижимо для фиксированных путей и
     // литеральных args этого модуля (ENOENT у spawn всегда асинхронный), но
-    // контракт ядра требует «НЕ бросает наружу» безусловно — заворачиваем в
-    // EventEmitter-заглушку без pid; ядро увидит её же 'error' на следующем
-    // тике, поведение то же самое, что и обычный асинхронный ENOENT ниже.
+    // контракт ядра требует «НЕ бросает наружу» безусловно — возвращаем
+    // НЕМУЮ EventEmitter-заглушку.
+    //
+    // Important-1 (ревью Task 2): НИКАКОГО emit('error') на заглушке —
+    // ядро по контракту 'error' не слушает, а EventEmitter при emit('error')
+    // БЕЗ слушателя бросает → uncaughtException → main.js гасит весь кокпит
+    // со всеми вкладками (живая проба ревьюера). Немая заглушка → ядро
+    // дойдёт до таймаута готовности и переберёт следующий бекенд — ровно
+    // штатный путь провала старта. Ошибку логируем здесь и сразу.
+    console.warn(`[stt] spawn ${exe} бросил синхронно: ${err.message}`);
     const stub = new EventEmitter();
-    stub.pid = undefined;
+    stub.pid = 0; // String(0) в контрольном taskkill даёт мгновенный отказ, а не «/PID undefined»
     stub.kill = () => {};
-    setImmediate(() => stub.emit('error', err));
     return stub;
   }
   child.on('error', (err) => {
@@ -807,6 +813,10 @@ function sttHttpGet(port, urlPath, timeoutMs) {
       host: '127.0.0.1', port, path: urlPath, timeout: timeoutMs,
     }, (res) => {
       res.resume();
+      // Minor-2 (ревью Task 2): обрыв сокета ПОСЛЕ резолва — ошибка уже
+      // никому не нужна, но без слушателя на res она может стать
+      // необработанной (симметрия с POST-веткой ниже).
+      res.on('error', () => {});
       resolve({ status: res.statusCode });
     });
     req.on('timeout', () => {
@@ -844,22 +854,12 @@ function sttHttpPost(port, urlPath, headers, bodyBuffer, timeoutMs) {
 // голосом за сессию кокпита ни разу не воспользовались.
 function getOrCreateStt() {
   if (stt) return stt;
-  // `|| {}` — урок nightWatch:null (см. nightCfg в registerIpc ниже по
-  // файлу): пользовательский `"stt": null` в config.json пережил бы
-  // deepMerge как null и уронил бы это место TypeError'ом на первом же
-  // нажатии Shift.
-  const sttCfg = getConfig().stt || {};
-  const config = {
-    ...sttCfg,
-    // Единственное вычисляемое поле дефолта stt (бриф/спека): DEFAULTS в
-    // config.js статичны, appRoot() резолвится только в рантайме Electron —
-    // подставляем ЗДЕСЬ, в момент создания инстанса, минимально инвазивно
-    // (не трогая config.js/getConfig() целиком). Пользовательский
-    // stackRoots (непустой массив в config.json/оверлее) — не перекрываем.
-    stackRoots: Array.isArray(sttCfg.stackRoots) && sttCfg.stackRoots.length
-      ? sttCfg.stackRoots
-      : [appRoot(), 'C:\\Users\\Lunev\\AssistClaude\\claude-companion'],
-  };
+  // Minor-4/5 (ревью Task 2): восстановление секции при `"stt": null` и
+  // вычисляемый дефолт stackRoots теперь живут в config.js (пост-merge патчи
+  // рядом с terminal.cwd) — ключ виден пользователю через config:get, и тост
+  // «см. stt.stackRoots в конфиге» ссылается на реально существующее поле.
+  // `|| {}` остаётся последним ремнём на случай будущих правок config.js.
+  const config = getConfig().stt || {};
   stt = createStt({
     spawnProc: sttSpawnProc,
     httpGet: sttHttpGet,
@@ -924,7 +924,14 @@ async function sttTranscribeHandler({ smoke, wav, getStt }) {
 // getStt() в smoke не зовётся вовсе.
 function sttStatusHandler({ smoke, getStt }) {
   if (smoke) return { available: false, backend: null, warm: false };
-  return getStt().status();
+  // Minor-3 (ревью Task 2): getStt()/status() вне try раньше могли реджектнуть
+  // IPC-канал вопреки правилу «наружу не бросаем» — деградируем к «недоступен».
+  try {
+    return getStt().status();
+  } catch (err) {
+    console.warn(`[stt] status упал: ${err && err.message}`);
+    return { available: false, backend: null, warm: false };
+  }
 }
 
 function registerIpc(win, opts = {}) {
@@ -1779,4 +1786,8 @@ module.exports = {
   // Task 2 фазы 9 (голосовой ввод): та же причина — см. комментарий у их
   // определения выше (смоук-гейт тестируется напрямую, без Electron).
   sttTranscribeHandler, sttStatusHandler,
+  // Minor-1 (ревью Task 2 фазы 9): HTTP-обёртки — самая рискованная часть
+  // обвязки (их контракт с ядром сверялся ревью дословно) — экспортированы
+  // ради теста против ЛОКАЛЬНОГО http-сервера (loopback, не сеть).
+  sttHttpGet, sttHttpPost,
 };
