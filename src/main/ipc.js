@@ -77,10 +77,17 @@ let nightWatch = null;   // Task 2 фазы 8 («Ночная смена»): и�
 // см. обработчик 'tab:status' в onEvent ниже, где prev читается ИЗ карты
 // СТРОГО ДО set(). Запись чистится на tabs:close (вкладки больше нет).
 let lastStatusByTab = new Map();
-// Task 2 фазы 9 (голосовой ввод): ленивый инстанс createStt (stt.js, Task 1)
-// — создаётся ТОЛЬКО при первом реальном обращении к stt:transcribe/status
-// (getOrCreateStt() ниже), НЕ при registerIpc: нечего резолвить корни стека
-// (~1.6ГБ модели), если голосом за сессию кокпита ни разу не воспользовались.
+// Task 2 фазы 9 (голосовой ввод): инстанс createStt (stt.js, Task 1) —
+// создаётся при ПЕРВОМ реальном обращении к stt:transcribe/status
+// (getOrCreateStt() ниже), НЕ при registerIpc.
+// M2 (ревью финальной волны): «ленивый» здесь описывает конструктор JS-
+// объекта, а НЕ подъём whisper-server.exe — Task 3 (renderer) зовёт
+// stt:status() уже в boot() (см. app.js/refreshSttStatus), так что ЭТОТ
+// инстанс на практике создаётся почти сразу при старте кокпита, а не
+// «только если голосом воспользовались». Единственное, что остаётся
+// по-настоящему ленивым — сам СЕРВЕРНЫЙ ПРОЦЕСС (ensureServer() внутри
+// stt.js): резолв корней стека/спавн whisper-server.exe откладывается до
+// первого РЕАЛЬНОГО transcribeWav(), status() его не трогает вовсе.
 let stt = null;
 
 function getSmokeOutput() {
@@ -848,10 +855,13 @@ function sttHttpPost(port, urlPath, headers, bodyBuffer, timeoutMs) {
   });
 }
 
-// Ленивый геттер инстанса createStt — создаётся при ПЕРВОМ реальном обращении
-// к stt:transcribe/status (через sttTranscribeHandler/sttStatusHandler ниже),
-// НЕ при registerIpc: нечего резолвить корни стека (~1.6ГБ модели), если
-// голосом за сессию кокпита ни разу не воспользовались.
+// Геттер инстанса createStt — создаёт JS-объект при ПЕРВОМ реальном
+// обращении к stt:transcribe/status (через sttTranscribeHandler/
+// sttStatusHandler ниже), НЕ при registerIpc. M2 (ревью финальной волны):
+// см. подробное уточнение у `let stt = null;` выше — этот геттер выполняется
+// уже в рамках boot() (Task 3 зовёт stt:status() сразу при старте окна), так
+// что «лениво» здесь — ТОЛЬКО про резолв корней стека/спавн сервера внутри
+// самого createStt (ensureServer()), не про момент создания этого объекта.
 function getOrCreateStt() {
   if (stt) return stt;
   // Minor-4/5 (ревью Task 2): восстановление секции при `"stt": null` и
@@ -880,7 +890,16 @@ function getOrCreateStt() {
     // (stt.js/killProc, B3 ревью Task 1) снимает точечно только СВОЙ
     // exit-хендлер и гарантированно переживает это (реестр — тот же самый,
     // не отдельная копия).
-    registerProcess: (child) => runners.trackChild(child),
+    // M5 (ревью финальной волны): trackChild() сам проверяет только
+    // `typeof child.pid === 'number'` — pid:0 (falsy, но typeof 'number')
+    // прошёл бы эту проверку и лёг бы в liveChildren по ключу 0, засоряя
+    // реестр записью, которую killAllTracked не сможет осмысленно убить
+    // (taskkill /PID 0 бьёт не по тому процессу). Гард здесь, а не в самом
+    // runners.js — trackChild общий для gh/git/npx, трогать его контракт
+    // ради одного вызывающего лишнее.
+    registerProcess: (child) => {
+      if (child && child.pid) runners.trackChild(child);
+    },
     config,
     log: (msg) => console.warn(msg),
   });
@@ -1693,9 +1712,10 @@ function registerIpc(win, opts = {}) {
   });
 
   // Task 2 фазы 9 (голосовой ввод): stt:transcribe/status — Task 3 (renderer,
-  // push-to-talk на правом Shift) дёргает их напрямую через preload. Инстанс
-  // ленивый (getOrCreateStt() выше, module scope) — здесь только проводка
-  // каналов, вся смоук-логика и создание инстанса — внутри самих хендлеров.
+  // push-to-talk на правом Shift) дёргает их напрямую через preload. Здесь
+  // только проводка каналов, вся смоук-логика и создание инстанса (M2,
+  // ревью финальной волны: подъём JS-объекта, НЕ сервера — см. getOrCreateStt
+  // выше) — внутри самих хендлеров.
   ipcMain.handle('stt:transcribe', (_e, wav) => sttTranscribeHandler({ smoke, wav, getStt: getOrCreateStt }));
 
   ipcMain.handle('stt:status', () => sttStatusHandler({ smoke, getStt: getOrCreateStt }));

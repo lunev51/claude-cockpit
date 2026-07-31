@@ -21,21 +21,45 @@ export class VoiceRecorder {
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
     });
 
-    this.#ctx = new AudioContext({ sampleRate: 16000 });
+    // ОТЛИЧИЕ ОТ ЭТАЛОНА Companion (I3, ревью финальной волны фазы 9 кокпита):
+    // getUserMedia выше уже открыл поток микрофона. Если что-то НИЖЕ (создание
+    // AudioContext, загрузка воркутлета) бросит — например, устройство
+    // отключили/переключили ПРЯМО в этот момент (выключенная Bluetooth-
+    // гарнитура) — #stream остаётся присвоенным полю, но НЕДОСТИЖИМЫМ снаружи:
+    // start() выбросит раньше, чем #recording станет true, а stop() (единственный
+    // код, умеющий закрывать #stream) молча не сработает, т.к. проверяет ИМЕННО
+    // #recording. Микрофон Windows горел бы до перезапуска окна при потухшем
+    // индикаторе кокпита. try/catch — единственная функциональная правка этой
+    // копии (байт-в-байт сверка с оригиналом Companion сделала своё дело при
+    // портировании Task 3 — остальной код 1-в-1): на любой сбой останавливаем
+    // уже открытые треки, закрываем контекст (если успел создаться), обнуляем
+    // поля и пробрасываем исходную ошибку — вызывающий код (recorder.start() в
+    // app.js) видит тот же reject, что и раньше, просто без утечки.
+    try {
+      this.#ctx = new AudioContext({ sampleRate: 16000 });
 
-    // Worklet-модуль загружается в КАЖДЫЙ новый контекст:
-    // stop() закрывает контекст, и регистрация процессора умирает вместе с ним.
-    await this.#ctx.audioWorklet.addModule('./js/voice/pcm-worklet.js');
+      // Worklet-модуль загружается в КАЖДЫЙ новый контекст:
+      // stop() закрывает контекст, и регистрация процессора умирает вместе с ним.
+      await this.#ctx.audioWorklet.addModule('./js/voice/pcm-worklet.js');
 
-    this.#source  = this.#ctx.createMediaStreamSource(this.#stream);
-    this.#worklet = new AudioWorkletNode(this.#ctx, 'pcm-capture');
+      this.#source  = this.#ctx.createMediaStreamSource(this.#stream);
+      this.#worklet = new AudioWorkletNode(this.#ctx, 'pcm-capture');
 
-    this.#worklet.port.onmessage = (e) => {
-      if (this.#recording) this.#chunks.push(e.data);
-    };
+      this.#worklet.port.onmessage = (e) => {
+        if (this.#recording) this.#chunks.push(e.data);
+      };
 
-    this.#source.connect(this.#worklet);
-    this.#worklet.connect(this.#ctx.destination);
+      this.#source.connect(this.#worklet);
+      this.#worklet.connect(this.#ctx.destination);
+    } catch (err) {
+      for (const track of this.#stream.getTracks()) track.stop();
+      this.#stream = null;
+      if (this.#ctx) {
+        try { await this.#ctx.close(); } catch (_) {}
+        this.#ctx = null;
+      }
+      throw err;
+    }
 
     this.#recording = true;
   }
