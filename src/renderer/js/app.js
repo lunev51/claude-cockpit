@@ -13,6 +13,13 @@ import { createSearch } from './search.js';
 import { createRecipeForm } from './recipe-form.js';
 import { createHotkeysOverlay } from './hotkeys.js';
 import { pluralTabs } from './format.js';
+// Task 3 фазы 9 (голосовой ввод, push-to-talk по правому Shift): recorder —
+// портирован из Companion как есть (src/renderer/js/voice/recorder.js, см.
+// комментарий там же — ни одного изменённого пути импорта не понадобилось,
+// структура renderer совпадает 1-в-1). voice-guards.js — чистые гарды,
+// вынесенные отдельно ради node --test (см. test/voice-guards.test.js).
+import { VoiceRecorder } from './voice/recorder.js';
+import { canStartRecording, resolveTranscribeResult } from './voice/voice-guards.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -109,6 +116,22 @@ const queueByTab = new Map();
 // queueByTab: поле может быть открыто даже при пустой очереди (это и есть
 // способ добавить самый первый элемент).
 let queueInputOpen = false;
+
+// Task 3 фазы 9 (голосовой ввод, push-to-talk): recorder создаётся в boot()
+// (VoiceRecorder — start()/stop() сами открывают/закрывают AudioContext на
+// КАЖДУЮ запись, см. voice/recorder.js). voiceState — единственный источник
+// для индикатора (updateVoiceIndicator) и для гарда «не начинать вторую
+// запись, пока первая ещё распознаётся» (bindVoiceHotkey ниже). sttAvailable —
+// кэш stt:status().available, снятый один раз при boot() и обновляемый
+// лениво: keydown-гард НЕ ходит в IPC на каждое нажатие Shift (латентность
+// старта записи иначе выросла бы на круг до main и обратно) — см. boot().
+let voiceRecorder = null;
+let voiceIndicatorEl = null;
+let voiceState = 'idle'; // 'idle' | 'recording' | 'transcribing'
+let voiceHoldStartedAt = 0;
+let minHoldMs = 300; // перезаписывается из config.stt.minHoldMs в bindVoiceHotkey()
+let sttAvailable = true;
+let sttUnavailableToastShown = false; // ОДИН тост за сессию (спека) — дальше no-op до перезапуска
 
 // Fix 8 (ревью): точка в титлбаре терракотовая, только пока есть хотя бы одна
 // вкладка в статусе waiting.
@@ -758,6 +781,151 @@ function writeCommandToTab(tabId, command) {
   }
   window.api.term.write(tabId, `${command}\r`);
   return true;
+}
+
+// --- Task 3 фазы 9: голосовой ввод (push-to-talk по правому Shift) ---
+
+// Индикатор в #action-right: «🎤 запись…» пока идёт запись, «🎤 …» пока
+// распознаётся, скрыт в покое (класс .hidden, см. app.css). Рамка вокруг
+// #action-bar — дешёвый доп.сигнал (бриф), ТОЛЬКО во время самой записи (не
+// во время распознавания после отпускания клавиши).
+function updateVoiceIndicator() {
+  if (!voiceIndicatorEl) return;
+  if (voiceState === 'recording') {
+    voiceIndicatorEl.textContent = '🎤 запись…';
+    voiceIndicatorEl.classList.remove('hidden');
+  } else if (voiceState === 'transcribing') {
+    voiceIndicatorEl.textContent = '🎤 …';
+    voiceIndicatorEl.classList.remove('hidden');
+  } else {
+    voiceIndicatorEl.classList.add('hidden');
+  }
+  $('action-bar')?.classList.toggle('recording', voiceState === 'recording');
+}
+
+// Бейдж создаётся программно в #action-right (тот же приём, что кнопки
+// #action-commands в renderActionBar выше) — бриф модифицирует только app.js/
+// app.css, не index.html.
+function initVoiceIndicator() {
+  const host = $('action-right');
+  if (!host) return;
+  voiceIndicatorEl = document.createElement('span');
+  voiceIndicatorEl.id = 'voice-indicator';
+  voiceIndicatorEl.className = 'hidden';
+  host.insertBefore(voiceIndicatorEl, host.firstChild);
+}
+
+// keydown ShiftRight → микрофон → WAV. try/catch вокруг recorder.start():
+// getUserMedia отклоняется, если пользователь/ОС запретили доступ к
+// микрофону или устройства нет вовсе (бриф) — тост, без исключения наружу
+// (обработчик keydown не должен падать).
+async function startVoiceRecording() {
+  voiceState = 'recording';
+  voiceHoldStartedAt = Date.now();
+  updateVoiceIndicator();
+  try {
+    await voiceRecorder.start();
+  } catch (err) {
+    console.warn('[voice] getUserMedia упал:', err);
+    voiceState = 'idle';
+    updateVoiceIndicator();
+    showToast('Микрофон недоступен', 'error');
+  }
+}
+
+// keyup ShiftRight — стоп записи. heldMs/overlayOpenedDuring считаются
+// СИНХРОННО прямо здесь (момент отпускания клавиши), ДО await recorder.stop() —
+// иначе «оверлей открылся во время записи» (спека) проверялся бы уже
+// post-factum, когда решение фактически нужно принять по состоянию НА МОМЕНТ
+// отпускания клавиши, а не по состоянию после закрытия AudioContext.
+function stopVoiceRecording() {
+  if (voiceState !== 'recording') return;
+  const heldMs = Date.now() - voiceHoldStartedAt;
+  const overlayOpenedDuring = Object.values(overlayFlags()).some(Boolean);
+  voiceState = 'idle';
+  updateVoiceIndicator();
+  voiceRecorder.stop().then((wav) => {
+    // recorder.js сам отбрасывает записи короче 0.3с (см. voice/recorder.js) —
+    // wav может быть null и по этой внутренней причине тоже, не только из-за
+    // heldMs/overlayOpenedDuring ниже.
+    if (!wav) return;
+    if (heldMs < minHoldMs || overlayOpenedDuring) return; // короткое нажатие / оверлей открылся во время записи — отмена молча
+    handleVoiceWav(wav);
+  }).catch((err) => {
+    console.warn('[voice] recorder.stop() упал:', err);
+  });
+}
+
+// WAV → main (stt:transcribe) → {text}|{error} → resolveTranscribeResult
+// (voice-guards.js, чистая функция, покрыта test/voice-guards.test.js) решает,
+// что дальше: тост (пусто/ошибка) или доставка распознанного текста.
+async function handleVoiceWav(wav) {
+  voiceState = 'transcribing';
+  updateVoiceIndicator();
+  let result;
+  try {
+    result = await window.api.stt.transcribe(wav);
+  } catch (err) {
+    // Контракт (preload.js/main/ipc.js, Task 2): stt:transcribe НИКОГДА не
+    // reject-ится, ошибки приходят полем {error}. Подстраховка на случай сбоя
+    // самого IPC-моста.
+    result = { error: err && err.message ? err.message : String(err) };
+  }
+  voiceState = 'idle';
+  updateVoiceIndicator();
+  const decision = resolveTranscribeResult(result);
+  if (decision.action === 'toast') {
+    showToast(decision.message, decision.level);
+    return;
+  }
+  await deliverVoiceText(decision.text);
+}
+
+// Доставка распознанного текста — ТОТ ЖЕ путь, что и рецепты (см. runRecipe
+// ниже): normalizeForPty схлопывает внутренние переносы строк в пробел, затем
+// гард статуса вкладки writeCommandToTab (waiting → тост, текст не
+// отправлен) → `текст + \r` в pty активной вкладки.
+async function deliverVoiceText(rawText) {
+  const tabId = tabStore.activeId;
+  if (!tabId) return; // вкладка закрылась, пока шло распознавание — защитный рубеж
+  const text = await window.api.recipes.normalizeForPty(rawText);
+  if (!text || !text.trim()) {
+    showToast('Не расслышал', 'warn');
+    return;
+  }
+  writeCommandToTab(tabId, text);
+  views.get(tabId)?.view.focus();
+}
+
+// keydown/keyup правого Shift — ОТДЕЛЬНЫЙ обработчик от bindHotkeys() (бриф):
+// Shift сам по себе ничего не печатает в терминал, а Shift+буква должен
+// продолжать работать штатно — БЕЗ preventDefault/stopPropagation, в отличие
+// от Ctrl-комбинаций в bindHotkeys(). capture-фаза — та же, что и там, чтобы
+// открытые оверлеи (которые тоже слушают keydown) не перехватили событие
+// первыми — хотя запись и так не стартует, пока открыт хоть один (см.
+// canStartRecording, voice-guards.js).
+function bindVoiceHotkey() {
+  const holdKey = config.stt?.holdKey || 'ShiftRight';
+  minHoldMs = Number.isFinite(config.stt?.minHoldMs) ? config.stt.minHoldMs : 300;
+
+  window.addEventListener('keydown', (ev) => {
+    if (ev.code !== holdKey || ev.repeat) return; // repeat — авто-повтор зажатой клавиши, не должен перезапускать запись
+    if (voiceState !== 'idle') return; // уже идёт запись/распознавание
+    const overlays = overlayFlags();
+    if (!canStartRecording({ overlays, hasActiveTab: !!tabStore.activeId, sttAvailable })) {
+      if (!sttAvailable && !sttUnavailableToastShown) {
+        sttUnavailableToastShown = true; // ОДИН тост за сессию (спека) — дальше no-op до перезапуска
+        showToast('Голосовой стек не найден (см. stt.stackRoots в конфиге)', 'warn');
+      }
+      return;
+    }
+    startVoiceRecording();
+  }, { capture: true });
+
+  window.addEventListener('keyup', (ev) => {
+    if (ev.code !== holdKey) return;
+    stopVoiceRecording();
+  }, { capture: true });
 }
 
 // Клик по ⚡: прописать хуки Cockpit в .claude/settings.json проекта вкладки.
@@ -1665,6 +1833,26 @@ async function boot() {
 
   renderActionBar();
 
+  // Task 3 фазы 9 (голосовой ввод): recorder — один инстанс на всё время
+  // жизни окна (start()/stop() сами открывают/закрывают AudioContext на
+  // каждую запись, см. voice/recorder.js). initVoiceIndicator() создаёт
+  // бейдж программно в #action-right — ПОСЛЕ renderActionBar() (та стирает
+  // #action-commands, но не #action-right, порядок здесь не критичен, только
+  // для читаемости — оба относятся к панели действий).
+  voiceRecorder = new VoiceRecorder();
+  initVoiceIndicator();
+  // Снимок status().available — см. bindVoiceHotkey/canStartRecording
+  // (voice-guards.js). Fire-and-forget, тот же приём, что usage.get()/
+  // night.get() ниже — не задерживаем boot() ради похода в main; keydown-гард
+  // просто использует то, что есть на момент первого нажатия (IPC-круг —
+  // миллисекунды, Shift физически не нажать раньше).
+  window.api.stt.status().then((s) => {
+    sttAvailable = !!(s && s.available);
+  }).catch((err) => {
+    console.warn('[voice] stt:status не удался:', err);
+    sttAvailable = false;
+  });
+
   // Task 3 фазы 5 (кольца лимитов): первичный usage:get — НЕ await, чтобы
   // первый (потенциально небыстрый — ленивый ccusage.get() дёргает npx на
   // первом вызове, до 60с таймаута) запрос не задерживал остальной boot()
@@ -1806,6 +1994,7 @@ async function boot() {
   });
 
   bindHotkeys();
+  bindVoiceHotkey();
 
   // Ghost-буфер (Task 5): периодический снимок ТОЛЬКО активной вкладки —
   // сериализация всех открытых вкладок каждые 30с дорога при нескольких
