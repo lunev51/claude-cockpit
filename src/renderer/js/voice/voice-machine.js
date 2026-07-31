@@ -68,6 +68,11 @@ function createVoiceMachine({
   clearTimer = (id) => clearTimeout(id),
   getActiveTabId = () => null,
   minHoldMs = 300,
+  // N-1 (ре-ревью финальной волны): диагностика ошибок рекордера/доставки —
+  // до рефакторинга app.js писал console.warn, переезд её потерял, а живая
+  // приёмка упирается ровно в «почему тост „Микрофон недоступен“». app.js
+  // передаёт console.warn; дефолт — тишина (тесты не шумят).
+  log = () => {},
 } = {}) {
   let state = 'idle';
   let pendingTimer = null;
@@ -117,7 +122,7 @@ function createVoiceMachine({
       await runOnRecorder(() => recorder.start());
       started = true;
     } catch (err) {
-      // тихо — обработка ниже, по факту started=false
+      log('[voice] recorder.start() упал:', err); // обработка ниже, по факту started=false
     }
     if (state !== 'starting') return;
     if (!started) {
@@ -159,8 +164,13 @@ function createVoiceMachine({
       }
       setState('idle'); // нечего отправлять — recorder.js сам решил, что звука недостаточно
       return undefined;
-    }).catch(() => {
-      setState('idle');
+    }).catch((err) => {
+      log('[voice] стоп/распознавание упало:', err);
+      // N-2 (ре-ревью финальной волны): transcribeAndDeliver ставит idle ДО
+      // await deliver — реджект из deliver долетает сюда, когда УЖЕ мог
+      // начаться новый цикл (pending/starting). Безусловный idle затирал бы
+      // его состояние (тот же класс, что N1) — правим только СВОЁ 'stopping'.
+      if (state === 'stopping') setState('idle');
     });
   }
 
@@ -181,7 +191,8 @@ function createVoiceMachine({
     setState('stopping');
     runOnRecorder(() => recorder.stop()).then(() => {
       setState('idle');
-    }).catch(() => {
+    }).catch((err) => {
+      log('[voice] recorder.stop() упал:', err);
       setState('idle');
     });
   }

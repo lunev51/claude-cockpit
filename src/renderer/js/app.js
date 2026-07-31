@@ -936,6 +936,9 @@ function bindVoiceHotkey() {
     indicator: updateVoiceIndicatorForState,
     getActiveTabId: () => tabStore.activeId,
     minHoldMs,
+    // N-1 (ре-ревью финальной волны): диагностика в DevTools — смоук считает
+    // только level 'error', warn его не ломает.
+    log: (msg, err) => console.warn(msg, err),
   });
 
   window.addEventListener('keydown', (ev) => {
