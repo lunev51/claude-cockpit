@@ -44,6 +44,21 @@ const DEFAULTS = {
     retryMs: 300000,
     maxRetries: 3,
   },
+  // Task 2 фазы 9 (голосовой ввод): дефолты для createStt (stt.js, Task 1,
+  // спека docs/superpowers/specs/2026-07-29-voice-input-design.md). БЕЗ
+  // stackRoots — DEFAULTS этого файла статичны (никакого require('electron')
+  // на этапе объявления объекта), а корень appRoot() резолвится только в
+  // рантайме Electron; дефолт stackRoots подставляется в момент создания
+  // инстанса в ipc.js (getOrCreateStt()) — минимально инвазивный способ,
+  // тот же приём, что terminal.cwd ниже (app.getPath('home') после merge).
+  stt: {
+    model: 'large-v3-turbo-q5_0',
+    language: 'ru',
+    threads: 6,
+    serverPort: 48753,
+    holdKey: 'ShiftRight',
+    minHoldMs: 300,
+  },
 };
 
 let cached = null;
@@ -96,6 +111,19 @@ function getConfig() {
   const overlay = readJson(overlayPath());
   cached = deepMerge(deepMerge(DEFAULTS, projectFile), overlay);
   if (!cached.terminal.cwd) cached.terminal.cwd = app.getPath('home');
+  // Minor-4/5 (ревью Task 2 фазы 9): вычисляемые/восстановительные патчи
+  // секции stt ПОСЛЕ merge — тем же приёмом, что terminal.cwd выше.
+  // (5) `"stt": null` у пользователя: deepMerge заменяет секцию целиком —
+  // без восстановления cfg.model стал бы undefined и стек «не находился бы»
+  // на полностью исправной машине (ggml-undefined.bin).
+  if (!cached.stt || typeof cached.stt !== 'object') cached.stt = deepMerge(DEFAULTS.stt, {});
+  // (4) stackRoots — вычисляемый дефолт: appRoot() доступен только в
+  // рантайме. Патч здесь (а не в ipc.js) кладёт ключ в эффективный конфиг —
+  // тост «см. stt.stackRoots в конфиге» ссылается на то, что пользователь
+  // реально может увидеть через config:get.
+  if (!Array.isArray(cached.stt.stackRoots) || !cached.stt.stackRoots.length) {
+    cached.stt.stackRoots = [appRoot(), 'C:\\Users\\Lunev\\AssistClaude\\claude-companion'];
+  }
   return cached;
 }
 

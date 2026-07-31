@@ -85,8 +85,26 @@ function createWindow() {
   const win = new BrowserWindow(winOpts);
   if (saved.isMaximized) win.maximize();
 
-  // Кокпиту не нужны браузерные разрешения (микрофона больше нет).
-  win.webContents.session.setPermissionRequestHandler((_wc, _permission, cb) => cb(false));
+  // Ревью Task 3 фазы 9 (C1, M1 ре-ревью): микрофон ВЕРНУЛСЯ в фазе 9
+  // (голосовой ввод, push-to-talk — src/renderer/js/voice/recorder.js зовёт
+  // getUserMedia({audio:true})). Этот хендлер раньше запрещал ЛЮБОЕ
+  // разрешение безусловно — реликт зачистки голосового стека Companion в
+  // фазе 0 («микрофона больше нет»), из-за которого getUserMedia падал с
+  // NotAllowedError на КАЖДОЕ нажатие Shift, и фича была мертва целиком (тост
+  // «Микрофон недоступен» всегда).
+  // M1 (ре-ревью раунда 1): в Electron 29 разрешение 'media' покрывает И
+  // микрофон, И камеру одним именем — проверки одного `permission==='media'`
+  // недостаточно, чтобы честно утверждать «камера по-прежнему запрещена».
+  // details.mediaTypes — массив запрошенных типов ('audio'/'video') для
+  // media-запросов; recorder.js просит только audio, так что легитимный
+  // запрос кокпита никогда не попадёт в mediaTypes.includes('video') — а вот
+  // гипотетическая веб-страница/будущий код, попросившие видео, получат
+  // отказ, даже если permission по имени совпал с 'media'.
+  win.webContents.session.setPermissionRequestHandler(
+    (_wc, permission, cb, details) => cb(
+      permission === 'media' && !details?.mediaTypes?.includes('video'),
+    ),
+  );
 
   // --- Сохранение состояния с debounce 500мс ---
   let saveTimer = null;

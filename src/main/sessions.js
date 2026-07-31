@@ -178,8 +178,17 @@ function createSessionManager({
     // ПОСЛЕДНЕМУ Notification; уход из 'waiting' в ЛЮБОЙ другой статус
     // делает их прошлым состоянием, а не текущим).
     if (status !== 'waiting') { tab.waitingText = ''; tab.waitingKind = ''; }
+    // C2 (Critical, ревью финальной волны фазы 9): waitingKind уже считался
+    // (classifyNotification выше) и уже уходит наружу через list() (для
+    // ipc.js/ночной смены), но НИКОГДА не попадал в сам payload 'tab:status' —
+    // renderer (Task 3 фазы 9, голосовой ввод) не мог отличить «ждёт
+    // idle_prompt» (пишущий статус, та же семантика, что ночная смена уже
+    // признаёт) от «ждёт диалога разрешения» (блокирующий), и блокировал
+    // ЛЮБОЙ 'waiting'. Лишний ключ инертен для остальных потребителей payload
+    // (тот же прецедент, что genProven чуть выше по функции).
     onEvent('tab:status', {
       tabId: tab.tabId, status, subtitle: tab.subtitle, waitingText: tab.waitingText,
+      waitingKind: tab.waitingKind,
       ...(extra || {}),
     });
   }
@@ -612,8 +621,15 @@ function createSessionManager({
         }
         tab.status = 'waiting';
         tab.subtitle = tab.waitingText.slice(0, 120);
+        // C2 (Critical, ревью финальной волны фазы 9): та же правка, что в
+        // setStatus() выше по файлу — waitingKind в payload, renderer больше
+        // не путает idle_prompt с permission_prompt.
         onEvent('tab:status', {
-          tabId: tab.tabId, status: 'waiting', subtitle: tab.subtitle, waitingText: tab.waitingText,
+          tabId: tab.tabId,
+          status: 'waiting',
+          subtitle: tab.subtitle,
+          waitingText: tab.waitingText,
+          waitingKind: tab.waitingKind,
         });
         break;
       }

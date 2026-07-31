@@ -1040,6 +1040,31 @@ html, body {
 /* Виджет лимита пока не наполняется (дашборд — следующая фаза) — скрыт, пока пуст. */
 #limit-5h:empty { display: none; }
 
+/* Task 3 фазы 9 (голосовой ввод): бейдж push-to-talk в #action-right —
+   создаётся программно (см. app.js/initVoiceIndicator), скрыт в покое классом
+   .hidden. Тот же урок, что .action-btn.armed выше (фаза 8): 🎤 (U+1F3A4,
+   Emoji_Presentation=Yes) рендерится цветным COLR-шрифтом независимо от
+   --font-mono — CSS color на сам глиф не действует, поэтому цветовую границу
+   несёт border, а не только текстовый color (тот раскрашивает соседний текст
+   «запись…»/«…», но не сам микрофон). Minor 1 (ревью раунда 1): flex:none —
+   #action-right (flex-контейнер) иначе сжимал бы бейдж наравне с #limit-5h в
+   узком окне; white-space:nowrap — «🎤 запись…» не переносится на вторую
+   строку и не вылезает за 32px высоты #action-bar. */
+#voice-indicator {
+  background: var(--bg-card);
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-s);
+  padding: 3px 8px;
+  font-size: 10px;
+  flex: none;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}
+/* Рамка всей панели действий — дешёвый доп.сигнал (бриф), ТОЛЬКО пока идёт
+   сама запись (не во время распознавания после отпускания клавиши). */
+#action-bar.recording { box-shadow: inset 0 0 0 1px var(--accent); }
+
 /* Fix 9 (ревью, спека §7): «focus — 2px кольцо терракотой» вместо дефолтного
    кольца Chromium. Task 3 фазы 4: .tab-row теперь focusable (tabindex=0, для
    Space → peek) — то же кольцо. */

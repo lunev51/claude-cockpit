@@ -20,6 +20,7 @@ const {
   recipesListWorkspacesHandler, recipesSaveWorkspaceHandler, recipesDeleteWorkspaceHandler,
   nightToggleHandler, nightGetHandler, hasRealUserInput,
   shouldDetectLimitStop, resumableTabStatus, isSnapshotFreshEnough, USAGE_SNAPSHOT_FRESH_MS,
+  sttTranscribeHandler, sttStatusHandler,
 } = require('../src/main/ipc');
 
 // gitInfo/ghInfo-заглушки, которые ПАДАЮТ, если их дёрнули: смоук-гейт по
@@ -556,4 +557,65 @@ test('isSnapshotFreshEnough: fetchedAt отсутствует/не число �
 test('isSnapshotFreshEnough: snapshot отсутствует вовсе → false, не бросает', () => {
   assert.strictEqual(isSnapshotFreshEnough(null, 1000000), false);
   assert.strictEqual(isSnapshotFreshEnough(undefined, 1000000), false);
+});
+
+// ------------------------------------------------------------- sttTranscribeHandler/sttStatusHandler --
+// Task 2 фазы 9 (голосовой ввод): stt:transcribe/status добавлены в ЭТОЙ ЖЕ
+// ветке с тем же классом смоук-гейта, что и остальные хендлеры выше —
+// заглушка getStt() ПАДАЕТ, если её дёрнули (та же причина: регрессия
+// «забыли `if (smoke) return ...`» обязана стать красной, а не просто вернуть
+// не то значение). Глобальное ограничение фазы: в smoke НЕ создавать
+// инстанс createStt вообще (не резолвить корни стека, не трогать fs).
+
+function throwingGetStt() {
+  return () => { throw new Error('getStt НЕ должен был вызваться в smoke'); };
+}
+
+test('sttTranscribeHandler: smoke:true → {error:"smoke"}, getStt НИКОГДА не вызывается', async () => {
+  const res = await sttTranscribeHandler({ smoke: true, wav: new ArrayBuffer(4), getStt: throwingGetStt() });
+  assert.deepStrictEqual(res, { error: 'smoke' });
+});
+
+test('sttStatusHandler: smoke:true → {available:false,backend:null,warm:false}, getStt НИКОГДА не вызывается', () => {
+  const res = sttStatusHandler({ smoke: true, getStt: throwingGetStt() });
+  assert.deepStrictEqual(res, { available: false, backend: null, warm: false });
+});
+
+test('sttTranscribeHandler: smoke:false, ArrayBuffer WAV → зовёт stt.transcribeWav(Buffer) байт-в-байт, отдаёт {text}', async () => {
+  const calls = [];
+  const fakeStt = { transcribeWav: (buf) => { calls.push(buf); return Promise.resolve('привет'); } };
+  const wav = new Uint8Array([1, 2, 3, 4]).buffer;
+  const res = await sttTranscribeHandler({ smoke: false, wav, getStt: () => fakeStt });
+  assert.deepStrictEqual(res, { text: 'привет' });
+  assert.strictEqual(calls.length, 1);
+  assert.ok(Buffer.isBuffer(calls[0]));
+  assert.deepStrictEqual([...calls[0]], [1, 2, 3, 4]);
+});
+
+test('sttTranscribeHandler: smoke:false, Uint8Array WAV (не весь ArrayBuffer, с offset) → конвертируется в Buffer точно по вкладке', async () => {
+  const calls = [];
+  const fakeStt = { transcribeWav: (buf) => { calls.push(buf); return Promise.resolve('ок'); } };
+  const full = new Uint8Array([9, 1, 2, 3, 4, 9]);
+  const view = full.subarray(1, 5); // Uint8Array{byteOffset:1, byteLength:4} поверх того же ArrayBuffer
+  const res = await sttTranscribeHandler({ smoke: false, wav: view, getStt: () => fakeStt });
+  assert.deepStrictEqual(res, { text: 'ок' });
+  assert.deepStrictEqual([...calls[0]], [1, 2, 3, 4]);
+});
+
+test('sttTranscribeHandler: smoke:false, transcribeWav реджектит → {error: message}, НЕ бросает (renderer покажет тост)', async () => {
+  const fakeStt = { transcribeWav: () => Promise.reject(new Error('whisper-server HTTP 500')) };
+  const res = await sttTranscribeHandler({ smoke: false, wav: new ArrayBuffer(2), getStt: () => fakeStt });
+  assert.deepStrictEqual(res, { error: 'whisper-server HTTP 500' });
+});
+
+test('sttTranscribeHandler: smoke:false, невалидный формат wav (не ArrayBuffer/Uint8Array) → {error}, transcribeWav не вызывается', async () => {
+  const fakeStt = { transcribeWav: () => { throw new Error('transcribeWav НЕ должен был вызваться'); } };
+  const res = await sttTranscribeHandler({ smoke: false, wav: 'not-a-buffer', getStt: () => fakeStt });
+  assert.ok(typeof res.error === 'string' && res.error.length > 0);
+});
+
+test('sttStatusHandler: smoke:false → отдаёт stt.status() как есть', () => {
+  const fakeStt = { status: () => ({ available: true, backend: 'whisper', warm: true }) };
+  const res = sttStatusHandler({ smoke: false, getStt: () => fakeStt });
+  assert.deepStrictEqual(res, { available: true, backend: 'whisper', warm: true });
 });

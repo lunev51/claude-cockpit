@@ -13,6 +13,19 @@ import { createSearch } from './search.js';
 import { createRecipeForm } from './recipe-form.js';
 import { createHotkeysOverlay } from './hotkeys.js';
 import { pluralTabs } from './format.js';
+// Task 3 фазы 9 (голосовой ввод, push-to-talk по правому Shift): recorder —
+// портирован из Companion как есть (src/renderer/js/voice/recorder.js, см.
+// комментарий там же — ни одного изменённого пути импорта не понадобилось,
+// структура renderer совпадает 1-в-1; I3 ревью финальной волны — точечный
+// try/catch внутри start(), см. сам файл). voice-guards.js — чистые гарды
+// (resolveStartBlock — можно ли стартовать запись), вынесенные отдельно ради
+// node --test (см. test/voice-guards.test.js). voice-machine.js (I4 ревью
+// финальной волны) — конечный автомат push-to-talk (start/stop/cancel,
+// сериализация на recorder, M3 — таймер minHoldMs); app.js теперь только
+// связывает DOM-события с методами машины (см. bindVoiceHotkey ниже).
+import { VoiceRecorder } from './voice/recorder.js';
+import { resolveStartBlock } from './voice/voice-guards.js';
+import { createVoiceMachine } from './voice/voice-machine.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -109,6 +122,22 @@ const queueByTab = new Map();
 // queueByTab: поле может быть открыто даже при пустой очереди (это и есть
 // способ добавить самый первый элемент).
 let queueInputOpen = false;
+
+// Task 3 фазы 9 (голосовой ввод, push-to-talk): voiceRecorder создаётся в
+// boot() (VoiceRecorder — start()/stop() сами открывают/закрывают
+// AudioContext на КАЖДУЮ запись, см. voice/recorder.js), voiceMachine — в
+// bindVoiceHotkey() (I4, ревью финальной волны: сам конечный автомат —
+// start/stop/cancel/сериализация на recorder — переехал в
+// voice/voice-machine.js; здесь остаётся только тонкая привязка DOM-событий
+// к его методам). sttAvailable — кэш stt:status().available, снятый один
+// раз при boot() и обновляемый лениво: keydown-гард НЕ ходит в IPC на
+// каждое нажатие Shift (латентность старта записи иначе выросла бы на круг
+// до main и обратно) — см. boot()/refreshSttStatus.
+let voiceRecorder = null;
+let voiceMachine = null;
+let voiceIndicatorEl = null;
+let sttAvailable = true;
+let sttUnavailableToastShown = false; // ОДИН тост за сессию, ТОЛЬКО для причины «стек не найден» (спека) — дальше no-op до перезапуска
 
 // Fix 8 (ревью): точка в титлбаре терракотовая, только пока есть хотя бы одна
 // вкладка в статусе waiting.
@@ -750,14 +779,218 @@ function showToast(text, level = 'info') {
 // не даёт голому Enter молча подтвердить дефолт диалога; статус вкладки его
 // не касается, потому что peek и есть штатный способ ответить, пока статус
 // waiting).
+//
+// C2 (Critical, ревью финальной волны фазы 9): 'waiting' САМ ПО СЕБЕ больше
+// не блокирует безусловно — см. isTabBlockedByDialog ниже. Claude Code шлёт
+// idle_prompt (~раз в 60с без фокуса терминала), пока просто простаивает у
+// промпта — это ПИШУЩИЙ статус, та же семантика, что уже применяет ночная
+// смена (main/ipc.js вбрасывает туда «продолжай»), а вовсе не диалог
+// разрешения с вариантами Yes/No. Блокируем ТОЛЬКО waitingKind==='permission'
+// (и неизвестные значения — консервативный дефолт, см. classifyNotification
+// в sessions.js).
+function isTabBlockedByDialog(tabId) {
+  return tabStore.statusOf(tabId) === 'waiting' && tabStore.waitingKindOf(tabId) !== 'idle';
+}
+
 function writeCommandToTab(tabId, command) {
   if (!tabId) return false;
-  if (tabStore.statusOf(tabId) === 'waiting') {
+  if (isTabBlockedByDialog(tabId)) {
     showToast('Вкладка ждёт ответа на диалог — команда не отправлена', 'warn');
     return false;
   }
   window.api.term.write(tabId, `${command}\r`);
   return true;
+}
+
+// --- Task 3 фазы 9: голосовой ввод (push-to-talk по правому Shift) ---
+// I4 (ревью финальной волны): сам конечный автомат (start/stop/cancel,
+// сериализация на recorder, M3 — таймер minHoldMs) переехал в
+// voice/voice-machine.js БЕЗ изменения поведения — здесь остаётся только
+// тонкая привязка DOM-событий к его методам, плюс индикатор/доставка,
+// которые машина не знает как рисовать/куда писать (инжектируются в неё).
+
+// Индикатор в #action-right: «🎤 запись…» пока идёт запись (в т.ч. пока
+// getUserMedia ещё грузится, 'starting', и пока идёт сам стоп, 'stopping' —
+// пользователю не нужно различать эти состояния на глаз, вся троица длится
+// от миллисекунд до долей секунды), «🎤 …» пока распознаётся, скрыт в покое
+// (включая 'pending' — M3, микрофон ещё не тронут, показывать «запись…» было
+// бы неправдой). Рамка вокруг #action-bar — дешёвый доп.сигнал (бриф), в те
+// же моменты, что и бейдж «запись…». Вызывается машиной на КАЖДЫЙ переход
+// состояния (indicator, см. createVoiceMachine).
+function updateVoiceIndicatorForState(state) {
+  if (!voiceIndicatorEl) return;
+  const recordingLike = state === 'starting' || state === 'recording' || state === 'stopping';
+  if (recordingLike) {
+    voiceIndicatorEl.textContent = '🎤 запись…';
+    voiceIndicatorEl.classList.remove('hidden');
+  } else if (state === 'transcribing') {
+    voiceIndicatorEl.textContent = '🎤 …';
+    voiceIndicatorEl.classList.remove('hidden');
+  } else {
+    voiceIndicatorEl.classList.add('hidden');
+  }
+  $('action-bar')?.classList.toggle('recording', recordingLike);
+}
+
+// Бейдж создаётся программно в #action-right (тот же приём, что кнопки
+// #action-commands в renderActionBar выше) — бриф модифицирует только app.js/
+// app.css, не index.html.
+function initVoiceIndicator() {
+  const host = $('action-right');
+  if (!host) return;
+  voiceIndicatorEl = document.createElement('span');
+  voiceIndicatorEl.id = 'voice-indicator';
+  voiceIndicatorEl.className = 'hidden';
+  host.insertBefore(voiceIndicatorEl, host.firstChild);
+}
+
+// Ревью Task 3, Minor 2: при обнаруженной недоступности стека на keydown
+// (см. bindVoiceHotkey) перечитываем status() заново, лениво и
+// fire-and-forget — стек, скопированный ПОСЛЕ boot() (пользователь долил
+// vendor/models, пока кокпит уже открыт), подхватится со следующего же
+// нажатия Shift, а не только после перезапуска приложения.
+function refreshSttStatus() {
+  window.api.stt.status().then((s) => {
+    sttAvailable = !!(s && s.available);
+  }).catch((err) => {
+    console.warn('[voice] stt:status не удался:', err);
+    sttAvailable = false; // сбой похода в main — безопаснее считать стек недоступным, чем оптимистичным true по умолчанию
+  });
+}
+
+// Инжектируется в voiceMachine как `deliver` — вызывается ЛИБО с тостом
+// (микрофон недоступен/пусто/ошибка распознавания — tabId будет null,
+// см. resolveTranscribeResult в voice-guards.js/voice-machine.js), ЛИБО с
+// решением «доставить текст» (decision.action==='deliver'). tabId — снимок
+// activeId, сделанный машиной СИНХРОННО на keyup (C1, Critical, ревью
+// финальной волны) — а НЕ на момент вызова этой функции (после
+// stt:transcribe: до 2×20с подъёма сервера + 60с инференса, с ретраем до
+// ~200с суммарно). Тот же принцип, что runRecipe (ниже) резолвит tabId ДО
+// await с явным комментарием «даже если он успеет переключиться» — без
+// этого пользователь мог продиктовать в A, переключиться в B (Ctrl+Tab/клик
+// по Windows-тосту), пока горит «🎤 …», и текст+Enter ушёл бы в ЧУЖОЙ проект.
+async function deliverVoiceOutcome(tabId, decision) {
+  if (decision.action === 'toast') {
+    showToast(decision.message, decision.level);
+    return;
+  }
+  // decision.action === 'deliver' — непустой распознанный текст.
+  // C1: вкладка могла закрыться, пока шло распознавание, ИЛИ её вообще не
+  // было в момент keyup (statusOf(null) тоже вернёт null) — тост, не отправляем.
+  if (!tabId || tabStore.statusOf(tabId) === null) {
+    showToast('Вкладка закрыта — текст не отправлен', 'warn');
+    return;
+  }
+  const text = await window.api.recipes.normalizeForPty(decision.text);
+  if (isTabBlockedByDialog(tabId)) {
+    // C2, смягчение (ревью финальной волны): waiting+permission блокирует
+    // обычную доставку — но распознанный текст не должен пропадать
+    // безвозвратно только потому, что вкладка сейчас ждёт ответа человека на
+    // СОВСЕМ ДРУГОЙ вопрос. Буфер обмена — fire-and-forget, без await на
+    // весь показ тоста (навигатор сам управляет своим таймингом).
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast('Вкладка ждёт диалога — текст скопирован в буфер обмена', 'warn');
+    } catch (err) {
+      console.warn('[voice] clipboard.writeText упал:', err);
+      showToast('Вкладка ждёт диалога — команда не отправлена', 'warn');
+    }
+    return;
+  }
+  // M1 (ревью финальной волны): focus() ТОЛЬКО при реально успешной записи —
+  // writeCommandToTab возвращает false и на случай гонки (isTabBlockedByDialog
+  // выше уже сказал «нет», но состояние вкладки успело измениться между этой
+  // проверкой и самой записью) — фокус терминала не должен перескакивать на
+  // вкладку, в которую текст фактически не попал.
+  if (writeCommandToTab(tabId, text)) views.get(tabId)?.view.focus();
+}
+
+// keydown/keyup правого Shift — ОТДЕЛЬНЫЙ обработчик от bindHotkeys() (бриф):
+// Shift сам по себе ничего не печатает в терминал, а Shift+буква должен
+// продолжать работать штатно — БЕЗ preventDefault/stopPropagation, в отличие
+// от Ctrl-комбинаций в bindHotkeys(). capture-фаза — та же, что и там, чтобы
+// открытые оверлеи (которые тоже слушают keydown) не перехватили событие
+// первыми — хотя запись и так не стартует, пока открыт хоть один (см.
+// resolveStartBlock, voice-guards.js).
+//
+// Ревью раунда 1: C2 (Alt+ShiftRight — смена раскладки Windows, Ctrl+Shift+*)
+// и I1 (печать другой клавиши во время удержания — заглавные буквы штатным
+// Shift+буква) — оба решаются здесь. C2: модификатор УЖЕ зажат в момент
+// нажатия ShiftRight — проверяем ev.ctrlKey/altKey/metaKey ПЕРВЫМ делом после
+// repeat, до старта записи. I1 и «модификатор нажат ПОСЛЕ ShiftRight»
+// (Shift нажат первым, затем Ctrl/Alt/любая буква) — единый случай: ЛЮБОЙ
+// keydown с ev.code, отличным от holdKey, пока машина не idle — тихая отмена
+// (voiceMachine.cancel(), она сама no-op'ает, если нечего отменять), это не
+// диктовка. Ревью финальной волны: I1 (мышь — mousedown/wheel, штатное
+// выделение в xterm Shift+клик/Shift+колесо) и C4 (blur/visibilitychange) —
+// тот же voiceMachine.cancel(), привязанный отдельными слушателями ниже —
+// машине всё равно, КТО попросил отменить.
+function bindVoiceHotkey() {
+  const holdKey = config.stt?.holdKey || 'ShiftRight';
+  const minHoldMs = Number.isFinite(config.stt?.minHoldMs) ? config.stt.minHoldMs : 300;
+
+  voiceMachine = createVoiceMachine({
+    recorder: voiceRecorder,
+    transcribe: (wav) => window.api.stt.transcribe(wav),
+    deliver: deliverVoiceOutcome,
+    indicator: updateVoiceIndicatorForState,
+    getActiveTabId: () => tabStore.activeId,
+    minHoldMs,
+    // N-1 (ре-ревью финальной волны): диагностика в DevTools — смоук считает
+    // только level 'error', warn его не ломает.
+    log: (msg, err) => console.warn(msg, err),
+  });
+
+  window.addEventListener('keydown', (ev) => {
+    if (ev.code !== holdKey) {
+      voiceMachine.cancel();
+      return;
+    }
+    if (ev.repeat) return; // авто-повтор зажатой клавиши — не должен перезапускать запись
+    if (ev.ctrlKey || ev.altKey || ev.metaKey) return; // C2: Alt+ShiftRight (смена раскладки)/Ctrl+Shift+* — модификатор зажат ДО ShiftRight, это не push-to-talk
+    if (voiceMachine.state !== 'idle') return; // занято: предыдущий цикл ещё не осел (N1)
+    const hasActiveTab = !!tabStore.activeId;
+    const overlaysOpen = Object.values(overlayFlags()).some(Boolean);
+    const block = resolveStartBlock({ overlaysOpen, hasActiveTab, sttAvailable });
+    if (!block.allowed) {
+      if (block.reason === 'stt-unavailable') {
+        refreshSttStatus(); // Minor 2: лениво подхватить стек, скопированный ПОСЛЕ boot(), без перезапуска приложения
+        if (!sttUnavailableToastShown) {
+          sttUnavailableToastShown = true; // ОДИН тост за сессию, ТОЛЬКО для причины «стек не найден» — дальше no-op до перезапуска
+          showToast(block.toast.message, block.toast.level);
+        }
+      }
+      return;
+    }
+    voiceMachine.requestStart();
+  }, { capture: true });
+
+  window.addEventListener('keyup', (ev) => {
+    if (ev.code !== holdKey) return;
+    // Оверлей открылся ВО ВРЕМЯ записи (спека) — тихая отмена, тот же исход,
+    // что и короткое нажатие/печать другой клавиши. Проверяется здесь (а не
+    // внутри машины), т.к. только app.js знает, что такое «оверлей».
+    const overlaysOpen = Object.values(overlayFlags()).some(Boolean);
+    if (overlaysOpen) voiceMachine.cancel();
+    else voiceMachine.requestStop();
+  }, { capture: true });
+
+  // C4 (ревью раунда 2): потеря фокуса окна (Alt+Tab, клик по другому
+  // приложению) или скрытие вкладки браузера — keyup, отпускающий ShiftRight,
+  // уйдёт уже ДРУГОМУ окну/вкладке и никогда не долетит до обработчика выше.
+  window.addEventListener('blur', () => voiceMachine.cancel());
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) voiceMachine.cancel();
+  });
+  // I1 (ревью финальной волны): мышь с зажатым Shift — штатное выделение
+  // текста в xterm (Shift+клик выделяет диапазон, Shift+колесо — горизонтальный
+  // скролл), НЕ диктовка. Без этого удержанный Shift во время обычной работы
+  // мышью тихо копил бы тишину/шум комнаты, и whisper (large-v3) на тишине
+  // регулярно галлюцинирует читаемый, но бессмысленный текст («Продолжение
+  // следует…», «Субтитры сделал…») — который улетел бы с Enter в терминал.
+  // passive:true на wheel — мы не зовём preventDefault, скролл не должен тормозить.
+  window.addEventListener('mousedown', () => voiceMachine.cancel(), { capture: true });
+  window.addEventListener('wheel', () => voiceMachine.cancel(), { capture: true, passive: true });
 }
 
 // Клик по ⚡: прописать хуки Cockpit в .claude/settings.json проекта вкладки.
@@ -1665,6 +1898,21 @@ async function boot() {
 
   renderActionBar();
 
+  // Task 3 фазы 9 (голосовой ввод): recorder — один инстанс на всё время
+  // жизни окна (start()/stop() сами открывают/закрывают AudioContext на
+  // каждую запись, см. voice/recorder.js). initVoiceIndicator() создаёт
+  // бейдж программно в #action-right — ПОСЛЕ renderActionBar() (та стирает
+  // #action-commands, но не #action-right, порядок здесь не критичен, только
+  // для читаемости — оба относятся к панели действий).
+  voiceRecorder = new VoiceRecorder();
+  initVoiceIndicator();
+  // Снимок status().available — см. bindVoiceHotkey/resolveStartBlock
+  // (voice-guards.js). Fire-and-forget (refreshSttStatus, тот же приём, что
+  // usage.get()/night.get() ниже) — не задерживаем boot() ради похода в
+  // main; keydown-гард просто использует то, что есть на момент первого
+  // нажатия (IPC-круг — миллисекунды, Shift физически не нажать раньше).
+  refreshSttStatus();
+
   // Task 3 фазы 5 (кольца лимитов): первичный usage:get — НЕ await, чтобы
   // первый (потенциально небыстрый — ленивый ccusage.get() дёргает npx на
   // первом вызове, до 60с таймаута) запрос не задерживал остальной boot()
@@ -1745,9 +1993,12 @@ async function boot() {
   // Статусы приходят из хуков Claude Code (sessions.js) — единый источник,
   // term:started/term:exit статус больше не выставляют (был двойной источник).
   window.api.tab.onStatus(({
-    tabId, status, subtitle, waitingText,
+    tabId, status, subtitle, waitingText, waitingKind,
   }) => {
-    tabStore.setStatus(tabId, status, subtitle, waitingText);
+    // C2 (Critical, ревью финальной волны фазы 9): waitingKind зеркалится в
+    // tabStore ровно тем же приёмом, что waitingText — см. tabs.js/setStatus,
+    // app.js/isTabBlockedByDialog (голосовой ввод/writeCommandToTab).
+    tabStore.setStatus(tabId, status, subtitle, waitingText, waitingKind);
     // Ledger-фикс (ревью): текст в поповере — статичный снимок на момент
     // открытия. Если Claude задаёт ВТОРОЙ вопрос той же вкладке, пока
     // поповер всё ещё открыт (статус остаётся waiting), пользователь рискует
@@ -1806,6 +2057,7 @@ async function boot() {
   });
 
   bindHotkeys();
+  bindVoiceHotkey();
 
   // Ghost-буфер (Task 5): периодический снимок ТОЛЬКО активной вкладки —
   // сериализация всех открытых вкладок каждые 30с дорога при нескольких

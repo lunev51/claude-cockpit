@@ -311,6 +311,53 @@ test('waitingKind чистится вместе с waitingText при уходе
   assert.strictEqual(mgr.list().find((t) => t.tabId === a.tabId).waitingKind, '');
 });
 
+// ---------- C2 (Critical, ревью финальной волны фазы 9): waitingKind в payload 'tab:status' ----------
+// waitingKind уже считался (classifyNotification выше) и уже уходит наружу
+// через list() (для ipc.js/ночной смены), но раньше НИКОГДА не попадал в сам
+// payload 'tab:status' — renderer (Task 3 фазы 9, голосовой ввод) не мог
+// отличить «ждёт idle_prompt» (пишущий статус) от «ждёт диалога разрешения»
+// (блокирующий) и блокировал ЛЮБОЙ 'waiting'.
+
+test('C2: waitingKind прокинут в payload tab:status — idle_prompt', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'Notification', {
+    message: 'Claude is waiting for your input', notification_type: 'idle_prompt',
+  });
+  const st = statusOf(events, a.tabId);
+  assert.strictEqual(st.status, 'waiting');
+  assert.strictEqual(st.waitingKind, 'idle');
+});
+
+test('C2: waitingKind прокинут в payload tab:status — permission_prompt', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'Notification', {
+    message: 'Claude needs your permission to use Bash', notification_type: 'permission_prompt',
+  });
+  const st = statusOf(events, a.tabId);
+  assert.strictEqual(st.status, 'waiting');
+  assert.strictEqual(st.waitingKind, 'permission');
+});
+
+test('C2: waitingKind в payload очищается при уходе из waiting — та же судьба, что waitingText', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'Notification', {
+    message: 'Claude is waiting for your input', notification_type: 'idle_prompt',
+  });
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', {});
+  const st = statusOf(events, a.tabId);
+  assert.strictEqual(st.status, 'working');
+  assert.strictEqual(st.waitingKind, '');
+});
+
 // ---------- Task 2 фазы 6: PostToolUse → git:changed, статус не трогает ----------
 
 test('applyHookEvent: PostToolUse НЕ меняет статус вкладки, но эмитит git:changed с tabId', () => {
