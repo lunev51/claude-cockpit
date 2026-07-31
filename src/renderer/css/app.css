@@ -1046,7 +1046,10 @@ html, body {
    Emoji_Presentation=Yes) рендерится цветным COLR-шрифтом независимо от
    --font-mono — CSS color на сам глиф не действует, поэтому цветовую границу
    несёт border, а не только текстовый color (тот раскрашивает соседний текст
-   «запись…»/«…», но не сам микрофон). */
+   «запись…»/«…», но не сам микрофон). Minor 1 (ревью раунда 1): flex:none —
+   #action-right (flex-контейнер) иначе сжимал бы бейдж наравне с #limit-5h в
+   узком окне; white-space:nowrap — «🎤 запись…» не переносится на вторую
+   строку и не вылезает за 32px высоты #action-bar. */
 #voice-indicator {
   background: var(--bg-card);
   color: var(--accent);
@@ -1054,6 +1057,8 @@ html, body {
   border-radius: var(--radius-s);
   padding: 3px 8px;
   font-size: 10px;
+  flex: none;
+  white-space: nowrap;
   font-family: var(--font-mono);
 }
 /* Рамка всей панели действий — дешёвый доп.сигнал (бриф), ТОЛЬКО пока идёт

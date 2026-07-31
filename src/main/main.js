@@ -85,8 +85,18 @@ function createWindow() {
   const win = new BrowserWindow(winOpts);
   if (saved.isMaximized) win.maximize();
 
-  // Кокпиту не нужны браузерные разрешения (микрофона больше нет).
-  win.webContents.session.setPermissionRequestHandler((_wc, _permission, cb) => cb(false));
+  // Ревью Task 3 фазы 9 (C1): микрофон ВЕРНУЛСЯ в фазе 9 (голосовой ввод,
+  // push-to-talk — src/renderer/js/voice/recorder.js зовёт getUserMedia).
+  // Этот хендлер раньше запрещал ЛЮБОЕ разрешение безусловно — реликт
+  // зачистки голосового стека Companion в фазе 0 («микрофона больше нет»),
+  // из-за которого getUserMedia падал с NotAllowedError на КАЖДОЕ нажатие
+  // Shift, и фича была мертва целиком (тост «Микрофон недоступен» всегда).
+  // Точечный allow: 'media' — единственное разрешение, которое кокпиту
+  // реально нужно (getUserMedia({audio:true}) в recorder.js); geolocation/
+  // notifications/camera и прочее по-прежнему запрещены.
+  win.webContents.session.setPermissionRequestHandler(
+    (_wc, permission, cb) => cb(permission === 'media'),
+  );
 
   // --- Сохранение состояния с debounce 500мс ---
   let saveTimer = null;
