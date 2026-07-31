@@ -19,6 +19,8 @@ Claude Code is a terminal app. Run it across many projects and the terminal beco
 - **Usage rings & spend dashboard (`Ctrl+D`)** — official OAuth usage endpoint for the 5-hour / weekly limit rings (with reset countdowns), [ccusage](https://github.com/ryoppippi/ccusage) for daily spend, per-project and per-model breakdowns.
 - **Diff & GitHub panels (`Ctrl+G`)** — uncommitted changes with full diffs (untracked files included), PR badge with CI status on every tab, powered by `git` and the `gh` CLI. Read-only by design.
 - **Toasts, taskbar badge, peek** — a Windows toast when a session needs you; `Space` on a waiting tab shows the exact question and lets you answer without switching.
+- **Night watch (🌙)** — arm it before bed: when a session hits the 5-hour usage limit mid-task, Cockpit waits for the window reset (exact time from the usage API), keeps the machine awake, and sends "continue" into the same live session. Morning journal in the dashboard. Proven-generation guards make sure nothing ever types into the wrong terminal.
+- **Voice input (hold Right Shift)** — dictate prompts instead of typing: local [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (offline, warm server, CUDA with CPU fallback), text lands in the active tab and submits. Binaries/models are looked up via `stt.stackRoots` config — nothing heavy ships in this repo.
 - **Warp-inspired neutral-black design** — design tokens throughout, ANSI palette from [Warp's default dark theme](https://github.com/warpdotdev/themes) (MIT).
 
 Press **⌨** in the action bar (or `Ctrl+P` → "Горячие клавиши") for the full hotkey cheat sheet.
@@ -26,7 +28,7 @@ Press **⌨** in the action bar (or `Ctrl+P` → "Горячие клавиши"
 ## Architecture notes
 
 - **Hooks, not scraping.** The only source of session state is Claude Code's own hook system. ANSI output is never parsed — statuses can't drift when the CLI changes its rendering.
-- **Pure cores, injected edges.** Every data layer (`sessions`, `workspace`, `history-index`, `recipes`, `usage`, `git-info`, `gh-info`, `runners`) is a dependency-injected factory with no Electron imports — tested directly with `node --test`. **421 tests**, plus a smoke mode (`npm run smoke`) that boots the real window without spawning processes or touching user data.
+- **Pure cores, injected edges.** Every data layer (`sessions`, `workspace`, `history-index`, `recipes`, `usage`, `git-info`, `gh-info`, `runners`, `night-watch`, `stt`) is a dependency-injected factory with no Electron imports — tested directly with `node --test`. **646 tests**, plus a smoke mode (`npm run smoke`) that boots the real window without spawning processes or touching user data.
 - **Failure is a state, not an exception.** Missing `gh`, no git repo, expired OAuth token, corrupted cache — every layer degrades to an honest empty state and recovers on its own.
 - **Process discipline.** Generation counters on every pty; helper process trees are cleaned up with a watchdog; killed sessions auto-respawn with their queue cleared.
 
@@ -51,7 +53,7 @@ npm start
 Add a project with **+ Проект**, then click **⚡** on the tab to write Cockpit's hooks into that project's `.claude/settings.json` — statuses go live from the next session. UI language is currently Russian.
 
 ```bash
-npm test           # 421 unit tests (node --test)
+npm test           # 646 unit tests (node --test)
 npm run smoke      # boot check: window + pty + zero renderer errors
 ```
 
