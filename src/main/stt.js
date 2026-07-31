@@ -284,6 +284,29 @@ function createStt({
     const port = Number(cfg.serverPort) || DEFAULT_PORT;
 
     const self = (async () => {
+      // Ре-ревью раунда 1 (хвост B2): весь цикл — под catch-обёрткой.
+      // Синхронный бросок из пролога итерации (spawnProc вернул null →
+      // child.on кинул TypeError; registerProcess упал) происходил ДО
+      // строки-фикса B2 — readyPromise оставался навсегда реджектнутым,
+      // тот самый паралич модуля, ради которого B2 был Critical.
+      //
+      // `await undefined` первым делом — НЕ косметика: он откладывает всё
+      // тело (включая синхронные броски пролога) в микрозадачу, которая
+      // выполняется ПОСЛЕ `readyPromise = self` ниже и после завершения
+      // инициализации const self. Без него catch при синхронном броске
+      // работал бы во время инициализации self (TDZ → ReferenceError), а
+      // `readyPromise = self` после конструирования всё равно установил бы
+      // уже реджектнутый промис.
+      await undefined;
+      try {
+        return await ensureLoop();
+      } catch (err) {
+        if (readyPromise === self) readyPromise = null;
+        throw err;
+      }
+    })();
+
+    async function ensureLoop() {
       let lastErr = null;
       for (let i = 0; i < resolved.backs.length; i++) {
         const backend = resolved.backs[i];
@@ -340,20 +363,17 @@ function createStt({
           readyPromise = self; // восстанавливаем in-flight промис для следующей итерации/параллельных вызовов
         }
       }
-      // B2 (ревью раунд 1, Critical): ПЕРЕД финальным throw обязаны обнулить
-      // readyPromise, если он всё ещё указывает на self — иначе он навсегда
-      // остаётся УЖЕ РЕДЖЕКТНУТЫМ промисом (readyPromise, будучи truthy,
-      // короткозамыкает верхнюю проверку `if (readyPromise) return
-      // readyPromise;` у ЛЮБОГО следующего ensureServer()), и модуль
-      // отравлен до перезапуска кокпита одним моргнувшим драйвером при
-      // прогреве. У Companion это было замаскировано приватностью модуля:
-      // startServer() дергался только из transcribeWavImpl, который сам,
-      // поймав ошибку, звал killProc() СНАРУЖИ — здесь же readyPromise
-      // публично «залипает» между вызовами ensureServer(), поэтому чинить
-      // нужно ВНУТРИ, а не полагаться на вызывающий код.
-      if (readyPromise === self) readyPromise = null;
+      // B2 (ревью раунд 1, Critical): очистка readyPromise при провале
+      // ВСЕГО перебора — теперь живёт в catch-обёртке self выше (хвост
+      // ре-ревью: синхронные броски из пролога итерации тоже должны её
+      // проходить). Иначе readyPromise навсегда остаётся УЖЕ РЕДЖЕКТНУТЫМ
+      // промисом (truthy → короткое замыкание `if (readyPromise) return
+      // readyPromise;`), и модуль отравлен до перезапуска кокпита одним
+      // моргнувшим драйвером при прогреве. У Companion это было
+      // замаскировано приватностью модуля — здесь ensureServer() публичен,
+      // чиним внутри, не полагаясь на вызывающий код.
       throw lastErr || new Error('whisper-server: не удалось запустить ни один бекенд');
-    })();
+    }
 
     readyPromise = self;
     return readyPromise;

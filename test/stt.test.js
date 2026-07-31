@@ -423,9 +423,12 @@ test('параллельные ensureServer(): два синхронных вы�
 
   const p1 = stt.ensureServer();
   const p2 = stt.ensureServer();
-  assert.strictEqual(spawnProc.calls.length, 1, 'второй синхронный вызов не должен был запустить свой spawnProc');
+  // Хвост B2 сдвинул спавн из синхронной фазы в микрозадачу (await undefined
+  // первым делом IIFE) — важное свойство теста не «КОГДА спавн», а «ОДИН
+  // спавн на обоих ожидающих»: оба вызова делят один перебор.
+  assert.strictEqual(p1, p2, 'оба синхронных вызова обязаны делить один in-flight промис');
   await Promise.all([p1, p2]);
-  assert.strictEqual(spawnProc.calls.length, 1);
+  assert.strictEqual(spawnProc.calls.length, 1, 'один спавн на оба вызова');
 });
 
 // ================================================================= multipart =====
@@ -962,4 +965,40 @@ test('status(): available=true до первого ensureServer(), warm=false и
   const { stt } = setup({ fs, config: baseConfig({ stackRoots: [root] }) });
 
   assert.deepStrictEqual(stt.status(), { available: true, backend: null, warm: false });
+});
+
+// Хвост B2 (ре-ревью раунда 1): СИНХРОННЫЙ бросок из пролога итерации
+// (registerProcess упал / spawnProc вернул null и child.on кинул TypeError)
+// раньше ронял IIFE до строки-фикса B2 — readyPromise навсегда оставался
+// реджектнутым тем же способом, что и в исходном B2. Фикс: await undefined
+// первым делом (тело — микрозадача после readyPromise=self) + catch-обёртка.
+test('B2-хвост: синхронный бросок registerProcess не отравляет модуль — после «починки» реестра спавн проходит', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([serverExePath(root, 'whisper'), modelPathFor(root, MODEL)]);
+  const httpGet = () => Promise.resolve({ status: 200 });
+  const timers = fakeTimers();
+  const clock = makeClock(0);
+  let failOnce = true;
+  const registered = [];
+  const registerProcess = (child) => {
+    if (failOnce) { failOnce = false; throw new Error('реестр упал'); }
+    registered.push(child);
+  };
+  const { stt, spawnProc } = setup({
+    fs, httpGet, timers, clock, registerProcess,
+    config: baseConfig({ stackRoots: [root] }),
+  });
+
+  const p1 = stt.ensureServer();
+  await driveUntilSettled(p1, timers, clock);
+  await assert.rejects(p1, /реестр упал/);
+
+  // Второй вызов обязан сделать НОВУЮ попытку (реестр «починился») и дойти
+  // до готовности — а не мгновенно вернуть старую ошибку.
+  const p2 = stt.ensureServer();
+  assert.notStrictEqual(p1, p2);
+  await driveUntilSettled(p2, timers, clock);
+  await p2; // резолвится — сервер поднят
+  assert.strictEqual(registered.length, 1, 'второй спавн зарегистрирован в реестре');
+  assert.ok(serverSpawns(spawnProc).length >= 2, 'вторая попытка сделала новый спавн');
 });
