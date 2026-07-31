@@ -779,10 +779,35 @@ function nightGetHandler({ smoke, nightWatch: nw }) {
 // слушает по контракту, обработка целиком здесь. Молчаливое поглощение (лог
 // и всё) — так и задумано: провал старта проявится ядру как таймаут
 // готовности (READY_TIMEOUT_MS), это штатный путь перебора бекендов CUDA→CPU.
+// Кольцевой буфер последних строк вывода whisper-server (боевой инцидент
+// живой приёмки фазы 9 + бэклог Minor-6 Task 2): со stdio:'ignore' сервер
+// умирал молча, и «read ECONNRESET» было единственной уликой. Пайпим оба
+// потока и ДРЕНИРУЕМ построчно в кольцо (контракт ядра требует именно «не
+// оставлять непрочитанных пайпов» — дренаж явно разрешён наравне с ignore).
+// Хвост кольца печатается в консоль при провале распознавания.
+const STT_LOG_RING_MAX = 40;
+const sttServerLog = [];
+function pushSttServerLine(line) {
+  const t = String(line).trimEnd();
+  if (!t) return;
+  sttServerLog.push(t);
+  if (sttServerLog.length > STT_LOG_RING_MAX) sttServerLog.splice(0, sttServerLog.length - STT_LOG_RING_MAX);
+}
+function sttServerLogTail(n = 15) {
+  return sttServerLog.slice(-n);
+}
+
 function sttSpawnProc(exe, args) {
+  const isServer = /whisper-server\.exe$/i.test(exe);
   let child;
   try {
-    child = spawn(exe, args, { stdio: 'ignore', windowsHide: true });
+    // Для whisper-server — пайпы под кольцо диагностики; для taskkill и
+    // прочей мелочи — ignore, как раньше (их вывод не нужен, а пайпы там
+    // никто не дренировал бы).
+    child = spawn(exe, args, {
+      stdio: isServer ? ['ignore', 'pipe', 'pipe'] : 'ignore',
+      windowsHide: true,
+    });
   } catch (err) {
     // Синхронный бросок — на практике недостижимо для фиксированных путей и
     // литеральных args этого модуля (ENOENT у spawn всегда асинхронный), но
@@ -804,6 +829,27 @@ function sttSpawnProc(exe, args) {
   child.on('error', (err) => {
     console.warn(`[stt] spawn ${exe} упал: ${err.message}`);
   });
+  if (isServer) {
+    // Дренаж обоих потоков в кольцо: построчно, с добивкой хвоста без \n.
+    const wire = (stream) => {
+      if (!stream) return;
+      let acc = '';
+      stream.setEncoding('utf8');
+      stream.on('data', (chunk) => {
+        acc += chunk;
+        const lines = acc.split(/\r?\n/);
+        acc = lines.pop();
+        for (const line of lines) pushSttServerLine(line);
+      });
+      stream.on('end', () => pushSttServerLine(acc));
+      stream.on('error', () => {});
+    };
+    wire(child.stdout);
+    wire(child.stderr);
+    child.on('exit', (code, signal) => {
+      pushSttServerLine(`[exit] code=${code} signal=${signal}`);
+    });
+  }
   return child;
 }
 
@@ -930,6 +976,12 @@ async function sttTranscribeHandler({ smoke, wav, getStt }) {
     const text = await getStt().transcribeWav(buf);
     return { text };
   } catch (err) {
+    // Боевой инцидент фазы 9: до кольцевого буфера сервер умирал молча —
+    // печатаем его последние строки, диагноз виден прямо в консоли запуска.
+    const tail = sttServerLogTail();
+    if (tail.length) {
+      console.warn(`[stt] распознавание упало; последние строки whisper-server:\n  ${tail.join('\n  ')}`);
+    }
     return { error: err && err.message ? err.message : String(err) };
   }
 }

@@ -108,6 +108,17 @@ function createStt({
   let serverPort = 0; // порт текущего сервера
   let readyPromise = null; // ожидание готовности сервера (in-flight или уже готовый)
   let activeBackendDir = null; // 'whisper-cuda' | 'whisper' | null — на чём поднят/поднимается текущий сервер
+  // Живая приёмка фазы 9 (боевой инцидент): CUDA-сервер может успешно
+  // ЗАГРУЗИТЬ модель («готов») и умереть на ПЕРВОМ инференсе — рабочие
+  // буферы (~360МБ VRAM) не влезли, потому что видеокарту в этот момент
+  // держит игра/браузер. Старый перебор бекендов срабатывал только при
+  // провале СТАРТА — ретрай инференса крутил один и тот же падающий CUDA
+  // по кругу (слепая зона, унаследованная от Companion). preferredBackendIdx
+  // — «с какого бекенда начинать следующий перебор»: успешный старт
+  // закрепляет свой индекс, смерть НА ИНФЕРЕНСЕ сдвигает на следующий
+  // (CUDA умер → дальше пробуем CPU; CPU последний — остаёмся на нём).
+  let preferredBackendIdx = 0;
+  let lastBacksCount = 0; // сколько бекендов видел последний resolveRoot — потолок для сдвига
   let warm = false; // сервер прошёл ready-поллинг и (предположительно) ещё жив
   let pollTimerId = null; // текущий таймер poll-цикла waitReady — снимается в dispose()
   let pendingReject = null; // reject ТЕКУЩЕГО waitReady (если есть) — Important-1(C): dispose() будит его напрямую
@@ -217,7 +228,9 @@ function createStt({
   // disposed проверяется В КАЖДОЙ continuation ПЕРЕД планированием нового
   // таймера (зонд B — иначе уже запущенный, но ещё не отработавший httpGet
   // планирует таймер УЖЕ ПОСЛЕ dispose(), и поллинг переживает teardown).
-  function waitReady(port, deadline) {
+  // stillAlive (необязателен) — «наш ли ребёнок всё ещё жив»: ensureLoop
+  // передаёт `() => proc === child`, см. боевой инцидент в комментариях attempt().
+  function waitReady(port, deadline, stillAlive) {
     return new Promise((resolve, reject) => {
       pendingReject = reject;
       function attempt() {
@@ -225,6 +238,16 @@ function createStt({
           () => {
             if (pendingReject === reject) pendingReject = null;
             pollTimerId = null;
+            // Боевой инцидент фазы 9: пинг ответил, но НАШ ребёнок уже умер
+            // (мгновенный краш/порт занят) — значит, на порту сидит ЧУЖОЙ
+            // процесс (осиротевший сервер прошлого запуска, другое
+            // приложение). Считать его «готовым» нельзя: его /inference
+            // сбросит соединение, и цикл «готов → reset → перезапуск»
+            // крутился бы вечно. Честный отказ этой попытки.
+            if (typeof stillAlive === 'function' && !stillAlive()) {
+              reject(new Error('whisper-server умер при старте (порт занят чужим процессом или мгновенный краш)'));
+              return;
+            }
             resolve();
           },
           () => {
@@ -232,6 +255,13 @@ function createStt({
             if (disposed) {
               pollTimerId = null;
               reject(new Error('stt: dispose() во время ready-поллинга'));
+              return;
+            }
+            // Тот же боевой инцидент: ребёнок умер, пока мы поллим, — нет
+            // смысла ждать дедлайн 20с, порт больше некому открыть.
+            if (typeof stillAlive === 'function' && !stillAlive()) {
+              pollTimerId = null;
+              reject(new Error('whisper-server умер при старте (мгновенный выход — краш или порт занят)'));
               return;
             }
             if (now() > deadline) {
@@ -308,7 +338,11 @@ function createStt({
 
     async function ensureLoop() {
       let lastErr = null;
-      for (let i = 0; i < resolved.backs.length; i++) {
+      lastBacksCount = resolved.backs.length;
+      // Перебор стартует с preferredBackendIdx (см. объявление): после смерти
+      // CUDA на инференсе следующая попытка не тратит время на него снова.
+      const startIdx = Math.min(preferredBackendIdx, resolved.backs.length - 1);
+      for (let i = startIdx; i < resolved.backs.length; i++) {
         const backend = resolved.backs[i];
         const args = [
           '-m', resolved.modelPath,
@@ -351,8 +385,9 @@ function createStt({
 
         const deadline = now() + READY_TIMEOUT_MS;
         try {
-          await waitReady(port, deadline);
+          await waitReady(port, deadline, () => proc === child);
           warm = true;
+          preferredBackendIdx = i; // успешный старт закрепляет бекенд для следующих переборов
           log(`[stt] whisper-server готов: бекенд ${backend.dir}${backend.cuda ? ' (CUDA)' : ' (CPU)'}, порт ${port}`);
           return;
         } catch (err) {
@@ -442,7 +477,18 @@ function createStt({
       await ensureServer();
       return await postInference(buffer);
     } catch (err) {
-      log(`[stt] сервер недоступен (${err.message}), перезапуск`);
+      // Боевой инцидент фазы 9: если сервер УМЕР на инференсе (proc уже
+      // обнулён exit-хендлером — рабочие буферы CUDA не влезли в занятую
+      // VRAM), ретрай на том же бекенде бессмыслен — он умрёт так же.
+      // Сдвигаем предпочтение на следующий бекенд (CUDA → CPU); CPU
+      // последний — остаёмся (обычный ретрай). Живой сервер с не-200/битым
+      // JSON — НЕ смерть, бекенд не виноват, предпочтение не трогаем.
+      if (proc === null && lastBacksCount > 0 && preferredBackendIdx < lastBacksCount - 1) {
+        preferredBackendIdx += 1;
+        log(`[stt] сервер умер на инференсе (${err.message}) — пробую следующий бекенд`);
+      } else {
+        log(`[stt] сервер недоступен (${err.message}), перезапуск`);
+      }
       killProc();
       try {
         await ensureServer();
