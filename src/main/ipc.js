@@ -837,9 +837,18 @@ function sttSpawnProc(exe, args) {
       stream.setEncoding('utf8');
       stream.on('data', (chunk) => {
         acc += chunk;
-        const lines = acc.split(/\r?\n/);
+        // Одиночный \r тоже разделитель (Minor-2 ревью инцидент-фикса):
+        // прогресс-строки whisper идут через \r без \n — без этого acc
+        // копил мегабайты, а кольцо оставалось пустым.
+        const lines = acc.split(/\r\n|\n|\r/);
         acc = lines.pop();
         for (const line of lines) pushSttServerLine(line);
+        // Потолок на недобитую строку: поток вообще без разделителей не
+        // должен раздувать память — сбрасываем как строку.
+        if (acc.length > 8192) {
+          pushSttServerLine(acc);
+          acc = '';
+        }
       });
       stream.on('end', () => pushSttServerLine(acc));
       stream.on('error', () => {});

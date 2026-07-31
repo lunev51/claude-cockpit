@@ -1022,8 +1022,12 @@ test('инцидент: сервер умер на инференсе → рет
   const httpPost = () => {
     postN += 1;
     if (postN === 1) {
-      // Смерть сервера ровно во время инференса: exit → затем reset.
-      children[0].emit('exit');
+      // ПРОДОВЫЙ порядок (Critical-1 ревью инцидент-фикса): reject сокета —
+      // микрозадача, приходит ПЕРВЫМ; событие exit на Windows едет через
+      // threadpool и опаздывает ВСЕГДА (20/20 замеров зонда). Эмитим exit
+      // поздним setImmediate — сдвиг обязан сработать по транспортной
+      // метке err.sttTransport, а не по гонке proc===null.
+      setImmediate(() => children[0].emit('exit'));
       return Promise.reject(new Error('read ECONNRESET'));
     }
     return Promise.resolve({ status: 200, body: Buffer.from('{"text":"привет"}', 'utf8') });
@@ -1054,7 +1058,7 @@ test('инцидент: после смерти CUDA следующий transcri
   const httpPost = () => {
     postN += 1;
     if (postN === 1) {
-      children[0].emit('exit');
+      setImmediate(() => children[0].emit('exit')); // продовый порядок: reject первым (Critical-1)
       return Promise.reject(new Error('read ECONNRESET'));
     }
     return Promise.resolve({ status: 200, body: Buffer.from('{"text":"ok"}', 'utf8') });
@@ -1065,7 +1069,12 @@ test('инцидент: после смерти CUDA следующий transcri
 
   await stt.transcribeWav(Buffer.from('wav1'));
   // Убьём CPU-сервер штатно (exit), чтобы следующий вызов спавнил заново.
-  children[1].emit('exit');
+  // ВАЖНО: адресуемся через serverSpawns().child, НЕ через children[индекс] —
+  // killProc (теперь реально выполняющийся: с продовым порядком exit
+  // опаздывает, proc жив в catch) спавнит taskkill, который СЪЕДАЕТ
+  // очередного ребёнка из массива fakeSpawn, и children[1] оказался бы
+  // taskkill-ребёнком, а не CPU-сервером.
+  serverSpawns(spawnProc)[1].child.emit('exit');
   await stt.transcribeWav(Buffer.from('wav2'));
   const spawns = serverSpawns(spawnProc);
   assert.strictEqual(spawns.length, 3);
@@ -1108,7 +1117,7 @@ test('инцидент: CPU (последний бекенд) умер на ин
   const httpPost = () => {
     postN += 1;
     if (postN === 1) {
-      children[0].emit('exit');
+      setImmediate(() => children[0].emit('exit')); // продовый порядок: reject первым (Critical-1)
       return Promise.reject(new Error('read ECONNRESET'));
     }
     return Promise.resolve({ status: 200, body: Buffer.from('{"text":"ok"}', 'utf8') });
@@ -1159,4 +1168,80 @@ test('инцидент: порт занят чужим (ready отвечает, 
     logs.some((l) => /умер при старте/.test(l)),
     'лог обязан назвать причину («умер при старте»), а не рапортовать готовность чужака',
   );
+});
+
+test('Important-1: провал СТАРТА всех бекендов — НЕ демоция; следующий вызов снова начинает с CUDA', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([
+    serverExePath(root, 'whisper-cuda'),
+    serverExePath(root, 'whisper'),
+    modelPathFor(root, MODEL),
+  ]);
+  const timers = fakeTimers();
+  const clock = makeClock(0);
+  let phase = 'down'; // 'down' → ни один бекенд не отвечает; 'up' → всё работает
+  const httpGet = () => (phase === 'down'
+    ? Promise.reject(new Error('econnrefused'))
+    : Promise.resolve({ status: 200 }));
+  const httpPost = () => Promise.resolve({ status: 200, body: Buffer.from('{"text":"ok"}', 'utf8') });
+  const spawnProc = fakeSpawn([]);
+  const logs = [];
+  const { stt } = setup({
+    fs, httpGet, httpPost, spawnProc, timers, clock,
+    config: baseConfig({ stackRoots: [root] }),
+    log: (m) => logs.push(m),
+  });
+
+  const p1 = stt.transcribeWav(Buffer.from('wav'));
+  p1.catch(() => {}); // ожидаемый провал — гасим unhandled
+  // transcribeWav делает ДВА полных перебора бекендов (попытка + ретрай):
+  // 2 × 2 бекенда × ~67 тиков поллинга до дедлайна — дефолтных 200 шагов
+  // драйвера не хватает.
+  await driveUntilSettled(p1, timers, clock, { maxSteps: 600 });
+  await assert.rejects(p1);
+  assert.ok(!logs.some((l) => /умер на инференсе/.test(l)),
+    'провал старта не должен маскироваться под смерть на инференсе');
+
+  phase = 'up';
+  const spawnsBefore = serverSpawns(spawnProc).length;
+  await stt.transcribeWav(Buffer.from('wav2'));
+  const spawns = serverSpawns(spawnProc);
+  assert.strictEqual(spawns[spawnsBefore].exe, serverExePath(root, 'whisper-cuda'),
+    'после провала старта предпочтение НЕ сдвинуто — снова CUDA');
+});
+
+test('Minor-1: демоция не навсегда — холодный старт спустя интервал снова пробует CUDA', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([
+    serverExePath(root, 'whisper-cuda'),
+    serverExePath(root, 'whisper'),
+    modelPathFor(root, MODEL),
+  ]);
+  const clock = makeClock(0);
+  const httpGet = () => Promise.resolve({ status: 200 });
+  const children = [fakeChild(111), fakeChild(222), fakeChild(333)];
+  const spawnProc = fakeSpawn(children);
+  let postN = 0;
+  const httpPost = () => {
+    postN += 1;
+    if (postN === 1) {
+      setImmediate(() => children[0].emit('exit'));
+      return Promise.reject(new Error('read ECONNRESET'));
+    }
+    return Promise.resolve({ status: 200, body: Buffer.from('{"text":"ok"}', 'utf8') });
+  };
+  const { stt } = setup({
+    fs, httpGet, httpPost, spawnProc, clock, config: baseConfig({ stackRoots: [root] }),
+  });
+
+  await stt.transcribeWav(Buffer.from('wav1')); // CUDA умер → CPU
+  // Через serverSpawns().child — killProc-таскилл съедает детей из массива
+  // по порядку вызовов (см. комментарий в тесте «предпочтение закреплено»).
+  serverSpawns(spawnProc)[1].child.emit('exit'); // тёплый CPU умер сам — состояние холодное
+  clock.set(6 * 60000); // интервал ре-пробы вышел
+  await stt.transcribeWav(Buffer.from('wav2'));
+  const spawns = serverSpawns(spawnProc);
+  assert.strictEqual(spawns.length, 3);
+  assert.strictEqual(spawns[2].exe, serverExePath(root, 'whisper-cuda'),
+    'холодный старт после интервала обязан снова попробовать CUDA');
 });

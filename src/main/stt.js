@@ -58,6 +58,10 @@ const DEFAULT_PORT = 48753; // кокпит; Companion живёт на 48752 —
 const READY_TIMEOUT_MS = 20000; // large-модель грузится дольше small — запас на весь размер
 const POLL_INTERVAL_MS = 300;
 const INFER_TIMEOUT_MS = 60000;
+// Minor-1 ревью инцидент-фикса: демоция бекенда (CUDA умер на инференсе —
+// VRAM была занята) не навсегда: причина транзиентна (игру закрыли — память
+// свободна). Холодный старт спустя этот интервал пробует CUDA снова.
+const BACKEND_RETRY_AFTER_MS = 5 * 60000;
 const PING_TIMEOUT_MS = 1000; // таймаут ОДНОГО GET / внутри поллинга готовности, не деталь READY_TIMEOUT_MS
 
 // === Контракты инжектируемых эффектов (Important-3, ревью раунд 1) ===
@@ -119,6 +123,7 @@ function createStt({
   // (CUDA умер → дальше пробуем CPU; CPU последний — остаёмся на нём).
   let preferredBackendIdx = 0;
   let lastBacksCount = 0; // сколько бекендов видел последний resolveRoot — потолок для сдвига
+  let demotedAt = null; // now() последней демоции, null = не было — 0 НЕ сигнальное значение (фейковые часы тестов стартуют с 0)
   let warm = false; // сервер прошёл ready-поллинг и (предположительно) ещё жив
   let pollTimerId = null; // текущий таймер poll-цикла waitReady — снимается в dispose()
   let pendingReject = null; // reject ТЕКУЩЕГО waitReady (если есть) — Important-1(C): dispose() будит его напрямую
@@ -311,6 +316,18 @@ function createStt({
       return Promise.reject(new Error(`Голосовой стек не найден. Проверено: ${detail}`));
     }
 
+    // Ре-проба демотированного бекенда (Minor-1 ревью инцидент-фикса):
+    // только на ХОЛОДНОМ старте (сюда не попасть, пока жив сервер или идёт
+    // подъём — readyPromise вернулся бы выше) и только спустя
+    // BACKEND_RETRY_AFTER_MS. Внутри-диктовочный ретрай приходит через
+    // секунды после демоции — интервал его отсекает, откат предпочтения
+    // ему не грозит.
+    if (preferredBackendIdx > 0 && demotedAt !== null && now() - demotedAt >= BACKEND_RETRY_AFTER_MS) {
+      preferredBackendIdx = 0;
+      demotedAt = null;
+      log('[stt] интервал после отказа бекенда вышел — пробуем CUDA снова');
+    }
+
     const port = Number(cfg.serverPort) || DEFAULT_PORT;
 
     const self = (async () => {
@@ -452,7 +469,19 @@ function createStt({
       'Content-Type': `multipart/form-data; boundary=${boundary}`,
       'Content-Length': String(body.length),
     };
-    const res = await httpPost(serverPort, '/inference', headers, body, INFER_TIMEOUT_MS);
+    let res;
+    try {
+      res = await httpPost(serverPort, '/inference', headers, body, INFER_TIMEOUT_MS);
+    } catch (err) {
+      // Ревью инцидент-фикса, Critical-1: транспортный провал (сокет
+      // сброшен/таймаут = сервер НЕ ОТВЕТИЛ ВООБЩЕ) метится явно. Полагаться
+      // на `proc === null` в вызывающем catch нельзя: reject сокета —
+      // микрозадача, а событие exit ребёнка на Windows едет через
+      // threadpool-хоп и приходит ПОЗЖЕ всегда (20/20 замеров зонда) —
+      // критерий «сервер умер» по одному proc не срабатывал бы никогда.
+      if (err && typeof err === 'object') err.sttTransport = true;
+      throw err;
+    }
     if (!res || res.status !== 200) {
       const text = bodyToText(res && res.body).slice(0, 200);
       throw new Error(`whisper-server HTTP ${res && res.status}: ${text}`);
@@ -473,18 +502,27 @@ function createStt({
   // шапку файла). Вызывать НАПРЯМУЮ нельзя — только через transcribeWav()
   // ниже (сериализация, B1).
   async function transcribeWavImpl(buffer) {
+    // Ревью инцидент-фикса, Important-1: различаем «упал СТАРТ» (started
+    // false — ensureServer реджектнул, бекенды перебраны там, демотировать
+    // нечего и не за что) и «умер НА ИНФЕРЕНСЕ» (started true + транспортный
+    // провал POST — сервер поднялся, но не пережил работу: VRAM занята,
+    // зависший инференс). Только второе — вина бекенда.
+    let started = false;
     try {
       await ensureServer();
+      started = true;
       return await postInference(buffer);
     } catch (err) {
-      // Боевой инцидент фазы 9: если сервер УМЕР на инференсе (proc уже
-      // обнулён exit-хендлером — рабочие буферы CUDA не влезли в занятую
-      // VRAM), ретрай на том же бекенде бессмыслен — он умрёт так же.
-      // Сдвигаем предпочтение на следующий бекенд (CUDA → CPU); CPU
-      // последний — остаёмся (обычный ретрай). Живой сервер с не-200/битым
-      // JSON — НЕ смерть, бекенд не виноват, предпочтение не трогаем.
-      if (proc === null && lastBacksCount > 0 && preferredBackendIdx < lastBacksCount - 1) {
+      // Боевой инцидент фазы 9: сервер умер на инференсе (рабочие буферы
+      // CUDA не влезли в занятую VRAM) — ретрай на том же бекенде
+      // бессмыслен, он умрёт так же. Критерий — транспортная метка POST
+      // (сокет сброшен/таймаут; см. Critical-1 у postInference) ЛИБО уже
+      // обнулённый proc (exit всё-таки успел). Живой сервер с не-200/битым
+      // JSON — НЕ смерть, бекенд не виноват. CPU последний — остаёмся.
+      const diedOnInference = started && (proc === null || (err && err.sttTransport === true));
+      if (diedOnInference && lastBacksCount > 0 && preferredBackendIdx < lastBacksCount - 1) {
         preferredBackendIdx += 1;
+        demotedAt = now();
         log(`[stt] сервер умер на инференсе (${err.message}) — пробую следующий бекенд`);
       } else {
         log(`[stt] сервер недоступен (${err.message}), перезапуск`);
