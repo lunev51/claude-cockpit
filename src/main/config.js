@@ -44,6 +44,21 @@ const DEFAULTS = {
     retryMs: 300000,
     maxRetries: 3,
   },
+  // Task 2 фазы 9 (голосовой ввод): дефолты для createStt (stt.js, Task 1,
+  // спека docs/superpowers/specs/2026-07-29-voice-input-design.md). БЕЗ
+  // stackRoots — DEFAULTS этого файла статичны (никакого require('electron')
+  // на этапе объявления объекта), а корень appRoot() резолвится только в
+  // рантайме Electron; дефолт stackRoots подставляется в момент создания
+  // инстанса в ipc.js (getOrCreateStt()) — минимально инвазивный способ,
+  // тот же приём, что terminal.cwd ниже (app.getPath('home') после merge).
+  stt: {
+    model: 'large-v3-turbo-q5_0',
+    language: 'ru',
+    threads: 6,
+    serverPort: 48753,
+    holdKey: 'ShiftRight',
+    minHoldMs: 300,
+  },
 };
 
 let cached = null;

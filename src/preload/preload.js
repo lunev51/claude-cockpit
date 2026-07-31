@@ -148,4 +148,13 @@ contextBridge.exposeInMainWorld('api', {
     // (см. usageMonitorTimer в main/ipc.js) — payload той же формы {limits, spend}.
     onUpdate: (cb) => ipcRenderer.on('usage:update', (_e, p) => cb(p)),
   },
+  stt: {
+    // Task 2 фазы 9 (голосовой ввод, push-to-talk): transcribe(wav) — wav
+    // ArrayBuffer/Uint8Array (recorder.js, Task 3) → main конвертирует в
+    // Buffer и зовёт stt.transcribeWav() (stt.js, Task 1) → {text} или
+    // {error: string} (НЕ reject — renderer сам показывает тост по полю error).
+    transcribe: (wav) => ipcRenderer.invoke('stt:transcribe', wav),
+    // status() → {available, backend, warm} — snapshot ядра, без прогрева.
+    status: () => ipcRenderer.invoke('stt:status'),
+  },
 });

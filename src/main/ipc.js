@@ -5,8 +5,10 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const https = require('https');
+const http = require('http');
 const readline = require('readline');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
+const { EventEmitter } = require('events');
 const {
   ipcMain, shell, dialog, app, clipboard, powerSaveBlocker,
 } = require('electron');
@@ -31,6 +33,7 @@ const { createHistoryIndex } = require('./history-index');
 const {
   createRecipeStore, extractPlaceholders, fillPrompt, normalizeForPty,
 } = require('./recipes');
+const { createStt } = require('./stt');
 
 let manager = null;
 let smokeOutput = '';
@@ -74,6 +77,11 @@ let nightWatch = null;   // Task 2 фазы 8 («Ночная смена»): и�
 // см. обработчик 'tab:status' в onEvent ниже, где prev читается ИЗ карты
 // СТРОГО ДО set(). Запись чистится на tabs:close (вкладки больше нет).
 let lastStatusByTab = new Map();
+// Task 2 фазы 9 (голосовой ввод): ленивый инстанс createStt (stt.js, Task 1)
+// — создаётся ТОЛЬКО при первом реальном обращении к stt:transcribe/status
+// (getOrCreateStt() ниже), НЕ при registerIpc: нечего резолвить корни стека
+// (~1.6ГБ модели), если голосом за сессию кокпита ни разу не воспользовались.
+let stt = null;
 
 function getSmokeOutput() {
   return smokeOutput;
@@ -745,6 +753,180 @@ function nightGetHandler({ smoke, nightWatch: nw }) {
   return nw.snapshot();
 }
 
+// --- Task 2 фазы 9 (голосовой ввод): реальные зависимости для createStt
+// (stt.js, Task 1, чистое ядро — spawnProc/httpGet/httpPost/registerProcess
+// только инжектируются, сам модуль ни child_process, ни http не видит).
+// Контракты каждой зависимости — блок в шапке createStt (src/main/stt.js,
+// «=== Контракты инжектируемых эффектов ===») — реализации ниже сверены с
+// ними построчно (явное наблюдение ревьюера Task 1, леджер фазы).
+
+// spawnProc(exe, args) → child-подобный объект, НЕ бросает наружу (ни
+// синхронно, ни необработанным асинхронным 'error'). stdio:'ignore' —
+// ОБЯЗАТЕЛЬНО контрактом ядра: непрочитанный пайп (дефолтный stdio:'pipe')
+// переполняется через сотни запросов (буфер ~64КБ) и вешает whisper-server
+// посреди инференса — нам нечего читать из stdout/stderr сервера, поэтому
+// просто игнорируем оба потока целиком. windowsHide — не мелькать консольным
+// окном. Провал старта (ENOENT — нет такого бинарника, бекенд не собран)
+// приходит АСИНХРОННО как событие 'error' — без подписки это необработанное
+// исключение уронило бы весь main-процесс; ядро (stt.js) само 'error' не
+// слушает по контракту, обработка целиком здесь. Молчаливое поглощение (лог
+// и всё) — так и задумано: провал старта проявится ядру как таймаут
+// готовности (READY_TIMEOUT_MS), это штатный путь перебора бекендов CUDA→CPU.
+function sttSpawnProc(exe, args) {
+  let child;
+  try {
+    child = spawn(exe, args, { stdio: 'ignore', windowsHide: true });
+  } catch (err) {
+    // Синхронный бросок — на практике недостижимо для фиксированных путей и
+    // литеральных args этого модуля (ENOENT у spawn всегда асинхронный), но
+    // контракт ядра требует «НЕ бросает наружу» безусловно — заворачиваем в
+    // EventEmitter-заглушку без pid; ядро увидит её же 'error' на следующем
+    // тике, поведение то же самое, что и обычный асинхронный ENOENT ниже.
+    const stub = new EventEmitter();
+    stub.pid = undefined;
+    stub.kill = () => {};
+    setImmediate(() => stub.emit('error', err));
+    return stub;
+  }
+  child.on('error', (err) => {
+    console.warn(`[stt] spawn ${exe} упал: ${err.message}`);
+  });
+  return child;
+}
+
+// httpGet(port, path, timeoutMs) → Promise<{status}> — РЕЗОЛВ на ЛЮБОЙ
+// завершённый HTTP-ответ (даже 404/500 — whisper-server на некоторых сборках
+// отвечает не-200 на голый GET /, критерий готовности «порт слушает», а не
+// «ответил 200»), REJECT ТОЛЬКО на сетевой сбой/таймаут (Important-3, ревью
+// Task 1 — расхождение здесь молча ломает ready-поллинг на части сборок).
+// Тело ответа не нужно — res.resume() сливает поток, чтобы сокет освободился
+// сразу, а не висел до собственного таймаута незаконченного потока.
+function sttHttpGet(port, urlPath, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const req = http.get({
+      host: '127.0.0.1', port, path: urlPath, timeout: timeoutMs,
+    }, (res) => {
+      res.resume();
+      resolve({ status: res.statusCode });
+    });
+    req.on('timeout', () => {
+      req.destroy(new Error(`stt httpGet: таймаут ${timeoutMs}мс`));
+    });
+    req.on('error', reject);
+  });
+}
+
+// httpPost(port, path, headers, bodyBuffer, timeoutMs) → Promise<{status,
+// body:Buffer}> — тот же принцип: резолв на ЛЮБОЙ код (код разбирает
+// postInference() внутри stt.js), reject только сеть/таймаут.
+function sttHttpPost(port, urlPath, headers, bodyBuffer, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: '127.0.0.1', port, path: urlPath, method: 'POST', headers, timeout: timeoutMs,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks) }));
+      res.on('error', reject);
+    });
+    req.on('timeout', () => {
+      req.destroy(new Error(`stt httpPost: таймаут ${timeoutMs}мс`));
+    });
+    req.on('error', reject);
+    req.write(bodyBuffer);
+    req.end();
+  });
+}
+
+// Ленивый геттер инстанса createStt — создаётся при ПЕРВОМ реальном обращении
+// к stt:transcribe/status (через sttTranscribeHandler/sttStatusHandler ниже),
+// НЕ при registerIpc: нечего резолвить корни стека (~1.6ГБ модели), если
+// голосом за сессию кокпита ни разу не воспользовались.
+function getOrCreateStt() {
+  if (stt) return stt;
+  // `|| {}` — урок nightWatch:null (см. nightCfg в registerIpc ниже по
+  // файлу): пользовательский `"stt": null` в config.json пережил бы
+  // deepMerge как null и уронил бы это место TypeError'ом на первом же
+  // нажатии Shift.
+  const sttCfg = getConfig().stt || {};
+  const config = {
+    ...sttCfg,
+    // Единственное вычисляемое поле дефолта stt (бриф/спека): DEFAULTS в
+    // config.js статичны, appRoot() резолвится только в рантайме Electron —
+    // подставляем ЗДЕСЬ, в момент создания инстанса, минимально инвазивно
+    // (не трогая config.js/getConfig() целиком). Пользовательский
+    // stackRoots (непустой массив в config.json/оверлее) — не перекрываем.
+    stackRoots: Array.isArray(sttCfg.stackRoots) && sttCfg.stackRoots.length
+      ? sttCfg.stackRoots
+      : [appRoot(), 'C:\\Users\\Lunev\\AssistClaude\\claude-companion'],
+  };
+  stt = createStt({
+    spawnProc: sttSpawnProc,
+    httpGet: sttHttpGet,
+    httpPost: sttHttpPost,
+    fs,
+    now: Date.now,
+    // unref — тот же приём, что у nightWatch/usageMonitorTimer выше: таймеры
+    // ready-поллинга не должны сами по себе держать процесс живым.
+    setTimer: (fn, ms) => {
+      const id = setTimeout(fn, ms);
+      if (id.unref) id.unref();
+      return id;
+    },
+    clearTimer: (id) => clearTimeout(id),
+    // Реестр процессов runners.js (Task 5 carryover фазы 6) — тот же, что для
+    // npx/git/gh: trackChild() вешает СВОЙ once('exit') для уборки
+    // liveChildren (killProcessTree/killAllTracked на выходе кокпита), ядро
+    // (stt.js/killProc, B3 ревью Task 1) снимает точечно только СВОЙ
+    // exit-хендлер и гарантированно переживает это (реестр — тот же самый,
+    // не отдельная копия).
+    registerProcess: (child) => runners.trackChild(child),
+    config,
+    log: (msg) => console.warn(msg),
+  });
+  return stt;
+}
+
+// stt:transcribe — ArrayBuffer/Uint8Array WAV → Buffer → stt.transcribeWav() →
+// {text} при успехе, {error: string} при ЛЮБОМ провале (невалидный формат
+// входа, отказ ядра — стек не найден/оба бекенда не поднялись/двойной провал
+// /inference) — НИКОГДА reject: renderer (Task 3) показывает тост по полю
+// error, а не оборачивает invoke() в try/catch. Смоук-гейт — ДО обращения к
+// getStt() вообще, тем же приёмом, что gitGetHandler/nightToggleHandler выше:
+// headless-прогон не должен резолвить корни стека/трогать fs ради голоса.
+// Экспортирована ради test/ipc-smoke-gate.test.js (паттерн gitGetHandler).
+async function sttTranscribeHandler({ smoke, wav, getStt }) {
+  if (smoke) return { error: 'smoke' };
+  let buf;
+  if (wav instanceof ArrayBuffer) {
+    buf = Buffer.from(wav);
+  } else if (ArrayBuffer.isView(wav)) {
+    // Uint8Array (Buffer — тоже Uint8Array) — байты как есть, без
+    // копирования лишнего диапазона (учитываем byteOffset/byteLength).
+    buf = Buffer.from(wav.buffer, wav.byteOffset, wav.byteLength);
+  } else {
+    return { error: 'stt: неверный формат WAV (ожидался ArrayBuffer/Uint8Array)' };
+  }
+  try {
+    const text = await getStt().transcribeWav(buf);
+    return { text };
+  } catch (err) {
+    return { error: err && err.message ? err.message : String(err) };
+  }
+}
+
+// stt:status — просто snapshot ядра {available, backend, warm}. НИКАКОГО
+// ensureServer()/прогрева отсюда намеренно не зовём (наблюдение ревьюера
+// Task 1, леджер фазы: pendingReject/pollTimerId — одиночные слоты в ядре;
+// отдельный прогревающий вызов мимо transcribeWav — риск, которого ни бриф,
+// ни спека не просят). Смоук-гейт отдаёт ту же форму ответа, что дал бы
+// реальный status() при отсутствующем стеке, но БЕЗ создания инстанса —
+// getStt() в smoke не зовётся вовсе.
+function sttStatusHandler({ smoke, getStt }) {
+  if (smoke) return { available: false, backend: null, warm: false };
+  return getStt().status();
+}
+
 function registerIpc(win, opts = {}) {
   const { smoke = false, attention = null, toaster = null } = opts;
 
@@ -795,6 +977,12 @@ function registerIpc(win, opts = {}) {
   lastCcusageResult = null;
   manualRefreshInFlight = null;
   lastManualRefreshAt = 0;
+  // Task 2 фазы 9 (голосовой ввод): stt остаётся null здесь (НЕ создаём
+  // createStt заранее — см. getOrCreateStt() выше), но сбрасываем ссылку на
+  // случай повторного registerIpc() в рамках одного процесса: без сброса
+  // getOrCreateStt() вернул бы уже disposed-инстанс прошлой регистрации
+  // (disposeSessions() зовёт stt.dispose() ниже, но не обнуляет переменную).
+  stt = null;
 
   // Task 4 фазы 7 (рецепты + именованные воркспейсы): recipeStore — чистое
   // ядро (recipes.js) + реальные пути в userData выше. Конструктор не делает
@@ -1496,6 +1684,14 @@ function registerIpc(win, opts = {}) {
     if (typeof tabId !== 'string') return;
     manager.clearQueue(tabId);
   });
+
+  // Task 2 фазы 9 (голосовой ввод): stt:transcribe/status — Task 3 (renderer,
+  // push-to-talk на правом Shift) дёргает их напрямую через preload. Инстанс
+  // ленивый (getOrCreateStt() выше, module scope) — здесь только проводка
+  // каналов, вся смоук-логика и создание инстанса — внутри самих хендлеров.
+  ipcMain.handle('stt:transcribe', (_e, wav) => sttTranscribeHandler({ smoke, wav, getStt: getOrCreateStt }));
+
+  ipcMain.handle('stt:status', () => sttStatusHandler({ smoke, getStt: getOrCreateStt }));
 }
 
 // Форсирует немедленную запись манифеста (debounce workspace.js иначе может
@@ -1544,6 +1740,12 @@ function disposeSessions() {
   // Идемпотентно (как и остальные вызовы этой функции) — disposeSessions()
   // зовётся несколько раз за один выход (window-all-closed, потом before-quit).
   if (nightWatch) nightWatch.dispose();
+  // Task 2 фазы 9 (голосовой ввод): dispose() убивает живой whisper-server
+  // (если был запущен) и снимает таймеры ready-поллинга — рядом с
+  // nightWatch.dispose() выше. Гард «если создавался» (см. getOrCreateStt()):
+  // если голосом за сессию ни разу не воспользовались, stt остаётся null, и
+  // дизпоузить нечего.
+  if (stt) stt.dispose();
   stopBridge();
   if (manager) manager.disposeAll();
   // Задача 5 фазы 6 (carryover): если приложение закрывается, пока
@@ -1574,4 +1776,7 @@ module.exports = {
   // без Electron, экспортированы ради собственных юнит-тестов (см. комментарии
   // у их определения выше).
   shouldDetectLimitStop, resumableTabStatus, isSnapshotFreshEnough, USAGE_SNAPSHOT_FRESH_MS,
+  // Task 2 фазы 9 (голосовой ввод): та же причина — см. комментарий у их
+  // определения выше (смоук-гейт тестируется напрямую, без Electron).
+  sttTranscribeHandler, sttStatusHandler,
 };
