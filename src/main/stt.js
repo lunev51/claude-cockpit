@@ -62,6 +62,9 @@ const INFER_TIMEOUT_MS = 60000;
 // VRAM была занята) не навсегда: причина транзиентна (игру закрыли — память
 // свободна). Холодный старт спустя этот интервал пробует CUDA снова.
 const BACKEND_RETRY_AFTER_MS = 5 * 60000;
+// Инцидент 8ГБ (01.08): простой, после которого тёплый whisper-server
+// глушится (возврат ~1ГБ ОЗУ); следующая диктовка прогревает заново (~2с).
+const STT_IDLE_STOP_MS = 10 * 60000;
 const PING_TIMEOUT_MS = 1000; // таймаут ОДНОГО GET / внутри поллинга готовности, не деталь READY_TIMEOUT_MS
 
 // === Контракты инжектируемых эффектов (Important-3, ревью раунд 1) ===
@@ -124,6 +127,7 @@ function createStt({
   let preferredBackendIdx = 0;
   let lastBacksCount = 0; // сколько бекендов видел последний resolveRoot — потолок для сдвига
   let demotedAt = null; // now() последней демоции, null = не было — 0 НЕ сигнальное значение (фейковые часы тестов стартуют с 0)
+  let idleTimer = null; // таймер глушения тёплого сервера по простою (инцидент 8ГБ) — перевзводится каждым transcribeWav
   let warm = false; // сервер прошёл ready-поллинг и (предположительно) ещё жив
   let pollTimerId = null; // текущий таймер poll-цикла waitReady — снимается в dispose()
   let pendingReject = null; // reject ТЕКУЩЕГО waitReady (если есть) — Important-1(C): dispose() будит его напрямую
@@ -554,9 +558,59 @@ function createStt({
   // POST, пока не осядет (успехом или неудачей) первый целиком, включая его
   // собственный ретрай.
   let chain = Promise.resolve();
+  // Инцидент 8ГБ (01.08): тёплый whisper-server держит ~1ГБ ОЗУ вечно —
+  // «тёплый до выхода» из спеки на 8ГБ-машине превращается в постоянный
+  // дефицит памяти. Глушим сервер после STT_IDLE_STOP_MS простоя (перевзвод
+  // таймера на каждом transcribeWav) — следующая диктовка просто прогреется
+  // заново (~2с на CUDA). Таймер снимается в dispose().
+  function disarmIdleShutdown() {
+    if (idleTimer !== null) {
+      clearTimer(idleTimer);
+      idleTimer = null;
+    }
+  }
+
+  function armIdleShutdown() {
+    if (disposed) return;
+    disarmIdleShutdown();
+    idleTimer = setTimer(() => {
+      idleTimer = null;
+      if (disposed || !proc) return;
+      log(`[stt] простой ${Math.round(STT_IDLE_STOP_MS / 60000)} мин — глушим whisper-server (возврат ~1ГБ ОЗУ)`);
+      killProc();
+    }, STT_IDLE_STOP_MS);
+  }
+
+  // Сколько диктовок сейчас «в полёте» (поставлены в chain и ещё не осели).
+  // Idle-таймер имеет право жить ТОЛЬКО при нуле — см. transcribeWav.
+  let inFlightTranscribes = 0;
+
+  // Ревью фикса инцидента 8ГБ, Critical (тот же класс, что B1 — killProc под
+  // живым запросом): снимать таймер ТОЛЬКО перевзводом в хвосте было
+  // недостаточно. Трасса отказа: диктовка №1 оседает → взводится T1 на 10 мин;
+  // пользователь молчит 9м59с; начинается диктовка №2 — и T1, доставшийся ей
+  // «в наследство», выстреливает на 10:00 ПОСРЕДИ её POST /inference.
+  // killProc убивает сервер под живым запросом, тот падает транспортной
+  // ошибкой, а transcribeWavImpl трактует это как «сервер умер на инференсе»
+  // → ЛОЖНАЯ демоция CUDA→CPU на BACKEND_RETRY_AFTER_MS плюс лишняя загрузка
+  // модели (~1ГБ — ровно та память, которую фикс экономил). Причём окно риска
+  // не случайное: оно приходится ровно на «вернулся после паузы ~10 минут» —
+  // самый частый сценарий работы. Поэтому таймер снимается СРАЗУ на входе
+  // transcribeWav, а взводится только когда осела ПОСЛЕДНЯЯ диктовка
+  // (счётчик — из-за сериализации B1: хвост №1 срабатывает, пока №2 ещё
+  // выполняется, и без счётчика взвёл бы таймер прямо под ней).
   function transcribeWav(buffer) {
-    chain = chain.catch(() => {}).then(() => transcribeWavImpl(buffer));
-    return chain;
+    inFlightTranscribes += 1;
+    disarmIdleShutdown();
+    const result = chain.catch(() => {}).then(() => transcribeWavImpl(buffer));
+    // Перевзвод idle-таймера ПОСЛЕ оседания (успех или провал — сервер тёплый
+    // в обоих случаях); в chain кладём хвост с уже проглоченной ошибкой,
+    // чтобы вызывающий получил СВОЙ result с честным reject.
+    chain = result.catch(() => {}).then(() => {
+      inFlightTranscribes -= 1;
+      if (inFlightTranscribes === 0) armIdleShutdown();
+    });
+    return result;
   }
 
   // {available, backend, warm}. available — найден ли стек ХОТЯ БЫ где-то
@@ -586,6 +640,7 @@ function createStt({
   function dispose() {
     try {
       disposed = true;
+      disarmIdleShutdown();
       if (pollTimerId !== null) {
         clearTimer(pollTimerId);
         pollTimerId = null;

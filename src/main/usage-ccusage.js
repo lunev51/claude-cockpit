@@ -165,13 +165,26 @@ function createCcusage({ run, cache, now = Date.now, ttlMs = 600000 }) {
     return buildResult(false, false, null, 0, kind);
   }
 
+  // Инцидент «зависает вместе с компом» (01.08, машина с 8ГБ ОЗУ, своп до
+  // 14.6ГБ). Замеры ревью на реальном хранилище (1.7ГБ транскриптов):
+  //   daily --json                              9.3с, пик RSS 594МБ
+  //   daily --json --since <окно>               7.6с, пик RSS 595МБ (!)
+  //   daily --json --offline --single-thread   ~7.6с, пик RSS 240МБ
+  // Вывод: --since НЕ экономит память вовсе (ccusage читает все JSONL и
+  // режет только агрегацию — проверено окном в 1 день: та же память), зато
+  // молча превращал карточки «(всего)» дашборда в оконные (терялось 23.5%
+  // аккаунта). Поэтому НИКАКОГО --since. Настоящие рычаги:
+  //   --offline       прайсинг из локального кэша ccusage, без сети;
+  //   --single-thread последовательная загрузка JSONL — пик двух
+  //                   параллельных прогонов падает с ~1.1ГБ до ~485МБ,
+  //                   на 8ГБ-машине это разница «тормозит»/«висит намертво».
   async function fetchFresh() {
     let dailyRes;
     let sessionRes;
     try {
       [dailyRes, sessionRes] = await Promise.all([
-        run(['claude', 'daily', '--json']),
-        run(['claude', 'session', '--json']),
+        run(['claude', 'daily', '--json', '--offline', '--single-thread']),
+        run(['claude', 'session', '--json', '--offline', '--single-thread']),
       ]);
     } catch (err) {
       return { kind: 'unavailable' };
@@ -192,12 +205,22 @@ function createCcusage({ run, cache, now = Date.now, ttlMs = 600000 }) {
     return { kind: null, data: normalize(dailyBody, sessionBody) };
   }
 
-  async function doGet({ force = false } = {}) {
+  async function doGet({ force = false, cacheOnly = false } = {}) {
     ensureLoadedFromCache();
 
     const nowMs = now();
     if (!force && lastGood && (nowMs - lastGood.fetchedAt) < ttlMs) {
       return buildResult(true, false, lastGood, lastGood.fetchedAt, null);
+    }
+
+    // Инцидент 8ГБ: стартовое окно кокпита (первые ~90с — шторм спавна
+    // сессий) не должно совпадать с npx-прогонами по транскриптам. cacheOnly
+    // отдаёт лучшее, что есть (память/диск, пусть и протухшее — с пометкой
+    // stale + kind 'deferred'), и НЕ спавнит ничего; без кэша — честный
+    // ok:false 'deferred', дашборд объяснит.
+    if (cacheOnly) {
+      if (lastGood) return buildResult(true, true, lastGood, lastGood.fetchedAt, 'deferred');
+      return buildResult(false, false, null, 0, 'deferred');
     }
 
     const result = await fetchFresh();

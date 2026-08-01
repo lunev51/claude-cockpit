@@ -63,6 +63,9 @@ let lastBroadcastKey = null;    // `fetchedAt|stale|error` последнего 
 let lastCcusageResult = null;   // последний известный ответ ccusage.get() — уходит и в usage:get/usage:refresh, и в usage:update
 let manualRefreshInFlight = null; // Promise текущего usage:refresh, если уже выполняется (single-flight, FINDING 2 ревью)
 let lastManualRefreshAt = 0;       // Date.now() последнего РЕАЛЬНО выполненного (не отбитого троттлингом) usage:refresh
+let ipcBootAt = 0;                 // Date.now() момента registerIpc — окно cacheOnly для ccusage (инцидент 8ГБ, см. usage:get)
+const CCUSAGE_BOOT_DEFER_MS = 90000;
+let deferredSpendTimer = null;     // отложенный пересчёт расходов на границе boot-окна (N1 ре-ревью: гасится в disposeSessions, как usageMonitorTimer)
 let nightWatch = null;   // Task 2 фазы 8 («Ночная смена»): инстанс createNightWatch (night-watch.js), см. регистрацию ниже
 // Task 2 фазы 8, КРИТИЧЕСКАЯ ЛОВУШКА (найдена на ревью Task 1, зафиксирована в
 // брифе Task 2): sessions.js на Stop-хуке СИНХРОННО ставит статус 'done' и
@@ -1016,6 +1019,7 @@ function sttStatusHandler({ smoke, getStt }) {
 
 function registerIpc(win, opts = {}) {
   const { smoke = false, attention = null, toaster = null } = opts;
+  ipcBootAt = Date.now(); // окно cacheOnly для ccusage — см. usage:get (инцидент 8ГБ)
 
   // Слои usage (Task 3 фазы 5): инстансы создаются ВСЕГДА (конструктор — это
   // просто замыкания над зависимостями, никакого I/O до первого refresh()/get()),
@@ -1323,6 +1327,29 @@ function registerIpc(win, opts = {}) {
       }
     }, 5000);
     usageMonitorTimer.unref?.();
+
+    // Important-3 (ревью инцидент-фикса 8ГБ): обещание «подсчёт начнётся
+    // через минуту» кто-то должен ВЫПОЛНИТЬ — boot()-ный usage:get всегда
+    // попадает в 90-секундное cacheOnly-окно, а больше реальный ccusage.get()
+    // ниоткуда не приходит (30с-таймер renderer только перерисовывает кэш).
+    // Один отложенный настоящий пересчёт по истечении окна + push свежего
+    // результата тем же каналом usage:update.
+    deferredSpendTimer = setTimeout(async () => {
+      deferredSpendTimer = null;
+      try {
+        const spend = await ccusage.get();
+        // N2 ре-ревью: не даём протухшему ответу перезаписать более свежий
+        // (гонка с параллельным usage:refresh) — deferred никогда не
+        // затирает настоящие данные.
+        if (!(spend && spend.error === 'deferred')) lastCcusageResult = spend;
+        if (!win.isDestroyed()) {
+          win.webContents.send('usage:update', {
+            limits: usagePoller.snapshot(), spend: lastCcusageResult,
+          });
+        }
+      } catch { /* ccusage.get сам не бросает; ремень на чужие сбои */ }
+    }, CCUSAGE_BOOT_DEFER_MS + 2000);
+    deferredSpendTimer.unref?.();
   }
 
   ipcMain.handle('config:get', () => getConfig());
@@ -1353,7 +1380,11 @@ function registerIpc(win, opts = {}) {
   ipcMain.handle('usage:get', async () => {
     const limits = usagePoller.snapshot();
     if (smoke) return { limits, spend: null };
-    lastCcusageResult = await ccusage.get({ force: false });
+    // Инцидент 8ГБ (01.08): первые 90с после старта — шторм спавна сессий
+    // restore; npx-прогоны ccusage по транскриптам в это окно складывались с
+    // ним и вгоняли машину в своп намертво. cacheOnly до истечения окна.
+    const bootStorm = Date.now() - ipcBootAt < CCUSAGE_BOOT_DEFER_MS;
+    lastCcusageResult = await ccusage.get({ force: false, cacheOnly: bootStorm });
     return { limits, spend: lastCcusageResult };
   });
 
@@ -1382,7 +1413,20 @@ function registerIpc(win, opts = {}) {
     lastManualRefreshAt = nowMs;
 
     manualRefreshInFlight = (async () => {
-      const [, spend] = await Promise.all([usagePoller.refresh(), ccusage.get({ force: true })]);
+      // Инцидент 8ГБ (01.08): кольца показывают ЛИМИТЫ — их и обновляем
+      // принудительно (дешёвый HTTP). force:true у ccusage прогонял два
+      // параллельных npx по 1.7ГБ транскриптов (~15с диска, ~190МБ пиковое
+      // дерево) НА КАЖДЫЙ клик мимо 10-минутного кэша — на задыхающейся
+      // машине это и был «клик по кольцам вешает комп». Расходы обновляются
+      // по своему TTL (10 мин) — для карточки «$ за день» этого достаточно.
+      // Important-4 (ревью инцидент-фикса): клик в первые 90с после старта
+      // не должен запускать npx одновременно со штормом restore — тот же
+      // cacheOnly-гейт, что у usage:get.
+      const bootStorm = Date.now() - ipcBootAt < CCUSAGE_BOOT_DEFER_MS;
+      const [, spend] = await Promise.all([
+        usagePoller.refresh(),
+        ccusage.get({ cacheOnly: bootStorm }),
+      ]);
       lastCcusageResult = spend;
       return { limits: usagePoller.snapshot(), spend };
     })();
@@ -1819,6 +1863,12 @@ function disposeSessions() {
   if (usageMonitorTimer) {
     clearInterval(usageMonitorTimer);
     usageMonitorTimer = null;
+  }
+  // N1 ре-ревью инцидент-фикса: отложенный пересчёт расходов не должен
+  // пережить teardown (иначе npx для уничтоженного окна после killAllTracked).
+  if (deferredSpendTimer) {
+    clearTimeout(deferredSpendTimer);
+    deferredSpendTimer = null;
   }
   if (usagePoller) usagePoller.stop();
   // Task 2 фазы 8 («Ночная смена»): dispose() снимает ВСЕ таймеры ядра

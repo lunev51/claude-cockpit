@@ -671,7 +671,11 @@ export function createDashboard({
     if (!spend || !spendOk) {
       const empty = document.createElement('div');
       empty.className = 'dashboard-spend-empty';
-      empty.textContent = SPEND_UNAVAILABLE_TEXT;
+      // Инцидент 8ГБ: первые ~90с после старта подсчёт расходов отложен
+      // (cacheOnly, kind 'deferred') — честно говорим «позже», а не «сломано».
+      empty.textContent = (spend && spend.error === 'deferred')
+        ? 'подсчёт расходов начнётся через минуту после запуска…'
+        : SPEND_UNAVAILABLE_TEXT;
       bodyEl.appendChild(empty);
     } else {
       bodyEl.appendChild(buildSpendMeta(spend));
