@@ -129,6 +129,18 @@ html, body {
   align-items: baseline;
 }
 .tab-name .meta { font-size: 10px; color: var(--text-dim); font-weight: 400; }
+/* Живая приёмка 01.08: «название» сессии между именем проекта и путём —
+   в одной папке живёт несколько сессий, различить их иначе нечем. Ярче
+   пути (--text, а не --text-muted) — это содержательная строка, ради
+   которой фича и делалась; курсив отделяет её от имени проекта. */
+.tab-session-label {
+  font-size: 10px;
+  font-style: italic;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .tab-sub {
   font-size: 10px;
   color: var(--text-muted);

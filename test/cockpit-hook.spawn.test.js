@@ -8,10 +8,25 @@ const { execFile } = require('child_process');
 const SCRIPT = path.join(__dirname, '..', 'scripts', 'cockpit-hook.js');
 
 // Запуск скрипта с given env/args/stdin → {code, stdout, stderr}
+//
+// ИЗОЛЯЦИЯ ОКРУЖЕНИЯ (найдено 01.08 живым прогоном): тесты запускаются в том
+// числе ИЗ САМОГО кокпита (пользователь работает в Claude Code внутри вкладки
+// — сессия наследует COCKPIT_TAB_ID/COCKPIT_TAB_GEN/COCKPIT_BRIDGE_PORT из
+// pty). Без явной вырезки этих переменных дочерний хук наследовал их у
+// родителя, и кейсы «переменной НЕТ → null» ловили реальные значения живой
+// вкладки: прогон падал в зависимости от того, ОТКУДА его запустили. Тест
+// обязан задавать своё окружение целиком, а не полагаться на чистоту чужого.
+const COCKPIT_ENV_KEYS = ['COCKPIT', 'COCKPIT_TAB_ID', 'COCKPIT_TAB_GEN', 'COCKPIT_BRIDGE_PORT'];
+function cleanEnv() {
+  const out = { ...process.env };
+  for (const k of COCKPIT_ENV_KEYS) delete out[k];
+  return out;
+}
+
 function runHook({ args = [], env = {}, stdin = '' }) {
   return new Promise((resolve) => {
     const child = execFile('node', [SCRIPT, ...args], {
-      env: { ...process.env, COCKPIT_BRIDGE_PORT: '', ...env },
+      env: { ...cleanEnv(), COCKPIT_BRIDGE_PORT: '', ...env },
       timeout: 5000,
     }, (err, stdout, stderr) => {
       resolve({ code: err ? err.code : 0, stdout, stderr });

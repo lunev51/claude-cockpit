@@ -1993,12 +1993,13 @@ async function boot() {
   // Статусы приходят из хуков Claude Code (sessions.js) — единый источник,
   // term:started/term:exit статус больше не выставляют (был двойной источник).
   window.api.tab.onStatus(({
-    tabId, status, subtitle, waitingText, waitingKind,
+    tabId, status, subtitle, waitingText, waitingKind, sessionLabel,
   }) => {
     // C2 (Critical, ревью финальной волны фазы 9): waitingKind зеркалится в
     // tabStore ровно тем же приёмом, что waitingText — см. tabs.js/setStatus,
     // app.js/isTabBlockedByDialog (голосовой ввод/writeCommandToTab).
-    tabStore.setStatus(tabId, status, subtitle, waitingText, waitingKind);
+    // sessionLabel (живая приёмка 01.08) — та же схема зеркалирования.
+    tabStore.setStatus(tabId, status, subtitle, waitingText, waitingKind, sessionLabel);
     // Ledger-фикс (ревью): текст в поповере — статичный снимок на момент
     // открытия. Если Claude задаёт ВТОРОЙ вопрос той же вкладке, пока
     // поповер всё ещё открыт (статус остаётся waiting), пользователь рискует

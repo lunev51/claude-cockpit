@@ -1501,3 +1501,118 @@ test('N2: после ВЫХОДА из waiting понижение разреше
   const tab = mgr.list().find((t) => t.tabId === a.tabId);
   assert.strictEqual(tab.waitingKind, 'idle');
 });
+
+// ---------- «Название» сессии в сайдбаре (живая приёмка 01.08) ----------
+// Пользователь: «в одной папке может быть несколько сессий, чтобы их
+// различить». Источник — ГОТОВОЕ поле session_title из payload хуков
+// (сверено с бинарём CLI 2.1.220: оно есть у SessionStart и UserPromptSubmit),
+// фолбэк — текст первого промпта, пока CLI ещё не сгенерировал заголовок.
+
+test('sessionLabel: SessionStart с session_title (случай --resume) подписывает вкладку сразу', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  mgr.start(a.tabId, 80, 24);
+
+  mgr.applyHookEvent(a.tabId, 'SessionStart', {
+    session_id: 'S1', session_title: 'Рефакторинг платёжного модуля',
+  });
+
+  assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'Рефакторинг платёжного модуля');
+});
+
+test('sessionLabel: пока session_title пуст — фолбэк на текст первого промпта', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  mgr.start(a.tabId, 80, 24);
+
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1' }); // заголовка ещё нет
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'почини тесты в модуле оплаты' });
+
+  assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'почини тесты в модуле оплаты');
+});
+
+test('sessionLabel: настоящий session_title ПЕРЕБИВАЕТ фолбэк-промпт, когда наконец приходит', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  mgr.start(a.tabId, 80, 24);
+
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'почини тесты' });
+  assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'почини тесты');
+
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', {
+    prompt: 'а теперь прогони линтер', session_title: 'Починка тестов оплаты',
+  });
+  assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'Починка тестов оплаты');
+});
+
+test('sessionLabel: второй промпт НЕ перезаписывает фолбэк (метка стабильна)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  mgr.start(a.tabId, 80, 24);
+
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'первый промпт' });
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'второй промпт' });
+
+  assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'первый промпт');
+});
+
+test('sessionLabel: пустой session_title НЕ затирает уже показанную метку', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  mgr.start(a.tabId, 80, 24);
+
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1', session_title: 'Живой заголовок' });
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'что-то', session_title: '' });
+
+  assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'Живой заголовок');
+});
+
+test('sessionLabel: многострочный промпт схлопывается в одну строку и режется многоточием', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  mgr.start(a.tabId, 80, 24);
+
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', {
+    prompt: 'первая строка\nвторая строка   с   лишними пробелами и очень длинным хвостом до упора',
+  });
+
+  const label = statusOf(events, a.tabId).sessionLabel;
+  assert.ok(!label.includes('\n'), 'переводов строк быть не должно');
+  assert.ok(!/\s{2,}/.test(label), 'кратных пробелов быть не должно');
+  assert.strictEqual(label.length, 48, 'ровно SESSION_LABEL_MAX символов');
+  assert.ok(label.endsWith('…'), 'обрезка помечена многоточием');
+});
+
+test('sessionLabel: restart сбрасывает метку — новая жизнь вкладки, новое название', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1', session_title: 'Старая сессия' });
+  assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'Старая сессия');
+
+  mgr.restart(a.tabId);
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S2', session_title: 'Новая сессия' });
+
+  assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'Новая сессия');
+});
+
+test('sessionLabel: событие без полей метки не роняет и не портит payload прочих статусов', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  mgr.start(a.tabId, 80, 24);
+
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1' });
+  mgr.applyHookEvent(a.tabId, 'PreToolUse', { tool_name: 'Bash' });
+
+  const st = statusOf(events, a.tabId);
+  assert.strictEqual(st.status, 'working');
+  assert.strictEqual(st.sessionLabel, '');
+});

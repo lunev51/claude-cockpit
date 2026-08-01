@@ -49,6 +49,60 @@ const AUTO_RECOVER_MAX_LIFETIME_MS = 15000;
 // первый сигнал; подстрока message — фолбэк для старых/изменённых версий,
 // где поля нет. Смена английского текста при живом поле больше не уводит
 // фичу обратно в C1.
+// Живая приёмка (01.08, отзыв пользователя): «в одной папке бывает несколько
+// сессий, нечем их различить» — вкладке нужна своя строка-«название».
+//
+// ИСТОЧНИК (сверено с бинарём CLI 2.1.220, не догадка): payload хуков несёт
+// ГОТОВОЕ поле session_title — собственный заголовок сессии Claude Code, тот
+// же, что виден в claude.ai:
+//   hook_event_name:"SessionStart",   …, session_title: r ?? fA(…)
+//   hook_event_name:"UserPromptSubmit", prompt: e, session_title: fA(Ht())
+// Именно SessionStart делает фичу полноценной: при --resume он приносит
+// НАСТОЯЩЕЕ имя резюмируемой сессии, поэтому восстановленные вкладки
+// подписываются сами, без чтения транскриптов и без персиста в манифесте.
+//
+// Заголовок генерируется CLI не мгновенно (у новой сессии первый
+// UserPromptSubmit обычно ещё несёт пустой session_title), поэтому:
+//   1) session_title, как только пришёл непустым, — главный источник и может
+//      ОБНОВИТЬСЯ позже (в отличие от исходной задумки «только первый раз»);
+//   2) пока его нет — фолбэк на текст первого промпта, чтобы вкладка была
+//      различима сразу же, а не через минуту;
+//   3) пустое значение НИКОГДА не затирает уже показанную метку.
+const SESSION_LABEL_MAX = 48;
+
+function truncateForLabel(text) {
+  // \s+ → пробел: многострочная вставка/диктовка не должна ломать одну
+  // строку сайдбара. Это ЧИСТО косметическое усечение — не путать с
+  // normalizeForPty (импорт выше), которая готовит текст к ОТПРАВКЕ в pty.
+  const squashed = String(text == null ? '' : text).replace(/\s+/g, ' ').trim();
+  if (!squashed) return '';
+  return squashed.length > SESSION_LABEL_MAX
+    ? `${squashed.slice(0, SESSION_LABEL_MAX - 1)}…`
+    : squashed;
+}
+
+// Единая точка обновления метки для обоих хуков. Возвращает true, если метка
+// действительно изменилась (вызывающему это нужно, чтобы не слать лишний
+// tab:status на каждый чих). Приоритет: session_title > первый промпт;
+// пустое не затирает; фолбэк-промпт не перебивает уже показанный titleа
+// и не перезаписывается вторым промптом.
+function applySessionLabel(tab, data) {
+  const title = truncateForLabel(data && data.session_title);
+  if (title) {
+    if (tab.sessionLabel === title) return false;
+    tab.sessionLabel = title;
+    tab.sessionLabelFromTitle = true; // дальше только другой session_title сможет это сменить
+    return true;
+  }
+  // session_title ещё не сгенерирован — подставляем первый промпт, но только
+  // если настоящего заголовка ещё не было и метки ещё нет вовсе.
+  if (tab.sessionLabelFromTitle || tab.sessionLabel) return false;
+  const fromPrompt = truncateForLabel(data && data.prompt);
+  if (!fromPrompt) return false;
+  tab.sessionLabel = fromPrompt;
+  return true;
+}
+
 function classifyNotification(message, notificationType) {
   if (notificationType === 'idle_prompt') return 'idle';
   if (notificationType === 'permission_prompt') return 'permission';
@@ -143,6 +197,12 @@ function createSessionManager({
       // applyHookEvent/case 'Notification' (classifyNotification выше),
       // чистится вместе с waitingText при уходе из 'waiting' (см. setStatus).
       waitingKind: '',
+      // Живая приёмка (01.08): «название» сессии для сайдбара — см.
+      // applySessionLabel() выше по файлу (session_title из хуков, фолбэк на
+      // первый промпт). Сбрасывается в restart() — новая жизнь вкладки
+      // заслуживает новую метку.
+      sessionLabel: '',
+      sessionLabelFromTitle: false, // метка пришла из настоящего session_title (фолбэк-промпт её больше не трогает)
       lastOutputAt: now(),
       // Очередь промптов (Task 1 фазы 7): ввод для КОНКРЕТНОЙ сессии этой
       // вкладки — переживает обычное переключение вкладок, но НЕ переживает
@@ -188,7 +248,7 @@ function createSessionManager({
     // (тот же прецедент, что genProven чуть выше по функции).
     onEvent('tab:status', {
       tabId: tab.tabId, status, subtitle: tab.subtitle, waitingText: tab.waitingText,
-      waitingKind: tab.waitingKind,
+      waitingKind: tab.waitingKind, sessionLabel: tab.sessionLabel,
       ...(extra || {}),
     });
   }
@@ -452,6 +512,11 @@ function createSessionManager({
     tab.sessionId = null; // новая жизнь — новый SessionStart перебиндит
     tab.sessionBound = false; // FIX 3: привязка тоже сбрасывается — новый спавн ещё не подтверждён
     tab.autoRecovered = false; // ручной рестарт — гард одноразовости авто-восстановления взводится заново
+    // Живая приёмка 01.08: новая жизнь вкладки — новая метка (её принесёт
+    // SessionStart нового процесса; при --resume это будет имя резюмируемой
+    // сессии, при голом старте — фолбэк с первого промпта).
+    tab.sessionLabel = '';
+    tab.sessionLabelFromTitle = false;
 
     if (boundSessionId) {
       // 1. session_id уже известен (из прошлого SessionStart) — резюмируем именно его.
@@ -596,9 +661,14 @@ function createSessionManager({
           bindSession(tabId, data.session_id);
           tab.overrideFailed = false; // resume/continue подтверждён хуком — попытка удалась
         }
+        // Живая приёмка 01.08: при --resume именно здесь приходит настоящее
+        // имя резюмируемой сессии — восстановленная вкладка подписывается
+        // сама (см. applySessionLabel выше). setStatus ниже разошлёт метку.
+        applySessionLabel(tab, data);
         setStatus(tab, 'working', 'сессия запущена');
         break;
       case 'UserPromptSubmit':
+        applySessionLabel(tab, data);
         setStatus(tab, 'working', 'думает…');
         break;
       case 'PreToolUse':
@@ -630,6 +700,7 @@ function createSessionManager({
           subtitle: tab.subtitle,
           waitingText: tab.waitingText,
           waitingKind: tab.waitingKind,
+          sessionLabel: tab.sessionLabel,
         });
         break;
       }
