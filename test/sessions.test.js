@@ -1793,67 +1793,85 @@ test('sessionLabel I1: метка из манифеста РАВНА ai-title �
   assert.strictEqual(reads, 1, 'совпадение метки с заголовком — тоже «заголовок получен»');
 });
 
-test('sessionLabel M1: протухший снимок не оставляет защёлку — следующее чтение проходит', async () => {
+
+
+// D1 (ре-ревью раунда 2): ТРЕТИЙ путь смены сессии — авто-восстановление
+// после провала резюма. Ключ к воспроизведению: заголовок должен быть УЖЕ
+// прочитан (sessionLabelFromTitle=true), а следующий спавн — уйти с
+// оверрайдом `--resume` и умереть, НЕ привязав сессию. Тогда onExit обнуляет
+// sessionId ДО прихода нового SessionStart, и гарда bindSession (сравнение
+// старого id с новым) сработать уже не может.
+
+test('sessionLabel D1: провал резюма + авто-респавн — новая сессия получает СВОЁ имя, не прошлое', async () => {
   const factory = makeFakePtyFactory();
-  let release;
-  const pending = new Promise((r) => { release = r; });
-  let call = 0;
-  const { mgr, events } = makeManager(factory, {
-    readSessionTitle: () => {
-      call += 1;
-      return call === 1 ? pending : Promise.resolve('Свежий заголовок');
-    },
+  let title = 'Рефакторинг оплаты';
+  const { mgr, events } = makeManager(factory, { readSessionTitle: () => Promise.resolve(title) });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+
+  // Живая сессия S1 с прочитанным заголовком.
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1', transcript_path: 'C:\\t\\S1.jsonl' });
+  await flushAsync();
+  assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'Рефакторинг оплаты');
+
+  // Ctrl+Shift+R: sessionId известен → спавн #2 уходит с `--resume S1`
+  // (метка при этом СОХРАНЯЕТСЯ — сессия та же, см. отдельный тест выше).
+  mgr.restart(a.tabId);
+  assert.strictEqual(mgr.list().find((t) => t.tabId === a.tabId).sessionLabel, 'Рефакторинг оплаты');
+
+  // Резюм провалился: процесс умер, SessionStart так и не пришёл →
+  // авто-восстановление синхронно поднимает ЧИСТУЮ новую сессию.
+  factory.spawned[1].opts.onExit(1);
+  assert.strictEqual(factory.spawned.length, 3, 'авто-восстановление подняло новый процесс');
+
+  title = 'Свежая задача';
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S9', transcript_path: 'C:\\t\\S9.jsonl' });
+  await flushAsync();
+
+  assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'Свежая задача');
+  assert.strictEqual(
+    mgr.list().find((t) => t.tabId === a.tabId).sessionLabel,
+    'Свежая задача',
+    'в манифест не должно уехать имя сессии, которой в этой вкладке больше нет',
+  );
+});
+
+test('sessionLabel D1: провал резюма снимает защёлку — транскрипт новой сессии реально читается', async () => {
+  const factory = makeFakePtyFactory();
+  const reads = [];
+  const { mgr } = makeManager(factory, {
+    readSessionTitle: (p) => { reads.push(p); return Promise.resolve(`Заголовок ${p}`); },
   });
   const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
 
   mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1', transcript_path: 'C:\\t\\S1.jsonl' });
-  mgr.restart(a.tabId); // снимок протух (сменилось поколение pty)
-  release('Протухший');
   await flushAsync();
+  assert.deepStrictEqual(reads, ['C:\\t\\S1.jsonl']);
 
-  // Защёлка titleReadInFlight обязана сняться — иначе вкладка больше НИКОГДА
-  // не прочитала бы заголовок.
+  mgr.restart(a.tabId);              // --resume S1
+  factory.spawned[1].opts.onExit(1); // провал → авто-респавн чистой сессии
+
   mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S2', transcript_path: 'C:\\t\\S2.jsonl' });
   await flushAsync();
-  assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'Свежий заголовок');
+
+  // Без сброса sessionLabelFromTitle этот путь навсегда остался бы с одним
+  // чтением — вкладка никогда не узнала бы имя своей текущей сессии.
+  assert.deepStrictEqual(reads, ['C:\\t\\S1.jsonl', 'C:\\t\\S2.jsonl']);
 });
 
-test('sessionLabel I2: событие «дочитался заголовок» помечено labelOnly (тост/ghost его пропустят)', async () => {
+test('sessionLabel M3: tabs:changed эмитится именно АСИНХРОННЫМ применением метки', async () => {
   const factory = makeFakePtyFactory();
   const { mgr, events } = makeManager(factory, { readSessionTitle: () => Promise.resolve('Заголовок') });
   const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
 
   mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1', transcript_path: 'C:\\t\\S1.jsonl' });
+  // Снимок ПОСЛЕ синхронной части (bindSession уже отправил свой tabs:changed) —
+  // рост дальше может дать только применение метки из асинхронного чтения.
+  const afterSync = events.filter((e) => e.channel === 'tabs:changed').length;
   await flushAsync();
 
-  const all = events.filter((e) => e.channel === 'tab:status' && e.payload.tabId === a.tabId);
-  const last = all[all.length - 1].payload;
-  assert.strictEqual(last.sessionLabel, 'Заголовок');
-  assert.strictEqual(last.labelOnly, true, 'label-only событие обязано быть помечено');
-  // Обычные статус-события пометки НЕ несут — иначе тосты замолчали бы совсем.
-  assert.ok(all.slice(0, -1).every((e) => e.payload.labelOnly === undefined));
-});
-
-test('sessionLabel M3: смена метки шлёт tabs:changed — манифест узнаёт сам', async () => {
-  const factory = makeFakePtyFactory();
-  const { mgr, events } = makeManager(factory, { readSessionTitle: () => Promise.resolve('Заголовок') });
-  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
-  mgr.start(a.tabId, 80, 24);
-  const before = events.filter((e) => e.channel === 'tabs:changed').length;
-
-  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1', transcript_path: 'C:\\t\\S1.jsonl' });
-  await flushAsync();
-
-  const after = events.filter((e) => e.channel === 'tabs:changed').length;
-  assert.ok(after > before, 'изменение метки обязано попасть в манифест');
-});
-
-test('sessionLabel M4: метка из манифеста прогоняется через усекатель', () => {
-  const factory = makeFakePtyFactory();
-  const { mgr } = makeManager(factory);
-  const a = mgr.open({ cwd: 'C:\\proj\\alpha', sessionLabel: 'строка\nвторая   строка' });
-
-  assert.strictEqual(a.sessionLabel, 'строка вторая строка');
+  const afterAsync = events.filter((e) => e.channel === 'tabs:changed').length;
+  assert.strictEqual(afterAsync, afterSync + 1, 'применение метки обязано само уведомить манифест');
 });

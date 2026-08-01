@@ -77,6 +77,26 @@ function truncateForLabel(text) {
     : squashed;
 }
 
+// Сброс ИДЕНТИЧНОСТИ метки: «показанное имя больше не наше». Три вызывающих,
+// по одному на каждый способ сменить сессию внутри живущей вкладки (D1
+// ре-ревью раунда 2 — третий путь был пропущен и воспроизводил исходный
+// симптом):
+//   1) bindSession — пришёл ДРУГОЙ session_id (`/clear` в том же pty);
+//   2) restart без известного sessionId — голый `--resume`, пикер приведёт
+//      любую сессию;
+//   3) onExit/failedOverride — резюм провалился, сейчас поднимется чистая
+//      новая сессия (здесь sessionId вот-вот станет null, и гарда (1) уже
+//      не сможет сработать).
+// labelGen++ ЗАОДНО обесценивает висящее чтение старого транскрипта: гарда
+// по tab.gen для этого не годится — pty во всех трёх случаях может не
+// меняться вовсе.
+function resetLabelIdentity(tab) {
+  tab.sessionLabel = '';
+  tab.sessionLabelFromTitle = false;
+  tab.titleReadInFlight = false;
+  tab.labelGen += 1;
+}
+
 // Фолбэк-метка из текста промпта. Ставится ТОЛЬКО если метки ещё нет вовсе
 // и настоящий заголовок ещё не приходил (иначе он был бы затёрт сегодняшней
 // репликой). Возвращает true, если метка изменилась.
@@ -327,6 +347,16 @@ function createSessionManager({
           const failedOverride = usedOverride && !tab.sessionBound;
           if (failedOverride) {
             tab.overrideFailed = true;
+            // D1 (ре-ревью раунда 2): «мы больше не эта сессия» доказано
+            // ЗДЕСЬ — резюм провалился, сейчас поднимется чистая новая
+            // сессия. Сбрасываем идентичность метки ДО обнуления sessionId:
+            // иначе гарда в bindSession (она сравнивает СТАРЫЙ id с новым)
+            // увидит уже null, не сработает, и вкладка навсегда останется
+            // подписана именем сессии, которой в ней больше нет — причём
+            // sessionLabelFromTitle остался бы true, и своё имя новая сессия
+            // не прочитала бы уже никогда. Бьёт по главному сценарию фичи:
+            // утренняя восстановленная вкладка с протухшим id.
+            resetLabelIdentity(tab);
             // Обнуляем протухший sessionId — иначе он уедет в манифест и
             // следующий запуск снова попробует резюмить уже мёртвую сессию.
             tab.sessionId = null;
@@ -527,10 +557,10 @@ function createSessionManager({
     // сессию — вот там метка обязана уйти, чтобы не подписывать вкладку
     // чужим именем.
     if (!boundSessionId) {
-      tab.sessionLabel = '';
-      tab.sessionLabelFromTitle = false;
+      resetLabelIdentity(tab);
+    } else {
+      tab.titleReadInFlight = false; // сессия та же, метка остаётся; висящее чтение отсечётся по gen
     }
-    tab.titleReadInFlight = false; // ответ старого чтения всё равно отсечётся по gen
 
     if (boundSessionId) {
       // 1. session_id уже известен (из прошлого SessionStart) — резюмируем именно его.
@@ -578,19 +608,11 @@ function createSessionManager({
   function bindSession(tabId, sessionId) {
     const tab = tabs.get(tabId);
     if (tab) {
-      // C1 (ре-ревью 01.08): сессия ПОДМЕНИЛАСЬ внутри той же вкладки —
-      // `/clear` (новый session_id в том же pty), авто-восстановление после
-      // провала резюма, выбор другой сессии в пикере. Старое имя стало чужим:
-      // без сброса вкладка продолжала бы уверенно зваться прежней темой (и
-      // это уезжало в манифест, переживая перезапуск кокпита). labelGen++
-      // ЗАОДНО обесценивает висящее чтение старого транскрипта — оно уже не
-      // сможет применить свой результат (гарда по tab.gen тут бессильна: pty
-      // тот же, поколение не менялось).
+      // C1 (ре-ревью 01.08): пришёл ДРУГОЙ session_id — сессия подменилась
+      // внутри той же вкладки (`/clear` в том же pty). Старое имя стало
+      // чужим — см. resetLabelIdentity() выше по файлу.
       if (tab.sessionId && sessionId && sessionId !== tab.sessionId) {
-        tab.sessionLabel = '';
-        tab.sessionLabelFromTitle = false;
-        tab.titleReadInFlight = false;
-        tab.labelGen += 1;
+        resetLabelIdentity(tab);
       }
       tab.sessionId = sessionId;
       tab.sessionBound = true; // FIX 3: единственное место, где привязка считается ПОДТВЕРЖДЁННОЙ
