@@ -10,6 +10,7 @@ const {
   registerIpc, disposeSessions, getSmokeOutput, flushWorkspace, getActiveTabId,
 } = require('./ipc');
 const { getConfig, isRootConfigCorrupt } = require('./config');
+const { appRoot } = require('./paths');
 const { setWindow, notify } = require('./notify');
 const { createAttention } = require('./attention');
 const { createToaster } = require('./toasts');
@@ -63,6 +64,10 @@ function createWindow() {
     minHeight: 600,
     backgroundColor: '#0F0F0F',
     title: 'Cockpit',
+    // Иконка окна/таскбара (01.08): своя, вместо дефолтного атома Electron —
+    // тот же файл, что у ярлыка на рабочем столе (assets/cockpit.ico,
+    // генератор — тёмный скруглённый квадрат + акцентный шеврон «❯_»).
+    icon: path.join(appRoot(), 'assets', 'cockpit.ico'),
     // Системный тайтлбар скрыт — своя drag-полоса в renderer (#titlebar),
     // кнопки окна рисует Windows поверх (overlay).
     titleBarStyle: 'hidden',
