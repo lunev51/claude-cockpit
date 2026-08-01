@@ -36,6 +36,11 @@
         <div class="group-body" data-body="done"></div>
         <div class="sidebar-section hidden" data-group="trouble">Проблемы · <span class="count"></span></div>
         <div class="group-body" data-body="trouble"></div>
+        <!-- «Наготове» — последняя секция: сессия поднята, но ничего не делает
+             и ничего не требует. Ниже «Проблем» именно потому, что порядок
+             секций — это порядок срочности, а срочности здесь ноль. -->
+        <div class="sidebar-section hidden" data-group="ready">Наготове · <span class="count"></span></div>
+        <div class="group-body" data-body="ready"></div>
       </div>
       <div class="sidebar-footer">
         <!-- Task 3 фазы 5: кольца лимитов (5ч/неделя) — renderRings (rings.js)

@@ -114,6 +114,10 @@ html, body {
 .tab-dot.error   { background: var(--err); }
 .tab-dot.stuck { background: var(--warn); }
 .tab-dot.dead  { background: var(--err); }
+/* «Наготове»: сессия жива, но ничего не происходит — точка приглушённая, без
+   цвета состояния. Полая (только контур) — чтобы отличаться от .done даже при
+   беглом взгляде и не притягивать внимание к тому, что его не требует. */
+.tab-dot.ready { background: transparent; box-shadow: inset 0 0 0 1.5px var(--text-muted); }
 
 @keyframes pulse {
   0%, 100% { opacity: 1; }

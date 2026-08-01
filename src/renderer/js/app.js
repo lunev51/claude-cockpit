@@ -667,6 +667,20 @@ function activateTab(tabId) {
   requestAnimationFrame(() => {
     entry.view.term.focus();
   });
+  // Переключился на вкладку — значит смотришь её результат (живая приёмка
+  // 01.08). Гард внутри: чужие/неактивные и не-'done' не тронет.
+  markSeenIfWatching(tabId);
+}
+
+// «Пользователь сейчас смотрит именно на эту вкладку» — тот же смысл, что у
+// isSuppressed в main/toasts.js («не уведомляем о том, на что и так смотришь»),
+// только здесь он проверяется в renderer: document.hasFocus() честнее любого
+// зеркала состояния окна, а активная вкладка — вообще локальное знание.
+// Сообщаем ядру, оно двигает статус 'done' → 'ready' (см. markSeen).
+function markSeenIfWatching(tabId) {
+  if (tabId !== tabStore.activeId) return;
+  if (!document.hasFocus()) return;
+  window.api.tabs.markSeen(tabId);
 }
 
 // Ghost-буфер (Task 5): сериализовать буфер вкладки и отдать main на запись.
@@ -985,6 +999,15 @@ function bindVoiceHotkey() {
   window.addEventListener('blur', () => voiceMachine.cancel());
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) voiceMachine.cancel();
+  });
+
+  // Живая приёмка 01.08: третий момент «прочитано» — окно вернуло фокус, а на
+  // экране всё это время висела вкладка, которая успела ответить. Первые два —
+  // переключение на вкладку (activateTab) и ответ, пришедший на активной
+  // вкладке (обработчик onStatus). Без этого результат, дождавшийся тебя из
+  // Alt+Tab, навсегда остался бы в «Готово».
+  window.addEventListener('focus', () => {
+    if (tabStore.activeId) markSeenIfWatching(tabStore.activeId);
   });
   // I1 (ревью финальной волны): мышь с зажатым Shift — штатное выделение
   // текста в xterm (Shift+клик выделяет диапазон, Shift+колесо — горизонтальный
@@ -2041,6 +2064,10 @@ async function boot() {
     // заголовок сессии) — лишняя сериализация полумегабайтного буфера на
     // диск здесь ни к чему.
     if (!labelOnly && (status === 'done' || status === 'waiting')) saveGhost(tabId);
+    // «Готово» — список НЕПРОЧИТАННОГО (живая приёмка 01.08). Если ответ
+    // пришёл, пока пользователь смотрел именно на эту вкладку, он его уже
+    // видит — в список непрочитанного ей попадать незачем.
+    if (status === 'done') markSeenIfWatching(tabId);
   });
 
   // Task 4 фазы 4: обработчик вынесен в newProject() — тот же сценарий

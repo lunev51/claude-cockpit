@@ -809,6 +809,117 @@ test('stuck: перезапуск вкладки снимает ожидание
   assert.notStrictEqual(statusOf(events, a.tabId).status, 'stuck');
 });
 
+// ---------- Живая приёмка 01.08: раздел «Наготове» ----------
+// Отзыв пользователя: «а что насчёт того, что они возвращались именно во
+// вкладку "работают", если по сути они просто открыты без дела?»
+//
+// «Работают» должно значить «Claude сейчас думает, не трогай». Поднявшаяся,
+// но нетронутая сессия не работает — она стоит наготове. При десяти
+// восстановленных вкладках счётчик «Работают · 10» выглядел так, будто десять
+// сессий жгут лимит.
+//
+// «Готово» пользователь выбрал списком НЕПРОЧИТАННОГО: посмотрел результат —
+// вкладка уходит в «Наготове».
+
+test('ready: запуск сессии — это «наготове», а не «работает»', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1', source: 'startup' });
+
+  assert.strictEqual(statusOf(events, a.tabId).status, 'ready');
+});
+
+test('ready: поручение переводит в «работают»', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1' });
+
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'почини тесты' });
+
+  assert.strictEqual(statusOf(events, a.tabId).status, 'working');
+});
+
+test('ready: markSeen переводит прочитанный результат из «готово» в «наготове»', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'почини тесты' });
+  mgr.applyHookEvent(a.tabId, 'Stop', {});
+  assert.strictEqual(statusOf(events, a.tabId).status, 'done');
+
+  mgr.markSeen(a.tabId);
+
+  const after = statusOf(events, a.tabId);
+  assert.strictEqual(after.status, 'ready');
+  assert.strictEqual(after.subtitle, '', 'подпись завершённой задачи не тащим в «наготове»');
+});
+
+test('ready: markSeen трогает ТОЛЬКО «готово» — работающую вкладку не сбивает', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'почини тесты' });
+
+  mgr.markSeen(a.tabId); // пользователь смотрит на вкладку, а она ещё думает
+
+  assert.strictEqual(statusOf(events, a.tabId).status, 'working');
+});
+
+test('ready: markSeen не будит ждущую и мёртвую вкладку', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'Notification', { message: 'Claude needs your permission to use Bash' });
+
+  mgr.markSeen(a.tabId);
+
+  assert.strictEqual(statusOf(events, a.tabId).status, 'waiting', 'смотреть на диалог не значит ответить на него');
+});
+
+test('ready: markSeen на неизвестной вкладке молчит и не бросает', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const before = events.length;
+  mgr.markSeen('нет-такой-вкладки');
+  assert.strictEqual(events.length, before);
+});
+
+test('ready: повторный markSeen на уже прочитанной вкладке не шлёт лишних событий', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'почини' });
+  mgr.applyHookEvent(a.tabId, 'Stop', {});
+  mgr.markSeen(a.tabId);
+  const after = events.filter((e) => e.channel === 'tab:status').length;
+
+  mgr.markSeen(a.tabId);
+
+  assert.strictEqual(events.filter((e) => e.channel === 'tab:status').length, after);
+});
+
+test('ready: «наготове» не считается зависанием, сколько бы ни стояла', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events, tick } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1' });
+
+  tick(1500);
+  mgr.checkStuck();
+
+  assert.strictEqual(statusOf(events, a.tabId).status, 'ready');
+});
+
 // ---------- Phase 2b Task 6: зачистка унаследованных маркеров Claude Code ----------
 
 // ---------- FIX 3 (ревью): sessionId восстановления не теряется, конфигурационные args сохраняются ----------

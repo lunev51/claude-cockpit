@@ -317,13 +317,43 @@ app.whenReady().then(() => {
     win.webContents.on('did-fail-load', () => {
       rendererErrors += 1;
     });
-    setTimeout(() => {
+    setTimeout(async () => {
       const ptyOutput = getSmokeOutput();
       console.log(`[smoke] pty=${ptyOutput.slice(0, 80)}`);
+      // Живая приёмка 01.08 («Наготове»): сайдбар — единственная часть, у
+      // которой нет юнит-тестов (DOM без jsdom), а правка была именно в нём.
+      // Спрашиваем настоящее окно: секция на месте, и вкладка без единого
+      // хук-события лежит ИМЕННО в ней, а не в «Работают».
+      let sidebar = '{"error":"не опрошен"}';
+      try {
+        sidebar = await win.webContents.executeJavaScript(`(() => {
+          const head = document.querySelector('[data-group="ready"]');
+          const body = document.querySelector('[data-body="ready"]');
+          const working = document.querySelector('[data-body="working"]');
+          return JSON.stringify({
+            section: head ? head.textContent.replace(/\\s+/g, ' ').trim() : null,
+            ready: body ? body.children.length : -1,
+            working: working ? working.children.length : -1,
+          });
+        })()`);
+      } catch (err) {
+        sidebar = `{"error":${JSON.stringify(String(err && err.message))}}`;
+      }
+      console.log(`[smoke] sidebar=${sidebar}`);
       console.log(`[smoke] renderer-errors=${rendererErrors}`);
       flushWorkspace();
       disposeSessions();
-      const ok = rendererErrors === 0 && ptyOutput.includes('PTY_OK');
+      let sidebarOk = false;
+      try {
+        const s = JSON.parse(sidebar);
+        // Что смоук может утверждать ЧЕСТНО: секция «Наготове» существует в
+        // разметке, и до первого хук-события в «Работают» никто не попал.
+        // Строк в сайдбаре при smoke нет вовсе (воркспейс не восстанавливается),
+        // поэтому «вкладка лежит именно там» проверяется юнит-тестами
+        // раскладки (test/tab-group.test.js), а не отсюда.
+        sidebarOk = typeof s.section === 'string' && s.section.startsWith('Наготове') && s.working === 0;
+      } catch { sidebarOk = false; }
+      const ok = rendererErrors === 0 && ptyOutput.includes('PTY_OK') && sidebarOk;
       app.exit(ok ? 0 : 1);
     }, 8000);
   }
