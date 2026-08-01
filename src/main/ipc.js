@@ -19,7 +19,7 @@ const { createHookBridge } = require('./hook-bridge');
 const { connectProject, isConnected } = require('./connector');
 const { notify } = require('./notify');
 const { createNightWatch } = require('./night-watch');
-const { createSessionTitleReader } = require('./session-title');
+const { createSessionTitleReader, createFsReadParts } = require('./session-title');
 const { createNightJournal, NIGHT_JOURNAL_MAX_ENTRIES } = require('./night-journal');
 const { createWorkspaceStore } = require('./workspace');
 const { createWorkspaceSync } = require('./workspace-sync');
@@ -914,27 +914,13 @@ function sttHttpPost(port, urlPath, headers, bodyBuffer, timeoutMs) {
   });
 }
 
-// Живая приёмка 01.08: чтение НАЧАЛА транскрипта (заголовок сессии, ai-title).
-// Именно префикс, а не файл целиком: транскрипты бывают сотни мегабайт (у
-// пользователя замерено 226 МБ), а нужная запись лежит в первых строках —
-// полное чтение стоило бы ровно того дискового шторма, который уже вешал
-// машину (см. инцидент ccusage). Один fs.read в буфер фиксированного размера:
-// ни потоков, ни склейки чанков, ни шанса прочитать больше запрошенного.
-function readTranscriptPrefix(filePath, maxBytes) {
-  return new Promise((resolve) => {
-    fs.open(filePath, 'r', (openErr, fd) => {
-      if (openErr) { resolve(''); return; }
-      const buf = Buffer.allocUnsafe(maxBytes);
-      fs.read(fd, buf, 0, maxBytes, 0, (readErr, bytesRead) => {
-        fs.close(fd, () => {});
-        if (readErr) { resolve(''); return; }
-        resolve(buf.toString('utf8', 0, bytesRead));
-      });
-    });
-  });
-}
-
-const sessionTitleReader = createSessionTitleReader({ readPrefix: readTranscriptPrefix });
+// Живая приёмка 01.08: чтение начала и конца транскрипта (два источника
+// «названия» сессии — ai-title в начале, custom-title от `/rename` в конце)
+// переехало в session-title.js с инжектируемым fs. Minor 1 ревью: здесь эта
+// функция была недостижима для тестов — все они ходили через стаб — и именно
+// в ней пряталась дыра «мёртвого окна» размеров (Critical 1). Там она теперь
+// покрыта тестами на настоящем временном файле.
+const sessionTitleReader = createSessionTitleReader({ readParts: createFsReadParts(fs) });
 
 // Геттер инстанса createStt — создаёт JS-объект при ПЕРВОМ реальном
 // обращении к stt:transcribe/status (через sttTranscribeHandler/
@@ -1182,10 +1168,12 @@ function registerIpc(win, opts = {}) {
     // чуть ниже) она ещё null, но вызывается это замыкание не раньше первого
     // реального Stop-хука — то есть уже после того, как nightWatch присвоен.
     holdQueueFor: (tabId) => !!(nightWatch && nightWatch.isPending(tabId)),
-    // Живая приёмка 01.08: «название» сессии из транскрипта (ai-title) —
-    // читаем ПРЕФИКС файла (транскрипт бывает 226 МБ, заголовок лежит в
-    // первых строках; подробное обоснование — в шапке session-title.js).
-    readSessionTitle: (transcriptPath) => sessionTitleReader.read(transcriptPath),
+    // Живая приёмка 01.08: «название» сессии из транскрипта — имя из
+    // `/rename`, а если его нет, автозаголовок Claude. Читаются НАЧАЛО и
+    // КОНЕЦ файла (источники лежат в разных концах, а транскрипт бывает
+    // 226 МБ); sessionId — страховка от чужих записей. Обоснование выбора
+    // источников, мест и размеров чтения — в шапке session-title.js.
+    readSessionTitle: (transcriptPath, sessionId) => sessionTitleReader.read(transcriptPath, sessionId),
     onEvent: (channel, payload) => {
       if (smoke && channel === 'term:data') smokeOutput += payload.data;
       if (channel === 'tabs:changed') syncWorkspace();

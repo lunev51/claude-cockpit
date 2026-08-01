@@ -1875,3 +1875,84 @@ test('sessionLabel M3: tabs:changed эмитится именно АСИНХРО
   const afterAsync = events.filter((e) => e.channel === 'tabs:changed').length;
   assert.strictEqual(afterAsync, afterSync + 1, 'применение метки обязано само уведомить манифест');
 });
+
+// Запрос пользователя 01.08: переименовал сессию через `/rename` → новое имя
+// подхватывается при перезапуске вкладки (Ctrl+Shift+R), а не на каждом
+// промпте. Сессия при этом ТА ЖЕ (--resume того же id), поэтому метку не
+// гасим (сайдбар не мигает), но заголовок обязаны перечитать.
+
+test('sessionLabel: Ctrl+Shift+R перечитывает имя сессии — /rename подхватывается', async () => {
+  const factory = makeFakePtyFactory();
+  let title = 'Организовать папку Акто';   // сначала автозаголовок
+  const reads = [];
+  const { mgr, events } = makeManager(factory, {
+    readSessionTitle: (p, sid) => { reads.push({ p, sid }); return Promise.resolve(title); },
+  });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1', transcript_path: 'C:\\t\\S1.jsonl' });
+  await flushAsync();
+  assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'Организовать папку Акто');
+  assert.strictEqual(reads.length, 1);
+  assert.strictEqual(reads[0].sid, 'S1', 'sessionId прокидывается — чужие записи в файле отсеиваются');
+
+  // Пользователь сделал /rename прямо в этой сессии...
+  title = 'RZ paper';
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'ещё', transcript_path: 'C:\\t\\S1.jsonl' });
+  await flushAsync();
+  assert.strictEqual(
+    statusOf(events, a.tabId).sessionLabel,
+    'Организовать папку Акто',
+    'на обычном промпте НЕ перечитываем — так выбрал пользователь',
+  );
+
+  // ...и нажал Ctrl+Shift+R — вот момент подхвата.
+  mgr.restart(a.tabId);
+  assert.strictEqual(
+    mgr.list().find((t) => t.tabId === a.tabId).sessionLabel,
+    'Организовать папку Акто',
+    'метка не гаснет на время перезапуска — сайдбар не мигает пустотой',
+  );
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1', transcript_path: 'C:\\t\\S1.jsonl' });
+  await flushAsync();
+
+  assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'RZ paper');
+  assert.strictEqual(reads.length, 2, 'ровно одно дополнительное чтение — на рестарте');
+});
+
+test('sessionLabel Minor 2: запоздавший ответ старой сессии не снимает занятость нового чтения', async () => {
+  // `/clear` во время висящего чтения — путь, где поколение pty НЕ меняется
+  // (та же труба), поэтому сверкой gen тут ничего не защитить: чтение старой
+  // сессии выглядит «своим» и гасит занятость, принадлежащую уже чтению
+  // новой. Следующий промпт после этого запускает третье чтение параллельно
+  // второму. Токен чтения различает их, gen — нет.
+  const factory = makeFakePtyFactory();
+  const resolvers = [];
+  const { mgr } = makeManager(factory, {
+    readSessionTitle: () => new Promise((resolve) => { resolvers.push(resolve); }),
+  });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1', transcript_path: 'C:\\t\\S1.jsonl' });
+  await flushAsync();
+  assert.strictEqual(resolvers.length, 1, 'чтение сессии S1 стартовало и висит');
+
+  // /clear: тот же pty, новая сессия — занятость сбрасывается, gen прежний.
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S2', transcript_path: 'C:\\t\\S2.jsonl' });
+  await flushAsync();
+  assert.strictEqual(resolvers.length, 2, 'для новой сессии открыто своё чтение');
+
+  resolvers[0]('Заголовок сессии S1'); // отвечает ПЕРВОЕ, второе ещё висит
+  await flushAsync();
+
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'ещё', transcript_path: 'C:\\t\\S2.jsonl' });
+  await flushAsync();
+  assert.strictEqual(resolvers.length, 2, 'третьего чтения нет — занятость второго цела');
+
+  // И занятость не залипла навсегда: второе чтение доводит дело до метки.
+  resolvers[1]('RZ paper');
+  await flushAsync();
+  assert.strictEqual(mgr.list().find((t) => t.tabId === a.tabId).sessionLabel, 'RZ paper');
+});
