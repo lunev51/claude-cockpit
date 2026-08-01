@@ -19,6 +19,7 @@ const { createHookBridge } = require('./hook-bridge');
 const { connectProject, isConnected } = require('./connector');
 const { notify } = require('./notify');
 const { createNightWatch } = require('./night-watch');
+const { createSessionTitleReader } = require('./session-title');
 const { createNightJournal, NIGHT_JOURNAL_MAX_ENTRIES } = require('./night-journal');
 const { createWorkspaceStore } = require('./workspace');
 const { createWorkspaceSync } = require('./workspace-sync');
@@ -913,6 +914,28 @@ function sttHttpPost(port, urlPath, headers, bodyBuffer, timeoutMs) {
   });
 }
 
+// Живая приёмка 01.08: чтение НАЧАЛА транскрипта (заголовок сессии, ai-title).
+// Именно префикс, а не файл целиком: транскрипты бывают сотни мегабайт (у
+// пользователя замерено 226 МБ), а нужная запись лежит в первых строках —
+// полное чтение стоило бы ровно того дискового шторма, который уже вешал
+// машину (см. инцидент ccusage). Один fs.read в буфер фиксированного размера:
+// ни потоков, ни склейки чанков, ни шанса прочитать больше запрошенного.
+function readTranscriptPrefix(filePath, maxBytes) {
+  return new Promise((resolve) => {
+    fs.open(filePath, 'r', (openErr, fd) => {
+      if (openErr) { resolve(''); return; }
+      const buf = Buffer.allocUnsafe(maxBytes);
+      fs.read(fd, buf, 0, maxBytes, 0, (readErr, bytesRead) => {
+        fs.close(fd, () => {});
+        if (readErr) { resolve(''); return; }
+        resolve(buf.toString('utf8', 0, bytesRead));
+      });
+    });
+  });
+}
+
+const sessionTitleReader = createSessionTitleReader({ readPrefix: readTranscriptPrefix });
+
 // Геттер инстанса createStt — создаёт JS-объект при ПЕРВОМ реальном
 // обращении к stt:transcribe/status (через sttTranscribeHandler/
 // sttStatusHandler ниже), НЕ при registerIpc. M2 (ревью финальной волны):
@@ -1159,6 +1182,10 @@ function registerIpc(win, opts = {}) {
     // чуть ниже) она ещё null, но вызывается это замыкание не раньше первого
     // реального Stop-хука — то есть уже после того, как nightWatch присвоен.
     holdQueueFor: (tabId) => !!(nightWatch && nightWatch.isPending(tabId)),
+    // Живая приёмка 01.08: «название» сессии из транскрипта (ai-title) —
+    // читаем ПРЕФИКС файла (транскрипт бывает 226 МБ, заголовок лежит в
+    // первых строках; подробное обоснование — в шапке session-title.js).
+    readSessionTitle: (transcriptPath) => sessionTitleReader.read(transcriptPath),
     onEvent: (channel, payload) => {
       if (smoke && channel === 'term:data') smokeOutput += payload.data;
       if (channel === 'tabs:changed') syncWorkspace();
@@ -1476,15 +1503,18 @@ function registerIpc(win, opts = {}) {
   // вкладки из манифеста, чтобы не заводить новый ghost-файл при каждом
   // restore и не осиротить старый.
   ipcMain.handle('tabs:open', (_e, {
-    cwd, command, args, ghostId, sessionId,
+    cwd, command, args, ghostId, sessionId, sessionLabel,
   } = {}) => {
     if (typeof cwd !== 'string' || !cwd) return null;
     const cmd = typeof command === 'string' ? command : undefined;
     const a = Array.isArray(args) && args.every((x) => typeof x === 'string') ? args : undefined;
     const gid = typeof ghostId === 'string' && ghostId ? ghostId : undefined;
     const sid = typeof sessionId === 'string' && sessionId ? sessionId : undefined;
+    // I3 (ревью 01.08): метка из манифеста — восстановление передаёт её сюда,
+    // вкладка подписана с первой отрисовки (см. sessions.js/open).
+    const label = typeof sessionLabel === 'string' && sessionLabel ? sessionLabel : undefined;
     return manager.open({
-      cwd, smoke, command: cmd, args: a, ghostId: gid, sessionId: sid,
+      cwd, smoke, command: cmd, args: a, ghostId: gid, sessionId: sid, sessionLabel: label,
     });
   });
 

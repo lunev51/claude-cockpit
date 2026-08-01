@@ -568,6 +568,10 @@ function toggleNight() {
 // воркспейса — см. sessionId ниже, FIX 3 ревью).
 async function openTab(cwd, {
   activate = true, command = null, args = null, preludeText = null, ghostId = null, sessionId = null,
+  // I3 (ревью 01.08): «название» сессии из манифеста — восстановленная
+  // вкладка подписана с первой отрисовки, а не через минуту-две (главный
+  // сценарий пользователя: утром десяток --resume вкладок в одной папке).
+  sessionLabel = null,
 } = {}) {
   // ghostId (Task 5, ревью finding 1a) — восстановление передаёт исходный id
   // вкладки, иначе main всегда минтит новый и старый ghost-файл осиротеет.
@@ -576,7 +580,7 @@ async function openTab(cwd, {
   // конфигурационных args вкладки, не подменяя их и не игнорируя
   // config.terminal.command (раньше это делал сам restoreFlow, см. ниже).
   const tab = await window.api.tabs.open({
-    cwd, command, args, ghostId, sessionId,
+    cwd, command, args, ghostId, sessionId, sessionLabel,
   });
   if (!tab) return null;
 
@@ -1662,6 +1666,9 @@ async function restoreFlow(chosen, activeIndex, overlay) {
           // config.terminal.command. sessionId идёт отдельно — sessions.js
           // сам достраивает --resume поверх конфигурационных args.
           sessionId: t.sessionId,
+          // I3 (ревью 01.08): «название» сессии из манифеста — вкладка
+          // подписана сразу, не дожидаясь хуков/чтения транскрипта.
+          sessionLabel: t.sessionLabel,
           preludeText,
           ghostId: t.ghostId,
         });

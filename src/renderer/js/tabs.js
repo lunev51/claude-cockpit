@@ -51,7 +51,7 @@ export function createTabStore({
     refreshGroups();
   }
 
-  function add({ tabId, name, cwd }) {
+  function add({ tabId, name, cwd, sessionLabel }) {
     const row = document.createElement('div');
     row.className = 'tab-row';
 
@@ -69,6 +69,13 @@ export function createTabStore({
     // именем проекта и путём; скрыт, пока метка не пришла (см. setStatus).
     const sessionLabelEl = document.createElement('div');
     sessionLabelEl.className = 'tab-session-label hidden';
+    // I3 (ревью 01.08): восстановленная вкладка приходит с меткой из
+    // манифеста — рисуем сразу, до первого tab:status.
+    if (typeof sessionLabel === 'string' && sessionLabel) {
+      sessionLabelEl.textContent = sessionLabel;
+      sessionLabelEl.title = sessionLabel;
+      sessionLabelEl.classList.remove('hidden');
+    }
     const sub = document.createElement('div');
     sub.className = 'tab-sub';
     sub.textContent = cwd;
@@ -174,7 +181,7 @@ export function createTabStore({
       // Живая приёмка 01.08: зеркало tab.sessionLabel из sessions.js —
       // «название» сессии под именем проекта (в одной папке живёт несколько
       // сессий, различить их иначе нечем).
-      sessionLabelEl, sessionLabel: '',
+      sessionLabelEl, sessionLabel: typeof sessionLabel === 'string' ? sessionLabel : '',
     };
     rows.set(tabId, r);
     order.push(tabId);
@@ -221,16 +228,17 @@ export function createTabStore({
     // waitingText выше — sessions.js уже чистит tab.waitingKind на выходе из
     // 'waiting' (эмитит ''), здесь только зеркалим payload, тем же приёмом.
     if (typeof waitingKind === 'string') r.waitingKind = waitingKind;
-    // Живая приёмка 01.08: «название» сессии. Пустая строка НЕ прячет уже
-    // показанную метку — источник (sessions.js/applySessionLabel) пустым
-    // значением её никогда не затирает, а вот СТАРЫЕ payload'ы (события,
-    // отправленные до этой фичи) поля не несут вовсе — undefined тем более
-    // не должен ничего гасить.
-    if (typeof sessionLabel === 'string' && sessionLabel && sessionLabel !== r.sessionLabel) {
+    // Живая приёмка 01.08: «название» сессии.
+    // I2 (ревью): различаем ДВА разных «нет значения». undefined — payload
+    // вообще без поля (событие не про метку) → не трогаем показанное. Пустая
+    // строка — ЯВНАЯ очистка из main (restart сменил сессию через пикер:
+    // старое имя стало чужим) → прячем, иначе вкладка осталась бы подписана
+    // именем сессии, которой в ней больше нет.
+    if (typeof sessionLabel === 'string' && sessionLabel !== r.sessionLabel) {
       r.sessionLabel = sessionLabel;
       r.sessionLabelEl.textContent = sessionLabel;
       r.sessionLabelEl.title = sessionLabel;
-      r.sessionLabelEl.classList.remove('hidden');
+      r.sessionLabelEl.classList.toggle('hidden', !sessionLabel);
     }
     if (regroup) placeRow(r);
   }

@@ -35,7 +35,15 @@ function createWorkspaceSync({ store, listTabs, smoke = false }) {
     store.set({
       version: 1,
       activeIndex: idx === -1 ? 0 : idx,
-      tabs: list.map(({ cwd, name, sessionId, ghostId }) => ({ cwd, name, sessionId, ghostId })),
+      // I3 (ревью 01.08): sessionLabel в манифесте — иначе после перезапуска
+      // кокпита утренние вкладки стоят БЕЗ меток до первого промпта, ровно в
+      // тот момент, когда их и надо различать. Поле аддитивное: isValid
+      // (workspace.js) требует только cwd, старые манифесты валидны без него.
+      tabs: list.map(({
+        cwd, name, sessionId, ghostId, sessionLabel,
+      }) => ({
+        cwd, name, sessionId, ghostId, sessionLabel,
+      })),
     });
   }
 

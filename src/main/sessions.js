@@ -52,50 +52,35 @@ const AUTO_RECOVER_MAX_LIFETIME_MS = 15000;
 // Живая приёмка (01.08, отзыв пользователя): «в одной папке бывает несколько
 // сессий, нечем их различить» — вкладке нужна своя строка-«название».
 //
-// ИСТОЧНИК (сверено с бинарём CLI 2.1.220, не догадка): payload хуков несёт
-// ГОТОВОЕ поле session_title — собственный заголовок сессии Claude Code, тот
-// же, что виден в claude.ai:
-//   hook_event_name:"SessionStart",   …, session_title: r ?? fA(…)
-//   hook_event_name:"UserPromptSubmit", prompt: e, session_title: fA(Ht())
-// Именно SessionStart делает фичу полноценной: при --resume он приносит
-// НАСТОЯЩЕЕ имя резюмируемой сессии, поэтому восстановленные вкладки
-// подписываются сами, без чтения транскриптов и без персиста в манифесте.
-//
-// Заголовок генерируется CLI не мгновенно (у новой сессии первый
-// UserPromptSubmit обычно ещё несёт пустой session_title), поэтому:
-//   1) session_title, как только пришёл непустым, — главный источник и может
-//      ОБНОВИТЬСЯ позже (в отличие от исходной задумки «только первый раз»);
-//   2) пока его нет — фолбэк на текст первого промпта, чтобы вкладка была
-//      различима сразу же, а не через минуту;
-//   3) пустое значение НИКОГДА не затирает уже показанную метку.
+// ИСТОЧНИКОВ ДВА, в порядке приоритета:
+//   1) НАСТОЯЩИЙ заголовок сессии — запись ai-title в транскрипте (см.
+//      session-title.js: почему не session_title из payload хука, и почему
+//      читается только префикс файла). Приходит АСИНХРОННО (чтение файла),
+//      поэтому применяется отдельным путём — см. applyTitleAsync ниже.
+//   2) Фолбэк «первый промпт» — мгновенная метка для сессии, у которой
+//      заголовка ещё нет (CLI генерирует его после первого обмена).
+// Настоящий заголовок ВСЕГДА перебивает фолбэк; пустое значение никогда не
+// затирает уже показанную метку.
 const SESSION_LABEL_MAX = 48;
 
 function truncateForLabel(text) {
   // \s+ → пробел: многострочная вставка/диктовка не должна ломать одну
   // строку сайдбара. Это ЧИСТО косметическое усечение — не путать с
   // normalizeForPty (импорт выше), которая готовит текст к ОТПРАВКЕ в pty.
-  const squashed = String(text == null ? '' : text).replace(/\s+/g, ' ').trim();
+  // M2 ревью: срезаем заведомо лишний хвост ДО regex — промпт бывает и на
+  // 100 КБ (вставка файла), гонять по нему схлопывание пробелов незачем.
+  const head = String(text == null ? '' : text).slice(0, SESSION_LABEL_MAX * 4);
+  const squashed = head.replace(/\s+/g, ' ').trim();
   if (!squashed) return '';
   return squashed.length > SESSION_LABEL_MAX
     ? `${squashed.slice(0, SESSION_LABEL_MAX - 1)}…`
     : squashed;
 }
 
-// Единая точка обновления метки для обоих хуков. Возвращает true, если метка
-// действительно изменилась (вызывающему это нужно, чтобы не слать лишний
-// tab:status на каждый чих). Приоритет: session_title > первый промпт;
-// пустое не затирает; фолбэк-промпт не перебивает уже показанный titleа
-// и не перезаписывается вторым промптом.
-function applySessionLabel(tab, data) {
-  const title = truncateForLabel(data && data.session_title);
-  if (title) {
-    if (tab.sessionLabel === title) return false;
-    tab.sessionLabel = title;
-    tab.sessionLabelFromTitle = true; // дальше только другой session_title сможет это сменить
-    return true;
-  }
-  // session_title ещё не сгенерирован — подставляем первый промпт, но только
-  // если настоящего заголовка ещё не было и метки ещё нет вовсе.
+// Фолбэк-метка из текста промпта. Ставится ТОЛЬКО если метки ещё нет вовсе
+// и настоящий заголовок ещё не приходил (иначе он был бы затёрт сегодняшней
+// репликой). Возвращает true, если метка изменилась.
+function applyPromptFallback(tab, data) {
   if (tab.sessionLabelFromTitle || tab.sessionLabel) return false;
   const fromPrompt = truncateForLabel(data && data.prompt);
   if (!fromPrompt) return false;
@@ -146,6 +131,11 @@ function createSessionManager({
   stuckAfterMs = 5 * 60 * 1000,
   getExtraEnv = () => ({}),
   holdQueueFor = null,
+  // Живая приёмка 01.08: (transcriptPath) => Promise<string> — чтение
+  // настоящего заголовка сессии (ai-title) из транскрипта. НЕОБЯЗАТЕЛЬНАЯ
+  // зависимость: без неё метка деградирует до фолбэка «первый промпт», всё
+  // остальное работает как раньше. Реализация — session-title.js (ipc.js).
+  readSessionTitle = null,
 }) {
   const tabs = new Map();
   // Global-счётчик поколений (Important 1, ревью раунд 1 задачи 5 фазы 7):
@@ -169,6 +159,10 @@ function createSessionManager({
 
   function open({
     cwd, command = null, args = null, smoke = false, ghostId = null, sessionId = null,
+    // I3 (ревью 01.08): метка из манифеста — восстановленная вкладка
+    // подписана СРАЗУ, ещё до первого хука. Настоящий заголовок из
+    // транскрипта её потом подтвердит/уточнит (requestSessionTitle).
+    sessionLabel = null,
   }) {
     const tabId = crypto.randomUUID();
     const name = path.basename(cwd) || cwd;
@@ -201,8 +195,9 @@ function createSessionManager({
       // applySessionLabel() выше по файлу (session_title из хуков, фолбэк на
       // первый промпт). Сбрасывается в restart() — новая жизнь вкладки
       // заслуживает новую метку.
-      sessionLabel: '',
-      sessionLabelFromTitle: false, // метка пришла из настоящего session_title (фолбэк-промпт её больше не трогает)
+      sessionLabel: typeof sessionLabel === 'string' ? sessionLabel : '',
+      sessionLabelFromTitle: false, // метка пришла из НАСТОЯЩЕГО заголовка (ai-title) — фолбэк-промпт её больше не трогает
+      titleReadInFlight: false,     // идёт асинхронное чтение заголовка — не плодим параллельные
       lastOutputAt: now(),
       // Очередь промптов (Task 1 фазы 7): ввод для КОНКРЕТНОЙ сессии этой
       // вкладки — переживает обычное переключение вкладок, но НЕ переживает
@@ -222,7 +217,9 @@ function createSessionManager({
       hookActive: false,
     });
     onEvent('tabs:changed', {}); // состав вкладок изменился — main пересоберёт манифест
-    return { tabId, cwd, name };
+    // sessionLabel в ответе (I3, ревью 01.08) — renderer рисует метку сразу
+    // при добавлении строки, не дожидаясь первого tab:status.
+    return { tabId, cwd, name, sessionLabel: tabs.get(tabId).sessionLabel };
   }
 
   // extra (Important 1, ревью Task 2 фазы 8) — необязательный объект,
@@ -512,11 +509,18 @@ function createSessionManager({
     tab.sessionId = null; // новая жизнь — новый SessionStart перебиндит
     tab.sessionBound = false; // FIX 3: привязка тоже сбрасывается — новый спавн ещё не подтверждён
     tab.autoRecovered = false; // ручной рестарт — гард одноразовости авто-восстановления взводится заново
-    // Живая приёмка 01.08: новая жизнь вкладки — новая метка (её принесёт
-    // SessionStart нового процесса; при --resume это будет имя резюмируемой
-    // сессии, при голом старте — фолбэк с первого промпта).
-    tab.sessionLabel = '';
-    tab.sessionLabelFromTitle = false;
+    // I1 (ревью 01.08): метку стираем ТОЛЬКО если рестарт реально меняет
+    // сессию. При сохранённом boundSessionId ниже спавнится `--resume
+    // <тот же id>` — сессия та же, и обнуление переименовывало бы вкладку
+    // следующим промптом («почини тесты» → «прогони линтер») без всякой
+    // причины. Голый `--resume` (интерактивный пикер) может привести ЛЮБУЮ
+    // сессию — вот там метка обязана уйти, чтобы не подписывать вкладку
+    // чужим именем.
+    if (!boundSessionId) {
+      tab.sessionLabel = '';
+      tab.sessionLabelFromTitle = false;
+    }
+    tab.titleReadInFlight = false; // ответ старого чтения всё равно отсечётся по gen
 
     if (boundSessionId) {
       // 1. session_id уже известен (из прошлого SessionStart) — резюмируем именно его.
@@ -625,6 +629,44 @@ function createSessionManager({
   // сессия, найдена по session_id) как «текущее поколение». genSeq делает
   // gen уникальным не только внутри вкладки, а на весь менеджер — только
   // тогда сравнение `gen !== tab.gen` действительно доказывает «это
+  // Запрос настоящего заголовка сессии (ai-title из транскрипта) — живая
+  // приёмка 01.08. Асинхронный, поэтому обвешан гардами: между запросом и
+  // ответом вкладка могла закрыться, перезапуститься (Ctrl+Shift+R) или
+  // сменить сессию — ровно тот класс гонки, что уже дважды кусал этот файл
+  // (гард поколения pty, вброс очереди в чужую сессию). Снимок gen на входе
+  // + сверка на выходе; чужой/устаревший ответ молча выбрасывается.
+  //
+  // Гарды до чтения: нет readSessionTitle (зависимость необязательна — тесты
+  // и старые вызывающие живут без неё) / нет пути / настоящий заголовок уже
+  // получен / чтение по этому пути уже летит.
+  function requestSessionTitle(tab, transcriptPath) {
+    if (!readSessionTitle || typeof transcriptPath !== 'string' || !transcriptPath) return;
+    if (tab.sessionLabelFromTitle) return; // настоящий заголовок уже есть — второй раз не читаем
+    if (tab.titleReadInFlight) return; // не плодим параллельные чтения на каждый промпт
+    tab.titleReadInFlight = true;
+    const myGen = tab.gen;
+    const myTabId = tab.tabId;
+    Promise.resolve()
+      .then(() => readSessionTitle(transcriptPath))
+      .then((title) => {
+        const live = tabs.get(myTabId);
+        // Вкладка закрыта / перезапущена (новое поколение) — ответ протух.
+        if (!live || live !== tab || live.gen !== myGen) return;
+        live.titleReadInFlight = false;
+        const clean = truncateForLabel(title);
+        if (!clean || clean === live.sessionLabel) return;
+        live.sessionLabel = clean;
+        live.sessionLabelFromTitle = true;
+        // Рассылаем метку тем же каналом, что и статусы: статус НЕ меняем —
+        // передаём текущий, чтобы не подделать состояние вкладки.
+        setStatus(live, live.status, live.subtitle);
+      })
+      .catch(() => {
+        const live = tabs.get(myTabId);
+        if (live && live === tab && live.gen === myGen) live.titleReadInFlight = false;
+      });
+  }
+
   // поколение ЭТОЙ КОНКРЕТНОЙ вкладки, а не чьё-то ещё».
   //
   // I4 (ревью финальной волны фазы 7): gen===null/undefined («доказательства
@@ -661,14 +703,19 @@ function createSessionManager({
           bindSession(tabId, data.session_id);
           tab.overrideFailed = false; // resume/continue подтверждён хуком — попытка удалась
         }
-        // Живая приёмка 01.08: при --resume именно здесь приходит настоящее
-        // имя резюмируемой сессии — восстановленная вкладка подписывается
-        // сама (см. applySessionLabel выше). setStatus ниже разошлёт метку.
-        applySessionLabel(tab, data);
+        // Живая приёмка 01.08: настоящий заголовок сессии живёт в
+        // транскрипте (ai-title), путь к которому CLI кладёт прямо в payload
+        // (transcript_path). Читаем асинхронно — это главный источник метки,
+        // и именно он подписывает утренние --resume вкладки.
+        requestSessionTitle(tab, data.transcript_path);
         setStatus(tab, 'working', 'сессия запущена');
         break;
       case 'UserPromptSubmit':
-        applySessionLabel(tab, data);
+        applyPromptFallback(tab, data);
+        // Заголовок мог сгенерироваться уже ПОСЛЕ SessionStart (новая сессия:
+        // на старте его в транскрипте ещё нет) — перепроверяем на каждом
+        // промпте, пока не получим настоящий (гард внутри — см. функцию).
+        requestSessionTitle(tab, data.transcript_path);
         setStatus(tab, 'working', 'думает…');
         break;
       case 'PreToolUse':
@@ -774,11 +821,14 @@ function createSessionManager({
     // в nightWatch.onTabStop() на момент детекта, ядро сверяет его же на
     // пробуждении через getTabGen — pty мог смениться (авто-респавн/ручной
     // рестарт в интерактивный пикер сессий) между детектом и пробуждением.
+    // sessionLabel (живая приёмка 01.08) — «название» сессии; уходит в
+    // манифест воркспейса (workspace-sync.js), чтобы утренние восстановленные
+    // вкладки были различимы СРАЗУ, не дожидаясь чтения транскрипта.
     return [...tabs.values()].map(({
-      tabId, cwd, name, alive, status, subtitle, sessionId, ghostId, waitingKind, gen,
+      tabId, cwd, name, alive, status, subtitle, sessionId, ghostId, waitingKind, gen, sessionLabel,
     }) => (
       {
-        tabId, cwd, name, alive, status, subtitle, sessionId, ghostId, waitingKind, gen,
+        tabId, cwd, name, alive, status, subtitle, sessionId, ghostId, waitingKind, gen, sessionLabel,
       }
     ));
   }

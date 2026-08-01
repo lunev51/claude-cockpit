@@ -1502,117 +1502,211 @@ test('N2: после ВЫХОДА из waiting понижение разреше
   assert.strictEqual(tab.waitingKind, 'idle');
 });
 
+
 // ---------- «Название» сессии в сайдбаре (живая приёмка 01.08) ----------
 // Пользователь: «в одной папке может быть несколько сессий, чтобы их
-// различить». Источник — ГОТОВОЕ поле session_title из payload хуков
-// (сверено с бинарём CLI 2.1.220: оно есть у SessionStart и UserPromptSubmit),
-// фолбэк — текст первого промпта, пока CLI ещё не сгенерировал заголовок.
+// различить». Источник — НАСТОЯЩИЙ заголовок сессии (запись ai-title в
+// транскрипте, читается асинхронно через инжектируемый readSessionTitle);
+// фолбэк — текст первого промпта, пока заголовка ещё нет.
+//
+// ВАЖНО (ревью 01.08 опровергло первую версию фичи): поле session_title из
+// payload хука НЕ используется — оно отдаёт только имя из /rename, а не
+// автозаголовок, и у ~94% реальных сессий пользователя отсутствует.
 
-test('sessionLabel: SessionStart с session_title (случай --resume) подписывает вкладку сразу', () => {
+// Ждём, пока осядут промисы асинхронного чтения заголовка.
+async function flushAsync(times = 5) {
+  for (let i = 0; i < times; i += 1) await Promise.resolve();
+}
+
+test('sessionLabel: ai-title из транскрипта подписывает вкладку (главный сценарий --resume)', async () => {
   const factory = makeFakePtyFactory();
-  const { mgr, events } = makeManager(factory);
-  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  const readCalls = [];
+  const { mgr, events } = makeManager(factory, {
+    readSessionTitle: (p) => { readCalls.push(p); return Promise.resolve('Организовать папку Акто'); },
+  });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
 
   mgr.applyHookEvent(a.tabId, 'SessionStart', {
-    session_id: 'S1', session_title: 'Рефакторинг платёжного модуля',
+    session_id: 'S1', transcript_path: 'C:\\t\\S1.jsonl',
   });
+  await flushAsync();
 
-  assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'Рефакторинг платёжного модуля');
+  assert.deepStrictEqual(readCalls, ['C:\\t\\S1.jsonl']);
+  assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'Организовать папку Акто');
 });
 
-test('sessionLabel: пока session_title пуст — фолбэк на текст первого промпта', () => {
+test('sessionLabel: SessionStart БЕЗ заголовка в транскрипте — метки нет, вкладка не врёт', async () => {
   const factory = makeFakePtyFactory();
-  const { mgr, events } = makeManager(factory);
-  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  const { mgr, events } = makeManager(factory, {
+    readSessionTitle: () => Promise.resolve(''), // ai-title ещё не сгенерирован
+  });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
 
-  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1' }); // заголовка ещё нет
+  mgr.applyHookEvent(a.tabId, 'SessionStart', {
+    session_id: 'S1', transcript_path: 'C:\\t\\S1.jsonl',
+  });
+  await flushAsync();
+
+  assert.strictEqual(statusOf(events, a.tabId).sessionLabel, '');
+});
+
+test('sessionLabel: пока заголовка нет — фолбэк на текст первого промпта', async () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory, { readSessionTitle: () => Promise.resolve('') });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+
   mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'почини тесты в модуле оплаты' });
+  await flushAsync();
 
   assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'почини тесты в модуле оплаты');
 });
 
-test('sessionLabel: настоящий session_title ПЕРЕБИВАЕТ фолбэк-промпт, когда наконец приходит', () => {
+test('sessionLabel: настоящий заголовок ПЕРЕБИВАЕТ фолбэк-промпт, когда появляется', async () => {
   const factory = makeFakePtyFactory();
-  const { mgr, events } = makeManager(factory);
-  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  let title = '';
+  const { mgr, events } = makeManager(factory, { readSessionTitle: () => Promise.resolve(title) });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
 
-  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'почини тесты' });
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'почини тесты', transcript_path: 'C:\\t\\S1.jsonl' });
+  await flushAsync();
   assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'почини тесты');
 
-  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', {
-    prompt: 'а теперь прогони линтер', session_title: 'Починка тестов оплаты',
-  });
+  title = 'Починка тестов оплаты'; // CLI сгенерировал заголовок
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'теперь линтер', transcript_path: 'C:\\t\\S1.jsonl' });
+  await flushAsync();
   assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'Починка тестов оплаты');
 });
 
-test('sessionLabel: второй промпт НЕ перезаписывает фолбэк (метка стабильна)', () => {
+test('sessionLabel: второй промпт НЕ перезаписывает фолбэк (метка стабильна)', async () => {
   const factory = makeFakePtyFactory();
-  const { mgr, events } = makeManager(factory);
-  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  const { mgr, events } = makeManager(factory, { readSessionTitle: () => Promise.resolve('') });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
 
   mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'первый промпт' });
   mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'второй промпт' });
+  await flushAsync();
 
   assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'первый промпт');
 });
 
-test('sessionLabel: пустой session_title НЕ затирает уже показанную метку', () => {
+test('sessionLabel: заголовок читается ОДИН раз — второй промпт не плодит чтений', async () => {
   const factory = makeFakePtyFactory();
-  const { mgr, events } = makeManager(factory);
-  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  let reads = 0;
+  const { mgr } = makeManager(factory, {
+    readSessionTitle: () => { reads += 1; return Promise.resolve('Заголовок'); },
+  });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
 
-  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1', session_title: 'Живой заголовок' });
-  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'что-то', session_title: '' });
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1', transcript_path: 'C:\\t\\S1.jsonl' });
+  await flushAsync();
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'ещё', transcript_path: 'C:\\t\\S1.jsonl' });
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'и ещё', transcript_path: 'C:\\t\\S1.jsonl' });
+  await flushAsync();
 
-  assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'Живой заголовок');
+  assert.strictEqual(reads, 1, 'настоящий заголовок получен — перечитывать незачем');
 });
 
-test('sessionLabel: многострочный промпт схлопывается в одну строку и режется многоточием', () => {
+test('sessionLabel: ответ чтения ПОСЛЕ restart не применяется (гонка поколений)', async () => {
   const factory = makeFakePtyFactory();
-  const { mgr, events } = makeManager(factory);
-  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  let release;
+  const pending = new Promise((r) => { release = r; });
+  const { mgr, events } = makeManager(factory, { readSessionTitle: () => pending });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1', transcript_path: 'C:\\t\\S1.jsonl' });
+  mgr.restart(a.tabId); // поколение сменилось, пока чтение висело
+  release('Заголовок протухшей сессии');
+  await flushAsync();
+
+  const st = statusOf(events, a.tabId);
+  assert.notStrictEqual(st && st.sessionLabel, 'Заголовок протухшей сессии');
+});
+
+test('sessionLabel: restart с ТОЙ ЖЕ сессией (--resume id) метку сохраняет', async () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory, { readSessionTitle: () => Promise.resolve('Рефакторинг оплаты') });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1', transcript_path: 'C:\\t\\S1.jsonl' });
+  await flushAsync();
+  assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'Рефакторинг оплаты');
+
+  mgr.restart(a.tabId); // sessionId известен — спавнится --resume S1, сессия ТА ЖЕ
+  const after = mgr.list().find((t) => t.tabId === a.tabId);
+  assert.strictEqual(after.sessionLabel, 'Рефакторинг оплаты', 'та же сессия — та же метка');
+});
+
+test('sessionLabel: restart БЕЗ известной сессии (пикер) метку гасит — она стала бы чужой', async () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory, { readSessionTitle: () => Promise.resolve('') });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'старая тема' });
+  await flushAsync();
+  assert.strictEqual(mgr.list().find((t) => t.tabId === a.tabId).sessionLabel, 'старая тема');
+
+  mgr.restart(a.tabId); // sessionId нет — голый --resume (интерактивный пикер)
+  assert.strictEqual(mgr.list().find((t) => t.tabId === a.tabId).sessionLabel, '');
+});
+
+test('sessionLabel: метка из манифеста подхватывается при open (восстановление)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha', sessionLabel: 'Вчерашняя тема' });
+
+  assert.strictEqual(a.sessionLabel, 'Вчерашняя тема', 'open() возвращает метку renderer-у');
+  assert.strictEqual(mgr.list().find((t) => t.tabId === a.tabId).sessionLabel, 'Вчерашняя тема');
+});
+
+test('sessionLabel: длинный многострочный промпт схлопывается и режется многоточием', async () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory, { readSessionTitle: () => Promise.resolve('') });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
 
   mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', {
     prompt: 'первая строка\nвторая строка   с   лишними пробелами и очень длинным хвостом до упора',
   });
+  await flushAsync();
 
   const label = statusOf(events, a.tabId).sessionLabel;
   assert.ok(!label.includes('\n'), 'переводов строк быть не должно');
   assert.ok(!/\s{2,}/.test(label), 'кратных пробелов быть не должно');
-  assert.strictEqual(label.length, 48, 'ровно SESSION_LABEL_MAX символов');
-  assert.ok(label.endsWith('…'), 'обрезка помечена многоточием');
+  assert.strictEqual(label.length, 48);
+  assert.ok(label.endsWith('…'));
 });
 
-test('sessionLabel: restart сбрасывает метку — новая жизнь вкладки, новое название', () => {
+test('sessionLabel: без зависимости readSessionTitle всё работает на одном фолбэке', async () => {
   const factory = makeFakePtyFactory();
-  const { mgr, events } = makeManager(factory);
-  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  const { mgr, events } = makeManager(factory); // readSessionTitle не передан вовсе
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
-  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1', session_title: 'Старая сессия' });
-  assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'Старая сессия');
 
-  mgr.restart(a.tabId);
-  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S2', session_title: 'Новая сессия' });
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1', transcript_path: 'C:\\t\\S1.jsonl' });
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'работает без чтения' });
+  await flushAsync();
 
-  assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'Новая сессия');
+  assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'работает без чтения');
 });
 
-test('sessionLabel: событие без полей метки не роняет и не портит payload прочих статусов', () => {
+test('sessionLabel: сбой чтения транскрипта не роняет вкладку', async () => {
   const factory = makeFakePtyFactory();
-  const { mgr, events } = makeManager(factory);
-  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  const { mgr, events } = makeManager(factory, {
+    readSessionTitle: () => Promise.reject(new Error('нет файла')),
+  });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
 
-  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1' });
-  mgr.applyHookEvent(a.tabId, 'PreToolUse', { tool_name: 'Bash' });
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1', transcript_path: 'C:\\t\\S1.jsonl' });
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'фолбэк выжил' });
+  await flushAsync();
 
-  const st = statusOf(events, a.tabId);
-  assert.strictEqual(st.status, 'working');
-  assert.strictEqual(st.sessionLabel, '');
+  assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'фолбэк выжил');
 });
