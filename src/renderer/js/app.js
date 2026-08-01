@@ -13,6 +13,7 @@ import { createSearch } from './search.js';
 import { createRecipeForm } from './recipe-form.js';
 import { createHotkeysOverlay } from './hotkeys.js';
 import { pluralTabs } from './format.js';
+import { shouldMarkSeen } from './seen.js';
 // Task 3 фазы 9 (голосовой ввод, push-to-talk по правому Shift): recorder —
 // портирован из Companion как есть (src/renderer/js/voice/recorder.js, см.
 // комментарий там же — ни одного изменённого пути импорта не понадобилось,
@@ -672,14 +673,23 @@ function activateTab(tabId) {
   markSeenIfWatching(tabId);
 }
 
-// «Пользователь сейчас смотрит именно на эту вкладку» — тот же смысл, что у
-// isSuppressed в main/toasts.js («не уведомляем о том, на что и так смотришь»),
-// только здесь он проверяется в renderer: document.hasFocus() честнее любого
-// зеркала состояния окна, а активная вкладка — вообще локальное знание.
-// Сообщаем ядру, оно двигает статус 'done' → 'ready' (см. markSeen).
+// «Пользователь сейчас видит результат этой вкладки» — тот же смысл, что у
+// isSuppressed в main/toasts.js («не уведомляем о том, на что и так
+// смотришь»), только проверяется в renderer: document.hasFocus() честнее
+// любого зеркала состояния окна, активная вкладка — локальное знание, а какой
+// оверлей сейчас накрывает терминал, в main вообще не известно.
+// Сам предикат — в seen.js (чистый, под тестом): решение принимают три разные
+// точки, и разъезжаться им нельзя. Ядро на сообщении двигает 'done' → 'ready'.
 function markSeenIfWatching(tabId) {
-  if (tabId !== tabStore.activeId) return;
-  if (!document.hasFocus()) return;
+  const visible = shouldMarkSeen({
+    tabId,
+    activeId: tabStore.activeId,
+    hasFocus: document.hasFocus(),
+    // queue и peek исключены: строка очереди и поповер терминал не
+    // перекрывают — тот же список исключений, что уже применён к Ctrl+G.
+    overlayCovering: otherOverlayOpen('queue', 'peek'),
+  });
+  if (!visible) return;
   window.api.tabs.markSeen(tabId);
 }
 
@@ -1007,7 +1017,15 @@ function bindVoiceHotkey() {
   // вкладке (обработчик onStatus). Без этого результат, дождавшийся тебя из
   // Alt+Tab, навсегда остался бы в «Готово».
   window.addEventListener('focus', () => {
-    if (tabStore.activeId) markSeenIfWatching(tabStore.activeId);
+    // Отсрочка — не косметика. Окно могло подняться кликом по тосту ЧУЖОЙ
+    // вкладки: main делает win.focus(), а 'tab:activate' шлёт следующей
+    // строкой (main.js/focusTab), и оба доезжают сюда асинхронно — порядок не
+    // гарантирован. Без паузы прочитанной пометилась бы вкладка, которая была
+    // активна ДО клика, то есть та, на которую как раз НЕ смотрели.
+    // markSeenIfWatching перечитывает activeId в момент срабатывания.
+    setTimeout(() => {
+      if (tabStore.activeId) markSeenIfWatching(tabStore.activeId);
+    }, 400);
   });
   // I1 (ревью финальной волны): мышь с зажатым Shift — штатное выделение
   // текста в xterm (Shift+клик выделяет диапазон, Shift+колесо — горизонтальный
