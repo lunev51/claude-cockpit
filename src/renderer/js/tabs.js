@@ -120,21 +120,40 @@ export function createTabStore({
       onClose(tabId);
     });
 
-    row.append(dot, info, prBadge, connectBtn, close);
+    // Кнопка 💬 — явный вход в peek (видна только на waiting-строке, см.
+    // setStatus ниже): быстрый ответ на диалог без переключения — теперь
+    // осознанный выбор, а не навязанный дефолт (живая приёмка 01.08).
+    const peekBtn = document.createElement('button');
+    peekBtn.className = 'tab-peek hidden';
+    peekBtn.textContent = '💬';
+    peekBtn.title = 'Ответить не переключаясь (peek); Space на строке — то же';
+    peekBtn.addEventListener('mousedown', (ev) => ev.preventDefault());
+    peekBtn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      onPeek(tabId, row);
+    });
 
-    // Task 3 фазы 4 (peek): строка со статусом waiting открывает поповер
-    // ВМЕСТО переключения вкладки — остальные статусы ведут себя как раньше.
-    // Space активирует то же самое, когда фокус на строке (tabindex ниже).
+    row.append(dot, info, prBadge, peekBtn, connectBtn, close);
+
+    // Живая приёмка (01.08, отзыв пользователя): клик по строке ВСЕГДА
+    // переключает на вкладку — в том числе для waiting. Прежнее поведение
+    // фазы 4 (клик по waiting открывал peek ВМЕСТО перехода) на практике
+    // неудобно: в поповере только короткий текст уведомления без контекста
+    // сессии — отвечать вслепую нечего, а самое частое действие «открой и
+    // покажи, что там» превращалось в двухходовку (клик → Ctrl+Enter).
+    // Peek остаётся ДОПОЛНИТЕЛЬНЫМ путём: кнопка 💬 на waiting-строке
+    // (ниже) и Space на сфокусированной строке — для быстрого ответа на
+    // диалог разрешения, когда контекст и так ясен.
     function trigger() {
-      if (r.status === 'waiting') onPeek(tabId, row);
-      else onActivate(tabId);
+      onActivate(tabId);
     }
     row.tabIndex = 0;
     row.addEventListener('click', trigger);
     row.addEventListener('keydown', (ev) => {
       if (ev.key === ' ' || ev.key === 'Spacebar') {
         ev.preventDefault();
-        trigger();
+        if (r.status === 'waiting') onPeek(tabId, row);
+        else trigger();
       }
     });
 
@@ -145,7 +164,7 @@ export function createTabStore({
       // tab.waitingKind из sessions.js, нужное writeCommandToTab (app.js),
       // чтобы отличить idle_prompt (пишущий статус) от диалога разрешения.
       waitingKind: '',
-      prBadge, prUrl: null,
+      prBadge, prUrl: null, peekBtn,
     };
     rows.set(tabId, r);
     order.push(tabId);
@@ -175,6 +194,8 @@ export function createTabStore({
     r.status = status;
     r.dot.className = `tab-dot ${status}`;
     r.row.classList.toggle('waiting', status === 'waiting');
+    // Кнопка 💬 (peek) видна только пока вкладка реально ждёт ответа.
+    r.peekBtn.classList.toggle('hidden', status !== 'waiting');
     if (typeof subtitle === 'string' && subtitle !== '') {
       r.sub.textContent = subtitle;
       r.sub.title = subtitle;

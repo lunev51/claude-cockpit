@@ -148,6 +148,12 @@ html, body {
   cursor: pointer; font-size: 12px; padding: 0 2px;
 }
 .tab-connect:hover { color: var(--text); }
+/* Живая приёмка 01.08: 💬 — явный вход в peek на waiting-строке (клик по
+   самой строке теперь всегда переключает вкладку). Стиль — как ⚡ рядом. */
+.tab-peek {
+  border: none; background: none;
+  cursor: pointer; font-size: 12px; padding: 0 2px;
+}
 
 /* Task 4 фазы 6 (бейдж PR): «#123» справа от имени проекта, перед ⚡/✕ (см.
    row.append в tabs.js). flex:none + align-self:center — строка сайдбара
