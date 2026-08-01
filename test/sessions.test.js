@@ -719,6 +719,50 @@ test('stuck: после реального промпта молчание до�
   assert.strictEqual(statusOf(events, a.tabId).status, 'stuck', 'поручение есть, ответа нет — это и есть зависание');
 });
 
+test('stuck: сжатие контекста посреди поручения НЕ снимает ожидание ответа', () => {
+  // SessionStart — не только «сессия поднялась»: контракт хука допускает
+  // source:'compact', а сжатие случается ПОСРЕДИ работы. Установленный CLI
+  // 2.1.220 такого события не шлёт (проверено по бинарнику, см. комментарий в
+  // sessions.js), но если пришлёт — детект не должен ослепнуть.
+  const factory = makeFakePtyFactory();
+  const { mgr, events, tick } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1', source: 'startup' });
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'большая задача' });
+  mgr.applyHookEvent(a.tabId, 'PreToolUse', { tool_name: 'Bash' });
+  factory.spawned[0].opts.onData('идёт работа');
+
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1', source: 'compact' });
+  tick(1500);
+  mgr.checkStuck();
+
+  assert.strictEqual(statusOf(events, a.tabId).status, 'stuck', 'поручение всё ещё в работе');
+});
+
+test('stuck: обычный SessionStart (startup/resume) ожидание снимает', () => {
+  // Обратная половина той же развилки — чтобы страховка выше не превратилась
+  // в «никогда не снимаем».
+  const factory = makeFakePtyFactory();
+  const { mgr, events, tick } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'задача' });
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S2', source: 'startup' });
+
+  tick(1500);
+  mgr.checkStuck();
+
+  assert.notStrictEqual(statusOf(events, a.tabId).status, 'stuck');
+});
+
+// Следующие два теста НИЧЕГО не измеряют про awaitingReply (Minor 2 ревью):
+// защищает их гард статуса в checkStuck ('working'), а из 'done'/'waiting'
+// детект и так не срабатывает. Они зелёные и до фикса — оставлены как
+// регрессионные на саму машину статусов, а снятие флага в Stop/Notification
+// сегодня страховочное: значимым оно станет, если кто-то добавит новый
+// переход обратно в 'working'.
+
 test('stuck: ответ получен (Stop) — следующее молчание уже не «зависание»', () => {
   const factory = makeFakePtyFactory();
   const { mgr, events, tick } = makeManager(factory);

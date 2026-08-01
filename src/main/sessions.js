@@ -834,8 +834,22 @@ function createSessionManager({
         requestSessionTitle(tab, data.transcript_path);
         // Сессия только поднялась — поручения нет, ждать нечего (в т.ч. после
         // `/clear`: новая сессия не наследует ожидание старой).
-        tab.awaitingReply = false;
-        setStatus(tab, 'working', 'сессия запущена');
+        //
+        // ИСКЛЮЧЕНИЕ — source:'compact'. Сжатие контекста происходит ПОСРЕДИ
+        // выполнения поручения, и работа продолжается сразу после него: гасить
+        // здесь ожидание значило бы ослепить детект ровно в том месте, где
+        // зависнуть проще всего. Установленный CLI (2.1.220) такого события не
+        // шлёт — проверено по бинарнику: все шесть эмиссий session-start идут с
+        // source:"startup" (включая путь --resume), а у сжатия свои события
+        // PreCompact/PostCompact, на которые кокпит не подписан (connector.js).
+        // Но контракт хука такой source допускает, CLI обновляется по несколько
+        // раз в неделю, а цена страховки — одна строка (ревью 01.08).
+        if (data.source !== 'compact') {
+          tab.awaitingReply = false;
+          setStatus(tab, 'working', 'сессия запущена');
+        } else {
+          setStatus(tab, 'working', 'сжимает контекст…');
+        }
         break;
       case 'UserPromptSubmit':
         applyPromptFallback(tab, data);
