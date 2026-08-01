@@ -1,7 +1,7 @@
 {
   "terminal": {
     "command": "claude",
-    "args": ["--model", "sonnet"],
+    "args": [],
     "cwd": "C:\\Users\\Lunev\\helper",
     "fontSize": 14,
     "fontFamily": "\"JetBrainsMono NF\", \"Cascadia Mono\", Consolas, monospace",
