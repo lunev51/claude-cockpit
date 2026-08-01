@@ -139,10 +139,18 @@ test('успешный разбор реального образца: totals и
   ]);
 
   assert.strictEqual(calls.length, 2);
-  // Инцидент 8ГБ: к базовым args добавились --since <окно 40д> и --offline —
-  // точные значения проверяет отдельный тест ниже, здесь фиксируем префикс.
-  assert.deepStrictEqual(calls.find((a) => a[1] === 'daily').slice(0, 3), ['claude', 'daily', '--json']);
-  assert.deepStrictEqual(calls.find((a) => a[1] === 'session').slice(0, 3), ['claude', 'session', '--json']);
+  // Инцидент 8ГБ: --offline (без сети за прайсингом) + --single-thread (пик
+  // RSS двух прогонов ~1.1ГБ → ~485МБ, замер ревью). НИКАКОГО --since — он
+  // не экономит память (ccusage всё равно читает все JSONL), но молча
+  // превращал карточки «(всего)» в оконные.
+  assert.deepStrictEqual(
+    calls.find((a) => a[1] === 'daily'),
+    ['claude', 'daily', '--json', '--offline', '--single-thread'],
+  );
+  assert.deepStrictEqual(
+    calls.find((a) => a[1] === 'session'),
+    ['claude', 'session', '--json', '--offline', '--single-thread'],
+  );
 });
 
 test('get() запускает daily и session ПАРАЛЛЕЛЬНО (Promise.all), а не по очереди', async () => {
@@ -457,20 +465,17 @@ test('rounding: дробные центы округляются до 2 знак
 
 // ============= инцидент 8ГБ (01.08): окно дат, офлайн-прайсинг, cacheOnly =====
 
-test('инцидент 8ГБ: run() получает --since (окно 40 дней от now) и --offline в ОБОИХ прогонах', async () => {
+test('инцидент 8ГБ: run() получает --offline и --single-thread, и НИКОГДА --since (он не экономит память, но портит totals)', async () => {
   const calls = [];
-  // now = 2026-08-01 00:00 локального времени; 40 дней назад = 2026-06-22.
-  const nowMs = new Date(2026, 7, 1).getTime();
-  const ccusage = createCcusage({ run: runFixture({ calls }), cache: noopCache(), now: () => nowMs });
+  const ccusage = createCcusage({ run: runFixture({ calls }), cache: noopCache(), now: () => 1000 });
 
   await ccusage.get();
 
   assert.strictEqual(calls.length, 2);
   for (const args of calls) {
-    const i = args.indexOf('--since');
-    assert.ok(i !== -1, `нет --since: ${JSON.stringify(args)}`);
-    assert.strictEqual(args[i + 1], '20260622');
     assert.ok(args.includes('--offline'), `нет --offline: ${JSON.stringify(args)}`);
+    assert.ok(args.includes('--single-thread'), `нет --single-thread: ${JSON.stringify(args)}`);
+    assert.ok(!args.includes('--since'), `--since вернулся: ${JSON.stringify(args)}`);
   }
 });
 

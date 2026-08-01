@@ -563,9 +563,16 @@ function createStt({
   // дефицит памяти. Глушим сервер после STT_IDLE_STOP_MS простоя (перевзвод
   // таймера на каждом transcribeWav) — следующая диктовка просто прогреется
   // заново (~2с на CUDA). Таймер снимается в dispose().
+  function disarmIdleShutdown() {
+    if (idleTimer !== null) {
+      clearTimer(idleTimer);
+      idleTimer = null;
+    }
+  }
+
   function armIdleShutdown() {
     if (disposed) return;
-    if (idleTimer !== null) clearTimer(idleTimer);
+    disarmIdleShutdown();
     idleTimer = setTimer(() => {
       idleTimer = null;
       if (disposed || !proc) return;
@@ -574,12 +581,35 @@ function createStt({
     }, STT_IDLE_STOP_MS);
   }
 
+  // Сколько диктовок сейчас «в полёте» (поставлены в chain и ещё не осели).
+  // Idle-таймер имеет право жить ТОЛЬКО при нуле — см. transcribeWav.
+  let inFlightTranscribes = 0;
+
+  // Ревью фикса инцидента 8ГБ, Critical (тот же класс, что B1 — killProc под
+  // живым запросом): снимать таймер ТОЛЬКО перевзводом в хвосте было
+  // недостаточно. Трасса отказа: диктовка №1 оседает → взводится T1 на 10 мин;
+  // пользователь молчит 9м59с; начинается диктовка №2 — и T1, доставшийся ей
+  // «в наследство», выстреливает на 10:00 ПОСРЕДИ её POST /inference.
+  // killProc убивает сервер под живым запросом, тот падает транспортной
+  // ошибкой, а transcribeWavImpl трактует это как «сервер умер на инференсе»
+  // → ЛОЖНАЯ демоция CUDA→CPU на BACKEND_RETRY_AFTER_MS плюс лишняя загрузка
+  // модели (~1ГБ — ровно та память, которую фикс экономил). Причём окно риска
+  // не случайное: оно приходится ровно на «вернулся после паузы ~10 минут» —
+  // самый частый сценарий работы. Поэтому таймер снимается СРАЗУ на входе
+  // transcribeWav, а взводится только когда осела ПОСЛЕДНЯЯ диктовка
+  // (счётчик — из-за сериализации B1: хвост №1 срабатывает, пока №2 ещё
+  // выполняется, и без счётчика взвёл бы таймер прямо под ней).
   function transcribeWav(buffer) {
+    inFlightTranscribes += 1;
+    disarmIdleShutdown();
     const result = chain.catch(() => {}).then(() => transcribeWavImpl(buffer));
     // Перевзвод idle-таймера ПОСЛЕ оседания (успех или провал — сервер тёплый
     // в обоих случаях); в chain кладём хвост с уже проглоченной ошибкой,
     // чтобы вызывающий получил СВОЙ result с честным reject.
-    chain = result.catch(() => {}).then(() => armIdleShutdown());
+    chain = result.catch(() => {}).then(() => {
+      inFlightTranscribes -= 1;
+      if (inFlightTranscribes === 0) armIdleShutdown();
+    });
     return result;
   }
 
@@ -610,10 +640,7 @@ function createStt({
   function dispose() {
     try {
       disposed = true;
-      if (idleTimer !== null) {
-        clearTimer(idleTimer);
-        idleTimer = null;
-      }
+      disarmIdleShutdown();
       if (pollTimerId !== null) {
         clearTimer(pollTimerId);
         pollTimerId = null;

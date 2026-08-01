@@ -1305,3 +1305,92 @@ test('инцидент 8ГБ: dispose снимает idle-таймер', async (
   stt.dispose();
   assert.strictEqual(timers.liveCount(), 0, 'после dispose живых таймеров нет');
 });
+
+test('Critical ревью фикса 8ГБ: idle-таймер прошлой диктовки НЕ убивает сервер под живой следующей (нет ложной демоции CUDA)', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([
+    serverExePath(root, 'whisper-cuda'), serverExePath(root, 'whisper'), modelPathFor(root, MODEL),
+  ]);
+  const timers = fakeTimers();
+  const clock = makeClock(0);
+  const spawnProc = fakeSpawn([]);
+  // POST №2 держим «висящим» — диктовка №2 живая в момент выстрела таймера.
+  let posts = 0;
+  let releaseSecondPost = null;
+  const httpPost = () => {
+    posts += 1;
+    if (posts === 2) {
+      return new Promise((res) => {
+        releaseSecondPost = () => res({ status: 200, body: Buffer.from('{"text":"вторая"}', 'utf8') });
+      });
+    }
+    return Promise.resolve({ status: 200, body: Buffer.from('{"text":"ok"}', 'utf8') });
+  };
+  const { stt } = setup({
+    fs,
+    timers,
+    clock,
+    spawnProc,
+    httpGet: () => Promise.resolve({ status: 200 }),
+    httpPost,
+    config: baseConfig({ stackRoots: [root] }),
+  });
+
+  await stt.transcribeWav(Buffer.from('a')); // диктовка №1 — сервер поднят на CUDA
+  await flush(10);
+  const idleId = timers.lastId();
+  assert.strictEqual(timers.lastMs(), 600000, 'после диктовки №1 взведён idle-таймер');
+
+  clock.advance(9 * 60000 + 59000); // почти простой
+  const p2 = stt.transcribeWav(Buffer.from('b')); // диктовка №2 стартовала, POST висит
+  p2.catch(() => {});
+  await flush(10);
+
+  // Ключ фикса: вход в transcribeWav СНИМАЕТ унаследованный таймер — выстрелить
+  // посреди живой диктовки ему уже нечем.
+  assert.strictEqual(timers.liveCount(), 0, 'idle-таймер снят на входе в диктовку №2');
+  assert.throws(() => timers.fire(idleId), /не запланирован или уже снят/);
+
+  // Сервер жив — POST №2 спокойно доотвечает (до фикса его сокет был бы
+  // сброшен killProc'ом таймера, и ретрай увёл бы стек на CPU).
+  releaseSecondPost();
+  assert.strictEqual(await p2, 'вторая', 'диктовка №2 доехала на том же тёплом сервере');
+  await flush(30);
+
+  const backends = serverSpawns(spawnProc).map((c) => path.basename(path.dirname(c.exe)));
+  assert.deepStrictEqual(backends, ['whisper-cuda'],
+    'CUDA не должна демотироваться: сервер никто не убивал под живым POST');
+});
+
+test('Critical ревью фикса 8ГБ: idle-таймер взводится только когда осела ПОСЛЕДНЯЯ из очереди диктовок', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([serverExePath(root, 'whisper'), modelPathFor(root, MODEL)]);
+  const timers = fakeTimers();
+  let posts = 0;
+  let releaseSecond = null;
+  const httpPost = () => {
+    posts += 1;
+    if (posts === 2) {
+      return new Promise((res) => {
+        releaseSecond = () => res({ status: 200, body: Buffer.from('{"text":"b"}', 'utf8') });
+      });
+    }
+    return Promise.resolve({ status: 200, body: Buffer.from('{"text":"a"}', 'utf8') });
+  };
+  const { stt } = setup({
+    fs, timers, httpGet: () => Promise.resolve({ status: 200 }), httpPost, config: baseConfig({ stackRoots: [root] }),
+  });
+
+  // Обе диктовки поставлены в chain (B1-сериализация) ДО оседания первой.
+  const p1 = stt.transcribeWav(Buffer.from('a'));
+  const p2 = stt.transcribeWav(Buffer.from('b'));
+  await p1;
+  await flush(10);
+  assert.strictEqual(timers.liveCount(), 0, 'хвост №1 не смеет взвести таймер, пока №2 в полёте');
+
+  releaseSecond();
+  await p2;
+  await flush(10);
+  assert.strictEqual(timers.liveCount(), 1, 'после оседания последней диктовки таймер взведён');
+  assert.strictEqual(timers.lastMs(), 600000);
+});

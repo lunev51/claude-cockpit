@@ -165,29 +165,26 @@ function createCcusage({ run, cache, now = Date.now, ttlMs = 600000 }) {
     return buildResult(false, false, null, 0, kind);
   }
 
-  // Инцидент «зависает вместе с компом» (01.08, машина с 8ГБ ОЗУ): без окна
-  // дат ccusage перемалывает ВСЕ транскрипты (1.7ГБ, два параллельных прогона
-  // daily+session = двойное чтение) — 15+ секунд диска и ~190МБ пикового
-  // дерева процессов на каждое обновление. Дашборд показывает максимум 30
-  // дней — окно в 40 (с запасом) режет объём чтения кратно. --offline —
-  // прайсинг из локального кэша ccusage, без похода в сеть.
-  const SPEND_WINDOW_DAYS = 40;
-
-  function sinceArg(nowMs) {
-    const d = new Date(nowMs - SPEND_WINDOW_DAYS * 86400000);
-    const mm = String(d.getMonth() + 1).padStart(2, '0');
-    const dd = String(d.getDate()).padStart(2, '0');
-    return `${d.getFullYear()}${mm}${dd}`;
-  }
-
+  // Инцидент «зависает вместе с компом» (01.08, машина с 8ГБ ОЗУ, своп до
+  // 14.6ГБ). Замеры ревью на реальном хранилище (1.7ГБ транскриптов):
+  //   daily --json                              9.3с, пик RSS 594МБ
+  //   daily --json --since <окно>               7.6с, пик RSS 595МБ (!)
+  //   daily --json --offline --single-thread   ~7.6с, пик RSS 240МБ
+  // Вывод: --since НЕ экономит память вовсе (ccusage читает все JSONL и
+  // режет только агрегацию — проверено окном в 1 день: та же память), зато
+  // молча превращал карточки «(всего)» дашборда в оконные (терялось 23.5%
+  // аккаунта). Поэтому НИКАКОГО --since. Настоящие рычаги:
+  //   --offline       прайсинг из локального кэша ccusage, без сети;
+  //   --single-thread последовательная загрузка JSONL — пик двух
+  //                   параллельных прогонов падает с ~1.1ГБ до ~485МБ,
+  //                   на 8ГБ-машине это разница «тормозит»/«висит намертво».
   async function fetchFresh() {
     let dailyRes;
     let sessionRes;
-    const since = sinceArg(now());
     try {
       [dailyRes, sessionRes] = await Promise.all([
-        run(['claude', 'daily', '--json', '--since', since, '--offline']),
-        run(['claude', 'session', '--json', '--since', since, '--offline']),
+        run(['claude', 'daily', '--json', '--offline', '--single-thread']),
+        run(['claude', 'session', '--json', '--offline', '--single-thread']),
       ]);
     } catch (err) {
       return { kind: 'unavailable' };

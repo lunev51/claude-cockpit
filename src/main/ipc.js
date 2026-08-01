@@ -1326,6 +1326,24 @@ function registerIpc(win, opts = {}) {
       }
     }, 5000);
     usageMonitorTimer.unref?.();
+
+    // Important-3 (ревью инцидент-фикса 8ГБ): обещание «подсчёт начнётся
+    // через минуту» кто-то должен ВЫПОЛНИТЬ — boot()-ный usage:get всегда
+    // попадает в 90-секундное cacheOnly-окно, а больше реальный ccusage.get()
+    // ниоткуда не приходит (30с-таймер renderer только перерисовывает кэш).
+    // Один отложенный настоящий пересчёт по истечении окна + push свежего
+    // результата тем же каналом usage:update.
+    const deferredSpendTimer = setTimeout(async () => {
+      try {
+        lastCcusageResult = await ccusage.get();
+        if (!win.isDestroyed()) {
+          win.webContents.send('usage:update', {
+            limits: usagePoller.snapshot(), spend: lastCcusageResult,
+          });
+        }
+      } catch { /* ccusage.get сам не бросает; ремень на чужие сбои */ }
+    }, CCUSAGE_BOOT_DEFER_MS + 2000);
+    deferredSpendTimer.unref?.();
   }
 
   ipcMain.handle('config:get', () => getConfig());
@@ -1395,7 +1413,14 @@ function registerIpc(win, opts = {}) {
       // дерево) НА КАЖДЫЙ клик мимо 10-минутного кэша — на задыхающейся
       // машине это и был «клик по кольцам вешает комп». Расходы обновляются
       // по своему TTL (10 мин) — для карточки «$ за день» этого достаточно.
-      const [, spend] = await Promise.all([usagePoller.refresh(), ccusage.get()]);
+      // Important-4 (ревью инцидент-фикса): клик в первые 90с после старта
+      // не должен запускать npx одновременно со штормом restore — тот же
+      // cacheOnly-гейт, что у usage:get.
+      const bootStorm = Date.now() - ipcBootAt < CCUSAGE_BOOT_DEFER_MS;
+      const [, spend] = await Promise.all([
+        usagePoller.refresh(),
+        ccusage.get({ cacheOnly: bootStorm }),
+      ]);
       lastCcusageResult = spend;
       return { limits: usagePoller.snapshot(), spend };
     })();
