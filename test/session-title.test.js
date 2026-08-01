@@ -7,7 +7,8 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const {
-  createSessionTitleReader, parseAiTitle, parseCustomTitle, truncateTitle, TITLE_MAX,
+  createSessionTitleReader, createFsReadParts,
+  parseAiTitle, parseCustomTitle, truncateTitle, TITLE_MAX,
 } = require('../src/main/session-title');
 
 const AI_LINE = '{"type":"ai-title","aiTitle":"Организовать папку Акто","sessionId":"S1"}';
@@ -132,4 +133,102 @@ test('truncateTitle: схлопывает пробелы и режет длин�
   const long = truncateTitle('я'.repeat(200));
   assert.strictEqual(long.length, TITLE_MAX);
   assert.ok(long.endsWith('…'));
+});
+
+// ---------------- createFsReadParts: чтение НАСТОЯЩЕГО файла ----------------
+// Critical 1 (ревью): именно здесь пряталась дыра «мёртвого окна» размеров —
+// у файлов чуть длиннее префикса хвост не читался вовсе, а префикс их не
+// покрывал, и байты между ними не читал НИКТО. `/rename` в этой полосе
+// терялся, а при двух переименованиях показывалось СТАРОЕ имя. Раньше эта
+// функция жила в ipc.js и была недостижима для тестов — теперь она здесь.
+
+const fsReal = require('fs');
+const os = require('os');
+const pathReal = require('path');
+
+// Собирает транскрипт нужного размера: ai-title в начале, наполнитель,
+// custom-title в самом конце — ровно как настоящий файл после `/rename`.
+function makeTranscript(sizeBytes, { customTitles = ['МОЁ ИМЯ'] } = {}) {
+  const dir = fsReal.mkdtempSync(pathReal.join(os.tmpdir(), 'cockpit-title-'));
+  const file = pathReal.join(dir, 'S1.jsonl');
+  const head = `{"type":"ai-title","aiTitle":"Автозаголовок Claude","sessionId":"S1"}\n`;
+  const tails = customTitles
+    .map((t) => `{"type":"custom-title","customTitle":${JSON.stringify(t)},"sessionId":"S1"}\n`);
+  const tailBytes = Buffer.byteLength(tails.join(''));
+  const fillerLine = `{"type":"user","message":{"role":"user","content":"${'x'.repeat(200)}"}}\n`;
+  const parts = [head];
+  let written = Buffer.byteLength(head) + tailBytes;
+  while (written + Buffer.byteLength(fillerLine) <= sizeBytes) {
+    parts.push(fillerLine);
+    written += Buffer.byteLength(fillerLine);
+  }
+  // Первый custom-title кладём в середину (имитируя переиздание на чекпоинте),
+  // последний — в конец файла.
+  if (tails.length > 1) {
+    parts.splice(Math.floor(parts.length / 2), 0, tails[0]);
+    parts.push(...tails.slice(1));
+  } else {
+    parts.push(...tails);
+  }
+  fsReal.writeFileSync(file, parts.join(''));
+  return { file, dir, size: fsReal.statSync(file).size };
+}
+
+const SIZES = [
+  ['короткий (10 КБ) — весь файл в префиксе', 10 * 1024],
+  ['ровно префикс (256 КБ)', 256 * 1024],
+  ['префикс + 1 КБ — начало мёртвого окна', 257 * 1024],
+  ['300 КБ — середина мёртвого окна', 300 * 1024],
+  ['320 КБ — конец мёртвого окна', 320 * 1024],
+  ['321 КБ — за окном', 321 * 1024],
+  ['600 КБ — обычный длинный', 600 * 1024],
+];
+
+for (const [label, size] of SIZES) {
+  test(`createFsReadParts: /rename найден в файле «${label}»`, async () => {
+    const { file, dir } = makeTranscript(size);
+    try {
+      const reader = createSessionTitleReader({ readParts: createFsReadParts(fsReal) });
+      assert.strictEqual(await reader.read(file, 'S1'), 'МОЁ ИМЯ');
+    } finally {
+      fsReal.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test('createFsReadParts: ДВА переименования в мёртвом окне — берётся СВЕЖЕЕ имя, не старое', async () => {
+  // Худший случай ревью: ранняя копия записи лежит в префиксе, свежая — в
+  // той самой дыре. Без фикса вкладка уверенно показывала бы старое имя.
+  const { file, dir } = makeTranscript(300 * 1024, { customTitles: ['СТАРОЕ ИМЯ', 'СВЕЖЕЕ ИМЯ'] });
+  try {
+    const reader = createSessionTitleReader({ readParts: createFsReadParts(fsReal) });
+    assert.strictEqual(await reader.read(file, 'S1'), 'СВЕЖЕЕ ИМЯ');
+  } finally {
+    fsReal.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('createFsReadParts: нет /rename — берётся автозаголовок из начала файла', async () => {
+  const { file, dir } = makeTranscript(300 * 1024, { customTitles: [] });
+  try {
+    const reader = createSessionTitleReader({ readParts: createFsReadParts(fsReal) });
+    assert.strictEqual(await reader.read(file, 'S1'), 'Автозаголовок Claude');
+  } finally {
+    fsReal.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('createFsReadParts: несуществующий файл — пусто, наружу не бросает', async () => {
+  const reader = createSessionTitleReader({ readParts: createFsReadParts(fsReal) });
+  assert.strictEqual(await reader.read(pathReal.join(os.tmpdir(), 'нет-такого-файла.jsonl'), 'S1'), '');
+});
+
+test('createFsReadParts: каталог вместо файла — пусто, не бросает', async () => {
+  const reader = createSessionTitleReader({ readParts: createFsReadParts(fsReal) });
+  assert.strictEqual(await reader.read(os.tmpdir(), 'S1'), '');
+});
+
+test('parseAiTitle: пустой aiTitle не считается заголовком', () => {
+  const empty = '{"type":"ai-title","aiTitle":"","sessionId":"S1"}';
+  assert.strictEqual(parseAiTitle([empty, USER_LINE, ''].join('\n')), '');
 });

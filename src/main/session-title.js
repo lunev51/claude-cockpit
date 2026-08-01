@@ -30,8 +30,18 @@
 
 // Начало файла — под ai-title (5× запаса над наблюдаемым максимумом 51 КБ).
 const PREFIX_BYTES = 256 * 1024;
-// Хвост файла — под custom-title (6× запаса над наблюдаемым максимумом 10 КБ).
-const SUFFIX_BYTES = 64 * 1024;
+// Хвост файла — под custom-title.
+//
+// Important 1 (ревью): 64 КБ было выбрано по НЕ ТОЙ величине — по расстоянию
+// последней копии от конца файла (0-10 КБ в замерах). Ограничивает же нас
+// ИНТЕРВАЛ МЕЖДУ копиями: custom-title переиздаётся на каждом чекпоинте
+// (43 копии в 236-МБ файле), и замеренные максимальные интервалы — 88 133 и
+// 89 640 байт. То есть существуют окна жизни файла, когда последняя копия
+// оказывается за пределами 64-килобайтного хвоста, и вкладка молча
+// показывает автозаголовок вместо имени пользователя. 256 КБ перекрывают
+// наблюдаемый интервал почти втрое; цена — 512 КБ чтения на сессию вместо
+// 320 КБ, на фоне 226-МБ транскриптов это шум.
+const SUFFIX_BYTES = 256 * 1024;
 
 // Максимальная длина метки — как в сайдбаре (одна строка, обрезка с «…»).
 const TITLE_MAX = 48;
@@ -45,8 +55,12 @@ function truncateTitle(text) {
 // Разбор одной строки JSONL в запись нужного типа. Никогда не бросает:
 // транскрипт — внутренний формат CLI, он меняется между версиями, а битая
 // или обрезанная границей чтения строка должна просто не дать метки.
-// sessionId: если запись его несёт и он НЕ наш — запись чужая (после
-// `--resume`/fork в файле встречаются записи других сессий), пропускаем.
+// sessionId: страховка на случай, если в файле окажется запись ЧУЖОЙ сессии
+// (гипотетический fork с копированием истории). Minor 3 ревью: на реальных
+// данных таких записей нет — `--resume` дописывает тот же файл с тем же id
+// (236-МБ транскрипт за полтора месяца содержит ровно один sessionId), так
+// что это именно страховка, а не решение наблюдаемой проблемы. Запись БЕЗ
+// sessionId принимается всегда — иначе страховка съела бы имя пользователя.
 function pickTitle(line, type, field, sessionId) {
   if (!line || line.indexOf(`"${type}"`) === -1) return '';
   let rec;
@@ -116,8 +130,62 @@ function createSessionTitleReader({
   return { read };
 }
 
+// Реальная реализация readParts поверх инжектируемого fs — живёт ЗДЕСЬ, а не
+// в ipc.js (Minor 1 ревью: там она была недостижима для тестов, и именно в
+// ней пряталась дыра «мёртвого окна» размеров). fs инжектируется, так что
+// модуль остаётся чистым, а тест гоняет её на настоящем временном файле.
+//
+// Читает НАЧАЛО (ai-title) и КОНЕЦ (custom-title) файла двумя fs.read в
+// буферы фиксированного размера. Никогда не реджектит — сбой любой стадии
+// даёт {prefix:'', suffix:''} (отсутствие метки — нормальное состояние).
+function createFsReadParts(fs) {
+  function readChunk(fd, length, position) {
+    return new Promise((resolve) => {
+      if (length <= 0) { resolve(''); return; }
+      const buf = Buffer.allocUnsafe(length);
+      fs.read(fd, buf, 0, length, position, (err, bytesRead) => {
+        resolve(err ? '' : buf.toString('utf8', 0, bytesRead));
+      });
+    });
+  }
+
+  return function readParts(filePath, prefixBytes, suffixBytes) {
+    return new Promise((resolve) => {
+      const empty = { prefix: '', suffix: '' };
+      fs.stat(filePath, (statErr, st) => {
+        if (statErr || !st || !st.isFile()) { resolve(empty); return; }
+        fs.open(filePath, 'r', async (openErr, fd) => {
+          if (openErr) { resolve(empty); return; }
+          try {
+            const { size } = st;
+            const prefix = await readChunk(fd, Math.min(prefixBytes, size), 0);
+            // Critical 1 (ревью): раньше условие было `size - suffixBytes >
+            // prefixBytes`, из-за чего у файлов размером (256 КБ, 320 КБ]
+            // хвост не читался ВООБЩЕ, а префикс их не покрывал — байты между
+            // 256 КБ и концом файла не читал никто. `/rename` в этой полосе
+            // терялся, а при двух переименованиях показывалось СТАРОЕ имя
+            // (ранние копии записи лежат в префиксе, свежие — в дыре).
+            // Теперь хвост начинается не раньше конца префикса, но читается
+            // всегда, когда файл длиннее префикса — дыры не остаётся.
+            const suffixStart = Math.max(prefixBytes, size - suffixBytes);
+            const suffix = size > prefixBytes
+              ? await readChunk(fd, size - suffixStart, suffixStart)
+              : '';
+            resolve({ prefix, suffix });
+          } catch {
+            resolve(empty);
+          } finally {
+            fs.close(fd, () => {});
+          }
+        });
+      });
+    });
+  };
+}
+
 module.exports = {
   createSessionTitleReader,
+  createFsReadParts,
   parseAiTitle,
   parseCustomTitle,
   truncateTitle,

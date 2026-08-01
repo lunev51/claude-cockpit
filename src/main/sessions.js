@@ -176,6 +176,10 @@ function createSessionManager({
   // повторяется ни у одной пары спавнов за всё время жизни менеджера, даже
   // между разными (в т.ч. уже закрытыми) вкладками.
   let genSeq = 0;
+  // Токены чтений заголовка сессии (Minor 2 ревью) — один счётчик на менеджер:
+  // каждое чтение метит своё «занято», чтобы гасить только его (см.
+  // requestSessionTitle).
+  let titleReadSeq = 0;
 
   function open({
     cwd, command = null, args = null, smoke = false, ghostId = null, sessionId = null,
@@ -696,7 +700,15 @@ function createSessionManager({
     if (!readSessionTitle || typeof transcriptPath !== 'string' || !transcriptPath) return;
     if (tab.sessionLabelFromTitle) return; // настоящий заголовок уже есть — второй раз не читаем
     if (tab.titleReadInFlight) return; // не плодим параллельные чтения на каждый промпт
-    tab.titleReadInFlight = true;
+    // Minor 2 (ревью): в поле лежит ТОКЕН конкретного чтения, а не просто
+    // «идёт/не идёт». Иначе запоздавший ответ старого чтения (после
+    // Ctrl+Shift+R, который сбрасывает поле и стартует новое) гасил бы флаг
+    // УЖЕ ИДУЩЕГО чтения, и следующий промпт запускал бы третье параллельно.
+    // Токен же снимает только своё — а сверять его с поколением нельзя:
+    // обычный spawn() тоже растит gen, и такая сверка вернула бы защёлку M1.
+    titleReadSeq += 1;
+    const myRead = titleReadSeq;
+    tab.titleReadInFlight = myRead;
     // Снимок ОБЕИХ идентичностей: gen — «тот же процесс», labelGen — «та же
     // сессия» (C1: `/clear` меняет сессию, не трогая процесс).
     const myGen = tab.gen;
@@ -705,9 +717,14 @@ function createSessionManager({
     // M1 (ре-ревью): флаг обязан сниматься на ЛЮБОМ исходе, включая ранний
     // выход по протухшему снимку — иначе односторонняя защёлка навсегда
     // глушила бы чтения этой вкладки (достижимо через авто-респавн).
+    // Снимаем занятость, только если в поле всё ещё НАШ токен: чужое
+    // (уже стартовавшее) чтение гасить нельзя, а своё — обязаны на ЛЮБОМ
+    // исходе, включая протухший снимок (M1: иначе односторонняя защёлка).
     const done = () => {
       const live = tabs.get(myTabId);
-      if (live && live === tab) live.titleReadInFlight = false;
+      if (live && live === tab && live.titleReadInFlight === myRead) {
+        live.titleReadInFlight = false;
+      }
     };
     const mySessionId = tab.sessionId;
     Promise.resolve()

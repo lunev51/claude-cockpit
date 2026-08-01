@@ -19,7 +19,7 @@ const { createHookBridge } = require('./hook-bridge');
 const { connectProject, isConnected } = require('./connector');
 const { notify } = require('./notify');
 const { createNightWatch } = require('./night-watch');
-const { createSessionTitleReader } = require('./session-title');
+const { createSessionTitleReader, createFsReadParts } = require('./session-title');
 const { createNightJournal, NIGHT_JOURNAL_MAX_ENTRIES } = require('./night-journal');
 const { createWorkspaceStore } = require('./workspace');
 const { createWorkspaceSync } = require('./workspace-sync');
@@ -914,51 +914,13 @@ function sttHttpPost(port, urlPath, headers, bodyBuffer, timeoutMs) {
   });
 }
 
-// Живая приёмка 01.08: чтение НАЧАЛА и КОНЦА транскрипта — там лежат два
-// источника «названия» сессии (ai-title в начале, custom-title от `/rename`
-// в конце; подробности и замеры — в шапке session-title.js). Именно два
-// куска, а не файл целиком: транскрипты бывают сотни мегабайт (замерено
-// 226 МБ), полное чтение стоило бы того дискового шторма, который уже вешал
-// машину (инцидент ccusage). Ровно два fs.read в буферы фиксированного
-// размера: ни потоков, ни склейки чанков, ни шанса прочитать больше.
-function readChunk(fd, length, position) {
-  return new Promise((resolve) => {
-    if (length <= 0) { resolve(''); return; }
-    const buf = Buffer.allocUnsafe(length);
-    fs.read(fd, buf, 0, length, position, (err, bytesRead) => {
-      resolve(err ? '' : buf.toString('utf8', 0, bytesRead));
-    });
-  });
-}
-
-function readTranscriptParts(filePath, prefixBytes, suffixBytes) {
-  return new Promise((resolve) => {
-    const empty = { prefix: '', suffix: '' };
-    fs.stat(filePath, (statErr, st) => {
-      if (statErr || !st || !st.isFile()) { resolve(empty); return; }
-      fs.open(filePath, 'r', async (openErr, fd) => {
-        if (openErr) { resolve(empty); return; }
-        try {
-          const size = st.size;
-          const prefix = await readChunk(fd, Math.min(prefixBytes, size), 0);
-          // Файл целиком уместился в префикс — хвост читать нечего и незачем
-          // (session-title.js в этом случае ищет custom-title в префиксе).
-          const suffixStart = size - suffixBytes;
-          const suffix = suffixStart > prefixBytes
-            ? await readChunk(fd, suffixBytes, suffixStart)
-            : '';
-          resolve({ prefix, suffix });
-        } catch {
-          resolve(empty);
-        } finally {
-          fs.close(fd, () => {});
-        }
-      });
-    });
-  });
-}
-
-const sessionTitleReader = createSessionTitleReader({ readParts: readTranscriptParts });
+// Живая приёмка 01.08: чтение начала и конца транскрипта (два источника
+// «названия» сессии — ai-title в начале, custom-title от `/rename` в конце)
+// переехало в session-title.js с инжектируемым fs. Minor 1 ревью: здесь эта
+// функция была недостижима для тестов — все они ходили через стаб — и именно
+// в ней пряталась дыра «мёртвого окна» размеров (Critical 1). Там она теперь
+// покрыта тестами на настоящем временном файле.
+const sessionTitleReader = createSessionTitleReader({ readParts: createFsReadParts(fs) });
 
 // Геттер инстанса createStt — создаёт JS-объект при ПЕРВОМ реальном
 // обращении к stt:transcribe/status (через sttTranscribeHandler/
