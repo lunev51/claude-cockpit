@@ -559,7 +559,14 @@ function createSessionManager({
     if (!boundSessionId) {
       resetLabelIdentity(tab);
     } else {
-      tab.titleReadInFlight = false; // сессия та же, метка остаётся; висящее чтение отсечётся по gen
+      // Сессия та же (--resume того же id) — саму метку НЕ гасим, чтобы
+      // сайдбар не мигал пустотой. Но заголовок ПЕРЕЧИТЫВАЕМ: Ctrl+Shift+R —
+      // выбранный пользователем момент подхвата нового имени из `/rename`
+      // (запрос 01.08: «пускай обновляется когда я перезапускаю сессию»).
+      // Без сброса флага requestSessionTitle рано вышел бы и новое имя
+      // осталось бы невидимым до перезапуска всего кокпита.
+      tab.sessionLabelFromTitle = false;
+      tab.titleReadInFlight = false; // висящее чтение отсечётся по gen
     }
 
     if (boundSessionId) {
@@ -702,8 +709,9 @@ function createSessionManager({
       const live = tabs.get(myTabId);
       if (live && live === tab) live.titleReadInFlight = false;
     };
+    const mySessionId = tab.sessionId;
     Promise.resolve()
-      .then(() => readSessionTitle(transcriptPath))
+      .then(() => readSessionTitle(transcriptPath, mySessionId))
       .then((title) => {
         const live = tabs.get(myTabId);
         done();

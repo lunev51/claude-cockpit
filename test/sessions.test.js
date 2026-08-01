@@ -1875,3 +1875,48 @@ test('sessionLabel M3: tabs:changed эмитится именно АСИНХРО
   const afterAsync = events.filter((e) => e.channel === 'tabs:changed').length;
   assert.strictEqual(afterAsync, afterSync + 1, 'применение метки обязано само уведомить манифест');
 });
+
+// Запрос пользователя 01.08: переименовал сессию через `/rename` → новое имя
+// подхватывается при перезапуске вкладки (Ctrl+Shift+R), а не на каждом
+// промпте. Сессия при этом ТА ЖЕ (--resume того же id), поэтому метку не
+// гасим (сайдбар не мигает), но заголовок обязаны перечитать.
+
+test('sessionLabel: Ctrl+Shift+R перечитывает имя сессии — /rename подхватывается', async () => {
+  const factory = makeFakePtyFactory();
+  let title = 'Организовать папку Акто';   // сначала автозаголовок
+  const reads = [];
+  const { mgr, events } = makeManager(factory, {
+    readSessionTitle: (p, sid) => { reads.push({ p, sid }); return Promise.resolve(title); },
+  });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1', transcript_path: 'C:\\t\\S1.jsonl' });
+  await flushAsync();
+  assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'Организовать папку Акто');
+  assert.strictEqual(reads.length, 1);
+  assert.strictEqual(reads[0].sid, 'S1', 'sessionId прокидывается — чужие записи в файле отсеиваются');
+
+  // Пользователь сделал /rename прямо в этой сессии...
+  title = 'RZ paper';
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'ещё', transcript_path: 'C:\\t\\S1.jsonl' });
+  await flushAsync();
+  assert.strictEqual(
+    statusOf(events, a.tabId).sessionLabel,
+    'Организовать папку Акто',
+    'на обычном промпте НЕ перечитываем — так выбрал пользователь',
+  );
+
+  // ...и нажал Ctrl+Shift+R — вот момент подхвата.
+  mgr.restart(a.tabId);
+  assert.strictEqual(
+    mgr.list().find((t) => t.tabId === a.tabId).sessionLabel,
+    'Организовать папку Акто',
+    'метка не гаснет на время перезапуска — сайдбар не мигает пустотой',
+  );
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1', transcript_path: 'C:\\t\\S1.jsonl' });
+  await flushAsync();
+
+  assert.strictEqual(statusOf(events, a.tabId).sessionLabel, 'RZ paper');
+  assert.strictEqual(reads.length, 2, 'ровно одно дополнительное чтение — на рестарте');
+});
