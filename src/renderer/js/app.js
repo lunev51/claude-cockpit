@@ -2000,7 +2000,7 @@ async function boot() {
   // Статусы приходят из хуков Claude Code (sessions.js) — единый источник,
   // term:started/term:exit статус больше не выставляют (был двойной источник).
   window.api.tab.onStatus(({
-    tabId, status, subtitle, waitingText, waitingKind, sessionLabel,
+    tabId, status, subtitle, waitingText, waitingKind, sessionLabel, labelOnly,
   }) => {
     // C2 (Critical, ревью финальной волны фазы 9): waitingKind зеркалится в
     // tabStore ровно тем же приёмом, что waitingText — см. tabs.js/setStatus,
@@ -2037,7 +2037,10 @@ async function boot() {
     // Ghost-буфер (Task 5): переход в done/waiting — момент «Claude закончил
     // ход», самый ценный кадр скроллбека — сериализуем именно эту вкладку
     // сразу, не дожидаясь общего 30-секундного таймера ниже.
-    if (status === 'done' || status === 'waiting') saveGhost(tabId);
+    // I2 (ре-ревью 01.08): labelOnly-событие статус НЕ меняло (дочитался
+    // заголовок сессии) — лишняя сериализация полумегабайтного буфера на
+    // диск здесь ни к чему.
+    if (!labelOnly && (status === 'done' || status === 'waiting')) saveGhost(tabId);
   });
 
   // Task 4 фазы 4: обработчик вынесен в newProject() — тот же сценарий

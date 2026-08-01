@@ -195,9 +195,19 @@ function createSessionManager({
       // applySessionLabel() выше по файлу (session_title из хуков, фолбэк на
       // первый промпт). Сбрасывается в restart() — новая жизнь вкладки
       // заслуживает новую метку.
-      sessionLabel: typeof sessionLabel === 'string' ? sessionLabel : '',
+      // M4 (ре-ревью): метка из манифеста проходит тот же усекатель, что и
+      // живые источники — правленый вручную/старый манифест не должен
+      // приносить в сайдбар многострочную простыню.
+      sessionLabel: truncateForLabel(sessionLabel),
       sessionLabelFromTitle: false, // метка пришла из НАСТОЯЩЕГО заголовка (ai-title) — фолбэк-промпт её больше не трогает
       titleReadInFlight: false,     // идёт асинхронное чтение заголовка — не плодим параллельные
+      // C1 (ре-ревью 01.08): токен ИДЕНТИЧНОСТИ МЕТКИ. Гарда по tab.gen
+      // недостаточно: `/clear` заводит НОВУЮ сессию в ТОМ ЖЕ pty (SessionStart
+      // с source:'clear' и новым session_id — сверено со схемой хука CLI
+      // 2.1.220), поколение при этом не меняется, и висящее чтение СТАРОГО
+      // транскрипта спокойно приземлилось бы на новую сессию. Счётчик растёт
+      // при каждой смене того, «чьё имя мы показываем».
+      labelGen: 0,
       lastOutputAt: now(),
       // Очередь промптов (Task 1 фазы 7): ввод для КОНКРЕТНОЙ сессии этой
       // вкладки — переживает обычное переключение вкладок, но НЕ переживает
@@ -568,6 +578,20 @@ function createSessionManager({
   function bindSession(tabId, sessionId) {
     const tab = tabs.get(tabId);
     if (tab) {
+      // C1 (ре-ревью 01.08): сессия ПОДМЕНИЛАСЬ внутри той же вкладки —
+      // `/clear` (новый session_id в том же pty), авто-восстановление после
+      // провала резюма, выбор другой сессии в пикере. Старое имя стало чужим:
+      // без сброса вкладка продолжала бы уверенно зваться прежней темой (и
+      // это уезжало в манифест, переживая перезапуск кокпита). labelGen++
+      // ЗАОДНО обесценивает висящее чтение старого транскрипта — оно уже не
+      // сможет применить свой результат (гарда по tab.gen тут бессильна: pty
+      // тот же, поколение не менялось).
+      if (tab.sessionId && sessionId && sessionId !== tab.sessionId) {
+        tab.sessionLabel = '';
+        tab.sessionLabelFromTitle = false;
+        tab.titleReadInFlight = false;
+        tab.labelGen += 1;
+      }
       tab.sessionId = sessionId;
       tab.sessionBound = true; // FIX 3: единственное место, где привязка считается ПОДТВЕРЖДЁННОЙ
       tab.autoRecovered = false; // резюм реально удался — авто-восстановление снова доступно на будущее
@@ -644,26 +668,49 @@ function createSessionManager({
     if (tab.sessionLabelFromTitle) return; // настоящий заголовок уже есть — второй раз не читаем
     if (tab.titleReadInFlight) return; // не плодим параллельные чтения на каждый промпт
     tab.titleReadInFlight = true;
+    // Снимок ОБЕИХ идентичностей: gen — «тот же процесс», labelGen — «та же
+    // сессия» (C1: `/clear` меняет сессию, не трогая процесс).
     const myGen = tab.gen;
+    const myLabelGen = tab.labelGen;
     const myTabId = tab.tabId;
+    // M1 (ре-ревью): флаг обязан сниматься на ЛЮБОМ исходе, включая ранний
+    // выход по протухшему снимку — иначе односторонняя защёлка навсегда
+    // глушила бы чтения этой вкладки (достижимо через авто-респавн).
+    const done = () => {
+      const live = tabs.get(myTabId);
+      if (live && live === tab) live.titleReadInFlight = false;
+    };
     Promise.resolve()
       .then(() => readSessionTitle(transcriptPath))
       .then((title) => {
         const live = tabs.get(myTabId);
-        // Вкладка закрыта / перезапущена (новое поколение) — ответ протух.
-        if (!live || live !== tab || live.gen !== myGen) return;
-        live.titleReadInFlight = false;
+        done();
+        // Вкладка закрыта / перезапущена (новое поколение pty) / сменила
+        // сессию в том же pty (новый labelGen) — ответ протух.
+        if (!live || live !== tab || live.gen !== myGen || live.labelGen !== myLabelGen) return;
         const clean = truncateForLabel(title);
-        if (!clean || clean === live.sessionLabel) return;
-        live.sessionLabel = clean;
+        if (!clean) return;
+        // I1 (ре-ревью): флаг взводим, КАК ТОЛЬКО получен непустой заголовок,
+        // ещё до сравнения с текущей меткой. Иначе главный сценарий (метка из
+        // манифеста уже РАВНА ai-title) не считался бы «заголовок получен», и
+        // чтение повторялось бы на каждом промпте до конца сессии.
         live.sessionLabelFromTitle = true;
+        if (clean === live.sessionLabel) return;
+        live.sessionLabel = clean;
         // Рассылаем метку тем же каналом, что и статусы: статус НЕ меняем —
-        // передаём текущий, чтобы не подделать состояние вкладки.
-        setStatus(live, live.status, live.subtitle);
+        // передаём текущий. labelOnly (I2 ре-ревью) помечает событие как
+        // «изменилась ТОЛЬКО метка»: потребители с побочными эффектами
+        // (Windows-тосты, сохранение ghost-буфера) обязаны его пропустить —
+        // статус-то не менялся, а повторный тост «готово» пользователю не
+        // нужен.
+        setStatus(live, live.status, live.subtitle, { labelOnly: true });
+        // M3 (ре-ревью): метка изменилась — манифест должен это узнать сам, а
+        // не ждать попутного чужого события (иначе для сессий без ai-title
+        // фолбэк-метка могла не дожить до утра).
+        onEvent('tabs:changed', {});
       })
       .catch(() => {
-        const live = tabs.get(myTabId);
-        if (live && live === tab && live.gen === myGen) live.titleReadInFlight = false;
+        done();
       });
   }
 

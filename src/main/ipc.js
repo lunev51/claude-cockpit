@@ -1215,7 +1215,12 @@ function registerIpc(win, opts = {}) {
       // Windows, по правилу «не уведомлять о том, на что смотришь». Имя
       // вкладки берём из manager.list() — payload статуса его не несёт.
       // smoke: headless-прогон никогда не должен показывать тосты.
-      if (!smoke && channel === 'tab:status' && toaster) {
+      // I2 (ре-ревью 01.08): labelOnly — событие, у которого изменилась ТОЛЬКО
+      // метка сессии (заголовок дочитался из транскрипта), статус тот же.
+      // Тостер обязан его пропустить: у 'done'/'waiting' нет дедупа по
+      // предыдущему статусу, и пользователь получил бы повторный Windows-тост
+      // «готово»/«ждёт ответа» ни с того ни с сего.
+      if (!smoke && channel === 'tab:status' && toaster && !payload.labelOnly) {
         const tab = manager.list().find((t) => t.tabId === payload.tabId);
         toaster.onStatus({
           tabId: payload.tabId,
