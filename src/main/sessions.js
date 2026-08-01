@@ -254,6 +254,19 @@ function createSessionManager({
       // (пользователь ещё не подключил хуки), не должна уезжать в «Проблемы».
       // Взводится ЛЮБЫМ хук-событием в applyHookEvent и живёт до конца вкладки.
       hookActive: false,
+      // Живая приёмка 01.08: «работает» бывает двух очень разных сортов, и
+      // детект зависаний имеет право только на второй.
+      //   • «сессия запущена» — процесс поднялся и стоит у промпта. Никто
+      //     ничего не просил, молчать он может сутками.
+      //   • «думает…»/«Bash…» — человек дал поручение и ждёт ответа. Вот
+      //     здесь молчание дольше порога и есть зависание.
+      // Флаг взводится поручением (UserPromptSubmit/PreToolUse) и снимается,
+      // когда ждать перестали: ответ пришёл (Stop), спросили разрешения
+      // (Notification), сессия сменилась (SessionStart) или процесс
+      // перезапустили (spawn). Без него нетронутые после запуска кокпита
+      // вкладки уезжали в «Проблемы» с надписью «нет вывода 5м», а клик по
+      // ним (перерисовка → вывод) возвращал обратно — и так по кругу.
+      awaitingReply: false,
     });
     onEvent('tabs:changed', {}); // состав вкладок изменился — main пересоберёт манифест
     // sessionLabel в ответе (I3, ревью 01.08) — renderer рисует метку сразу
@@ -311,6 +324,11 @@ function createSessionManager({
     const spec = tab.smoke
       ? { command: 'cmd.exe', args: ['/c', 'echo PTY_OK'] }
       : { command: tab.command || t.command, args: extraArgs ? [...baseArgs, ...extraArgs] : baseArgs };
+    // Новый процесс никто ни о чём не просил — ожидание ответа снимаем ЗДЕСЬ,
+    // а не в SessionStart: резюм может не подтвердиться вовсе (провал
+    // --resume), и тогда SessionStart не придёт, а флаг остался бы взведённым
+    // от прошлой жизни вкладки — и она уехала бы в «Проблемы» ни за что.
+    tab.awaitingReply = false;
     // Поколение растёт ДО вызова фабрики: синхронные колбэки нового процесса
     // проходят гард, а все колбэки предыдущего поколения — отсекаются.
     // GLOBAL-счётчик genSeq (Important 1, ревью раунд 1) — не += 1 у самой
@@ -807,6 +825,9 @@ function createSessionManager({
         // (transcript_path). Читаем асинхронно — это главный источник метки,
         // и именно он подписывает утренние --resume вкладки.
         requestSessionTitle(tab, data.transcript_path);
+        // Сессия только поднялась — поручения нет, ждать нечего (в т.ч. после
+        // `/clear`: новая сессия не наследует ожидание старой).
+        tab.awaitingReply = false;
         setStatus(tab, 'working', 'сессия запущена');
         break;
       case 'UserPromptSubmit':
@@ -815,9 +836,15 @@ function createSessionManager({
         // на старте его в транскрипте ещё нет) — перепроверяем на каждом
         // промпте, пока не получим настоящий (гард внутри — см. функцию).
         requestSessionTitle(tab, data.transcript_path);
+        tab.awaitingReply = true; // вот теперь ответа реально ждут
         setStatus(tab, 'working', 'думает…');
         break;
       case 'PreToolUse':
+        // Работа инструментом — тоже доказательство, что ответ в процессе.
+        // Взводим и здесь: промпт мог уйти мимо кокпита (сторонний процесс той
+        // же сессии, маршрутизация по session_id), а зависнуть на инструменте
+        // такая работа может ровно так же.
+        tab.awaitingReply = true;
         setStatus(tab, 'working', data.tool_name ? `${data.tool_name}…` : 'работает…');
         break;
       case 'Notification': {
@@ -836,6 +863,9 @@ function createSessionManager({
           tab.waitingKind = kind;
         }
         tab.status = 'waiting';
+        // Ждут уже человека, а не машину: молчание здесь нормально и
+        // зависанием не является, сколько бы ни длилось.
+        tab.awaitingReply = false;
         tab.subtitle = tab.waitingText.slice(0, 120);
         // C2 (Critical, ревью финальной волны фазы 9): та же правка, что в
         // setStatus() выше по файлу — waitingKind в payload, renderer больше
@@ -866,6 +896,7 @@ function createSessionManager({
         // по функции) — прокидываем его же в payload 'tab:status', чтобы
         // обвязка ipc.js могла потребовать ДОКАЗАННОЕ поколение и для детекта
         // ночной смены, тем же приёмом, что уже защищает вброс очереди.
+        tab.awaitingReply = false; // ответ пришёл — ждать больше нечего
         setStatus(tab, 'done', '', { genProven });
         // Task 1 фазы 7 (очередь промптов): вбрасываем СТРОГО один элемент
         // очереди на этот Stop — не всю очередь разом. Гарды (pty жив,
@@ -899,13 +930,18 @@ function createSessionManager({
     }
   }
 
-  // Детект зависания: working без вывода дольше порога. Зовётся таймером main.
+  // Детект зависания: работа НАД ПОРУЧЕНИЕМ без вывода дольше порога.
+  // Зовётся таймером main.
   function checkStuck() {
     const ts = now();
     for (const tab of tabs.values()) {
       // Идле-арминг (Task 6): без единого хук-события «working» не отличить
       // от «терминал просто открыт и стоит у промпта» — честно пропускаем.
       if (!tab.hookActive) continue;
+      // Живая приёмка 01.08: и с хуками «working» ещё не значит «работает над
+      // моим вопросом» — сессия могла просто запуститься. Молчание считаем
+      // зависанием, только пока ждём ответа на поручение (см. awaitingReply).
+      if (!tab.awaitingReply) continue;
       if (tab.status === 'working' && tab.proc && ts - tab.lastOutputAt > stuckAfterMs) {
         const min = Math.max(1, Math.round((ts - tab.lastOutputAt) / 60000));
         setStatus(tab, 'stuck', `нет вывода ${min}м`);

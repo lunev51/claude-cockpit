@@ -393,14 +393,16 @@ test('UserPromptSubmit переводит done в working', () => {
   assert.strictEqual(statusOf(events, a.tabId).status, 'working');
 });
 
-test('checkStuck: working без вывода дольше порога (hookActive=true после хук-события) → stuck; вывод возвращает working', () => {
+test('checkStuck: working без вывода дольше порога → stuck; вывод возвращает working', () => {
   const factory = makeFakePtyFactory();
   const { mgr, events, tick } = makeManager(factory);
   const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
-  // Армируем hookActive хук-событием — иначе checkStuck честно пропустит
-  // вкладку (см. тесты idle-арминга ниже).
+  // Армируем детект ПОРУЧЕНИЕМ, а не фактом запуска сессии: раньше здесь
+  // стоял SessionStart, и тест закреплял ровно тот баг, на который пожаловался
+  // пользователь 01.08 — нетронутая вкладка уезжала в «Проблемы».
   mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'sess-1' });
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'почини тесты' });
   tick(1500);
   mgr.checkStuck();
   assert.strictEqual(statusOf(events, a.tabId).status, 'stuck');
@@ -636,6 +638,110 @@ test('checkStuck: после первого хук-события (hookActive=tr
   tick(1500);
   mgr.checkStuck();
   assert.strictEqual(statusOf(events, a.tabId).status, 'stuck');
+});
+
+// ---------- Живая приёмка 01.08: ложное «зависание» у нетронутых вкладок ----------
+// Отзыв пользователя: «после запуска кокпита во вкладках, в которых я ещё
+// ничего не писал, сначала пишет "нет вывода 5м", потом отправляются в раздел
+// "проблемы". Если нажать на них, они снова переезжают в "работают", хотя я
+// ничего не писал, и потом опять уезжают в "проблемы"».
+//
+// «Нет вывода» — обещание про КОНКРЕТНОЕ поручение: я спросил, а ответа нет.
+// Сессия, которой никто ничего не поручал, зависнуть не может, сколько бы она
+// ни молчала.
+
+test('stuck: восстановленная вкладка, которой ничего не писали, НЕ уезжает в «проблемы»', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events, tick } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha', sessionId: 'S1' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1' }); // резюм подтверждён
+  factory.spawned[0].opts.onData('CLI отрисовал восстановленную переписку');
+
+  tick(1500); // дольше порога
+  mgr.checkStuck();
+
+  assert.notStrictEqual(statusOf(events, a.tabId).status, 'stuck', 'поручения не было — зависать нечему');
+});
+
+test('stuck: клик по нетронутой вкладке не гоняет её между разделами', () => {
+  // Клик наводит фокус и рефит → CLI перерисовывает экран → приходит вывод.
+  // Раньше вывод возвращал вкладку из stuck в working, и через порог она
+  // уезжала обратно — бесконечная качель, ровно как в отзыве.
+  const factory = makeFakePtyFactory();
+  const { mgr, events, tick } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha', sessionId: 'S1' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1' });
+
+  for (let i = 0; i < 3; i += 1) {
+    tick(1500);
+    mgr.checkStuck();
+    // Проверяем ДО перерисовки: она сама возвращает статус, и проверка после
+    // неё прошла бы вхолостую, ничего не измерив.
+    assert.notStrictEqual(statusOf(events, a.tabId).status, 'stuck', `круг ${i + 1}`);
+    factory.spawned[0].opts.onData('перерисовка после клика');
+  }
+});
+
+test('stuck: после реального промпта молчание дольше порога — по-прежнему «нет вывода»', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events, tick } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1' });
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'почини тесты' });
+
+  tick(1500);
+  mgr.checkStuck();
+
+  assert.strictEqual(statusOf(events, a.tabId).status, 'stuck', 'поручение есть, ответа нет — это и есть зависание');
+});
+
+test('stuck: ответ получен (Stop) — следующее молчание уже не «зависание»', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events, tick } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'почини тесты' });
+  mgr.applyHookEvent(a.tabId, 'Stop', {});
+  // Stop → 'done'. Вывод после ответа (перерисовка, клик) не должен
+  // возвращать вкладку в «работает» с последующим ложным зависанием.
+  factory.spawned[0].opts.onData('перерисовка');
+  tick(1500);
+  mgr.checkStuck();
+
+  assert.notStrictEqual(statusOf(events, a.tabId).status, 'stuck');
+});
+
+test('stuck: вкладка ждёт РАЗРЕШЕНИЯ — это не зависание, сколько бы ни ждала', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events, tick } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'снеси папку' });
+  mgr.applyHookEvent(a.tabId, 'Notification', { message: 'Claude needs your permission to use Bash' });
+  factory.spawned[0].opts.onData('перерисовка окна разрешения');
+  tick(1500);
+  mgr.checkStuck();
+
+  assert.strictEqual(statusOf(events, a.tabId).status, 'waiting', 'ждёт человека, а не молчит в работе');
+});
+
+test('stuck: перезапуск вкладки снимает ожидание ответа — новый процесс никто ни о чём не просил', () => {
+  // Резюм может и не подтвердиться (SessionStart не придёт вовсе), поэтому
+  // рассчитывать на его сброс нельзя — снимаем на самом спавне.
+  const factory = makeFakePtyFactory();
+  const { mgr, events, tick } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'почини тесты' });
+
+  mgr.restart(a.tabId);
+  tick(1500);
+  mgr.checkStuck();
+
+  assert.notStrictEqual(statusOf(events, a.tabId).status, 'stuck');
 });
 
 // ---------- Phase 2b Task 6: зачистка унаследованных маркеров Claude Code ----------
