@@ -65,6 +65,7 @@ let manualRefreshInFlight = null; // Promise текущего usage:refresh, е�
 let lastManualRefreshAt = 0;       // Date.now() последнего РЕАЛЬНО выполненного (не отбитого троттлингом) usage:refresh
 let ipcBootAt = 0;                 // Date.now() момента registerIpc — окно cacheOnly для ccusage (инцидент 8ГБ, см. usage:get)
 const CCUSAGE_BOOT_DEFER_MS = 90000;
+let deferredSpendTimer = null;     // отложенный пересчёт расходов на границе boot-окна (N1 ре-ревью: гасится в disposeSessions, как usageMonitorTimer)
 let nightWatch = null;   // Task 2 фазы 8 («Ночная смена»): инстанс createNightWatch (night-watch.js), см. регистрацию ниже
 // Task 2 фазы 8, КРИТИЧЕСКАЯ ЛОВУШКА (найдена на ревью Task 1, зафиксирована в
 // брифе Task 2): sessions.js на Stop-хуке СИНХРОННО ставит статус 'done' и
@@ -1333,9 +1334,14 @@ function registerIpc(win, opts = {}) {
     // ниоткуда не приходит (30с-таймер renderer только перерисовывает кэш).
     // Один отложенный настоящий пересчёт по истечении окна + push свежего
     // результата тем же каналом usage:update.
-    const deferredSpendTimer = setTimeout(async () => {
+    deferredSpendTimer = setTimeout(async () => {
+      deferredSpendTimer = null;
       try {
-        lastCcusageResult = await ccusage.get();
+        const spend = await ccusage.get();
+        // N2 ре-ревью: не даём протухшему ответу перезаписать более свежий
+        // (гонка с параллельным usage:refresh) — deferred никогда не
+        // затирает настоящие данные.
+        if (!(spend && spend.error === 'deferred')) lastCcusageResult = spend;
         if (!win.isDestroyed()) {
           win.webContents.send('usage:update', {
             limits: usagePoller.snapshot(), spend: lastCcusageResult,
@@ -1857,6 +1863,12 @@ function disposeSessions() {
   if (usageMonitorTimer) {
     clearInterval(usageMonitorTimer);
     usageMonitorTimer = null;
+  }
+  // N1 ре-ревью инцидент-фикса: отложенный пересчёт расходов не должен
+  // пережить teardown (иначе npx для уничтоженного окна после killAllTracked).
+  if (deferredSpendTimer) {
+    clearTimeout(deferredSpendTimer);
+    deferredSpendTimer = null;
   }
   if (usagePoller) usagePoller.stop();
   // Task 2 фазы 8 («Ночная смена»): dispose() снимает ВСЕ таймеры ядра
