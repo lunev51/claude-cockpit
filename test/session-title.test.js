@@ -252,6 +252,53 @@ test('createFsReadParts: нет /rename — берётся автозаголо�
   }
 });
 
+// Файл без завершающего перевода строки. Правила «отбросить крайнюю строку»
+// защищают от среза посреди записи, но когда кусок — это ВЕСЬ файл, срезов
+// нет, и правила надо отменять. У custom-title это делалось с самого начала,
+// у ai-title — нет, и такой файл не давал метки вовсе.
+const NO_NEWLINE = [
+  ['ai-title последней строкой', ['{"type":"user","message":{"role":"user","content":"привет"}}', '{"type":"ai-title","aiTitle":"Автозаголовок","sessionId":"S1"}'], 'Автозаголовок'],
+  ['ai-title единственной строкой', ['{"type":"ai-title","aiTitle":"Автозаголовок","sessionId":"S1"}'], 'Автозаголовок'],
+  ['custom-title последней строкой', ['{"type":"ai-title","aiTitle":"Автозаголовок","sessionId":"S1"}', '{"type":"custom-title","customTitle":"МОЁ ИМЯ","sessionId":"S1"}'], 'МОЁ ИМЯ'],
+];
+
+for (const [label, lines, want] of NO_NEWLINE) {
+  test(`createFsReadParts: файл без финального перевода строки, ${label}`, async () => {
+    const dir = fsReal.mkdtempSync(pathReal.join(os.tmpdir(), 'cockpit-nl-'));
+    try {
+      const file = pathReal.join(dir, 'S1.jsonl');
+      fsReal.writeFileSync(file, lines.join('\n')); // без '\n' в конце
+      const reader = createSessionTitleReader({ readParts: createFsReadParts(fsReal) });
+      assert.strictEqual(await reader.read(file, 'S1'), want);
+    } finally {
+      fsReal.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test('createFsReadParts: у ДЛИННОГО файла запись, разрезанная границей куска, не даёт метки', async () => {
+  // Обратная сторона отмены правил выше: когда файл читается двумя кусками,
+  // границы — настоящие срезы. Держат тут два рубежа сразу — отбрасывание
+  // крайней строки и то, что обрезанный JSON всё равно не разберётся; тест
+  // проверяет итог (ложной метки нет), не различая, который сработал.
+  const dir = fsReal.mkdtempSync(pathReal.join(os.tmpdir(), 'cockpit-cut-'));
+  try {
+    const file = pathReal.join(dir, 'S1.jsonl');
+    const line = `{"type":"user","message":{"role":"user","content":"${'x'.repeat(200)}"}}\n`;
+    const parts = [];
+    while (Buffer.byteLength(parts.join('')) < 900 * 1024) parts.push(line);
+    const body = Buffer.from(parts.join(''));
+    // Обрезанный ai-title начинается ДО края префикса и продолжается за ним.
+    const cut = Buffer.from('{"type":"ai-title","aiTitle":"ОБРЕЗОК","sessionId":"S1"}\n');
+    cut.copy(body, 262144 - 20);
+    fsReal.writeFileSync(file, body);
+    const reader = createSessionTitleReader({ readParts: createFsReadParts(fsReal) });
+    assert.strictEqual(await reader.read(file, 'S1'), '', 'запись на срезе куска не считается заголовком');
+  } finally {
+    fsReal.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('createFsReadParts: несуществующий файл — пусто, наружу не бросает', async () => {
   const reader = createSessionTitleReader({ readParts: createFsReadParts(fsReal) });
   assert.strictEqual(await reader.read(pathReal.join(os.tmpdir(), 'нет-такого-файла.jsonl'), 'S1'), '');

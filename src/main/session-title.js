@@ -120,12 +120,17 @@ function createSessionTitleReader({
     }
     const prefix = (parts && parts.prefix) || '';
     const suffix = (parts && parts.suffix) || '';
-    // Имя пользователя (`/rename`) приоритетнее автозаголовка. Ищем в хвосте,
-    // а если хвоста нет (короткий файл прочитан целиком в prefix) — в нём же.
+    // Пустой хвост означает «файл прочитан ЦЕЛИКОМ в prefix» — тогда обе
+    // границы этого куска настоящие, а не срез посреди строки, и правила
+    // «отбросить крайнюю строку» надо отменить: у custom-title спереди
+    // (подставляем фиктивную пустую строку), у ai-title сзади (дописываем
+    // перевод строки). Без второй половины файл БЕЗ финального перевода,
+    // где ai-title последняя запись, метки не давал вовсе — проверено.
+    const whole = !suffix;
     const custom = parseCustomTitle(suffix, sessionId)
-      || (suffix ? '' : parseCustomTitle(`\n${prefix}`, sessionId));
+      || (whole ? parseCustomTitle(`\n${prefix}`, sessionId) : '');
     if (custom) return custom;
-    return parseAiTitle(prefix, sessionId);
+    return parseAiTitle(whole ? `${prefix}\n` : prefix, sessionId);
   }
   return { read };
 }
