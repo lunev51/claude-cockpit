@@ -139,8 +139,10 @@ test('успешный разбор реального образца: totals и
   ]);
 
   assert.strictEqual(calls.length, 2);
-  assert.deepStrictEqual(calls.find((a) => a[1] === 'daily'), ['claude', 'daily', '--json']);
-  assert.deepStrictEqual(calls.find((a) => a[1] === 'session'), ['claude', 'session', '--json']);
+  // Инцидент 8ГБ: к базовым args добавились --since <окно 40д> и --offline —
+  // точные значения проверяет отдельный тест ниже, здесь фиксируем префикс.
+  assert.deepStrictEqual(calls.find((a) => a[1] === 'daily').slice(0, 3), ['claude', 'daily', '--json']);
+  assert.deepStrictEqual(calls.find((a) => a[1] === 'session').slice(0, 3), ['claude', 'session', '--json']);
 });
 
 test('get() запускает daily и session ПАРАЛЛЕЛЬНО (Promise.all), а не по очереди', async () => {
@@ -451,4 +453,63 @@ test('rounding: дробные центы округляются до 2 знак
   assert.strictEqual(snap.byDay[0].tokens, 11);
   assert.strictEqual(Number.isInteger(snap.byDay[0].tokens), true);
   assert.strictEqual(Number.isInteger(snap.totals.tokens), true);
+});
+
+// ============= инцидент 8ГБ (01.08): окно дат, офлайн-прайсинг, cacheOnly =====
+
+test('инцидент 8ГБ: run() получает --since (окно 40 дней от now) и --offline в ОБОИХ прогонах', async () => {
+  const calls = [];
+  // now = 2026-08-01 00:00 локального времени; 40 дней назад = 2026-06-22.
+  const nowMs = new Date(2026, 7, 1).getTime();
+  const ccusage = createCcusage({ run: runFixture({ calls }), cache: noopCache(), now: () => nowMs });
+
+  await ccusage.get();
+
+  assert.strictEqual(calls.length, 2);
+  for (const args of calls) {
+    const i = args.indexOf('--since');
+    assert.ok(i !== -1, `нет --since: ${JSON.stringify(args)}`);
+    assert.strictEqual(args[i + 1], '20260622');
+    assert.ok(args.includes('--offline'), `нет --offline: ${JSON.stringify(args)}`);
+  }
+});
+
+test('инцидент 8ГБ: cacheOnly при протухшем кэше — отдаёт кэш со stale+deferred, НЕ спавнит', async () => {
+  const calls = [];
+  const run = runFixture({ calls });
+  let t = 1000;
+  const ccusage = createCcusage({ run, cache: noopCache(), now: () => t, ttlMs: 500 });
+
+  await ccusage.get(); // прогрев кэша (2 вызова run)
+  t = 10000; // TTL истёк
+  const snap = await ccusage.get({ cacheOnly: true });
+
+  assert.strictEqual(calls.length, 2, 'cacheOnly не должен спавнить новые прогоны');
+  assert.strictEqual(snap.ok, true);
+  assert.strictEqual(snap.stale, true);
+  assert.strictEqual(snap.error, 'deferred');
+});
+
+test('инцидент 8ГБ: cacheOnly без какого-либо кэша — ok:false, kind deferred, ноль прогонов', async () => {
+  const calls = [];
+  const ccusage = createCcusage({ run: runFixture({ calls }), cache: noopCache(), now: () => 1000 });
+
+  const snap = await ccusage.get({ cacheOnly: true });
+
+  assert.strictEqual(calls.length, 0);
+  assert.strictEqual(snap.ok, false);
+  assert.strictEqual(snap.error, 'deferred');
+});
+
+test('инцидент 8ГБ: cacheOnly при СВЕЖЕМ кэше — обычный свежий ответ без deferred', async () => {
+  const calls = [];
+  const ccusage = createCcusage({ run: runFixture({ calls }), cache: noopCache(), now: () => 1000, ttlMs: 600000 });
+
+  await ccusage.get();
+  const snap = await ccusage.get({ cacheOnly: true });
+
+  assert.strictEqual(calls.length, 2);
+  assert.strictEqual(snap.ok, true);
+  assert.strictEqual(snap.stale, false);
+  assert.strictEqual(snap.error, null);
 });

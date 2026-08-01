@@ -1245,3 +1245,63 @@ test('Minor-1: демоция не навсегда — холодный ста�
   assert.strictEqual(spawns[2].exe, serverExePath(root, 'whisper-cuda'),
     'холодный старт после интервала обязан снова попробовать CUDA');
 });
+
+// ============= инцидент 8ГБ (01.08): глушение тёплого сервера по простою =====
+
+test('инцидент 8ГБ: после transcribeWav взводится idle-таймер (600000мс); его выстрел глушит сервер', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([serverExePath(root, 'whisper'), modelPathFor(root, MODEL)]);
+  const timers = fakeTimers();
+  const httpGet = () => Promise.resolve({ status: 200 });
+  const httpPost = () => Promise.resolve({ status: 200, body: Buffer.from('{"text":"ok"}', 'utf8') });
+  const children = [fakeChild(111), fakeChild(222)];
+  const spawnProc = fakeSpawn(children);
+  const { stt } = setup({
+    fs, timers, httpGet, httpPost, spawnProc, config: baseConfig({ stackRoots: [root] }),
+  });
+
+  await stt.transcribeWav(Buffer.from('wav'));
+  await flush(5); // хвост цепочки (armIdleShutdown) — микрозадачи
+  assert.strictEqual(timers.lastMs(), 600000, 'idle-таймер на 10 минут');
+  assert.strictEqual(timers.liveCount(), 1);
+
+  timers.fire(timers.lastId()); // простой вышел
+  // Сервер заглушен: kill у ребёнка + контрольный taskkill.
+  assert.ok(children[0].calls.some((c) => c.op === 'kill'), 'сервер убит по простою');
+  // Следующая диктовка прогревает заново.
+  await stt.transcribeWav(Buffer.from('wav2'));
+  assert.strictEqual(serverSpawns(spawnProc).length, 2, 'после глушения — новый спавн');
+});
+
+test('инцидент 8ГБ: каждый transcribeWav перевзводит idle-таймер (старый снят, не копятся)', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([serverExePath(root, 'whisper'), modelPathFor(root, MODEL)]);
+  const timers = fakeTimers();
+  const httpGet = () => Promise.resolve({ status: 200 });
+  const httpPost = () => Promise.resolve({ status: 200, body: Buffer.from('{"text":"ok"}', 'utf8') });
+  const { stt } = setup({
+    fs, timers, httpGet, httpPost, config: baseConfig({ stackRoots: [root] }),
+  });
+
+  await stt.transcribeWav(Buffer.from('a'));
+  await flush(5);
+  await stt.transcribeWav(Buffer.from('b'));
+  await flush(5);
+  assert.strictEqual(timers.liveCount(), 1, 'живой idle-таймер ровно один');
+});
+
+test('инцидент 8ГБ: dispose снимает idle-таймер', async () => {
+  const root = ROOT1();
+  const fs = fakeFs([serverExePath(root, 'whisper'), modelPathFor(root, MODEL)]);
+  const timers = fakeTimers();
+  const httpGet = () => Promise.resolve({ status: 200 });
+  const httpPost = () => Promise.resolve({ status: 200, body: Buffer.from('{"text":"ok"}', 'utf8') });
+  const { stt } = setup({
+    fs, timers, httpGet, httpPost, config: baseConfig({ stackRoots: [root] }),
+  });
+
+  await stt.transcribeWav(Buffer.from('a'));
+  await flush(5);
+  stt.dispose();
+  assert.strictEqual(timers.liveCount(), 0, 'после dispose живых таймеров нет');
+});

@@ -165,13 +165,29 @@ function createCcusage({ run, cache, now = Date.now, ttlMs = 600000 }) {
     return buildResult(false, false, null, 0, kind);
   }
 
+  // Инцидент «зависает вместе с компом» (01.08, машина с 8ГБ ОЗУ): без окна
+  // дат ccusage перемалывает ВСЕ транскрипты (1.7ГБ, два параллельных прогона
+  // daily+session = двойное чтение) — 15+ секунд диска и ~190МБ пикового
+  // дерева процессов на каждое обновление. Дашборд показывает максимум 30
+  // дней — окно в 40 (с запасом) режет объём чтения кратно. --offline —
+  // прайсинг из локального кэша ccusage, без похода в сеть.
+  const SPEND_WINDOW_DAYS = 40;
+
+  function sinceArg(nowMs) {
+    const d = new Date(nowMs - SPEND_WINDOW_DAYS * 86400000);
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    return `${d.getFullYear()}${mm}${dd}`;
+  }
+
   async function fetchFresh() {
     let dailyRes;
     let sessionRes;
+    const since = sinceArg(now());
     try {
       [dailyRes, sessionRes] = await Promise.all([
-        run(['claude', 'daily', '--json']),
-        run(['claude', 'session', '--json']),
+        run(['claude', 'daily', '--json', '--since', since, '--offline']),
+        run(['claude', 'session', '--json', '--since', since, '--offline']),
       ]);
     } catch (err) {
       return { kind: 'unavailable' };
@@ -192,12 +208,22 @@ function createCcusage({ run, cache, now = Date.now, ttlMs = 600000 }) {
     return { kind: null, data: normalize(dailyBody, sessionBody) };
   }
 
-  async function doGet({ force = false } = {}) {
+  async function doGet({ force = false, cacheOnly = false } = {}) {
     ensureLoadedFromCache();
 
     const nowMs = now();
     if (!force && lastGood && (nowMs - lastGood.fetchedAt) < ttlMs) {
       return buildResult(true, false, lastGood, lastGood.fetchedAt, null);
+    }
+
+    // Инцидент 8ГБ: стартовое окно кокпита (первые ~90с — шторм спавна
+    // сессий) не должно совпадать с npx-прогонами по транскриптам. cacheOnly
+    // отдаёт лучшее, что есть (память/диск, пусть и протухшее — с пометкой
+    // stale + kind 'deferred'), и НЕ спавнит ничего; без кэша — честный
+    // ok:false 'deferred', дашборд объяснит.
+    if (cacheOnly) {
+      if (lastGood) return buildResult(true, true, lastGood, lastGood.fetchedAt, 'deferred');
+      return buildResult(false, false, null, 0, 'deferred');
     }
 
     const result = await fetchFresh();
