@@ -1,16 +1,16 @@
 'use strict';
 // Стор вкладок + рендер сайдбара с группировкой по срочности (спека, мокап B):
-// Ждут тебя → Работают → Готово → Проблемы (stuck+dead). Пустые секции скрыты.
+// Ждут тебя → Работают → Готово → Проблемы (stuck+dead) → Наготове. Пустые
+// секции скрыты; порядок и раскладка — в tab-group.js.
 // Порядок вкладок для Ctrl+1..9 — порядок создания, группировка чисто визуальная.
 
-const GROUP_OF = {
-  waiting: 'waiting',
-  working: 'working',
-  done: 'done',
-  stuck: 'trouble',
-  dead: 'trouble',
-  idle: 'working', // idle пока живёт в «Работают» (реальный idle появится в 2b)
-};
+// Раскладка по секциям (включая «Наготове», живая приёмка 01.08) живёт в
+// отдельном чистом модуле — здесь её нельзя было бы проверить тестом, а
+// ошибка в ней и есть та самая жалоба «работают, хотя вкладка просто открыта».
+// Раньше тут же стояла заглушка `idle: 'working'` с пометкой «реальный idle
+// появится в 2b»: статус 'idle' не ставил никто, и нетронутые вкладки
+// раздували счётчик «Работают». Теперь это настоящий статус 'ready'.
+import { groupOf, GROUP_ORDER } from './tab-group.js';
 
 // Task 4 фазы 6 (бейдж PR): классификация checks ('passing'|'failing'|'pending'|
 // 'none') → CSS-модификатор .tab-pr-badge. Черновик (isDraft) визуально
@@ -37,7 +37,7 @@ export function createTabStore({
   const headOf = (group) => root.querySelector(`[data-group="${group}"]`);
 
   function refreshGroups() {
-    for (const group of ['waiting', 'working', 'done', 'trouble']) {
+    for (const group of GROUP_ORDER) {
       const body = bodyOf(group);
       const head = headOf(group);
       const n = body.children.length;
@@ -47,7 +47,7 @@ export function createTabStore({
   }
 
   function placeRow(r) {
-    bodyOf(GROUP_OF[r.status] || 'working').appendChild(r.row);
+    bodyOf(groupOf(r.status)).appendChild(r.row);
     refreshGroups();
   }
 
@@ -56,7 +56,7 @@ export function createTabStore({
     row.className = 'tab-row';
 
     const dot = document.createElement('span');
-    dot.className = 'tab-dot working';
+    dot.className = 'tab-dot ready';
 
     const info = document.createElement('div');
     info.className = 'tab-info';
@@ -171,7 +171,7 @@ export function createTabStore({
     });
 
     const r = {
-      row, dot, sub, connectBtn, name, cwd, status: 'working', waitingText: '',
+      row, dot, sub, connectBtn, name, cwd, status: 'ready', waitingText: '',
       // C2 (Critical, ревью финальной волны фазы 9): waitingKind — та же
       // судьба, что waitingText (см. setStatus/waitingKindOf ниже) — зеркало
       // tab.waitingKind из sessions.js, нужное writeCommandToTab (app.js),
@@ -207,7 +207,7 @@ export function createTabStore({
   function setStatus(tabId, status, subtitle, waitingText, waitingKind, sessionLabel) {
     const r = rows.get(tabId);
     if (!r) return;
-    const regroup = GROUP_OF[r.status] !== GROUP_OF[status];
+    const regroup = groupOf(r.status) !== groupOf(status);
     r.status = status;
     r.dot.className = `tab-dot ${status}`;
     r.row.classList.toggle('waiting', status === 'waiting');
@@ -318,7 +318,8 @@ export function createTabStore({
   // waitingCount() (Task 5 carryover фазы 4/5): агрегат «сколько вкладок
   // сейчас waiting» — считаем по ТОЙ ЖЕ карте rows и тому же полю r.status,
   // которое placeRow() уже использует, чтобы решить, класть ли строку в
-  // секцию «Ждут тебя» (GROUP_OF.waiting === 'waiting') — структурно тот же
+  // секцию «Ждут тебя» (groupOf('waiting') === 'waiting', см. tab-group.js) —
+  // структурно тот же
   // критерий, а не отдельный Set в app.js, который нужно было вручную держать
   // в синхроне (add/remove/setStatus) и который однажды рассинхронизировался
   // бы сам по себе. Дёшево: вкладок обычно единицы, полный проход по rows на

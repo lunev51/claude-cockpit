@@ -15,7 +15,11 @@ const crypto = require('crypto');
 // (рецепт и очередь) должны быть захардены ОДИНАКОВО — см. enqueue() ниже.
 const { normalizeForPty } = require('./recipes');
 
-const STATUSES = ['working', 'waiting', 'done', 'stuck', 'dead'];
+// 'ready' («Наготове», живая приёмка 01.08) — сессия поднята и стоит у
+// промпта: никто ничего не поручал, ждать нечего, смотреть не на что. До этого
+// такие вкладки жили в «Работают», и счётчик «Работают · 10» после утреннего
+// восстановления выглядел так, будто десять сессий жгут лимит.
+const STATUSES = ['working', 'waiting', 'done', 'stuck', 'dead', 'ready'];
 
 // Мягкая деградация провала резюма (спека §6): процесс с оверрайдом (--resume
 // <id>/--resume), проживший меньше этого порога и умерший, не привязав
@@ -451,7 +455,15 @@ function createSessionManager({
       if (myGen === tab.gen && tab.status !== 'dead') {
         tab.proc = proc;
         tab.alive = true;
-        setStatus(tab, 'working', 'сессия запущена');
+        // Процесс поднят — но он ещё ничего не делает: 'ready' («Наготове»),
+        // не 'working'. Important 1 ревью 01.08: правку статуса сделали только
+        // в обработчике SessionStart и забыли, что первый статус ставит сам
+        // спавн. Для проекта БЕЗ подключённых хуков (штатное состояние, ⚡ в
+        // сайдбаре) SessionStart не придёт никогда — и вкладка висела в
+        // «Работают» до закрытия кокпита, то есть ровно та жалоба, ради
+        // которой всё затевалось. Плюс восстановление десятка вкладок больше
+        // не гоняет счётчик «Работают» весь стаггер.
+        setStatus(tab, 'ready', 'сессия запущена');
         onEvent('term:started', { tabId: tab.tabId, pid: proc.pid });
       }
     } catch (err) {
@@ -846,7 +858,8 @@ function createSessionManager({
         // раз в неделю, а цена страховки — одна строка (ревью 01.08).
         if (data.source !== 'compact') {
           tab.awaitingReply = false;
-          setStatus(tab, 'working', 'сессия запущена');
+          // Не 'working': поднявшаяся сессия ещё ничего не делает (см. STATUSES).
+          setStatus(tab, 'ready', 'сессия запущена');
         } else {
           setStatus(tab, 'working', 'сжимает контекст…');
         }
@@ -951,6 +964,20 @@ function createSessionManager({
     }
   }
 
+  // «Пользователь прочитал результат» — вкладка уезжает из «Готово» в
+  // «Наготове» (живая приёмка 01.08: «Готово» — список НЕПРОЧИТАННОГО).
+  //
+  // Решает НЕ ядро, а renderer: только он знает, что сейчас на экране и есть
+  // ли у окна фокус (тот же смысл, что у isSuppressed в toasts.js — «смотрит
+  // именно на эту вкладку прямо сейчас»). Здесь — узкий гард: трогаем ровно
+  // 'done'. Работающую вкладку взгляд не сбивает, ждущую диалога — не
+  // «отвечает» за человека, мёртвую не воскрешает.
+  function markSeen(tabId) {
+    const tab = tabs.get(tabId);
+    if (!tab || tab.status !== 'done') return;
+    setStatus(tab, 'ready', '');
+  }
+
   // Детект зависания: работа НАД ПОРУЧЕНИЕМ без вывода дольше порога.
   // Зовётся таймером main.
   function checkStuck() {
@@ -999,7 +1026,7 @@ function createSessionManager({
 
   return {
     open, start, write, resize, restart, close, list, disposeAll,
-    bindSession, has, findBySessionId, findUnboundByCwd, applyHookEvent, checkStuck,
+    bindSession, has, findBySessionId, findUnboundByCwd, applyHookEvent, checkStuck, markSeen,
     enqueue, removeFromQueue, clearQueue, dequeueAll,
   };
 }

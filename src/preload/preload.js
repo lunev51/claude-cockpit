@@ -12,6 +12,11 @@ contextBridge.exposeInMainWorld('api', {
     open: (opts) => ipcRenderer.invoke('tabs:open', opts),
     close: (tabId) => ipcRenderer.invoke('tabs:close', tabId),
     chooseFolder: () => ipcRenderer.invoke('tabs:chooseFolder'),
+    // «Я это увидел»: вкладка из «Готово» уезжает в «Наготове» (живая приёмка
+    // 01.08 — «Готово» стало списком непрочитанного). Решает renderer, потому
+    // что только он знает, что показано на экране и есть ли у окна фокус;
+    // ядро на этом сообщении лишь двигает статус и гардит его (markSeen).
+    markSeen: (tabId) => ipcRenderer.send('tabs:seen', { tabId }),
   },
   term: {
     start: (tabId, cols, rows) => ipcRenderer.send('term:start', { tabId, cols, rows }),

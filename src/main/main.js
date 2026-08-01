@@ -317,13 +317,56 @@ app.whenReady().then(() => {
     win.webContents.on('did-fail-load', () => {
       rendererErrors += 1;
     });
-    setTimeout(() => {
+    setTimeout(async () => {
       const ptyOutput = getSmokeOutput();
       console.log(`[smoke] pty=${ptyOutput.slice(0, 80)}`);
+      // Живая приёмка 01.08 («Наготове»): сайдбар — единственная часть, у
+      // которой нет юнит-тестов (DOM без jsdom), а правка была именно в нём.
+      // Спрашиваем настоящее окно: секция на месте, и вкладка без единого
+      // хук-события лежит ИМЕННО в ней, а не в «Работают».
+      let sidebar = '{"error":"не опрошен"}';
+      try {
+        sidebar = await win.webContents.executeJavaScript(`(() => {
+          const head = document.querySelector('[data-group="ready"]');
+          const count = (g) => {
+            const b = document.querySelector('[data-body="' + g + '"]');
+            return b ? b.children.length : -1;
+          };
+          return JSON.stringify({
+            section: head ? head.textContent.replace(/\\s+/g, ' ').trim() : null,
+            waiting: count('waiting'), working: count('working'),
+            done: count('done'), trouble: count('trouble'), ready: count('ready'),
+            rows: document.querySelectorAll('#tab-groups .tab-row').length,
+          });
+        })()`);
+      } catch (err) {
+        sidebar = `{"error":${JSON.stringify(String(err && err.message))}}`;
+      }
+      console.log(`[smoke] sidebar=${sidebar}`);
       console.log(`[smoke] renderer-errors=${rendererErrors}`);
       flushWorkspace();
       disposeSessions();
-      const ok = rendererErrors === 0 && ptyOutput.includes('PTY_OK');
+      let sidebarOk = false;
+      try {
+        const s = JSON.parse(sidebar);
+        // Строка в сайдбаре при smoke РОВНО ОДНА: воркспейс не
+        // восстанавливается, но boot() открывает вкладку на config.terminal.cwd
+        // — это и есть тот pty, что печатает PTY_OK выше. Её процесс
+        // (cmd.exe /c echo) завершается сразу, значит к моменту опроса она
+        // обязана лежать в «Проблемах» — и это живая проверка всей цепочки
+        // groupOf → placeRow → refreshGroups на настоящем DOM, а не только
+        // наличия разметки.
+        //
+        // Первая версия этой проверки (Important 3 ревью) утверждала
+        // «working === 0» и объясняла это тем, что строк нет вовсе. Строка
+        // есть, а «Работают» пуста по совсем другой причине — вкладка успела
+        // умереть; проверка была зелёной при любой раскладке, включая
+        // сломанную.
+        sidebarOk = typeof s.section === 'string' && s.section.startsWith('Наготове')
+          && s.rows === 1 && s.trouble === 1
+          && s.working === 0 && s.ready === 0 && s.waiting === 0 && s.done === 0;
+      } catch { sidebarOk = false; }
+      const ok = rendererErrors === 0 && ptyOutput.includes('PTY_OK') && sidebarOk;
       app.exit(ok ? 0 : 1);
     }, 8000);
   }

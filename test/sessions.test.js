@@ -205,12 +205,13 @@ test('двойной start() на одной вкладке — no-op, фабр�
 
 // ---------- новые тесты фазы 2a ----------
 
-test('spawn ставит статус working; естественный exit — dead с кодом', () => {
+test('spawn ставит статус ready; естественный exit — dead с кодом', () => {
   const factory = makeFakePtyFactory();
   const { mgr, events } = makeManager(factory);
   const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
-  assert.strictEqual(statusOf(events, a.tabId).status, 'working');
+  // Процесс поднят, но ещё ничего не делает — «Наготове» (живая приёмка 01.08).
+  assert.strictEqual(statusOf(events, a.tabId).status, 'ready');
   factory.spawned[0].opts.onExit(3);
   const st = statusOf(events, a.tabId);
   assert.strictEqual(st.status, 'dead');
@@ -619,14 +620,17 @@ test('restart: kill() фабрики синхронно зовёт свой onEx
 
 // ---------- Phase 2b Task 6: idle-арминг stuck-детекта ----------
 
-test('checkStuck: без хук-событий (hookActive=false) stuck НЕ наступает даже после порога — без хуков "working" значит лишь "терминал открыт"', () => {
+test('checkStuck: без хук-событий (hookActive=false) stuck НЕ наступает даже после порога', () => {
+  // Раньше тест утверждал «останется working» — то есть закреплял вечное
+  // «Работают» у проекта без хуков. Утверждение теста то же самое (порог не
+  // делает вкладку зависшей), но ожидание теперь честное: она «Наготове».
   const factory = makeFakePtyFactory();
   const { mgr, events, tick } = makeManager(factory);
   const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
   tick(1500); // дольше stuckAfterMs
   mgr.checkStuck();
-  assert.strictEqual(statusOf(events, a.tabId).status, 'working');
+  assert.strictEqual(statusOf(events, a.tabId).status, 'ready');
 });
 
 test('checkStuck: после первого хук-события (hookActive=true) stuck наступает по порогу как раньше', () => {
@@ -809,6 +813,145 @@ test('stuck: перезапуск вкладки снимает ожидание
   assert.notStrictEqual(statusOf(events, a.tabId).status, 'stuck');
 });
 
+// ---------- Живая приёмка 01.08: раздел «Наготове» ----------
+// Отзыв пользователя: «а что насчёт того, что они возвращались именно во
+// вкладку "работают", если по сути они просто открыты без дела?»
+//
+// «Работают» должно значить «Claude сейчас думает, не трогай». Поднявшаяся,
+// но нетронутая сессия не работает — она стоит наготове. При десяти
+// восстановленных вкладках счётчик «Работают · 10» выглядел так, будто десять
+// сессий жгут лимит.
+//
+// «Готово» пользователь выбрал списком НЕПРОЧИТАННОГО: посмотрел результат —
+// вкладка уходит в «Наготове».
+
+test('ready: проект БЕЗ хуков Cockpit не висит вечно в «Работают»', () => {
+  // Хуки — штатно необязательны (кнопка ⚡ в сайдбаре их предлагает, но жить
+  // без них можно). Тогда SessionStart не придёт НИКОГДА, и статус, который
+  // поставил сам spawn(), остаётся навсегда. Пока это было 'working', ровно
+  // такая вкладка и порождала жалобу «работают, хотя я в них ничего не писал».
+  const factory = makeFakePtyFactory();
+  const { mgr, events, tick } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\no-hooks' });
+  mgr.start(a.tabId, 80, 24);
+
+  assert.strictEqual(statusOf(events, a.tabId).status, 'ready', 'сразу после спавна');
+
+  tick(60 * 60 * 1000);
+  mgr.checkStuck();
+  assert.strictEqual(statusOf(events, a.tabId).status, 'ready', 'и через час тоже');
+});
+
+test('ready: восстановленная вкладка не мигает через «Работают» до прихода SessionStart', () => {
+  // Восстановление идёт со стаггером, вкладок бывает десяток — счётчик
+  // «Работают · N» прыгал бы всё восстановление.
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha', sessionId: 'S-old' });
+  mgr.start(a.tabId, 80, 24);
+
+  assert.strictEqual(statusOf(events, a.tabId).status, 'ready');
+});
+
+test('ready: запуск сессии — это «наготове», а не «работает»', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1', source: 'startup' });
+
+  assert.strictEqual(statusOf(events, a.tabId).status, 'ready');
+});
+
+test('ready: поручение переводит в «работают»', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1' });
+
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'почини тесты' });
+
+  assert.strictEqual(statusOf(events, a.tabId).status, 'working');
+});
+
+test('ready: markSeen переводит прочитанный результат из «готово» в «наготове»', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'почини тесты' });
+  mgr.applyHookEvent(a.tabId, 'Stop', {});
+  assert.strictEqual(statusOf(events, a.tabId).status, 'done');
+
+  mgr.markSeen(a.tabId);
+
+  const after = statusOf(events, a.tabId);
+  assert.strictEqual(after.status, 'ready');
+  assert.strictEqual(after.subtitle, '', 'подпись завершённой задачи не тащим в «наготове»');
+});
+
+test('ready: markSeen трогает ТОЛЬКО «готово» — работающую вкладку не сбивает', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'почини тесты' });
+
+  mgr.markSeen(a.tabId); // пользователь смотрит на вкладку, а она ещё думает
+
+  assert.strictEqual(statusOf(events, a.tabId).status, 'working');
+});
+
+test('ready: markSeen не будит ждущую и мёртвую вкладку', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'Notification', { message: 'Claude needs your permission to use Bash' });
+
+  mgr.markSeen(a.tabId);
+
+  assert.strictEqual(statusOf(events, a.tabId).status, 'waiting', 'смотреть на диалог не значит ответить на него');
+});
+
+test('ready: markSeen на неизвестной вкладке молчит и не бросает', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const before = events.length;
+  mgr.markSeen('нет-такой-вкладки');
+  assert.strictEqual(events.length, before);
+});
+
+test('ready: повторный markSeen на уже прочитанной вкладке не шлёт лишних событий', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'почини' });
+  mgr.applyHookEvent(a.tabId, 'Stop', {});
+  mgr.markSeen(a.tabId);
+  const after = events.filter((e) => e.channel === 'tab:status').length;
+
+  mgr.markSeen(a.tabId);
+
+  assert.strictEqual(events.filter((e) => e.channel === 'tab:status').length, after);
+});
+
+test('ready: «наготове» не считается зависанием, сколько бы ни стояла', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events, tick } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1' });
+
+  tick(1500);
+  mgr.checkStuck();
+
+  assert.strictEqual(statusOf(events, a.tabId).status, 'ready');
+});
+
 // ---------- Phase 2b Task 6: зачистка унаследованных маркеров Claude Code ----------
 
 // ---------- FIX 3 (ревью): sessionId восстановления не теряется, конфигурационные args сохраняются ----------
@@ -946,7 +1089,7 @@ test('spawn: унаследованные CLAUDE_CODE_*/CLAUDECODE вычище�
 // оставалась dead — пользователь чинил её руками (Ctrl+Shift+R). Теперь
 // кокпит сам один раз перезапускает вкладку с чистыми (голыми) args.
 
-test('провал резюма (короткоживущий процесс, SessionStart не пришёл) → авто-восстановление одной чистой попыткой, статус working', () => {
+test('провал резюма (короткоживущий процесс, SessionStart не пришёл) → авто-восстановление одной чистой попыткой, вкладка жива', () => {
   const factory = makeFakePtyFactory();
   const { mgr, events, tick } = makeManager(factory);
   const a = mgr.open({ cwd: 'C:\\proj\\alpha', sessionId: 'ghost-session' });
@@ -964,7 +1107,7 @@ test('провал резюма (короткоживущий процесс, Se
   );
 
   const st = statusOf(events, a.tabId);
-  assert.strictEqual(st.status, 'working', 'вкладка должна остаться working, а не dead');
+  assert.strictEqual(st.status, 'ready', 'вкладка должна остаться живой, а не dead');
 
   const notice = events.find(
     (e) => e.channel === 'term:data' && e.payload.data.includes('сессия не найдена'),
@@ -1082,7 +1225,7 @@ test('успешная привязка сессии и/или ручной rest
     'авто-восстановление должно снова сработать после сброса флага',
   );
   assert.deepStrictEqual(factory.spawned[3].opts.args, []);
-  assert.strictEqual(statusOf(events, a.tabId).status, 'working');
+  assert.strictEqual(statusOf(events, a.tabId).status, 'ready', 'свежий процесс поднят и ждёт поручения');
 });
 
 test('ручной restart() САМ ПО СЕБЕ сбрасывает autoRecovered — без единого bindSession/SessionStart за весь тест', () => {
@@ -1124,7 +1267,7 @@ test('ручной restart() САМ ПО СЕБЕ сбрасывает autoRecov
     'restart() один сбросил autoRecovered — авто-восстановление сработало снова без единого SessionStart',
   );
   assert.deepStrictEqual(factory.spawned[4].opts.args, []);
-  assert.strictEqual(statusOf(events, a.tabId).status, 'working');
+  assert.strictEqual(statusOf(events, a.tabId).status, 'ready', 'свежий процесс поднят и ждёт поручения');
 });
 
 // ---------- Phase 7 Task 1: очередь промптов ----------

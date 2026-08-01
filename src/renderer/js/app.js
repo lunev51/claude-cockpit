@@ -13,6 +13,7 @@ import { createSearch } from './search.js';
 import { createRecipeForm } from './recipe-form.js';
 import { createHotkeysOverlay } from './hotkeys.js';
 import { pluralTabs } from './format.js';
+import { shouldMarkSeen } from './seen.js';
 // Task 3 фазы 9 (голосовой ввод, push-to-talk по правому Shift): recorder —
 // портирован из Companion как есть (src/renderer/js/voice/recorder.js, см.
 // комментарий там же — ни одного изменённого пути импорта не понадобилось,
@@ -667,6 +668,29 @@ function activateTab(tabId) {
   requestAnimationFrame(() => {
     entry.view.term.focus();
   });
+  // Переключился на вкладку — значит смотришь её результат (живая приёмка
+  // 01.08). Гард внутри: чужие/неактивные и не-'done' не тронет.
+  markSeenIfWatching(tabId);
+}
+
+// «Пользователь сейчас видит результат этой вкладки» — тот же смысл, что у
+// isSuppressed в main/toasts.js («не уведомляем о том, на что и так
+// смотришь»), только проверяется в renderer: document.hasFocus() честнее
+// любого зеркала состояния окна, активная вкладка — локальное знание, а какой
+// оверлей сейчас накрывает терминал, в main вообще не известно.
+// Сам предикат — в seen.js (чистый, под тестом): решение принимают три разные
+// точки, и разъезжаться им нельзя. Ядро на сообщении двигает 'done' → 'ready'.
+function markSeenIfWatching(tabId) {
+  const visible = shouldMarkSeen({
+    tabId,
+    activeId: tabStore.activeId,
+    hasFocus: document.hasFocus(),
+    // queue и peek исключены: строка очереди и поповер терминал не
+    // перекрывают — тот же список исключений, что уже применён к Ctrl+G.
+    overlayCovering: otherOverlayOpen('queue', 'peek'),
+  });
+  if (!visible) return;
+  window.api.tabs.markSeen(tabId);
 }
 
 // Ghost-буфер (Task 5): сериализовать буфер вкладки и отдать main на запись.
@@ -985,6 +1009,23 @@ function bindVoiceHotkey() {
   window.addEventListener('blur', () => voiceMachine.cancel());
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) voiceMachine.cancel();
+  });
+
+  // Живая приёмка 01.08: третий момент «прочитано» — окно вернуло фокус, а на
+  // экране всё это время висела вкладка, которая успела ответить. Первые два —
+  // переключение на вкладку (activateTab) и ответ, пришедший на активной
+  // вкладке (обработчик onStatus). Без этого результат, дождавшийся тебя из
+  // Alt+Tab, навсегда остался бы в «Готово».
+  window.addEventListener('focus', () => {
+    // Отсрочка — не косметика. Окно могло подняться кликом по тосту ЧУЖОЙ
+    // вкладки: main делает win.focus(), а 'tab:activate' шлёт следующей
+    // строкой (main.js/focusTab), и оба доезжают сюда асинхронно — порядок не
+    // гарантирован. Без паузы прочитанной пометилась бы вкладка, которая была
+    // активна ДО клика, то есть та, на которую как раз НЕ смотрели.
+    // markSeenIfWatching перечитывает activeId в момент срабатывания.
+    setTimeout(() => {
+      if (tabStore.activeId) markSeenIfWatching(tabStore.activeId);
+    }, 400);
   });
   // I1 (ревью финальной волны): мышь с зажатым Shift — штатное выделение
   // текста в xterm (Shift+клик выделяет диапазон, Shift+колесо — горизонтальный
@@ -2041,6 +2082,10 @@ async function boot() {
     // заголовок сессии) — лишняя сериализация полумегабайтного буфера на
     // диск здесь ни к чему.
     if (!labelOnly && (status === 'done' || status === 'waiting')) saveGhost(tabId);
+    // «Готово» — список НЕПРОЧИТАННОГО (живая приёмка 01.08). Если ответ
+    // пришёл, пока пользователь смотрел именно на эту вкладку, он его уже
+    // видит — в список непрочитанного ей попадать незачем.
+    if (status === 'done') markSeenIfWatching(tabId);
   });
 
   // Task 4 фазы 4: обработчик вынесен в newProject() — тот же сценарий
