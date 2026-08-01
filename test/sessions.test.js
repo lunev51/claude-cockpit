@@ -664,6 +664,27 @@ test('stuck: восстановленная вкладка, которой ни�
   assert.notStrictEqual(statusOf(events, a.tabId).status, 'stuck', 'поручения не было — зависать нечему');
 });
 
+test('stuck: ожившая вкладка перестаёт уверять, что вывода нет', () => {
+  // Вкладка вернулась в «Работают» ровно потому, что вывод ПРИШЁЛ, — держать
+  // на ней надпись «нет вывода 5м» абсурдно. Возвращаем ту подпись, с которой
+  // она в зависание ушла.
+  const factory = makeFakePtyFactory();
+  const { mgr, events, tick } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'PreToolUse', { tool_name: 'Bash' });
+  assert.strictEqual(statusOf(events, a.tabId).subtitle, 'Bash…');
+
+  tick(1500);
+  mgr.checkStuck();
+  assert.strictEqual(statusOf(events, a.tabId).status, 'stuck');
+
+  factory.spawned[0].opts.onData('вывод пошёл');
+  const after = statusOf(events, a.tabId);
+  assert.strictEqual(after.status, 'working');
+  assert.strictEqual(after.subtitle, 'Bash…', 'вернулась подпись работы, а не "нет вывода"');
+});
+
 test('stuck: клик по нетронутой вкладке не гоняет её между разделами', () => {
   // Клик наводит фокус и рефит → CLI перерисовывает экран → приходит вывод.
   // Раньше вывод возвращал вкладку из stuck в working, и через порог она

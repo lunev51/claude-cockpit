@@ -267,6 +267,9 @@ function createSessionManager({
       // вкладки уезжали в «Проблемы» с надписью «нет вывода 5м», а клик по
       // ним (перерисовка → вывод) возвращал обратно — и так по кругу.
       awaitingReply: false,
+      // Подпись, с которой вкладка ушла в «зависла» — чтобы вернуть её при
+      // первом же выводе, а не оставлять «нет вывода Nм» на работающей.
+      subtitleBeforeStuck: '',
     });
     onEvent('tabs:changed', {}); // состав вкладок изменился — main пересоберёт манифест
     // sessionLabel в ответе (I3, ревью 01.08) — renderer рисует метку сразу
@@ -359,7 +362,11 @@ function createSessionManager({
         onData: (data) => {
           if (myGen !== tab.gen) return; // хвост убитого процесса
           tab.lastOutputAt = now();
-          if (tab.status === 'stuck') setStatus(tab, 'working', tab.subtitle);
+          // Ожила — вернуть не только статус, но и осмысленную подпись.
+          // Раньше сюда передавалась tab.subtitle, то есть САМА надпись
+          // «нет вывода Nм»: вкладка возвращалась в «Работают», продолжая
+          // уверять, что вывода нет — прямо в тот момент, когда он пришёл.
+          if (tab.status === 'stuck') setStatus(tab, 'working', tab.subtitleBeforeStuck || 'работает…');
           onEvent('term:data', { tabId: tab.tabId, data });
         },
         onExit: (exitCode) => {
@@ -944,6 +951,10 @@ function createSessionManager({
       if (!tab.awaitingReply) continue;
       if (tab.status === 'working' && tab.proc && ts - tab.lastOutputAt > stuckAfterMs) {
         const min = Math.max(1, Math.round((ts - tab.lastOutputAt) / 60000));
+        // Запоминаем, ЧЕМ вкладка была занята («думает…», «Bash…»): когда
+        // вывод вернётся, ей нужно вернуть эту подпись, а не оставить
+        // «нет вывода» (см. onData в spawn).
+        tab.subtitleBeforeStuck = tab.subtitle;
         setStatus(tab, 'stuck', `нет вывода ${min}м`);
       }
     }
