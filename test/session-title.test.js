@@ -58,7 +58,7 @@ test('parseCustomTitle: нет записи — пустая строка', () =
   assert.strictEqual(parseCustomTitle(['', USER_LINE, USER_LINE].join('\n')), '');
 });
 
-test('parseCustomTitle: чужой sessionId пропускается (после --resume/fork в файле бывают чужие записи)', () => {
+test('parseCustomTitle: чужой sessionId пропускается (страховка на случай чужих записей в файле)', () => {
   const alien = '{"type":"custom-title","customTitle":"ЧУЖОЕ ИМЯ","sessionId":"OTHER"}';
   assert.strictEqual(parseCustomTitle(['', alien].join('\n'), 'S1'), '');
   assert.strictEqual(parseCustomTitle(['', CUSTOM_LINE].join('\n'), 'S1'), 'RZ paper');
@@ -146,48 +146,64 @@ const fsReal = require('fs');
 const os = require('os');
 const pathReal = require('path');
 
-// Собирает транскрипт нужного размера: ai-title в начале, наполнитель,
-// custom-title в самом конце — ровно как настоящий файл после `/rename`.
-function makeTranscript(sizeBytes, { customTitles = ['МОЁ ИМЯ'] } = {}) {
+// Собирает транскрипт РОВНО заданного размера: ai-title в начале,
+// наполнитель, custom-title, а после него — ещё `tailGap` байт обычных
+// записей. tailGap здесь не мелочь, а суть: в живом транскрипте `/rename`
+// почти никогда не последняя строка, после него работа продолжается. Пока
+// фикстура клала запись впритык к концу файла, она не ловила НИ дыру
+// просмотра (запись всегда попадала в хвост любого размера), НИ откат
+// SUFFIX_BYTES — оба бага проходили её зелёными.
+function makeTranscript(sizeBytes, { customTitles = ['МОЁ ИМЯ'], tailGap = 0 } = {}) {
   const dir = fsReal.mkdtempSync(pathReal.join(os.tmpdir(), 'cockpit-title-'));
   const file = pathReal.join(dir, 'S1.jsonl');
   const head = `{"type":"ai-title","aiTitle":"Автозаголовок Claude","sessionId":"S1"}\n`;
   const tails = customTitles
     .map((t) => `{"type":"custom-title","customTitle":${JSON.stringify(t)},"sessionId":"S1"}\n`);
-  const tailBytes = Buffer.byteLength(tails.join(''));
-  const fillerLine = `{"type":"user","message":{"role":"user","content":"${'x'.repeat(200)}"}}\n`;
+  const filler = (n) => `{"type":"user","message":{"role":"user","content":"${'x'.repeat(n)}"}}\n`;
+  const line = filler(200);
+  const lineBytes = Buffer.byteLength(line);
+
   const parts = [head];
-  let written = Buffer.byteLength(head) + tailBytes;
-  while (written + Buffer.byteLength(fillerLine) <= sizeBytes) {
-    parts.push(fillerLine);
-    written += Buffer.byteLength(fillerLine);
-  }
-  // Первый custom-title кладём в середину (имитируя переиздание на чекпоинте),
-  // последний — в конец файла.
+  let written = Buffer.byteLength(head) + Buffer.byteLength(tails.join('')) + tailGap;
+  while (written + lineBytes <= sizeBytes) { parts.push(line); written += lineBytes; }
+  // Ранние копии — в середину (переиздание на чекпоинтах), последняя — за
+  // tailGap байт до конца файла.
   if (tails.length > 1) {
-    parts.splice(Math.floor(parts.length / 2), 0, tails[0]);
-    parts.push(...tails.slice(1));
-  } else {
-    parts.push(...tails);
+    parts.splice(Math.floor(parts.length / 2), 0, ...tails.slice(0, -1));
+  }
+  parts.push(tails[tails.length - 1] || '');
+  let rest = tailGap;
+  while (rest >= lineBytes) { parts.push(line); rest -= lineBytes; }
+  // Добиваем до ТОЧНОГО размера — границы вроде 262145 иначе не проверить.
+  const short = sizeBytes - Buffer.byteLength(parts.join(''));
+  if (short >= lineBytes) {
+    parts.push(filler(200 + short - lineBytes));
+  } else if (short > 0) {
+    parts.push(`${'#'.repeat(short - 1)}\n`); // хвостовой мусор: парсер его пропустит
   }
   fsReal.writeFileSync(file, parts.join(''));
   return { file, dir, size: fsReal.statSync(file).size };
 }
 
+// Границы задаёт геометрия чтения: 262144 — край префикса, 524288 — предел
+// непрерывности двух кусков. Ровно на них менялось поведение в обоих
+// провалившихся раундах, поэтому проверяются они и их соседи ±1 байт.
 const SIZES = [
-  ['короткий (10 КБ) — весь файл в префиксе', 10 * 1024],
-  ['ровно префикс (256 КБ)', 256 * 1024],
-  ['префикс + 1 КБ — начало мёртвого окна', 257 * 1024],
-  ['300 КБ — середина мёртвого окна', 300 * 1024],
-  ['320 КБ — конец мёртвого окна', 320 * 1024],
-  ['321 КБ — за окном', 321 * 1024],
-  ['600 КБ — обычный длинный', 600 * 1024],
+  ['короткий (10 КБ) — весь файл в префиксе', 10 * 1024, 0],
+  ['ровно край префикса, 262144', 262144, 8 * 1024],
+  ['край префикса + 1 байт, 262145', 262145, 8 * 1024],
+  ['270 КБ, /rename в 8 КБ от конца', 270 * 1024, 8 * 1024],
+  ['400 КБ, /rename в 60 КБ от конца', 400 * 1024, 60 * 1024],
+  ['ровно предел непрерывности, 524288', 524288, 100 * 1024],
+  ['предел непрерывности + 1 байт, 524289', 524289, 100 * 1024],
+  ['1 МБ, /rename в 100 КБ от конца — уже два раздельных куска', 1024 * 1024, 100 * 1024],
 ];
 
-for (const [label, size] of SIZES) {
+for (const [label, size, tailGap] of SIZES) {
   test(`createFsReadParts: /rename найден в файле «${label}»`, async () => {
-    const { file, dir } = makeTranscript(size);
+    const { file, dir, size: real } = makeTranscript(size, { tailGap });
     try {
+      assert.strictEqual(real, size, 'фикстура обязана дать ТОЧНЫЙ размер — проверяются границы');
       const reader = createSessionTitleReader({ readParts: createFsReadParts(fsReal) });
       assert.strictEqual(await reader.read(file, 'S1'), 'МОЁ ИМЯ');
     } finally {
@@ -196,10 +212,28 @@ for (const [label, size] of SIZES) {
   });
 }
 
-test('createFsReadParts: ДВА переименования в мёртвом окне — берётся СВЕЖЕЕ имя, не старое', async () => {
-  // Худший случай ревью: ранняя копия записи лежит в префиксе, свежая — в
-  // той самой дыре. Без фикса вкладка уверенно показывала бы старое имя.
-  const { file, dir } = makeTranscript(300 * 1024, { customTitles: ['СТАРОЕ ИМЯ', 'СВЕЖЕЕ ИМЯ'] });
+test('createFsReadParts: хвоста 256 КБ хватает на интервал переиздания /rename (сторож SUFFIX_BYTES)', async () => {
+  // Именно этот замер сделал 64 КБ негодными: custom-title переиздаётся на
+  // чекпоинтах с интервалом до 89 640 байт, значит последняя копия может
+  // отстоять от конца файла дальше, чем короткий хвост. Файл берём заведомо
+  // длиннее предела непрерывности, чтобы работал именно хвост, а не
+  // полное чтение. При откате SUFFIX_BYTES на 64 КБ тест краснеет.
+  const { file, dir } = makeTranscript(1024 * 1024, { tailGap: 100 * 1024 });
+  try {
+    const reader = createSessionTitleReader({ readParts: createFsReadParts(fsReal) });
+    assert.strictEqual(await reader.read(file, 'S1'), 'МОЁ ИМЯ');
+  } finally {
+    fsReal.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('createFsReadParts: ДВА переименования — берётся СВЕЖЕЕ имя, не старое', async () => {
+  // Ранняя копия записи лежит в префиксе, свежая — дальше по файлу. Пока
+  // просмотр префикса был единственным путём, вкладка уверенно показывала
+  // бы старое имя.
+  const { file, dir } = makeTranscript(300 * 1024, {
+    customTitles: ['СТАРОЕ ИМЯ', 'СВЕЖЕЕ ИМЯ'], tailGap: 8 * 1024,
+  });
   try {
     const reader = createSessionTitleReader({ readParts: createFsReadParts(fsReal) });
     assert.strictEqual(await reader.read(file, 'S1'), 'СВЕЖЕЕ ИМЯ');

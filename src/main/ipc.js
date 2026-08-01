@@ -1168,11 +1168,11 @@ function registerIpc(win, opts = {}) {
     // чуть ниже) она ещё null, но вызывается это замыкание не раньше первого
     // реального Stop-хука — то есть уже после того, как nightWatch присвоен.
     holdQueueFor: (tabId) => !!(nightWatch && nightWatch.isPending(tabId)),
-    // Живая приёмка 01.08: «название» сессии из транскрипта (ai-title) —
-    // читаем ПРЕФИКС файла (транскрипт бывает 226 МБ, заголовок лежит в
-    // первых строках; подробное обоснование — в шапке session-title.js).
-    // sessionId — фильтр «чужих» записей: после --resume/fork в транскрипте
-    // встречаются записи других сессий, и подхватить чужое имя было бы обидно.
+    // Живая приёмка 01.08: «название» сессии из транскрипта — имя из
+    // `/rename`, а если его нет, автозаголовок Claude. Читаются НАЧАЛО и
+    // КОНЕЦ файла (источники лежат в разных концах, а транскрипт бывает
+    // 226 МБ); sessionId — страховка от чужих записей. Обоснование выбора
+    // источников, мест и размеров чтения — в шапке session-title.js.
     readSessionTitle: (transcriptPath, sessionId) => sessionTitleReader.read(transcriptPath, sessionId),
     onEvent: (channel, payload) => {
       if (smoke && channel === 'term:data') smokeOutput += payload.data;
