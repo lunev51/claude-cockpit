@@ -27,19 +27,30 @@ test('sync до markReady() — store.set НЕ вызван', () => {
 test('после markReady() — store.set вызван, activeIndex верно найден по tabId', () => {
   const store = makeFakeStore();
   const tabs = [
-    { tabId: 't-1', cwd: 'C:\\a', name: 'a', sessionId: null, ghostId: 'g-1' },
-    { tabId: 't-2', cwd: 'C:\\b', name: 'b', sessionId: 's-2', ghostId: 'g-2' },
+    {
+      tabId: 't-1', cwd: 'C:\\a', name: 'a', sessionId: null, ghostId: 'g-1', sessionLabel: 'Тема A',
+    },
+    {
+      tabId: 't-2', cwd: 'C:\\b', name: 'b', sessionId: 's-2', ghostId: 'g-2', sessionLabel: '',
+    },
   ];
   const wsync = createWorkspaceSync({ store, listTabs: () => tabs });
   wsync.markReady();
   wsync.sync('t-2');
   assert.strictEqual(store.calls.length, 1);
+  // sessionLabel (живая приёмка 01.08) — «название» сессии переживает
+  // перезапуск кокпита: иначе утренние --resume вкладки в одной папке стоят
+  // неразличимыми до первого промпта.
   assert.deepStrictEqual(store.current, {
     version: 1,
     activeIndex: 1,
     tabs: [
-      { cwd: 'C:\\a', name: 'a', sessionId: null, ghostId: 'g-1' },
-      { cwd: 'C:\\b', name: 'b', sessionId: 's-2', ghostId: 'g-2' },
+      {
+        cwd: 'C:\\a', name: 'a', sessionId: null, ghostId: 'g-1', sessionLabel: 'Тема A',
+      },
+      {
+        cwd: 'C:\\b', name: 'b', sessionId: 's-2', ghostId: 'g-2', sessionLabel: '',
+      },
     ],
   });
 });
@@ -136,12 +147,18 @@ test('readyAndSync при непустом списке вкладок — store
   const wsync = createWorkspaceSync({ store, listTabs: () => tabs });
   wsync.readyAndSync('t-2');
   assert.strictEqual(store.calls.length, 1);
+  // sessionLabel отсутствует во ВХОДНЫХ вкладках этого теста — маппинг
+  // обязан класть undefined, а не падать (старые вкладки/иные вызывающие).
   assert.deepStrictEqual(store.current, {
     version: 1,
     activeIndex: 1,
     tabs: [
-      { cwd: 'C:\\a', name: 'a', sessionId: null, ghostId: 'g-1' },
-      { cwd: 'C:\\b', name: 'b', sessionId: 's-2', ghostId: 'g-2' },
+      {
+        cwd: 'C:\\a', name: 'a', sessionId: null, ghostId: 'g-1', sessionLabel: undefined,
+      },
+      {
+        cwd: 'C:\\b', name: 'b', sessionId: 's-2', ghostId: 'g-2', sessionLabel: undefined,
+      },
     ],
   });
 });

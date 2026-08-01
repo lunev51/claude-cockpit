@@ -51,7 +51,7 @@ export function createTabStore({
     refreshGroups();
   }
 
-  function add({ tabId, name, cwd }) {
+  function add({ tabId, name, cwd, sessionLabel }) {
     const row = document.createElement('div');
     row.className = 'tab-row';
 
@@ -63,11 +63,24 @@ export function createTabStore({
     const nameEl = document.createElement('div');
     nameEl.className = 'tab-name';
     nameEl.textContent = name;
+    // Живая приёмка (01.08, отзыв пользователя): «в одной папке бывает
+    // несколько сессий — нечем различить». sessionLabelEl — стабильное
+    // «название» вкладки (первый промпт этой сессии, sessions.js), между
+    // именем проекта и путём; скрыт, пока метка не пришла (см. setStatus).
+    const sessionLabelEl = document.createElement('div');
+    sessionLabelEl.className = 'tab-session-label hidden';
+    // I3 (ревью 01.08): восстановленная вкладка приходит с меткой из
+    // манифеста — рисуем сразу, до первого tab:status.
+    if (typeof sessionLabel === 'string' && sessionLabel) {
+      sessionLabelEl.textContent = sessionLabel;
+      sessionLabelEl.title = sessionLabel;
+      sessionLabelEl.classList.remove('hidden');
+    }
     const sub = document.createElement('div');
     sub.className = 'tab-sub';
     sub.textContent = cwd;
     sub.title = cwd;
-    info.append(nameEl, sub);
+    info.append(nameEl, sessionLabelEl, sub);
 
     // Task 4 фазы 6 (бейдж PR): маленький значок «#123» справа от имени, перед
     // кнопками ⚡/✕ (см. порядок row.append ниже) — скрыт, пока setPr(tabId, ...)
@@ -165,6 +178,10 @@ export function createTabStore({
       // чтобы отличить idle_prompt (пишущий статус) от диалога разрешения.
       waitingKind: '',
       prBadge, prUrl: null, peekBtn,
+      // Живая приёмка 01.08: зеркало tab.sessionLabel из sessions.js —
+      // «название» сессии под именем проекта (в одной папке живёт несколько
+      // сессий, различить их иначе нечем).
+      sessionLabelEl, sessionLabel: typeof sessionLabel === 'string' ? sessionLabel : '',
     };
     rows.set(tabId, r);
     order.push(tabId);
@@ -187,7 +204,7 @@ export function createTabStore({
     activeId = tabId;
   }
 
-  function setStatus(tabId, status, subtitle, waitingText, waitingKind) {
+  function setStatus(tabId, status, subtitle, waitingText, waitingKind, sessionLabel) {
     const r = rows.get(tabId);
     if (!r) return;
     const regroup = GROUP_OF[r.status] !== GROUP_OF[status];
@@ -211,6 +228,18 @@ export function createTabStore({
     // waitingText выше — sessions.js уже чистит tab.waitingKind на выходе из
     // 'waiting' (эмитит ''), здесь только зеркалим payload, тем же приёмом.
     if (typeof waitingKind === 'string') r.waitingKind = waitingKind;
+    // Живая приёмка 01.08: «название» сессии.
+    // I2 (ревью): различаем ДВА разных «нет значения». undefined — payload
+    // вообще без поля (событие не про метку) → не трогаем показанное. Пустая
+    // строка — ЯВНАЯ очистка из main (restart сменил сессию через пикер:
+    // старое имя стало чужим) → прячем, иначе вкладка осталась бы подписана
+    // именем сессии, которой в ней больше нет.
+    if (typeof sessionLabel === 'string' && sessionLabel !== r.sessionLabel) {
+      r.sessionLabel = sessionLabel;
+      r.sessionLabelEl.textContent = sessionLabel;
+      r.sessionLabelEl.title = sessionLabel;
+      r.sessionLabelEl.classList.toggle('hidden', !sessionLabel);
+    }
     if (regroup) placeRow(r);
   }
 

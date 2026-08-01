@@ -568,6 +568,10 @@ function toggleNight() {
 // воркспейса — см. sessionId ниже, FIX 3 ревью).
 async function openTab(cwd, {
   activate = true, command = null, args = null, preludeText = null, ghostId = null, sessionId = null,
+  // I3 (ревью 01.08): «название» сессии из манифеста — восстановленная
+  // вкладка подписана с первой отрисовки, а не через минуту-две (главный
+  // сценарий пользователя: утром десяток --resume вкладок в одной папке).
+  sessionLabel = null,
 } = {}) {
   // ghostId (Task 5, ревью finding 1a) — восстановление передаёт исходный id
   // вкладки, иначе main всегда минтит новый и старый ghost-файл осиротеет.
@@ -576,7 +580,7 @@ async function openTab(cwd, {
   // конфигурационных args вкладки, не подменяя их и не игнорируя
   // config.terminal.command (раньше это делал сам restoreFlow, см. ниже).
   const tab = await window.api.tabs.open({
-    cwd, command, args, ghostId, sessionId,
+    cwd, command, args, ghostId, sessionId, sessionLabel,
   });
   if (!tab) return null;
 
@@ -1662,6 +1666,9 @@ async function restoreFlow(chosen, activeIndex, overlay) {
           // config.terminal.command. sessionId идёт отдельно — sessions.js
           // сам достраивает --resume поверх конфигурационных args.
           sessionId: t.sessionId,
+          // I3 (ревью 01.08): «название» сессии из манифеста — вкладка
+          // подписана сразу, не дожидаясь хуков/чтения транскрипта.
+          sessionLabel: t.sessionLabel,
           preludeText,
           ghostId: t.ghostId,
         });
@@ -1993,12 +2000,13 @@ async function boot() {
   // Статусы приходят из хуков Claude Code (sessions.js) — единый источник,
   // term:started/term:exit статус больше не выставляют (был двойной источник).
   window.api.tab.onStatus(({
-    tabId, status, subtitle, waitingText, waitingKind,
+    tabId, status, subtitle, waitingText, waitingKind, sessionLabel, labelOnly,
   }) => {
     // C2 (Critical, ревью финальной волны фазы 9): waitingKind зеркалится в
     // tabStore ровно тем же приёмом, что waitingText — см. tabs.js/setStatus,
     // app.js/isTabBlockedByDialog (голосовой ввод/writeCommandToTab).
-    tabStore.setStatus(tabId, status, subtitle, waitingText, waitingKind);
+    // sessionLabel (живая приёмка 01.08) — та же схема зеркалирования.
+    tabStore.setStatus(tabId, status, subtitle, waitingText, waitingKind, sessionLabel);
     // Ledger-фикс (ревью): текст в поповере — статичный снимок на момент
     // открытия. Если Claude задаёт ВТОРОЙ вопрос той же вкладке, пока
     // поповер всё ещё открыт (статус остаётся waiting), пользователь рискует
@@ -2029,7 +2037,10 @@ async function boot() {
     // Ghost-буфер (Task 5): переход в done/waiting — момент «Claude закончил
     // ход», самый ценный кадр скроллбека — сериализуем именно эту вкладку
     // сразу, не дожидаясь общего 30-секундного таймера ниже.
-    if (status === 'done' || status === 'waiting') saveGhost(tabId);
+    // I2 (ре-ревью 01.08): labelOnly-событие статус НЕ меняло (дочитался
+    // заголовок сессии) — лишняя сериализация полумегабайтного буфера на
+    // диск здесь ни к чему.
+    if (!labelOnly && (status === 'done' || status === 'waiting')) saveGhost(tabId);
   });
 
   // Task 4 фазы 4: обработчик вынесен в newProject() — тот же сценарий
