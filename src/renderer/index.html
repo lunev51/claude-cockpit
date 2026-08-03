@@ -127,6 +127,11 @@
        overflow'ом сайдбара; createDashboard/createPeek стиля не требует —
        app.js сам наполняет/чистит этот контейнер (см. showToast). -->
   <div id="toast-root"></div>
+  <!-- Выбор транспорта. В Electron window.api уже собран preload'ом; в
+       браузере его собирает сетевой мост поверх WebSocket. Одна разметка
+       на оба случая — чтобы не заводить вторую страницу, которая начнёт
+       отставать от первой. -->
+  <script type="module" src="./js/api-boot.js"></script>
   <script type="module" src="./js/app.js"></script>
 </body>
 </html>
