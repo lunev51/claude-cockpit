@@ -24,8 +24,9 @@
 - **Запуск дубликата только с флагом** `--user-data-dir=C:\Users\Lunev\AppData\Roaming\cockpit-net-data`.
   Без него дубликат перезапишет `workspace.json` рабочего кокпита и, что опаснее, его
   `bridge-port` — хуки живых сессий уйдут не в тот процесс.
-- **`package.json` и код изоляции не менять** — изоляция сделана флагом запуска именно
-  для того, чтобы не утечь переименованием в основной проект при слиянии PR.
+- **Поле `name` в `package.json` не менять** — изоляция сделана флагом запуска именно
+  для того, чтобы не утечь переименованием в основной проект при слиянии PR. Добавлять
+  зависимости в `package.json` при этом можно и нужно (задача 5 ставит `ws`).
 - Windows 10, PowerShell 5.1: нет `&&`, `||`, тернарника. Только `if/else` и `;`.
 - Никаких нативных модулей. `ws` — чистый JS, ставится как `npm i ws`.
 - Тесты: `npm test` (= `node --test`), смоук: `npm run smoke -- --user-data-dir=...`.
@@ -1289,10 +1290,14 @@ const netServer = createNetServer({
     '/assets': path.join(appRoot(), 'assets'),
     '/': path.join(appRoot(), 'src', 'renderer'),
   },
-  port: 48300,
+  port: cfg.net && cfg.net.port ? cfg.net.port : 48300,
   // Слушаем ТОЛЬКО адрес Tailscale: на 0.0.0.0 кокпит был бы виден любому
   // в чужом вайфае, а это выполнение произвольных команд на машине.
-  host: '100.120.245.85',
+  // Адрес — из конфига, а не прошит в коде: он принадлежит МАШИНЕ, а не
+  // программе, и меняется при перевыпуске ключа Tailscale. Дефолт
+  // '127.0.0.1' безопасен по умолчанию: не настроив ничего, пользователь
+  // получает сервер, доступный только с самого ПК.
+  host: cfg.net && cfg.net.host ? cfg.net.host : '127.0.0.1',
 });
 netServer.start().catch((err) => console.log(`[net] сервер не поднялся: ${err.message}`));
 ```
@@ -1306,6 +1311,19 @@ netServer.start().catch((err) => console.log(`[net] сервер не подня
 
 Выполнить: `npm test` — ожидается `fail 0`
 Выполнить: `npm run smoke -- --user-data-dir=C:\Users\Lunev\AppData\Roaming\cockpit-net-data` — ожидается `[smoke] renderer-errors=0`
+
+Адрес и порт добавить в дефолты `src/main/config.js` рядом с остальными секциями:
+
+```js
+  net: { host: '127.0.0.1', port: 48300 },
+```
+
+а фактический адрес Tailscale прописать в `config.user.json` дубликата (файл вне
+репозитория, лежит в `C:\Users\Lunev\AppData\Roaming\cockpit-net-data`):
+
+```json
+{ "net": { "host": "100.120.245.85" } }
+```
 
 - [ ] **Шаг 4: Живой запуск дубликата**
 
