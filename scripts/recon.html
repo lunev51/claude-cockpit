@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Кокпит — разведка перед портированием</title>
+<!-- ГЛАВНАЯ ПРОВЕРКА ДОГАДКИ: путь такой же, как в src/renderer/index.html.
+     Из http://host/ браузер схлопнет ../../ в корень, то есть попадёт в
+     /node_modules/... Если xterm ниже отрисовался — разметку кокпита при
+     переезде в сеть править не придётся вообще. -->
+<link rel="stylesheet" href="../../node_modules/@xterm/xterm/css/xterm.css" />
+<link rel="stylesheet" href="./../src/renderer/css/fonts.css" />
+<script src="../../node_modules/@xterm/xterm/lib/xterm.js"></script>
+<script src="../../node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; padding:24px; background:#16161a; color:#e6e6e6;
+         font:14px/1.55 -apple-system,BlinkMacSystemFont,'Inter',sans-serif; }
+  h1 { font-size:19px; margin:0 0 4px; } h2 { font-size:15px; margin:26px 0 8px; }
+  .muted { color:#9a9a9a; } .ok { color:#7bd88f; } .bad { color:#ff6b6b; } .warn { color:#ffb454; }
+  section { max-width:920px; }
+  #term { height:220px; border:1px solid #2c2c33; border-radius:8px; padding:6px; background:#0d0d10; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  td,th { border-bottom:1px solid #26262c; padding:5px 8px; text-align:left; }
+  kbd { background:#26262c; border-radius:4px; padding:1px 6px; font-family:ui-monospace,monospace; }
+  button { background:#2b6cb0; color:#fff; border:0; border-radius:7px;
+           padding:10px 18px; font-size:14px; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  #keylog { max-height:190px; overflow:auto; border:1px solid #2c2c33; border-radius:8px; }
+  .big { font-size:22px; font-weight:600; }
+</style>
+</head>
+<body>
+<section>
+  <h1>Разведка кокпита</h1>
+  <p class="muted">Страница отдаётся твоим ПК. Пройди три шага и нажми кнопку внизу —
+     отчёт уедет обратно на ПК, разбирать его буду я.</p>
+
+  <h2>1. Канал</h2>
+  <p id="net" class="muted">меряю…</p>
+
+  <h2>2. Шрифт и глифы терминала</h2>
+  <p id="fontinfo" class="muted">проверяю…</p>
+  <div id="term"></div>
+  <p class="muted">Смотри на рамки, стрелки и иконки. Если вместо них квадратики
+     или «тофу» — на маке нет нужного шрифта, и это надо будет решать.</p>
+
+  <h2>3. Горячие клавиши</h2>
+  <p><b>Сначала кликни мышкой по этой странице</b> — иначе нажатия уйдут не сюда
+     и отчёт получится пустым.</p>
+  <p>Нажми по очереди каждое сочетание из таблицы. Те, что <b>не появятся</b> в
+     журнале ниже, браузер забрал себе — кокпит их использовать не сможет.</p>
+  <p id="counter" class="big warn">получено нажатий: 0</p>
+  <p class="warn">⚠️ <kbd>Cmd</kbd>+<kbd>W</kbd> закроет эту вкладку — это и есть ответ
+     по нему. Жми его ПОСЛЕДНИМ, уже после отправки отчёта.</p>
+  <table id="combos"></table>
+  <h2 class="muted" style="font-size:13px">Журнал нажатий</h2>
+  <div id="keylog"></div>
+
+  <h2>4. Отправить</h2>
+  <p><button id="send" disabled>Отправить отчёт на ПК</button>
+     <span id="sendstate" class="muted">кнопка включится после пяти нажатий — иначе отчёт будет пустым</span></p>
+</section>
+
+<script>
+const COMBOS = [
+  ['Ctrl+P',        e => e.ctrlKey && !e.metaKey && e.code==='KeyP',  'палитра команд'],
+  ['Cmd+P',         e => e.metaKey && e.code==='KeyP',                'печать в браузере'],
+  ['Ctrl+D',        e => e.ctrlKey && !e.metaKey && e.code==='KeyD',  'дашборд лимитов'],
+  ['Cmd+D',         e => e.metaKey && e.code==='KeyD',                'закладка в браузере'],
+  ['Ctrl+Q',        e => e.ctrlKey && !e.metaKey && e.code==='KeyQ',  'очередь промптов'],
+  ['Cmd+Q',         e => e.metaKey && e.code==='KeyQ',                'выход из браузера (macOS)'],
+  ['Ctrl+Shift+H',  e => e.ctrlKey && e.shiftKey && e.code==='KeyH',  'поиск истории'],
+  ['Ctrl+Shift+R',  e => e.ctrlKey && e.shiftKey && e.code==='KeyR',  'перезапуск сессии'],
+  ['Ctrl+1',        e => e.ctrlKey && e.code==='Digit1',              'вкладка 1'],
+  ['Cmd+1',         e => e.metaKey && e.code==='Digit1',              'вкладка 1 (маковский вариант)'],
+  ['Ctrl+Tab',      e => e.ctrlKey && e.code==='Tab',                 'следующая вкладка'],
+  ['Ctrl+C',        e => e.ctrlKey && e.code==='KeyC',                'прерывание в терминале'],
+  ['Ctrl+T',        e => e.ctrlKey && e.code==='KeyT',                '—'],
+  ['Cmd+T',         e => e.metaKey && e.code==='KeyT',                'новая вкладка браузера'],
+  ['Cmd+N',         e => e.metaKey && e.code==='KeyN',                'новое окно браузера'],
+  ['ShiftRight',    e => e.code==='ShiftRight',                       'голосовой ввод'],
+];
+const seen = {}; COMBOS.forEach(c => seen[c[0]] = false);
+
+const tbody = document.getElementById('combos');
+// id по ИНДЕКСУ, а не по названию сочетания: в названиях есть «+», и попытка
+// экранировать его в разметке (CSS.escape) расходилась с поиском по
+// getElementById — все сочетания со знаком плюс не отмечались на экране, хотя
+// в отчёт попадали. Поймано прогоном страницы в браузере.
+tbody.innerHTML = '<tr><th>сочетание</th><th>зачем в кокпите</th><th>дошло?</th></tr>'
+  + COMBOS.map(([n,,why], i) => `<tr><td><kbd>${n.replace(/\+/g,'</kbd>+<kbd>')}</kbd></td>`
+      + `<td class="muted">${why}</td><td id="st-${i}" class="muted">—</td></tr>`).join('');
+
+const log = document.getElementById('keylog');
+// Счётчик ВСЕХ нажатий, а не только распознанных сочетаний. Первый прогон
+// вернул отчёт, где «браузер забрал» все шестнадцать строк, включая Ctrl+C и
+// ShiftRight — которые он перехватить не может. То есть клавиш просто не
+// касались, а страница это молча приняла за результат. Теперь пустой отчёт
+// отправить нельзя.
+let strokes = 0;
+const counter = document.getElementById('counter');
+const sendBtn = () => document.getElementById('send');
+function bumpCounter() {
+  strokes += 1;
+  counter.textContent = `получено нажатий: ${strokes}`;
+  if (strokes >= 5) {
+    counter.className = 'big ok';
+    sendBtn().disabled = false;
+  }
+  scheduleSend(); // сам молчит, пока нажатий меньше пяти
+}
+
+addEventListener('keydown', (e) => {
+  bumpCounter();
+  // preventDefault — именно то, что делал бы кокпит. Если сочетание всё равно
+  // не доехало, значит его перехватила ОС или браузер, и мы бессильны.
+  const hit = [];
+  COMBOS.forEach(([name, test], i) => {
+    let ok = false;
+    try { ok = test(e); } catch { ok = false; }
+    if (!ok) return;
+    hit.push(name);
+    seen[name] = true;
+    const cell = document.getElementById(`st-${i}`);
+    if (cell) { cell.textContent = 'дошло'; cell.className = 'ok'; }
+  });
+  if (hit.length) e.preventDefault();
+  const row = document.createElement('div');
+  row.style.cssText = 'padding:3px 8px;font-family:ui-monospace,monospace;font-size:12px';
+  row.textContent = `${e.code}  meta:${+e.metaKey} ctrl:${+e.ctrlKey} alt:${+e.altKey} shift:${+e.shiftKey}`
+    + (hit.length ? `   → ${hit.join(', ')}` : '');
+  log.prepend(row);
+}, true);
+
+// --- шрифт ---
+const FONTS = ['JetBrainsMono Nerd Font','JetBrains Mono','Inter','Menlo','SF Mono'];
+const have = FONTS.filter(f => { try { return document.fonts.check(`14px "${f}"`); } catch { return false; } });
+document.getElementById('fontinfo').innerHTML =
+  'есть на этой машине: ' + (have.length
+    ? `<span class="ok">${have.join(', ')}</span>`
+    : '<span class="bad">ни одного из ожидаемых</span>');
+
+const term = new Terminal({
+  fontFamily: '"JetBrainsMono Nerd Font","JetBrains Mono",Menlo,monospace',
+  fontSize: 13, theme: { background: '#0d0d10' }, allowProposedApi: true,
+});
+const fit = new FitAddon.FitAddon(); term.loadAddon(fit);
+term.open(document.getElementById('term')); fit.fit();
+const E='\x1b[';
+term.writeln(`${E}1;36m Проверка глифов ${E}0m — так рисует Claude Code:`);
+term.writeln(' рамки:  ┌──┐  │ текст │  └──┘  ║╔╗');
+term.writeln(' стрелки: → ← ↑ ↓  ▶ ◀  • · …');
+term.writeln(' иконки Nerd Font:       ');
+term.writeln(' эмодзи: ✅ ❌ ⚠️ 🌙 🎤 ⚡');
+term.writeln(` цвета: ${E}31m█${E}32m█${E}33m█${E}34m█${E}35m█${E}36m█${E}0m`);
+term.writeln(' кириллица: съешь ещё этих мягких булок');
+term.writeln(`${E}2m тусклый${E}0m ${E}1m жирный${E}0m ${E}3m курсив${E}0m ${E}4m подчёркнутый${E}0m`);
+term.write(' курсор здесь █');
+
+// --- канал ---
+const net = document.getElementById('net');
+let rtts = [];
+(async () => {
+  for (let i = 0; i < 25; i++) {
+    const t0 = performance.now();
+    try { await fetch('/ping?' + i, { cache: 'no-store' }); } catch { break; }
+    rtts.push(performance.now() - t0);
+    await new Promise(r => setTimeout(r, 120));
+  }
+  if (!rtts.length) { net.innerHTML = '<span class="bad">сервер недоступен</span>'; return; }
+  const s = [...rtts].sort((a,b)=>a-b);
+  const avg = rtts.reduce((a,b)=>a+b,0)/rtts.length;
+  const q = avg < 40 ? 'ok' : avg < 120 ? 'warn' : 'bad';
+  net.innerHTML = `<span class="${q} big">${avg.toFixed(0)} мс</span> средний отклик `
+    + `<span class="muted">(мин ${s[0].toFixed(0)}, медиана ${s[12].toFixed(0)}, макс ${s[s.length-1].toFixed(0)}; ${rtts.length} проб)</span>`;
+})();
+
+function buildReport() {
+  const s = [...rtts].sort((a,b)=>a-b);
+  const report = {
+    когда: new Date().toISOString(),
+    браузер: navigator.userAgent,
+    платформа: navigator.platform,
+    экран: `${screen.width}x${screen.height} @${devicePixelRatio}`,
+    канал_мс: rtts.length ? {
+      проб: rtts.length, мин: +s[0].toFixed(1),
+      медиана: +s[Math.floor(s.length/2)].toFixed(1), макс: +s[s.length-1].toFixed(1),
+      средний: +(rtts.reduce((a,b)=>a+b,0)/rtts.length).toFixed(1),
+    } : null,
+    шрифты_есть: have,
+    всего_нажатий: strokes,
+    хоткеи_дошли: Object.entries(seen).filter(([,v])=>v).map(([k])=>k),
+    хоткеи_забрал_браузер: Object.entries(seen).filter(([,v])=>!v).map(([k])=>k),
+    xterm_загрузился: typeof Terminal === 'function',
+  };
+  return report;
+}
+
+// Отправляем САМИ, не дожидаясь кнопки, и переотправляем после каждого нового
+// нажатия. Второй заход разведки сорвался ровно на том, что данные собрались,
+// а до ПК не доехали: кнопку легко не заметить, а страница молчала.
+let sendTimer = null;
+let lastSent = 0;
+async function sendReport(why) {
+  const state = document.getElementById('sendstate');
+  try {
+    await fetch('/report', { method:'POST', headers:{'content-type':'application/json'},
+                             body: JSON.stringify(buildReport(), null, 2) });
+    lastSent += 1;
+    state.innerHTML = `<span class="ok">отчёт ушёл на ПК в ${new Date().toLocaleTimeString('ru-RU')}</span>`
+      + `<span class="muted"> (${why}, отправок: ${lastSent})</span>`;
+  } catch (e) {
+    state.innerHTML = `<span class="bad">не ушло: ${e.message}</span>`;
+  }
+}
+function scheduleSend() {
+  if (strokes < 5) return;
+  clearTimeout(sendTimer);
+  sendTimer = setTimeout(() => sendReport('автоматически'), 1500);
+}
+document.getElementById('send').addEventListener('click', () => sendReport('по кнопке'));
+</script>
+</body>
+</html>
