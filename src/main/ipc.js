@@ -12,6 +12,7 @@ const { EventEmitter } = require('events');
 const {
   ipcMain, shell, dialog, app, clipboard, powerSaveBlocker,
 } = require('electron');
+const { createCommandRegistry } = require('./command-registry');
 const { getConfig, setConfig } = require('./config');
 const { createPty } = require('./pty');
 const { createSessionManager } = require('./sessions');
@@ -1483,6 +1484,12 @@ function registerIpc(win, opts = {}) {
     attention.update({ count, dataUrl: typeof dataUrl === 'string' ? dataUrl : null });
   });
 
+  // Реестр команд (command-registry.js): обработчики группы tabs:* кладутся
+  // СРАЗУ в ipcMain (локальный renderer работает как раньше) и в карту имён
+  // (сетевой транспорт фазы «кокпит по сети» зовёт их по имени канала).
+  // Создаётся один раз, рядом с первой регистрацией этой группы.
+  const registry = createCommandRegistry({ ipcMain });
+
   // Регистрация вкладки. cwd обязателен — renderer берёт его из диалога
   // или из конфига; smoke-режим подменяет команду в sessions.js.
   // command/args — прозрачный проброс: явный оверрайд конкретного спавна
@@ -1495,7 +1502,7 @@ function registerIpc(win, opts = {}) {
   // ghostId (Task 5, ревью finding 1a) — восстановление передаёт исходный id
   // вкладки из манифеста, чтобы не заводить новый ghost-файл при каждом
   // restore и не осиротить старый.
-  ipcMain.handle('tabs:open', (_e, {
+  registry.handle('tabs:open', ({
     cwd, command, args, ghostId, sessionId, sessionLabel,
   } = {}) => {
     if (typeof cwd !== 'string' || !cwd) return null;
@@ -1511,7 +1518,7 @@ function registerIpc(win, opts = {}) {
     });
   });
 
-  ipcMain.handle('tabs:close', (_e, tabId) => {
+  registry.handle('tabs:close', (tabId) => {
     if (typeof tabId !== 'string') return;
     // Резолвим ghostId ДО manager.close (Task 5) — close() удаляет вкладку
     // из менеджера, и list() её больше не найдёт; отдельного ghost:delete
@@ -1605,7 +1612,7 @@ function registerIpc(win, opts = {}) {
   // реально смотрит на эту вкладку — она уезжает из «Готово» в «Наготове».
   // Гард узкий и живёт в ядре (manager.markSeen): двигаем только 'done', так
   // что лишнее или запоздавшее сообщение безвредно.
-  ipcMain.on('tabs:seen', (_e, p) => {
+  registry.on('tabs:seen', (p) => {
     if (p && typeof p.tabId === 'string') manager.markSeen(p.tabId);
   });
 
@@ -1635,7 +1642,7 @@ function registerIpc(win, opts = {}) {
     wsync.readyAndSync(activeTabId);
   });
 
-  ipcMain.handle('tabs:chooseFolder', async () => {
+  registry.handle('tabs:chooseFolder', async () => {
     const result = await dialog.showOpenDialog(win, {
       properties: ['openDirectory', 'createDirectory'],
       title: 'Папка проекта для Claude',
