@@ -46,6 +46,15 @@ test('on: команда без ответа тоже вызывается по 
 
   await reg.call('term:write', [{ tabId: 'T1', data: 'ls\r' }]);
   assert.deepStrictEqual(seen, [{ tabId: 'T1', data: 'ls\r' }]);
+
+  // Симметрично handle-тесту выше: реестр обязан не только сам уметь звать
+  // send-обработчик по имени (call), но и реально зарегистрировать его в
+  // ipcMain.on — и так же отбросить объект события при вызове через ipcMain,
+  // иначе локальный и сетевой путь незаметно разъедутся сигнатурами.
+  const viaIpc = ipc.oned.get('term:write');
+  assert.ok(viaIpc, 'send-канал обязан быть зарегистрирован и в ipcMain');
+  viaIpc({ sender: 'фиктивное событие' }, { tabId: 'T2', data: 'pwd\r' });
+  assert.deepStrictEqual(seen[1], { tabId: 'T2', data: 'pwd\r' }, 'объект события не должен доехать до обработчика');
 });
 
 test('call: неизвестная команда — понятная ошибка, а не тишина', async () => {
