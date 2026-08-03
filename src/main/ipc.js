@@ -1373,9 +1373,19 @@ function registerIpc(win, opts = {}) {
     deferredSpendTimer.unref?.();
   }
 
-  ipcMain.handle('config:get', () => getConfig());
+  // Реестр команд (command-registry.js): каждый обработчик кладётся СРАЗУ в
+  // ipcMain (локальный renderer работает как раньше) и в карту имён (сетевой
+  // транспорт фазы «кокпит по сети» зовёт их по имени канала). Задача 1
+  // перевела на реестр только группу tabs:*, задача 2 — все остальные каналы
+  // без исключения (см. test/command-registry.coverage.test.js: в файле не
+  // должно остаться ни одной прямой регистрации на ipcMain). Создаётся один
+  // раз, здесь же, ДО первой регистрации — раньше объявление жило ниже, перед
+  // tabs:open, единственной группой, которая тогда его использовала.
+  const registry = createCommandRegistry({ ipcMain });
 
-  ipcMain.handle('config:set', (_e, partial) => {
+  registry.handle('config:get', () => getConfig());
+
+  registry.handle('config:set', (partial) => {
     if (!partial || typeof partial !== 'object' || Array.isArray(partial)) {
       throw new TypeError('config:set ожидает plain-object');
     }
@@ -1388,9 +1398,9 @@ function registerIpc(win, opts = {}) {
   // КАЖДОЕ изменение состояния, отдельного IPC для него не требуется. Логика
   // смоук-гейта — в nightToggleHandler()/nightGetHandler() выше по файлу (та
   // же причина, что и у остальных вынесенных хендлеров — см. комментарий там).
-  ipcMain.handle('night:toggle', () => nightToggleHandler({ smoke, nightWatch }));
+  registry.handle('night:toggle', () => nightToggleHandler({ smoke, nightWatch }));
 
-  ipcMain.handle('night:get', () => nightGetHandler({ smoke, nightWatch }));
+  registry.handle('night:get', () => nightGetHandler({ smoke, nightWatch }));
 
   // Task 3 фазы 5 (кольца лимитов): usagePoller.snapshot() — синхронный, без
   // сети. ccusage.get() — лениво: первый usage:get и есть тот самый «первый
@@ -1398,7 +1408,7 @@ function registerIpc(win, opts = {}) {
   // чаще ttlMs (проводить свой отдельный троттлинг здесь не нужно — это уже
   // сделано в модуле). smoke: НИ сети, НИ npx — spend всегда null, ccusage.get()
   // не зовётся вовсе.
-  ipcMain.handle('usage:get', async () => {
+  registry.handle('usage:get', async () => {
     const limits = usagePoller.snapshot();
     if (smoke) return { limits, spend: null };
     // Инцидент 8ГБ (01.08): первые 90с после старта — шторм спавна сессий
@@ -1423,7 +1433,7 @@ function registerIpc(win, opts = {}) {
   // (б) минимальный интервал MANUAL_REFRESH_MIN_INTERVAL_MS (10с) между
   //     РЕАЛЬНО выполненными обновлениями — вызов внутри окна получает текущий
   //     снапшот без единой сетевой/npx операции.
-  ipcMain.handle('usage:refresh', async () => {
+  registry.handle('usage:refresh', async () => {
     if (smoke) return { limits: usagePoller.snapshot(), spend: null };
     if (manualRefreshInFlight) return manualRefreshInFlight;
 
@@ -1458,13 +1468,13 @@ function registerIpc(win, opts = {}) {
     }
   });
 
-  ipcMain.handle('shell:openExternal', (_e, url) => {
+  registry.handle('shell:openExternal', (url) => {
     if (typeof url === 'string' && /^https?:\/\//i.test(url)) shell.openExternal(url);
   });
 
   // Task 4 фазы 4 (палитра команд): «Открыть DevTools» — то же самое, что
   // делает F12 (см. main.js/before-input-event), просто доступное и из палитры.
-  ipcMain.handle('app:devtools', () => {
+  registry.handle('app:devtools', () => {
     if (!win.isDestroyed()) win.webContents.toggleDevTools();
   });
 
@@ -1473,7 +1483,7 @@ function registerIpc(win, opts = {}) {
   // attention — чистый модуль (attention.js), инстанс создаётся в main.js
   // (там же живут nativeImage и win.setOverlayIcon) и прокидывается сюда
   // через opts — ipc.js только маршрутизирует IPC-пейлоад.
-  ipcMain.on('attention:update', (_e, payload) => {
+  registry.on('attention:update', (payload) => {
     if (!attention || !payload || typeof payload !== 'object') return;
     const { count, dataUrl } = payload;
     // Fix (ревью): typeof count !== 'number' пропускал NaN (typeof NaN ===
@@ -1483,12 +1493,6 @@ function registerIpc(win, opts = {}) {
     if (!Number.isInteger(count) || count < 0) return;
     attention.update({ count, dataUrl: typeof dataUrl === 'string' ? dataUrl : null });
   });
-
-  // Реестр команд (command-registry.js): обработчики группы tabs:* кладутся
-  // СРАЗУ в ipcMain (локальный renderer работает как раньше) и в карту имён
-  // (сетевой транспорт фазы «кокпит по сети» зовёт их по имени канала).
-  // Создаётся один раз, рядом с первой регистрацией этой группы.
-  const registry = createCommandRegistry({ ipcMain });
 
   // Регистрация вкладки. cwd обязателен — renderer берёт его из диалога
   // или из конфига; smoke-режим подменяет команду в sessions.js.
@@ -1554,7 +1558,7 @@ function registerIpc(win, opts = {}) {
   // восстановлении показать «вчерашний вывод» мгновенно, пока живой pty ещё
   // поднимается. Best-effort — ошибка записи не должна ронять приложение.
   // smoke: no-op — headless-прогон не должен трогать userData.
-  ipcMain.handle('ghost:save', (_e, payload) => {
+  registry.handle('ghost:save', (payload) => {
     if (smoke) return;
     if (!payload || typeof payload !== 'object') return;
     const { tabId, text } = payload;
@@ -1583,7 +1587,7 @@ function registerIpc(win, opts = {}) {
     }
   });
 
-  ipcMain.handle('ghost:load', (_e, ghostId) => {
+  registry.handle('ghost:load', (ghostId) => {
     // smoke-гейт для консистентности с ghost:save (ревью, finding 2) —
     // headless-прогон не должен трогать userData.
     if (smoke) return null;
@@ -1599,9 +1603,9 @@ function registerIpc(win, opts = {}) {
   // и репортит активную вкладку при каждом переключении.
   // smoke-изоляция: headless-прогон не должен видеть оверлей restore — иначе
   // он завис бы до таймаута (никто не жмёт Enter/Esc в smoke).
-  ipcMain.handle('workspace:get', () => (smoke ? null : store.load()));
+  registry.handle('workspace:get', () => (smoke ? null : store.load()));
 
-  ipcMain.on('workspace:setActive', (_e, p) => {
+  registry.on('workspace:setActive', (p) => {
     if (p && typeof p.tabId === 'string') {
       activeTabId = p.tabId;
       syncWorkspace();
@@ -1638,7 +1642,7 @@ function registerIpc(win, opts = {}) {
   // Сама логика (markReady + условный sync) вынесена в wsync.readyAndSync —
   // это чистый (без Electron) код workspace-sync.js, покрытый test/workspace-sync.test.js;
   // ipc.js больше не содержит непокрытой тестами ветки этого хотфикса.
-  ipcMain.on('workspace:ready', () => {
+  registry.on('workspace:ready', () => {
     wsync.readyAndSync(activeTabId);
   });
 
@@ -1665,7 +1669,7 @@ function registerIpc(win, opts = {}) {
   // не обновлялась бы сама, а пользователь не узнал бы, что нужно сделать.
   // notify() — тот же канал app:notice, что main уже использует для других
   // уведомлений (см. main.js) — renderer показывает его тостом (app.js).
-  ipcMain.handle('project:connect', (_e, tabId) => {
+  registry.handle('project:connect', (tabId) => {
     const cwd = tabCwd(tabId);
     if (!cwd) return { connected: false, error: 'вкладка не найдена' };
     const res = connectProject(cwd, hookOpts());
@@ -1675,7 +1679,7 @@ function registerIpc(win, opts = {}) {
     return res;
   });
 
-  ipcMain.handle('project:status', (_e, tabId) => {
+  registry.handle('project:status', (tabId) => {
     const cwd = tabCwd(tabId);
     return { connected: cwd ? isConnected(cwd) : false };
   });
@@ -1687,7 +1691,7 @@ function registerIpc(win, opts = {}) {
   // повтор (кнопка «Обновить» панели), опрокидывает TTL-кэш gitInfo.
   // Сама логика — в gitGetHandler() (см. выше по файлу, п.4 брифа задачи 5
   // фазы 7): вынесена, чтобы смоук-гейт был протестирован без Electron.
-  ipcMain.handle('git:get', async (_e, tabId, opts) => gitGetHandler({
+  registry.handle('git:get', async (tabId, opts) => gitGetHandler({
     smoke, tabId, opts, tabCwd, gitInfo,
   }));
 
@@ -1696,7 +1700,7 @@ function registerIpc(win, opts = {}) {
   // внешние процессы сверх PTY_OK-смоука. force — ручной повтор, опрокидывает
   // TTL-кэш ghInfo. Логика — в ghRepoHandler() выше по файлу (та же причина,
   // что у git:get).
-  ipcMain.handle('gh:repo', async (_e, tabId, opts) => ghRepoHandler({
+  registry.handle('gh:repo', async (tabId, opts) => ghRepoHandler({
     smoke, tabId, opts, tabCwd, ghInfo,
   }));
 
@@ -1704,7 +1708,7 @@ function registerIpc(win, opts = {}) {
   // непрочитанных уведомлений, без привязки к конкретной вкладке (дашборд,
   // Task 4 фазы 6). smoke — тот же гейт, что и gh:repo выше. Логика —
   // в ghGlobalHandler() выше по файлу.
-  ipcMain.handle('gh:global', async (_e, opts) => ghGlobalHandler({ smoke, opts, ghInfo }));
+  registry.handle('gh:global', async (opts) => ghGlobalHandler({ smoke, opts, ghInfo }));
 
   // Task 3 фазы 7 (глобальный поиск истории, Ctrl+Shift+H) + I5 (ревью
   // финальной волны, TTL индекса): смотри search.js (renderer) — оверлей с
@@ -1712,11 +1716,11 @@ function registerIpc(win, opts = {}) {
   // в historySearchHandler()/historyRefreshHandler() выше по файлу (вынесены
   // ради тестируемости смоук-гейта — «дыра тестов №1», ревью финальной
   // волны — и TTL-фикса I5, см. подробные комментарии там).
-  ipcMain.handle('history:search', async (_e, query, opts) => historySearchHandler({
+  registry.handle('history:search', async (query, opts) => historySearchHandler({
     smoke, query, opts, state: historyIndexState, historyIndex,
   }));
 
-  ipcMain.handle('history:refresh', async (_e, opts) => historyRefreshHandler({
+  registry.handle('history:refresh', async (opts) => historyRefreshHandler({
     smoke, opts, state: historyIndexState, historyIndex,
   }));
 
@@ -1731,28 +1735,28 @@ function registerIpc(win, opts = {}) {
   // выше по файлу (та же причина, что historySearchHandler/gitGetHandler —
   // ipc.js целиком не тестируется, а этот канал добавлен в ЭТОЙ ЖЕ ветке
   // фазы 7 с тем же классом смоук-гейта, но остался без единого теста).
-  ipcMain.handle('recipes:list', () => recipesListHandler({ smoke, recipeStore }));
+  registry.handle('recipes:list', () => recipesListHandler({ smoke, recipeStore }));
 
   // Сохранение/удаление рецепта — CRUD-контракт recipes.js целиком (бриф),
   // текущий UI (палитра) сам новые рецепты не создаёт и не удаляет (только
   // читает дефолты + то, что уже лежит в prompts.json) — задел на будущую
   // форму редактирования библиотеки, тот же приём, что history:refresh выше.
   // Логика — в recipesSavePromptHandler()/recipesDeletePromptHandler() выше.
-  ipcMain.handle('recipes:savePrompt', (_e, p) => recipesSavePromptHandler({ smoke, recipe: p, recipeStore }));
+  registry.handle('recipes:savePrompt', (p) => recipesSavePromptHandler({ smoke, recipe: p, recipeStore }));
 
-  ipcMain.handle('recipes:deletePrompt', (_e, id) => recipesDeletePromptHandler({ smoke, id, recipeStore }));
+  registry.handle('recipes:deletePrompt', (id) => recipesDeletePromptHandler({ smoke, id, recipeStore }));
 
   // fillPrompt — чистая текстовая подстановка без единого обращения к диску,
   // смысла гейтить smoke'ом нет (тот же довод, что config:get/shell.openExternal
   // выше по файлу не гейтятся) — просто безвредный no-op на пустых values.
-  ipcMain.handle('recipes:fillPrompt', (_e, text, values) => fillPrompt(text, values));
+  registry.handle('recipes:fillPrompt', (text, values) => fillPrompt(text, values));
 
   // Minor 8 (ревью раунд 1): нормализация переносов строк перед записью в pty —
   // тоже чистая функция без диска, тот же довод, что recipes:fillPrompt выше,
   // не гейтим smoke'ом. Зовётся app.js/runRecipe БЕЗУСЛОВНО (даже без
   // плейсхолдеров), чтобы внутренний \n текста рецепта не ушёл в терминал
   // отдельным Enter (в т.ч. молчаливым подтверждением диалога разрешения).
-  ipcMain.handle('recipes:normalizeForPty', (_e, text) => normalizeForPty(text));
+  registry.handle('recipes:normalizeForPty', (text) => normalizeForPty(text));
 
   // Именованные воркспейсы (Task 4 фазы 7): listWorkspaces/saveWorkspace —
   // палитра читает и пишет их напрямую (действия «Открыть воркспейс: <name>»/
@@ -1763,20 +1767,20 @@ function registerIpc(win, opts = {}) {
   // Дыра тестов №1 (ревью финальной волны): логика — в
   // recipesListWorkspacesHandler()/recipesSaveWorkspaceHandler()/
   // recipesDeleteWorkspaceHandler() выше по файлу (та же причина).
-  ipcMain.handle('recipes:listWorkspaces', () => recipesListWorkspacesHandler({ smoke, recipeStore }));
+  registry.handle('recipes:listWorkspaces', () => recipesListWorkspacesHandler({ smoke, recipeStore }));
 
-  ipcMain.handle('recipes:saveWorkspace', (_e, name, tabs) => recipesSaveWorkspaceHandler({
+  registry.handle('recipes:saveWorkspace', (name, tabs) => recipesSaveWorkspaceHandler({
     smoke, name, tabs, recipeStore,
   }));
 
-  ipcMain.handle('recipes:deleteWorkspace', (_e, id) => recipesDeleteWorkspaceHandler({ smoke, id, recipeStore }));
+  registry.handle('recipes:deleteWorkspace', (id) => recipesDeleteWorkspaceHandler({ smoke, id, recipeStore }));
 
   // Task 4 фазы 4 (вставка скриншотов): cwd вкладки резолвим тем же путём,
   // что project:connect/status — tabCwd (manager.list()). saveClipboardImage —
   // чистый модуль (screenshot.js), clipboard.readImage() инжектируется отсюда.
   // Любая ошибка (в т.ч. пустой буфер, недоступный clipboard) → null — renderer
   // (terminal.js) сам падает на обычную текстовую вставку в этом случае.
-  ipcMain.handle('screenshot:paste', (_e, tabId) => {
+  registry.handle('screenshot:paste', (tabId) => {
     if (typeof tabId !== 'string') return null;
     const cwd = tabCwd(tabId);
     if (!cwd) return null;
@@ -1788,7 +1792,7 @@ function registerIpc(win, opts = {}) {
     }
   });
 
-  ipcMain.on('term:start', (_e, payload) => {
+  registry.on('term:start', (payload) => {
     // Payload может прийти не объектом (null и т.п.) — деструктуризация упала
     // бы через uncaughtException прямо в app.exit(1). Отсекаем заранее.
     if (!payload || typeof payload !== 'object') return;
@@ -1798,13 +1802,13 @@ function registerIpc(win, opts = {}) {
     manager.start(tabId, cols, rows);
   });
 
-  ipcMain.on('term:restart', (_e, payload) => {
+  registry.on('term:restart', (payload) => {
     if (!payload || typeof payload !== 'object') return;
     const { tabId } = payload;
     if (typeof tabId === 'string') manager.restart(tabId);
   });
 
-  ipcMain.on('term:write', (_e, payload) => {
+  registry.on('term:write', (payload) => {
     if (!payload || typeof payload !== 'object') return;
     const { tabId, data } = payload;
     if (typeof tabId !== 'string' || typeof data !== 'string') return;
@@ -1821,7 +1825,7 @@ function registerIpc(win, opts = {}) {
     if (nightWatch && hasRealUserInput(data)) nightWatch.onUserInput(tabId);
   });
 
-  ipcMain.on('term:resize', (_e, payload) => {
+  registry.on('term:resize', (payload) => {
     if (!payload || typeof payload !== 'object') return;
     const { tabId, cols, rows } = payload;
     if (typeof tabId !== 'string') return;
@@ -1833,21 +1837,21 @@ function registerIpc(win, opts = {}) {
   // term:write/term:restart выше — состояние возвращается отдельным событием
   // (queue:changed, генерируется sessions.js и уходит через generic onEvent
   // в начале registerIpc), синхронный ответ invoke() здесь не нужен.
-  ipcMain.on('queue:add', (_e, payload) => {
+  registry.on('queue:add', (payload) => {
     if (!payload || typeof payload !== 'object') return;
     const { tabId, text } = payload;
     if (typeof tabId !== 'string' || typeof text !== 'string') return;
     manager.enqueue(tabId, text);
   });
 
-  ipcMain.on('queue:remove', (_e, payload) => {
+  registry.on('queue:remove', (payload) => {
     if (!payload || typeof payload !== 'object') return;
     const { tabId, index } = payload;
     if (typeof tabId !== 'string' || !Number.isInteger(index)) return;
     manager.removeFromQueue(tabId, index);
   });
 
-  ipcMain.on('queue:clear', (_e, payload) => {
+  registry.on('queue:clear', (payload) => {
     if (!payload || typeof payload !== 'object') return;
     const { tabId } = payload;
     if (typeof tabId !== 'string') return;
@@ -1859,9 +1863,16 @@ function registerIpc(win, opts = {}) {
   // только проводка каналов, вся смоук-логика и создание инстанса (M2,
   // ревью финальной волны: подъём JS-объекта, НЕ сервера — см. getOrCreateStt
   // выше) — внутри самих хендлеров.
-  ipcMain.handle('stt:transcribe', (_e, wav) => sttTranscribeHandler({ smoke, wav, getStt: getOrCreateStt }));
+  registry.handle('stt:transcribe', (wav) => sttTranscribeHandler({ smoke, wav, getStt: getOrCreateStt }));
 
-  ipcMain.handle('stt:status', () => sttStatusHandler({ smoke, getStt: getOrCreateStt }));
+  registry.handle('stt:status', () => sttStatusHandler({ smoke, getStt: getOrCreateStt }));
+
+  // Задачам 5 и 7 (сетевой сервер + мост window.api в браузере) реестр нужен
+  // снаружи этой функции — до этой правки он жил только внутри registerIpc()
+  // и был недостижим (см. progress.md, Task 1, отложенный minor). Возврат
+  // ничего не ломает: единственный вызывающий (main.js) до сих пор не
+  // использовал результат registerIpc() вовсе.
+  return { registry };
 }
 
 // Форсирует немедленную запись манифеста (debounce workspace.js иначе может
