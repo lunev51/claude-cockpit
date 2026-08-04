@@ -42,8 +42,17 @@ function stripAnsi(text) {
     .replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, '');
 }
 
+// autoStart (Important ре-ревью фикс-волны финального ревью) — поднимать ли
+// pty этой вкладке. true (умолчание) — прежнее поведение: вкладку только что
+// создал tabs:open, процесс ей и правда нужен. false — ПОДКЛЮЧЕНИЕ к вкладке,
+// у которой процесса уже нет (см. attachTab в app.js): её нельзя стартовать
+// молча. sessions.js/start() на вкладке без proc делает spawn БЕЗ --resume —
+// флаг resumeOnFirstSpawn одноразовый и давно израсходован, — то есть вместо
+// продолжения работы поднялась бы чистая новая сессия, а старая потерялась
+// бы. Штатный Ctrl+Shift+R (term.restart) сессию бережёт: он резюмит
+// известный sessionId. Подключение не имеет права вести себя хуже рестарта.
 export function initTerminal(container, config, {
-  tabId, onPtyStatus, onFontSize = () => {}, preludeText = null,
+  tabId, onPtyStatus, onFontSize = () => {}, preludeText = null, autoStart = true,
 }) {
   const cfg = config.terminal;
   const term = new window.Terminal({
@@ -326,8 +335,18 @@ export function initTerminal(container, config, {
   }
 
   // --- статус и запуск PTY ---
-  onPtyStatus('запускается…');
-  window.api.term.start(tabId, term.cols, term.rows);
+  // Единственное место, откуда renderer вообще просит поднять процесс, —
+  // поэтому гард стоит здесь, а не у вызывающего: любой будущий путь создания
+  // терминала проходит через эту строку.
+  if (autoStart) {
+    onPtyStatus('запускается…');
+    window.api.term.start(tabId, term.cols, term.rows);
+  } else {
+    // Процесса нет и поднимать его мы не просим. alive остаётся false — ввод
+    // заблокирован (см. term.onData ниже), человек сам решит, перезапускать
+    // ли вкладку: Ctrl+Shift+R резюмит её сессию, а не заводит новую.
+    onPtyStatus('процесс не запущен — Ctrl+Shift+R для перезапуска');
+  }
 
   // Двусторонний поток: клавиатура → PTY (только при живом процессе), PTY → экран.
   term.onData((data) => { if (alive) window.api.term.write(tabId, data); });

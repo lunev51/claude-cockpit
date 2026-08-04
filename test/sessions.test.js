@@ -121,6 +121,76 @@ test('restart убивает старый pty и спавнит новый с т
   assert.strictEqual(factory.spawned[1].opts.rows, 40);
 });
 
+// Найдено живой проверкой фикс-волны финального ревью (не регресс ветки —
+// баг базового продукта). Гард в spare-ветке spawn() — `tab.status !== 'dead'`
+// — задумывался против СИНХРОННОГО exit из самой фабрики («не воскрешаем
+// только что умерший процесс»). Но статус 'dead' остаётся на вкладке и ПОСЛЕ
+// естественной смерти процесса, а restart() его не сбрасывает: значит рестарт
+// УЖЕ мёртвой вкладки — то есть ровно тот Ctrl+Shift+R, который сам кокпит
+// печатает в терминал строкой «процесс завершён (код N) — Ctrl+Shift+R для
+// перезапуска», — спавнил pty и тут же от него отрекался.
+//
+// Живьём (браузер, вкладка после /exit): процесс claude поднялся и печатал в
+// терминал, но manager.list() отдавал alive:false, term:started не приходил,
+// а term.write уходил в никуда — ввод мёртв навсегда. Хуже того, proc не
+// принадлежит вкладке: close()/restart() его не убьют, и каждый следующий
+// Ctrl+Shift+R добавлял бы ещё один осиротевший процесс.
+test('рестарт УЖЕ мёртвой вкладки отдаёт ей новый pty (а не спавнит осиротевший процесс)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 120, 40);
+  // Естественная смерть процесса: вкладка уезжает в 'dead'.
+  factory.spawned[0].opts.onExit(0);
+  assert.strictEqual(statusOf(events, a.tabId).status, 'dead');
+  assert.strictEqual(mgr.list()[0].alive, false);
+
+  const startedBefore = events.filter((e) => e.channel === 'term:started').length;
+  mgr.restart(a.tabId);
+
+  assert.strictEqual(factory.spawned.length, 2, 'рестарт обязан спавнить новый pty');
+  assert.strictEqual(mgr.list()[0].alive, true, 'новый pty должен принадлежать вкладке, иначе ввод мёртв, а процесс осиротел');
+  assert.strictEqual(
+    events.filter((e) => e.channel === 'term:started').length,
+    startedBefore + 1,
+    'без term:started renderer навсегда держит ввод заблокированным',
+  );
+  // Ввод реально доходит до НОВОГО процесса.
+  mgr.write(a.tabId, 'после рестарта');
+  assert.deepStrictEqual(factory.spawned[1].written, ['после рестарта']);
+  // И вкладка снова управляема: закрытие убивает именно этот процесс.
+  mgr.close(a.tabId);
+  assert.ok(factory.spawned[1].killed, 'закрытие вкладки обязано убить её процесс, а не оставить осиротевшим');
+});
+
+// Обратная сторона того же гарда: синхронный exit ИЗ САМОЙ ФАБРИКИ (процесс
+// умер, не успев родиться) по-прежнему не должен «воскрешать» вкладку.
+test('синхронный exit из фабрики не воскрешает вкладку — гард сохраняет исходный смысл', () => {
+  const events = [];
+  let nowMs = 0;
+  const spawned = [];
+  const factory = (opts) => {
+    const proc = {
+      opts, written: [], killed: false, pid: 1000 + spawned.length, write() {}, resize() {}, kill() { this.killed = true; },
+    };
+    spawned.push(proc);
+    opts.onExit(1); // умер прямо внутри фабрики, ДО возврата инстанса
+    return proc;
+  };
+  const mgr = createSessionManager({
+    ptyFactory: factory,
+    getTermConfig: () => ({ command: 'claude', args: [], useConpty: true, useConptyDll: true }),
+    onEvent: (channel, payload) => events.push({ channel, payload }),
+    now: () => nowMs,
+    stuckAfterMs: 1000,
+  });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  assert.strictEqual(mgr.list()[0].alive, false, 'умерший внутри фабрики процесс не должен считаться живым');
+  assert.strictEqual(statusOf(events, a.tabId).status, 'dead');
+  assert.strictEqual(events.filter((e) => e.channel === 'term:started').length, 0);
+});
+
 test('close убивает pty и удаляет вкладку; disposeAll убивает всё', () => {
   const factory = makeFakePtyFactory();
   const { mgr } = makeManager(factory);

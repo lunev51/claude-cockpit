@@ -25,6 +25,9 @@ import { createRecipeForm } from './recipe-form.js';
 import { createHotkeysOverlay } from './hotkeys.js';
 import { pluralTabs } from './format.js';
 import { shouldMarkSeen } from './seen.js';
+// Important (ре-ревью фикс-волны): подключение к вкладке без живого процесса
+// не должно его поднимать — обоснование в самом модуле.
+import { shouldStartPty } from './attach-guards.js';
 // Task 3 фазы 9 (голосовой ввод, push-to-talk по правому Shift): recorder —
 // портирован из Companion как есть (src/renderer/js/voice/recorder.js, см.
 // комментарий там же — ни одного изменённого пути импорта не понадобилось,
@@ -659,9 +662,18 @@ async function attachTab(t, { activate = false } = {}) {
   // приглушённый, с вырезанными escape-последовательностями, с подписью
   // «сессия поднимается»). Здесь же приезжает ЖИВАЯ история работающего pty —
   // её надо напечатать как есть, со всеми цветами (см. replayHistory).
+  //
+  // autoStart (Important ре-ревью): подключение НЕ имеет права поднимать
+  // процесс вкладке, у которой он уже умер — обоснование и цена ошибки в
+  // shouldStartPty (attach-guards.js). На живой вкладке значение true, и
+  // тогда term.start внутри initTerminal делает ровно одно: заставляет
+  // sessions.js/start() повторить 'term:started', без которого terminal.js
+  // держал бы ввод за флагом alive навсегда («запускается…» и проглоченные
+  // нажатия) — второго pty при этом не появляется (см. sessions.js/start).
   const view = initTerminal(container, config, {
     tabId: t.tabId,
     preludeText: null,
+    autoStart: shouldStartPty(t),
     onPtyStatus: (s) => {
       entry.lastPtyStatus = s;
     },
@@ -671,10 +683,6 @@ async function attachTab(t, { activate = false } = {}) {
   });
   entry.view = view;
 
-  // initTerminal внутри зовёт term.start(tabId, cols, rows). На живом процессе
-  // sessions.js/start() не спавнит второй pty, а повторяет 'term:started' —
-  // без этого повтора terminal.js держал бы ввод за флагом alive навсегда
-  // («запускается…» и проглоченные нажатия), см. комментарий в sessions.js.
   tabStore.add(t);
   // Статус из менеджера — вкладка сразу встаёт в свою секцию сайдбара
   // («Ждут тебя»/«Работают»/…), а не ждёт следующего хука Claude Code,
@@ -717,10 +725,16 @@ async function replayHistory(tabId) {
   for (const chunk of pending) entry.view.term.write(chunk);
 }
 
-// Подключение ко всем живым вкладкам подряд. Стаггер здесь не нужен (в
-// отличие от restoreFlow): ни одного нового процесса не поднимается, мы лишь
-// заводим xterm'ы и просим историю. Ошибка на одной вкладке не должна
-// оставить остальные без экрана — тот же принцип, что в restoreFlow.
+// Подключение ко всем вкладкам менеджера подряд. Стаггер здесь не нужен (в
+// отличие от restoreFlow): ни одного НОВОГО процесса не поднимается — живой
+// вкладке term.start лишь возвращает 'term:started' (второго pty не будет,
+// см. sessions.js/start), а мёртвой мы его вовсе не шлём (shouldStartPty,
+// Important ре-ревью: раньше подключение стартовало ей чистую сессию БЕЗ
+// --resume и теряло старую, а N мёртвых вкладок давали N одновременных
+// спавнов). Остаётся завести xterm'ы и попросить историю.
+//
+// Ошибка на одной вкладке не должна оставить остальные без экрана — тот же
+// принцип, что в restoreFlow.
 async function attachLiveTabs(liveTabs) {
   let firstAttached = null;
   for (const t of liveTabs) {

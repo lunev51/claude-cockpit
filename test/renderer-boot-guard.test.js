@@ -42,6 +42,7 @@ const APP_JS = read('src', 'renderer', 'js', 'app.js');
 const API_BOOT_JS = read('src', 'renderer', 'js', 'api-boot.js');
 const INDEX_HTML = read('src', 'renderer', 'index.html');
 const NET_SERVER_JS = read('src', 'main', 'net-server.js');
+const TERMINAL_JS = read('src', 'renderer', 'js', 'terminal.js');
 
 // --- 1. порядок загрузки моста ---
 
@@ -78,6 +79,52 @@ test('браузерный мост стучится в тот же путь с�
     inBoot[1],
     onServer[1],
     'мост и сервер разошлись путём сокета — страница загрузится, а window.api не соберётся никогда',
+  );
+});
+
+// --- 1a. подключение не поднимает процесс мёртвой вкладке ---
+//
+// Important (ре-ревью фикс-волны): подключение переиспользует обычный путь
+// создания терминала, а тот звал term.start БЕЗУСЛОВНО — и sessions.js/start()
+// на вкладке без живого процесса делал spawn. Живьём: вкладка была
+// alive:false, после подключения браузера стала alive:true с новым процессом.
+// Спавн уходил БЕЗ --resume (флаг одноразовый, уже израсходован), то есть
+// вместо продолжения работы поднималась чистая новая сессия, а старая
+// терялась — подключение вело себя хуже штатного Ctrl+Shift+R.
+//
+// Решение проверяется на трёх уровнях: сам предикат, его использование в
+// app.js и гард внутри terminal.js. Порознь любой из трёх можно обойти,
+// оставив два других зелёными.
+
+test('shouldStartPty: процесс поднимаем ТОЛЬКО живой вкладке', async () => {
+  const { shouldStartPty } = await import('../src/renderer/js/attach-guards.js');
+  assert.strictEqual(shouldStartPty({ tabId: 'T1', alive: true }), true, 'живой вкладке term.start нужен — иначе её ввод навсегда заблокирован');
+  assert.strictEqual(shouldStartPty({ tabId: 'T1', alive: false }), false, 'мёртвой вкладке спавн из подключения теряет её сессию');
+  // Поле могло не доехать (старый main, урезанный ответ) — цена ошибки
+  // несимметрична, поэтому «не знаю» = «не стартовать».
+  assert.strictEqual(shouldStartPty({ tabId: 'T1' }), false);
+  assert.strictEqual(shouldStartPty({ tabId: 'T1', alive: 'yes' }), false);
+  assert.strictEqual(shouldStartPty(null), false);
+  assert.strictEqual(shouldStartPty(undefined), false);
+});
+
+test('attachTab передаёт решение shouldStartPty в initTerminal (а не стартует безусловно)', () => {
+  assert.match(
+    APP_JS,
+    /autoStart:\s*shouldStartPty\(t\)/,
+    'подключение снова стартует pty безусловно: мёртвая вкладка получит чистую новую сессию БЕЗ --resume, '
+    + 'а её собственная потеряется',
+  );
+  assert.match(APP_JS, /import\s+\{\s*shouldStartPty\s*\}\s+from\s+'\.\/attach-guards\.js'/, 'предикат больше не импортируется — значение autoStart взялось откуда-то ещё');
+});
+
+test('terminal.js просит поднять pty только под гардом autoStart', () => {
+  const starts = [...TERMINAL_JS.matchAll(/window\.api\.term\.start\s*\(/g)];
+  assert.strictEqual(starts.length, 1, `window.api.term.start встречается ${starts.length} раз(а) — гард стоит перед ОДНИМ вызовом, второй пройдёт мимо него`);
+  assert.match(
+    TERMINAL_JS,
+    /if\s*\(\s*autoStart\s*\)[\s\S]{0,200}?window\.api\.term\.start\s*\(/,
+    'вызов term.start больше не под `if (autoStart)` — подключение снова будет поднимать процесс мёртвым вкладкам',
   );
 });
 
