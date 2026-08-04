@@ -16,24 +16,29 @@ const { resolveNetConfig, startNetServerWithRetries } = require('../src/main/ipc
 
 // --- resolveNetConfig ---
 
-test('resolveNetConfig: пустой конфиг → 127.0.0.1:48300 (дефолт, БУКВАЛЬНЫЙ литерал в assert — не константа модуля)', () => {
-  assert.deepStrictEqual(resolveNetConfig({}), { host: '127.0.0.1', port: 48300 });
-  assert.deepStrictEqual(resolveNetConfig(undefined), { host: '127.0.0.1', port: 48300 });
-  assert.deepStrictEqual(resolveNetConfig(null), { host: '127.0.0.1', port: 48300 });
+test('resolveNetConfig: пустой конфиг → 127.0.0.1:48300, allowedHosts:[] (дефолт, БУКВАЛЬНЫЙ литерал в assert — не константа модуля)', () => {
+  assert.deepStrictEqual(resolveNetConfig({}), { host: '127.0.0.1', port: 48300, allowedHosts: [] });
+  assert.deepStrictEqual(resolveNetConfig(undefined), { host: '127.0.0.1', port: 48300, allowedHosts: [] });
+  assert.deepStrictEqual(resolveNetConfig(null), { host: '127.0.0.1', port: 48300, allowedHosts: [] });
 });
 
-test('resolveNetConfig: адрес и порт из конфига доезжают как есть', () => {
+test('resolveNetConfig: адрес, порт и allowedHosts из конфига доезжают как есть', () => {
   const warnings = [];
-  const result = resolveNetConfig({ host: '100.120.245.85', port: 48301 }, (m) => warnings.push(m));
-  assert.deepStrictEqual(result, { host: '100.120.245.85', port: 48301 });
+  const result = resolveNetConfig(
+    { host: '100.120.245.85', port: 48301, allowedHosts: ['cockpit-desktop.tailnet.ts.net'] },
+    (m) => warnings.push(m),
+  );
+  assert.deepStrictEqual(result, {
+    host: '100.120.245.85', port: 48301, allowedHosts: ['cockpit-desktop.tailnet.ts.net'],
+  });
   assert.deepStrictEqual(warnings, []); // валидные значения — без единого предупреждения
 });
 
-test('resolveNetConfig: мусор в конфиге откатывается к умолчанию, с предупреждением', () => {
+test('resolveNetConfig: мусор в конфиге (включая allowedHosts не-массивом) откатывается к умолчанию, с предупреждением', () => {
   const warnings = [];
-  const result = resolveNetConfig({ host: 12345, port: 'мусор' }, (m) => warnings.push(m));
-  assert.deepStrictEqual(result, { host: '127.0.0.1', port: 48300 });
-  assert.strictEqual(warnings.length, 2); // и host, и port предупредили независимо
+  const result = resolveNetConfig({ host: 12345, port: 'мусор', allowedHosts: 'не-массив' }, (m) => warnings.push(m));
+  assert.deepStrictEqual(result, { host: '127.0.0.1', port: 48300, allowedHosts: [] });
+  assert.strictEqual(warnings.length, 3); // host, port и allowedHosts предупредили независимо
 });
 
 test('resolveNetConfig: пустая строка host — тоже мусор, не «валидная строка»', () => {
@@ -61,6 +66,42 @@ test('resolveNetConfig: port строкой-мусором ("abc") откаты�
   const result = resolveNetConfig({ port: 'abc' }, (m) => warnings.push(m));
   assert.strictEqual(result.port, 48300);
   assert.strictEqual(warnings.length, 1);
+});
+
+// M1 (координатор, фикс DNS-rebinding в net-server.js, раунд 4): allowedHosts —
+// доп. имена для белого списка Host (net-server.js уже принимает параметр и
+// по умолчанию считает его []) — разбор здесь не мягче, чем у host/port выше.
+
+test('resolveNetConfig: allowedHosts отсутствует в конфиге → пустой массив, без предупреждений', () => {
+  const warnings = [];
+  const result = resolveNetConfig({}, (m) => warnings.push(m));
+  assert.deepStrictEqual(result.allowedHosts, []);
+  assert.deepStrictEqual(warnings, []);
+});
+
+test('resolveNetConfig: allowedHosts — нормальный список доезжает как есть', () => {
+  const warnings = [];
+  const list = ['cockpit-desktop.tailnet.ts.net', '100.120.245.85'];
+  const result = resolveNetConfig({ allowedHosts: list }, (m) => warnings.push(m));
+  assert.deepStrictEqual(result.allowedHosts, list);
+  assert.deepStrictEqual(warnings, []);
+});
+
+test('resolveNetConfig: allowedHosts не массивом целиком откатывается к [], с предупреждением', () => {
+  const warnings = [];
+  const result = resolveNetConfig({ allowedHosts: 'cockpit-desktop.tailnet.ts.net' }, (m) => warnings.push(m));
+  assert.deepStrictEqual(result.allowedHosts, []);
+  assert.strictEqual(warnings.length, 1);
+});
+
+test('resolveNetConfig: allowedHosts массивом с мусором — не-строки и пустые строки отбрасываются поэлементно, валидные остаются', () => {
+  const warnings = [];
+  const result = resolveNetConfig(
+    { allowedHosts: ['valid.tailnet.ts.net', 123, '', '   ', null, 'second-valid.example'] },
+    (m) => warnings.push(m),
+  );
+  assert.deepStrictEqual(result.allowedHosts, ['valid.tailnet.ts.net', 'second-valid.example']);
+  assert.strictEqual(warnings.length, 4); // по одному предупреждению на каждый из 4 отброшенных элементов
 });
 
 // --- startNetServerWithRetries ---
@@ -171,10 +212,14 @@ test('проводка: registerIpc зовёт resolveNetConfig(getConfig().net)
   );
 });
 
-test('проводка: createNetServer получает host/port ИЗ netCfg, а не литералами', () => {
+test('проводка: createNetServer получает host/port/allowedHosts ИЗ netCfg, а не литералами', () => {
   assert.ok(
     ipcSrc.includes('port: netCfg.port,') && ipcSrc.includes('host: netCfg.host,'),
     'createNetServer() должен получать host/port из результата resolveNetConfig(), а не захардкоженными литералами',
+  );
+  assert.ok(
+    ipcSrc.includes('allowedHosts: netCfg.allowedHosts,'),
+    'createNetServer() должен получать allowedHosts из результата resolveNetConfig() — иначе доп. имена тайлнета собираются, но никуда не доезжают',
   );
 });
 

@@ -1111,7 +1111,34 @@ function resolveNetConfig(netCfg, warn = (msg) => console.warn(msg)) {
     }
   }
 
-  return { host, port };
+  // allowedHosts (соседняя задача, фикс DNS-rebinding в net-server.js,
+  // раунд 4): доп. имена для белого списка Host — к машине приходят и по
+  // адресу, и по DNS-имени тайлнета одновременно, а host выше хранит
+  // обычно только одно из двух. Разбор не мягче, чем у host/port выше: не
+  // массив — откат к пустому с предупреждением; элементы не строки или
+  // пустые строки — отбрасываются по одному, тоже с предупреждением
+  // (называющим конкретный отброшенный элемент, не просто «что-то не так»).
+  // Валидные элементы не проверяются на формат имени/IP — net-server.js сам
+  // сравнивает их с заголовком Host регистронезависимо, лишний формальный
+  // барьер здесь просто отсеивал бы легитимные варианты записи.
+  let allowedHosts = [];
+  if (cfg.allowedHosts !== undefined) {
+    if (Array.isArray(cfg.allowedHosts)) {
+      const clean = [];
+      for (const item of cfg.allowedHosts) {
+        if (typeof item === 'string' && item.trim()) {
+          clean.push(item);
+        } else {
+          warn(`[net] allowedHosts содержит некорректный элемент (${JSON.stringify(item)}) — отброшен`);
+        }
+      }
+      allowedHosts = clean;
+    } else {
+      warn(`[net] allowedHosts в конфиге некорректен (${JSON.stringify(cfg.allowedHosts)}), использую []`);
+    }
+  }
+
+  return { host, port, allowedHosts };
 }
 
 // M2 (ревью раунда 2, Important 2): раньше сбой netServer.start() ТОЛЬКО
@@ -1560,7 +1587,11 @@ function registerIpc(win, opts = {}) {
   // этого же ПК. Разбор секции — через resolveNetConfig() (см. её
   // комментарий выше по файлу) — единая точка, которую покрывает
   // test/ipc-net-boot.test.js, а не инлайн-тернарники, которые ревью раунда
-  // 2 подменило дефолтом '0.0.0.0' без единого красного теста.
+  // 2 подменило дефолтом '0.0.0.0' без единого красного теста. allowedHosts
+  // — доп. имена для белого списка Host внутри net-server.js (фикс
+  // DNS-rebinding, соседняя задача, раунд 4): к машине приходят и по
+  // адресу, и по DNS-имени тайлнета одновременно, а host выше хранит
+  // обычно только одно из двух.
   const netCfg = resolveNetConfig(getConfig().net);
   const netServer = createNetServer({
     registry,
@@ -1573,6 +1604,7 @@ function registerIpc(win, opts = {}) {
     },
     port: netCfg.port,
     host: netCfg.host,
+    allowedHosts: netCfg.allowedHosts,
   });
   // startBridge() выше сама ловит ошибки старта и делает фолбэк на эфемерный
   // порт — у сетевого сервера такого фолбэка нет (адрес важен пользователю
