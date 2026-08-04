@@ -3,13 +3,15 @@
 // Тесты интеграционные — поднимаем настоящий сервер на случайном порту и
 // ходим настоящим клиентом: протокол нельзя проверить моками, в нём вся суть.
 //
-// Второй раунд ревью нашёл, что первая версия падала на живой сети: битая
-// percent-escape в адресе роняла весь Electron, префиксные корни не работали
-// на Windows, тест на traversal ничего не проверял (fetch() сам режет '..'
-// до отправки на провод), а WebSocket принимал подключение с любого сайта.
-// Ниже — тесты именно на эти сценарии, сырым сокетом там, где fetch()/ws
-// сглаживает то, что реально уходит на провод.
-const test = require('node:test');
+// Раунд 2 нашёл: битая percent-escape в адресе роняла весь Electron,
+// префиксные корни не работали на Windows, тест на traversal ничего не
+// проверял (fetch() сам режет '..' до отправки), WebSocket принимал
+// подключение с любого сайта, занятый порт всё равно ронял процесс через
+// wss.emit('error'), а упавший ДО server.stop() тест вешал весь прогон
+// node --test навсегда (слушающий сокет держит цикл событий).
+// Раунд 3: сравнение Origin с Host в одиночку открывало DNS-rebinding —
+// закрыто ниже двухэтапной проверкой (Host против белого списка первым).
+const { test, afterEach } = require('node:test');
 const assert = require('node:assert');
 const path = require('node:path');
 const fs = require('node:fs');
@@ -22,6 +24,19 @@ const { createBroadcast } = require('../src/main/broadcast');
 const { createOutputBuffer } = require('../src/main/output-buffer');
 
 const fakeIpcMain = () => ({ handle: () => {}, on: () => {} });
+
+// Серверы, созданные ЗА ТЕКУЩИЙ тест — afterEach ниже гасит их всегда,
+// независимо от того, дошёл ли тест до собственного server.stop(). Без
+// этого упавший ДО остановки тест оставляет слушающий сокет открытым, тот
+// держит цикл событий, и node --test не даёт красный отчёт, а виснет
+// навсегда (подтверждено вручную: реальный прогон на этой машине завис и
+// был снят по трёхминутному таймауту, пока в файле не было этой уборки).
+let activeServers = [];
+afterEach(async () => {
+  const servers = activeServers;
+  activeServers = [];
+  await Promise.all(servers.map((s) => s.stop().catch(() => { /* уже мог быть остановлен телом теста */ })));
+});
 
 function makeServer(extra = {}) {
   const registry = createCommandRegistry({ ipcMain: fakeIpcMain() });
@@ -38,6 +53,7 @@ function makeServer(extra = {}) {
     host: '127.0.0.1',
     ...extra,
   });
+  activeServers.push(server);
   return { server, registry, broadcast, outputBuffer };
 }
 
@@ -76,7 +92,6 @@ test('отдаёт страницу renderer по HTTP', async () => {
   const body = await res.text();
   assert.strictEqual(res.status, 200);
   assert.ok(body.includes('<div id="app">'), 'отдана не та страница');
-  await server.stop();
 });
 
 test('команда доходит до реестра и возвращает результат', async () => {
@@ -86,7 +101,6 @@ test('команда доходит до реестра и возвращает 
   ws.send(JSON.stringify({ id: 1, channel: 'эхо', args: ['привет'] }));
   assert.deepStrictEqual(await nextFrame(ws), { id: 1, ok: true, result: { эхо: 'привет' } });
   ws.close();
-  await server.stop();
 });
 
 test('ошибка обработчика приезжает клиенту текстом, а не тишиной', async () => {
@@ -98,7 +112,6 @@ test('ошибка обработчика приезжает клиенту те
   assert.strictEqual(frame.ok, false);
   assert.match(frame.error, /обработчик упал/);
   ws.close();
-  await server.stop();
 });
 
 test('неизвестная команда — понятная ошибка', async () => {
@@ -110,7 +123,6 @@ test('неизвестная команда — понятная ошибка', 
   assert.strictEqual(frame.ok, false);
   assert.match(frame.error, /неизвестная команда/);
   ws.close();
-  await server.stop();
 });
 
 test('события рассылки долетают до подключённого клиента', async () => {
@@ -121,7 +133,6 @@ test('события рассылки долетают до подключённ
   broadcast.emit('tab:status', { tabId: 'T1', status: 'working' });
   assert.deepStrictEqual(await frame, { event: 'tab:status', payload: { tabId: 'T1', status: 'working' } });
   ws.close();
-  await server.stop();
 });
 
 test('net:buffer отдаёт накопленную историю вкладки', async () => {
@@ -132,7 +143,6 @@ test('net:buffer отдаёт накопленную историю вкладк
   ws.send(JSON.stringify({ id: 4, channel: 'net:buffer', args: ['T1'] }));
   assert.deepStrictEqual(await nextFrame(ws), { id: 4, ok: true, result: 'старый вывод' });
   ws.close();
-  await server.stop();
 });
 
 test('битый кадр не роняет сервер', async () => {
@@ -143,7 +153,6 @@ test('битый кадр не роняет сервер', async () => {
   ws.send(JSON.stringify({ id: 5, channel: 'эхо', args: ['жив'] }));
   assert.deepStrictEqual(await nextFrame(ws), { id: 5, ok: true, result: { эхо: 'жив' } });
   ws.close();
-  await server.stop();
 });
 
 test('отключившийся клиент снимается с рассылки', async () => {
@@ -155,10 +164,9 @@ test('отключившийся клиент снимается с рассыл
   await new Promise((r) => { setTimeout(r, 50); });
   assert.strictEqual(server.clientCount(), 0);
   broadcast.emit('tab:status', {}); // не должно бросить
-  await server.stop();
 });
 
-// --- Critical 1: битая percent-escape в адресе не роняет процесс ---------
+// --- Critical: битая percent-escape в адресе не роняет процесс -----------
 
 test('битый %-escape в адресе отвечает 400, а не роняет сервер', async () => {
   const { server } = makeServer();
@@ -174,10 +182,9 @@ test('битый %-escape в адресе отвечает 400, а не роня
   // процесс, и следующий запрос не отвечал бы никогда.
   const ok = await rawRequest(port, 'GET /index.html HTTP/1.1');
   assert.strictEqual(statusOf(ok), 200);
-  await server.stop();
 });
 
-// --- Important 1: обход каталога наружу — сырым сокетом, с реальной уликой -
+// --- Important: обход каталога наружу — сырым сокетом, с реальной уликой -
 
 test('обход каталога наружу не отдаёт файл за пределами корня (сырой сокет)', async () => {
   // fetch() сам нормализует '..' в URL до отправки (WHATWG URL,
@@ -206,7 +213,6 @@ test('обход каталога наружу не отдаёт файл за �
       assert.notStrictEqual(statusOf(raw), 200, `утекло по запросу: ${attempt}`);
       assert.ok(!raw.includes('ЗАЩИТА СЛОМАНА'), `тело ответа содержит секрет: ${attempt}`);
     }
-    await server.stop();
   } finally {
     fs.unlinkSync(markerPath);
   }
@@ -217,10 +223,9 @@ test('обход каталога через ../../package.json (эталонн�
   const { port } = await server.start();
   const raw = await rawRequest(port, 'GET /../../package.json HTTP/1.1');
   assert.notStrictEqual(statusOf(raw), 200);
-  await server.stop();
 });
 
-// --- Important 2: префиксные корни на Windows и граница сегмента ---------
+// --- Important: префиксные корни на Windows и граница сегмента -----------
 
 test('многокорневая раздача: реальные файлы xterm через префикс /node_modules (сценарий задачи 7)', async () => {
   // Ровно та конфигурация, которую задача 7 передаёт в createNetServer:
@@ -239,7 +244,6 @@ test('многокорневая раздача: реальные файлы xte
   const body = await res.text();
   assert.strictEqual(res.status, 200, 'xterm.css не отдался через префиксный корень');
   assert.ok(body.length > 0);
-  await server.stop();
 });
 
 test('префикс совпадает по границе сегмента, а не по началу строки', async () => {
@@ -259,7 +263,6 @@ test('префикс совпадает по границе сегмента, а
     assert.strictEqual(ok.status, 200);
     const leak = await fetch(`http://127.0.0.1:${port}/assets-private/secret.txt`);
     assert.notStrictEqual(leak.status, 200, 'соседний корень отдался по похожему префиксу');
-    await server.stop();
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -287,7 +290,6 @@ test('".." не выводит из префиксного корня в сос�
       assert.notStrictEqual(statusOf(raw), 200, `утекло по запросу: ${attempt}`);
       assert.ok(!raw.includes('ПРИВАТНОЕ'), attempt);
     }
-    await server.stop();
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -304,49 +306,125 @@ test('относительный root не превращает раздачу �
   const { port } = await server.start();
   const res = await fetch(`http://127.0.0.1:${port}/index.html`);
   assert.strictEqual(res.status, 200, `относительный root '${relative}' не сработал`);
-  await server.stop();
 });
 
-// --- Important 3: WebSocket принимает только свой origin ------------------
-// Раунд 2 ревью: белый список, собранный из host/port КОНФИГУРАЦИИ сервера
-// ('127.0.0.1'/'localhost'), отсекал ровно тот случай, ради которого всё
-// затевалось, — сервер поднят на Tailscale-адресе (задача 7), браузер на
-// макбуке шлёт Origin с ЭТИМ адресом, и такого адреса в списке нет: страница
-// грузится, а сокет получает 403. Проверка переписана на сравнение Origin с
-// заголовком Host ТОГО ЖЕ запроса — работает при любом адресе, включая
-// Tailscale, и не требует заранее знать, по какому имени к серверу придут.
+test('префикс с двоеточием в конфиге не ломает раздачу остальных корней', async () => {
+  // ':' в САМОМ ПУТИ ЗАПРОСА блокируется целиком как защита от NTFS ADS
+  // (index.html::$DATA) — значит запрос, которому нужен буквальный ':' в
+  // пути, до сервера не дойдёт никогда, это ожидаемо и отдельно от этого
+  // теста. Раньше баг был в другом месте: разбор ПРЕФИКСА ('/weird:root'
+  // как строки конфигурации) прогонялся через ТУ ЖЕ функцию, что и путь
+  // запроса, — она видела ':' и возвращала null для сегментов префикса на
+  // КАЖДОМ вызове resolveFile, вне зависимости от того, какой запрос
+  // разбирался. Само по себе это не крашило сервер, но смешение проверки
+  // «доверенный конфиг» и «недоверенный ввод» в одной функции — источник
+  // будущих сюрпризов. Префикс и путь запроса разобраны разными функциями;
+  // здесь проверяем реально наблюдаемое: наличие такого корня в
+  // конфигурации не мешает штатной раздаче ОСТАЛЬНЫХ корней.
+  const { server } = makeServer({
+    staticRoots: {
+      '/weird:root': path.join(__dirname, '..', 'assets'),
+      '/': path.join(__dirname, '..', 'src', 'renderer'),
+    },
+  });
+  const { port } = await server.start();
+  const res = await fetch(`http://127.0.0.1:${port}/index.html`);
+  assert.strictEqual(res.status, 200, 'соседний обычный корень должен работать как обычно');
+});
 
-test('WebSocket с Origin, не совпадающим с Host запроса, отклоняется на этапе апгрейда', async () => {
+// --- Раунд 2/3: WebSocket принимает только свой origin ---------------------
+// Раунд 2: белый список, собранный из host/port КОНФИГУРАЦИИ сервера,
+// отсекал сценарий, ради которого всё затевается, — сервер поднят на
+// Tailscale-адресе, браузер шлёт Origin с ЭТИМ адресом. Первый фикс раунда 2
+// сравнивал ТОЛЬКО Origin с заголовком Host того же запроса — чинил макбук,
+// но открывал DNS-rebinding: Host целиком в руках клиента, домен
+// атакующего с коротким TTL сам подставляет и Origin, и Host на одно и то
+// же чужое имя — сравнение "Origin == Host" в одиночку это пропускает,
+// потому что оба совпадают, оба подделаны одним и тем же клиентом.
+// Раунд 3: Host сначала сверяется с белым списком (host конфигурации,
+// 127.0.0.1/localhost, allowedHosts), и только ПОТОМ Origin — с уже
+// проверенным Host.
+
+test('свой Origin на дефолтном host (127.0.0.1) — подключается', async () => {
+  const { server } = makeServer();
+  const { port } = await server.start();
+  const ws = await open(`ws://127.0.0.1:${port}/ws`, { origin: `http://127.0.0.1:${port}` });
+  ws.send(JSON.stringify({ id: 1, channel: 'эхо', args: ['свой'] }));
+  assert.deepStrictEqual(await nextFrame(ws), { id: 1, ok: true, result: { эхо: 'свой' } });
+  ws.close();
+});
+
+test('чужой Origin при штатном Host (127.0.0.1) отклоняется на этапе апгрейда', async () => {
   const { server } = makeServer();
   const { port } = await server.start();
   await assert.rejects(
     () => open(`ws://127.0.0.1:${port}/ws`, { origin: 'https://evil.example.com' }),
-    (err) => {
-      assert.strictEqual(err.statusCode, 403);
-      return true;
-    },
+    (err) => { assert.strictEqual(err.statusCode, 403); return true; },
   );
   assert.strictEqual(server.clientCount(), 0, 'чужой origin не должен был попасть в клиенты');
-  await server.stop();
 });
 
-test('WebSocket с Origin, совпадающим с Host НЕСТАНДАРТНОГО адреса, подключается (сценарий задачи 7)', async () => {
-  // Сокет в тесте физически слушает 127.0.0.1, но заголовок Host у самого
-  // запроса подделываем на будущий Tailscale-адрес — именно так реальный
-  // браузер на макбуке обратился бы к серверу, поднятому не на localhost.
-  // Проверено отдельно (вне тестов): ws-клиент реально пробрасывает
-  // кастомный Host в HTTP-апгрейд, сервер видит его в req.headers.host.
+test('DNS-rebinding: Origin и Host ОДНОВРЕМЕННО подделаны на одно чужое имя — отклоняется', async () => {
+  // Это и есть закрываемый Critical: имя не входит в белый список — не
+  // важно, что Origin ему "соответствует", подделать оба одновременно
+  // может сам атакующий домен.
   const { server } = makeServer();
   const { port } = await server.start();
-  const fakeHost = '100.120.245.85:48300';
-  const ws = await open(`ws://127.0.0.1:${port}/ws`, {
-    origin: `http://${fakeHost}`,
-    headers: { Host: fakeHost },
-  });
-  ws.send(JSON.stringify({ id: 1, channel: 'эхо', args: ['с макбука'] }));
-  assert.deepStrictEqual(await nextFrame(ws), { id: 1, ok: true, result: { эхо: 'с макбука' } });
+  const evilHost = `evil.example.com:${port}`;
+  await assert.rejects(
+    () => open(`ws://127.0.0.1:${port}/ws`, { origin: `http://${evilHost}`, headers: { Host: evilHost } }),
+    (err) => { assert.strictEqual(err.statusCode, 403); return true; },
+  );
+  assert.strictEqual(server.clientCount(), 0);
+});
+
+test('allowedHosts: дополнительное имя из конфига (вход в тайлнет по имени, когда в конфиге записан IP) — подключается', async () => {
+  const dnsName = 'cockpit-desktop.tailXXXX.ts.net';
+  const { server } = makeServer({ allowedHosts: [dnsName] });
+  const { port } = await server.start();
+  const fakeHost = `${dnsName}:${port}`;
+  const ws = await open(`ws://127.0.0.1:${port}/ws`, { origin: `http://${fakeHost}`, headers: { Host: fakeHost } });
+  ws.send(JSON.stringify({ id: 1, channel: 'эхо', args: ['по имени'] }));
+  assert.deepStrictEqual(await nextFrame(ws), { id: 1, ok: true, result: { эхо: 'по имени' } });
   ws.close();
-  await server.stop();
+});
+
+test('имя вне host и вне allowedHosts отклоняется, даже когда Origin ему равен', async () => {
+  const { server } = makeServer({ allowedHosts: ['cockpit-desktop.tailXXXX.ts.net'] });
+  const { port } = await server.start();
+  const otherHost = `other-name.example:${port}`;
+  await assert.rejects(
+    () => open(`ws://127.0.0.1:${port}/ws`, { origin: `http://${otherHost}`, headers: { Host: otherHost } }),
+    (err) => { assert.strictEqual(err.statusCode, 403); return true; },
+  );
+});
+
+test("host='0.0.0.0' (слушать везде) сам по себе не становится разрешённым именем", async () => {
+  // '0.0.0.0' — адрес «слушать на всех интерфейсах», а не имя, по которому
+  // реально пришёл запрос. Включить его в белый список значило бы
+  // разрешить буквально любой Host, стоит серверу слушать 0.0.0.0.
+  const { server } = makeServer({ host: '0.0.0.0' });
+  const { port } = await server.start();
+  const fakeHost = `0.0.0.0:${port}`;
+  await assert.rejects(
+    () => open(`ws://127.0.0.1:${port}/ws`, { origin: `http://${fakeHost}`, headers: { Host: fakeHost } }),
+    (err) => { assert.strictEqual(err.statusCode, 403); return true; },
+  );
+  // Но 127.0.0.1 (всегда в списке) на том же сервере по-прежнему работает.
+  const ws = await open(`ws://127.0.0.1:${port}/ws`, { origin: `http://127.0.0.1:${port}` });
+  ws.send(JSON.stringify({ id: 1, channel: 'эхо', args: ['жив'] }));
+  assert.deepStrictEqual(await nextFrame(ws), { id: 1, ok: true, result: { эхо: 'жив' } });
+  ws.close();
+});
+
+test('Host в другом регистре (LOCALHOST) распознаётся как разрешённый', async () => {
+  const { server } = makeServer();
+  const { port } = await server.start();
+  const mixedHost = `LOCALHOST:${port}`;
+  const ws = await open(`ws://127.0.0.1:${port}/ws`, { origin: `http://${mixedHost}`, headers: { Host: mixedHost } });
+  ws.send(JSON.stringify({ id: 1, channel: 'эхо', args: ['регистр'] }));
+  assert.deepStrictEqual(await nextFrame(ws), { id: 1, ok: true, result: { эхо: 'регистр' } });
+  ws.close();
 });
 
 test('WebSocket без Origin (не браузер) подключается как раньше', async () => {
@@ -356,7 +434,6 @@ test('WebSocket без Origin (не браузер) подключается к�
   ws.send(JSON.stringify({ id: 1, channel: 'эхо', args: ['свой'] }));
   assert.deepStrictEqual(await nextFrame(ws), { id: 1, ok: true, result: { эхо: 'свой' } });
   ws.close();
-  await server.stop();
 });
 
 // --- Мелочи: протокол отвечает ошибкой, а не тишиной ----------------------
@@ -370,7 +447,6 @@ test('кадр с id, но без валидного channel — получае�
   assert.strictEqual(frame.id, 6);
   assert.strictEqual(frame.ok, false);
   ws.close();
-  await server.stop();
 });
 
 test('args не массивом — явная ошибка протокола, а не молчаливый вызов без аргументов', async () => {
@@ -381,7 +457,6 @@ test('args не массивом — явная ошибка протокола,
   const frame = await nextFrame(ws);
   assert.strictEqual(frame.ok, false);
   ws.close();
-  await server.stop();
 });
 
 test('несериализуемый результат канала получает ok:false, а не тишину', async () => {
@@ -398,27 +473,29 @@ test('несериализуемый результат канала получ�
   assert.strictEqual(frame.id, 8);
   assert.strictEqual(frame.ok, false);
   ws.close();
-  await server.stop();
 });
 
-// --- Раунд 2: занятый порт не роняет процесс -------------------------------
+// --- Занятый порт не роняет процесс ---------------------------------------
 
 test('порт занят посторонним сервером — start() отклоняется, процесс жив', async () => {
   // WebSocket.Server({server}) сам переизлучает ЛЮБУЮ ошибку http-сервера
-  // как wss.emit('error', err) — без своего слушателя на wss (а не только
-  // на server) EventEmitter бросает необработанное исключение НА ЭТОМ,
-  // отдельном пути, и роняет весь процесс раньше, чем reject() успевает
-  // сработать. Если бы process упал, этот тест не досчитался бы до
-  // assert.rejects — сам факт зелёного теста и есть доказательство.
+  // как wss.emit('error', err) — без своего слушателя на wss EventEmitter
+  // бросает необработанное исключение НА ЭТОМ, отдельном пути, и роняет
+  // весь процесс раньше, чем reject() успевает сработать. Если бы process
+  // упал, этот тест не досчитался бы до assert.rejects — сам факт зелёного
+  // теста и есть доказательство.
   const foreign = net.createServer();
   await new Promise((resolve) => foreign.listen(0, '127.0.0.1', resolve));
-  const busyPort = foreign.address().port;
-  const { server } = makeServer({ port: busyPort });
-  await assert.rejects(() => server.start(), /EADDRINUSE/);
-  await new Promise((resolve) => foreign.close(resolve));
+  try {
+    const busyPort = foreign.address().port;
+    const { server } = makeServer({ port: busyPort });
+    await assert.rejects(() => server.start(), /EADDRINUSE/);
+  } finally {
+    await new Promise((resolve) => foreign.close(resolve));
+  }
 });
 
-// --- Раунд 2: stop() не должен виснуть на открытых соединениях ------------
+// --- stop() не должен виснуть на открытых соединениях ---------------------
 
 test('stop() не виснет на висящем keep-alive соединении', async () => {
   // Раньше server.close() ждал, пока браузер САМ отпустит keep-alive-связь
@@ -428,17 +505,20 @@ test('stop() не виснет на висящем keep-alive соединени
   const { server } = makeServer();
   const { port } = await server.start();
   const sock = net.connect(port, '127.0.0.1');
-  await new Promise((resolve, reject) => {
-    sock.once('connect', resolve);
-    sock.once('error', reject);
-  });
-  sock.write('GET /index.html HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n');
-  await new Promise((resolve) => sock.once('data', resolve)); // ответ пошёл, соединение НЕ закрываем
-  const t0 = Date.now();
-  await server.stop();
-  const elapsed = Date.now() - t0;
-  assert.ok(elapsed < 1000, `stop() занял ${elapsed} мс — висит на keep-alive`);
-  sock.destroy();
+  try {
+    await new Promise((resolve, reject) => {
+      sock.once('connect', resolve);
+      sock.once('error', reject);
+    });
+    sock.write('GET /index.html HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n');
+    await new Promise((resolve) => sock.once('data', resolve)); // ответ пошёл, соединение НЕ закрываем
+    const t0 = Date.now();
+    await server.stop();
+    const elapsed = Date.now() - t0;
+    assert.ok(elapsed < 1000, `stop() занял ${elapsed} мс — висит на keep-alive`);
+  } finally {
+    sock.destroy();
+  }
 });
 
 // --- Мелочь: сегмент с ':' (обход MIME/расширения через NTFS ADS) ---------
@@ -448,5 +528,4 @@ test('сегмент с двоеточием (index.html::$DATA) не отдаё
   const { port } = await server.start();
   const res = await fetch(`http://127.0.0.1:${port}/index.html::$DATA`);
   assert.notStrictEqual(res.status, 200, 'ADS-путь не должен отдавать файл');
-  await server.stop();
 });

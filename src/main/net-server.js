@@ -10,9 +10,9 @@
 // кадр-событие без id. Ничего, кроме JSON, — отлаживается глазами в консоли
 // браузера.
 //
-// История правок — в комментариях у конкретных мест, не здесь: первый раунд
-// ревью закрыл traversal/percent-encoding/CORS, второй — падение процесса на
-// занятом порту, отказ подключений с Tailscale-адреса и зависание stop().
+// История правок — в комментариях у конкретных мест, не здесь: раунд 1
+// закрыл traversal/percent-encoding/CORS, раунд 2 — падение процесса на
+// занятом порту и зависание stop(), раунд 3 — DNS-rebinding в проверке Origin.
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -40,8 +40,8 @@ function splitSegments(p) {
 }
 
 // Гасим '.' и '..' вручную, сегмент за сегментом, не давая уйти выше начала
-// списка. '..' на пустом стеке просто отбрасывается — подняться выше
-// стартовой точки невозможно, сколько бы '..' ни было в запросе. Это
+// списка. pop() на пустом массиве и без охраны ничего не делает (не
+// бросает) — отдельная проверка перед ним была бессмысленной. Это
 // единственный источник защиты от traversal: она работает ДО path.join, а
 // не проверяется постфактум строкой startsWith (та проверка добавляла
 // ложное чувство безопасности, но реальной работы не делала).
@@ -49,24 +49,47 @@ function splitSegments(p) {
 // Сегмент с ':' отбрасываем целиком (не как файл, не как проход): на NTFS
 // синтаксис 'файл::$DATA' читает тот же файл через альтернативный поток —
 // за корень это не выводит, но обходит определение MIME-типа по расширению
-// и обойдёт любой будущий фильтр, завязанный на path.extname. Легитимным
-// именам ':' не нужен ни в одном staticRoot этого проекта.
+// и обойдёт любой будущий фильтр, завязанный на path.extname.
+//
+// ВАЖНО: эта функция — только для ПУТИ ЗАПРОСА (недоверенный ввод). Для
+// префиксов staticRoots ниже используется отдельная splitPrefixSegments —
+// без запрета на ':' и без схлопывания '..'. Раньше здесь была одна функция
+// на оба случая, и префикс с ':' (пусть и маловероятный, но валидный ключ
+// объекта) тихо получал prefixSegs === null и навсегда переставал
+// совпадать — корень умирал без единой ошибки в логе. Доверенная
+// конфигурация не должна страдать от защиты, рассчитанной на чужой ввод.
 function collapseSegments(segments) {
   const out = [];
   for (const seg of segments) {
     if (seg === '' || seg === '.') continue;
-    if (seg === '..') { if (out.length) out.pop(); continue; }
+    if (seg === '..') { out.pop(); continue; }
     if (seg.includes(':')) return null;
     out.push(seg);
   }
   return out;
 }
 
+// Префикс staticRoots — часть кода/конфига, не запроса: не подчищаем '..'
+// (в нём его и не будет) и не отбрасываем ':' — просто убираем пустые
+// сегменты, чтобы сравнение по сегментам ниже совпадало 1-в-1 с тем, что
+// даёт collapseSegments на пути запроса.
+function splitPrefixSegments(prefix) {
+  return splitSegments(prefix).filter((seg) => seg !== '' && seg !== '.');
+}
+
+// '0.0.0.0' и '::' — адрес «слушать на всех интерфейсах», а не имя, по
+// которому реально пришёл запрос. Включить их в белый список Host означало
+// бы разрешить буквально любой заголовок Host, который умеет подделать
+// кто угодно, — то есть выключить проверку целиком именно тогда, когда
+// сервер слушает шире всего.
+const LISTEN_ANYWHERE = new Set(['0.0.0.0', '::', '::0']);
+
 function createNetServer({
-  registry, broadcast, outputBuffer, staticRoots, port = 48300, host = '127.0.0.1',
+  registry, broadcast, outputBuffer, staticRoots, port = 48300, host = '127.0.0.1', allowedHosts = [],
 }) {
   let server = null;
   let wss = null;
+  let hostAllowlist = null; // Set<'имя:порт'> в нижнем регистре — заполняется после listen()
   const clients = new Set();
   const heartbeats = new Map(); // ws → жив ли с прошлого пинга
 
@@ -88,7 +111,7 @@ function createNetServer({
 
   function resolveFile(decodedPath) {
     const clean = collapseSegments(splitSegments(decodedPath.split('?')[0]));
-    if (clean === null) return null; // ':' в сегменте — потенциальный ADS-обход
+    if (clean === null) return null; // ':' в сегменте пути — потенциальный ADS-обход
     for (const [rawPrefix, root] of roots) {
       let rest;
       if (rawPrefix === '/') {
@@ -97,8 +120,8 @@ function createNetServer({
         // Сравнение ПО СЕГМЕНТАМ, а не по началу строки: префикс '/assets'
         // не имеет права подхватить запрос к '/assets-private/...' — это
         // была бы утечка соседнего корня через похожее имя.
-        const prefixSegs = collapseSegments(splitSegments(rawPrefix));
-        const matches = prefixSegs && prefixSegs.length <= clean.length
+        const prefixSegs = splitPrefixSegments(rawPrefix);
+        const matches = prefixSegs.length <= clean.length
           && prefixSegs.every((seg, i) => clean[i] === seg);
         if (!matches) continue;
         rest = clean.slice(prefixSegs.length);
@@ -181,31 +204,50 @@ function createNetServer({
     }
   }
 
+  // Белый список Host собирается ОДИН раз, когда становится известен
+  // реальный порт (после listen — port:0 отдаёт эфемерный). Источники:
+  // сам host конфигурации (кроме 0.0.0.0/:: — «везде», не имя), 127.0.0.1
+  // и localhost всегда, и необязательный allowedHosts — доп. имена. Он
+  // нужен, потому что к машине приходят и по IP, и по имени в тайлнете
+  // одновременно, а в конфиге записан обычно один адрес: без allowedHosts
+  // человек пропишет IP, зайдёт по имени — и получит тот же отказ, который
+  // мы чиним, только с другой стороны.
+  function buildHostAllowlist(boundPort) {
+    const names = new Set(['127.0.0.1', 'localhost']);
+    if (host && !LISTEN_ANYWHERE.has(host)) names.add(host);
+    for (const extra of allowedHosts || []) { if (extra) names.add(String(extra)); }
+    return new Set([...names].map((n) => `${n.toLowerCase()}:${boundPort}`));
+  }
+
   // Разрешаем подключаться только странице, реально загруженной С ЭТОГО
   // сервера. Без этой проверки любая вкладка, открытая в браузере на том же
   // ПК, могла бы подключиться к сокету и вызвать ЛЮБУЮ команду реестра —
   // включая запись в терминал. WebSocket не подчиняется CORS/same-origin
   // сам по себе, это надо проверять руками на этапе апгрейда.
   //
-  // Сверяем Origin с заголовком Host ТОГО ЖЕ запроса, а не со списком,
-  // собранным из host/port конфигурации сервера. Причина: сервер слушает
-  // адрес из конфига (Tailscale IP, задача 7), а браузер на макбуке шлёт
-  // Origin именно с этим адресом — заранее вычисленный список из
-  // '127.0.0.1'/'localhost' его не содержал бы, и легитимный клиент
-  // получал бы 403 (проверено ре-ревьюером: страница грузится, сокет —
-  // нет). Host и Origin у одного и того же запроса браузер всегда
-  // выставляет из одного и того же адреса навигации — совпадение и есть
-  // подтверждение «страницу отдали мы же», при любом host/port/имени.
+  // DNS-rebinding: заголовок Host целиком контролирует клиент — браузер
+  // ставит туда то имя, по которому его отправили, а не то, куда реально
+  // подключился TCP-сокет. Атака: домен атакующего с коротким TTL сначала
+  // указывает на его сервер (страница грузится и открывает ws на то же
+  // имя), затем DNS перепривязывается на адрес кокпита — Origin и Host
+  // совпадают, ОБА равны вредоносному имени. Проверка «Origin == Host» в
+  // одиночку это ПРОПУСКАЕТ: оба совпадают именно потому, что оба
+  // подделаны. Поэтому Host сверяется с белым списком ПЕРВЫМ (имя, которое
+  // мы реально ожидаем), и только потом Origin — с уже проверенным Host.
   //
   // Origin отсутствует — не браузер (тестовый клиент, будущий нативный
   // инструмент): пропускаем. Подделать сам заголовок со страницы браузер
   // не даёт, риск именно в случаях, когда Origin ЕСТЬ и он чужой.
   function isAllowedOrigin(origin, requestHost) {
     if (!origin) return true;
-    if (!requestHost) return false;
-    let originHost;
-    try { originHost = new URL(origin).host; } catch { return false; }
-    return originHost === requestHost;
+    if (!requestHost || !hostAllowlist.has(requestHost.toLowerCase())) return false;
+    let originUrl;
+    try { originUrl = new URL(origin); } catch { return false; }
+    // Сервер не поднимает TLS: Origin со схемой https:// не может быть
+    // «нами», даже если имя и порт совпали — сравнение host было бы верным
+    // технически, но перестало бы означать «страницу отдали мы же».
+    if (originUrl.protocol !== 'http:') return false;
+    return originUrl.host.toLowerCase() === requestHost.toLowerCase();
   }
 
   return {
@@ -217,7 +259,7 @@ function createNetServer({
           path: '/ws',
           verifyClient: (info, callback) => {
             const ok = isAllowedOrigin(info.origin, info.req.headers.host);
-            callback(ok, ok ? undefined : 403, ok ? undefined : 'чужой origin');
+            callback(ok, ok ? undefined : 403, ok ? undefined : 'чужой origin/host');
           },
         });
         wss.on('connection', (ws) => {
@@ -244,23 +286,21 @@ function createNetServer({
 
         // ВАЖНО: WebSocket.Server({server}) сам переизлучает ЛЮБУЮ ошибку
         // http-сервера как wss.emit('error', err) — см.
-        // ws/lib/websocket-server.js (слушатель ставится в конструкторе,
-        // раньше, чем наш server.on('error') ниже). Без СВОЕГО слушателя
-        // на wss этот 'error' остаётся необработанным на этом, отдельном,
-        // пути — EventEmitter бросает его синхронно, и process падает
-        // ДО того, как успевает сработать server.on('error'). Один и тот
-        // же EADDRINUSE (порт занят — не гипотетический сценарий, у
-        // пользователя уже был конфликт на 48200) иначе валит весь
-        // Electron вместе со всеми pty открытых вкладок, несмотря на,
-        // казалось бы, обработанный reject() ниже.
+        // ws/lib/websocket-server.js (слушатель ставится в конструкторе
+        // САМОГО wss, то есть раньше, чем что-либо наше). Слушаем ошибку
+        // ТОЛЬКО на wss, а не отдельно ещё и на server: второй слушатель
+        // на том же исходном событии удваивал бы лог ПОСЛЕ старта (одна
+        // ошибка — две строки), а до старта без слушателя на wss этот
+        // 'error' остаётся необработанным на своём, отдельном пути —
+        // EventEmitter бросает его синхронно, и process падает ДО того,
+        // как успевает сработать reject() (EADDRINUSE — не гипотетический
+        // сценарий, у пользователя уже был конфликт портов).
         const onStartError = (err) => { clearInterval(heartbeat); reject(err); };
-        server.on('error', onStartError);
         wss.on('error', onStartError);
         server.listen(port, host, () => {
-          server.removeListener('error', onStartError);
           wss.removeListener('error', onStartError);
-          server.on('error', (err) => console.log(`[net] ошибка сервера: ${err.message}`));
-          wss.on('error', (err) => console.log(`[net] ошибка WebSocket-сервера: ${err.message}`));
+          wss.on('error', (err) => console.log(`[net] ошибка сервера: ${err.message}`));
+          hostAllowlist = buildHostAllowlist(server.address().port);
           server._cockpitHeartbeat = heartbeat; // чтобы stop() мог его погасить
           resolve({ port: server.address().port });
         });
