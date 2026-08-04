@@ -17,6 +17,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
 const net = require('node:net');
+const { EventEmitter } = require('node:events');
 const WebSocket = require('ws');
 const { createNetServer } = require('../src/main/net-server');
 const { createCommandRegistry } = require('../src/main/command-registry');
@@ -427,6 +428,52 @@ test('Host в другом регистре (LOCALHOST) распознаётся
   ws.close();
 });
 
+// --- Раунд 4: IPv6-литерал и «молчаливо мёртвые» записи белого списка ----
+// Браузер всегда шлёт IPv6-литерал в Host/Origin в квадратных скобках
+// ('[::1]:порт', RFC 3986) — голый '::1' в белом списке никогда бы не
+// совпал с тем, что реально приходит по сети, и адрес Tailscale IPv6
+// (выдаётся всегда, наравне с IPv4) отрезал бы браузер целиком.
+
+test('IPv6-литерал в allowedHosts автоматически оборачивается в скобки и совпадает с Host браузера', async () => {
+  // Голая запись в конфиге — 'fd7a:115c:1234::1' (без скобок, как и
+  // задокументировано в комментарии у allowedHosts); браузер же всегда
+  // шлёт Host в скобках — сервер обязан свести оба вида к одному.
+  const ipv6 = 'fd7a:115c:1234::1';
+  const { server } = makeServer({ allowedHosts: [ipv6] });
+  const { port } = await server.start();
+  const bracketedHost = `[${ipv6}]:${port}`;
+  const ws = await open(`ws://127.0.0.1:${port}/ws`, {
+    origin: `http://${bracketedHost}`,
+    headers: { Host: bracketedHost },
+  });
+  ws.send(JSON.stringify({ id: 1, channel: 'эхо', args: ['ipv6'] }));
+  assert.deepStrictEqual(await nextFrame(ws), { id: 1, ok: true, result: { эхо: 'ipv6' } });
+  ws.close();
+});
+
+test('пробелы по краям в allowedHosts не превращают запись в молчаливо мёртвую', async () => {
+  const dnsName = 'cockpit-desktop.tailXXXX.ts.net';
+  const { server } = makeServer({ allowedHosts: [`  ${dnsName}  `] });
+  const { port } = await server.start();
+  const fakeHost = `${dnsName}:${port}`;
+  const ws = await open(`ws://127.0.0.1:${port}/ws`, { origin: `http://${fakeHost}`, headers: { Host: fakeHost } });
+  ws.send(JSON.stringify({ id: 1, channel: 'эхо', args: ['без пробелов'] }));
+  assert.deepStrictEqual(await nextFrame(ws), { id: 1, ok: true, result: { эхо: 'без пробелов' } });
+  ws.close();
+});
+
+test("'0.0.0.0' в allowedHosts тоже отбрасывается, а не только в host", async () => {
+  // Раньше фильтр «это не имя, это 'слушать везде'» применялся только к
+  // host — в allowedHosts 0.0.0.0 проходил как есть и разрешал ЛЮБОЙ Host.
+  const { server } = makeServer({ allowedHosts: ['0.0.0.0'] });
+  const { port } = await server.start();
+  const fakeHost = `0.0.0.0:${port}`;
+  await assert.rejects(
+    () => open(`ws://127.0.0.1:${port}/ws`, { origin: `http://${fakeHost}`, headers: { Host: fakeHost } }),
+    (err) => { assert.strictEqual(err.statusCode, 403); return true; },
+  );
+});
+
 test('WebSocket без Origin (не браузер) подключается как раньше', async () => {
   const { server } = makeServer();
   const { port } = await server.start();
@@ -528,4 +575,54 @@ test('сегмент с двоеточием (index.html::$DATA) не отдаё
   const { port } = await server.start();
   const res = await fetch(`http://127.0.0.1:${port}/index.html::$DATA`);
   assert.notStrictEqual(res.status, 200, 'ADS-путь не должен отдавать файл');
+});
+
+// --- Важное наследие раунда 1: ошибка чтения файла не роняет процесс -----
+// .pipe() слушает ошибки только на приёмнике — ошибка чтения источника
+// (EBUSY: антивирус, npm install поверх node_modules, автообновление,
+// редактор с открытым файлом — злоумышленник для этого не нужен) была
+// необработанным исключением и валила ВЕСЬ Electron. Живьём проверено
+// отдельно (не в этом наборе) настоящей блокировкой файла через PowerShell
+// ([System.IO.File]::Open(..., 'None')) — 500, сервер остался жив и тут же
+// штатно отдал следующий файл. Здесь — детерминированная регрессия через
+// подмену fs.createReadStream: тестировать НЕПРЕДСКАЗУЕМУЮ по времени
+// внешнюю блокировку каждый прогон было бы медленно и хрупко, а код не
+// различает ПРИЧИНУ ошибки потока — реагирует ровно на само событие 'error'.
+
+test('ошибка чтения ДО открытия файла (аналог EBUSY) — 500, а не падение процесса', async (t) => {
+  const { server } = makeServer();
+  const { port } = await server.start();
+  const mockFn = t.mock.method(fs, 'createReadStream', () => {
+    const emitter = new EventEmitter();
+    emitter.pipe = () => emitter; // не участвует в проверке — просто заглушка
+    process.nextTick(() => {
+      emitter.emit('error', Object.assign(new Error('EBUSY: resource busy or locked'), { code: 'EBUSY' }));
+    });
+    return emitter;
+  });
+  const res = await fetch(`http://127.0.0.1:${port}/index.html`);
+  assert.strictEqual(res.status, 500, 'заблокированный файл должен отвечать 500, а не убивать процесс');
+  mockFn.mock.restore();
+  // Сервер жив — тот же порт штатно обслуживает следующий, уже настоящий запрос.
+  const ok = await fetch(`http://127.0.0.1:${port}/index.html`);
+  assert.strictEqual(ok.status, 200, 'сервер должен остаться живым после ошибки чтения');
+});
+
+test('ошибка чтения ПОСЛЕ открытия файла (обрыв на середине) — соединение рвётся, а не притворяется целым файлом', async (t) => {
+  const { server } = makeServer();
+  const { port } = await server.start();
+  t.mock.method(fs, 'createReadStream', () => {
+    const emitter = new EventEmitter();
+    emitter.pipe = () => emitter; // заголовки уже уйдут по 'open' — реального тела не шлём
+    process.nextTick(() => {
+      emitter.emit('open'); // res.writeHead(200) уже случился к этому моменту
+      process.nextTick(() => {
+        emitter.emit('error', Object.assign(new Error('EIO: чтение упало на середине'), { code: 'EIO' }));
+      });
+    });
+    return emitter;
+  });
+  // Заголовки (200) уже ушли к моменту ошибки — по протоколу соединение
+  // должно оборваться, а не тихо закрыться так, будто файл дошёл целиком.
+  await assert.rejects(() => fetch(`http://127.0.0.1:${port}/index.html`).then((r) => r.text()));
 });

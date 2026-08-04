@@ -151,8 +151,32 @@ function createNetServer({
     }
     const file = resolveFile(decoded);
     if (!file) { res.writeHead(404); res.end('нет такого'); return; }
-    res.writeHead(200, { 'content-type': MIME[path.extname(file)] || 'application/octet-stream' });
-    fs.createReadStream(file).pipe(res);
+    // .pipe() слушает ошибки только на ПРИЁМНИКЕ (res), не на источнике —
+    // ошибка чтения (EBUSY: антивирус, npm install поверх node_modules,
+    // автообновление, редактор с открытым файлом — злоумышленник для этого
+    // не нужен) становится необработанным исключением и валит ВЕСЬ процесс
+    // Electron (main.js ловит это как критический сбой и делает app.exit(1)),
+    // тот же класс, что и битый %-escape в задаче 1, просто другой триггер.
+    // Слушаем 'error' прямо на читающем потоке. 'open' — сигнал, что файл
+    // реально открылся: заголовки шлём ТОЛЬКО после него, поэтому если
+    // ошибка случится ДО открытия, клиент получает честный 500, а не
+    // оборванное "200 OK" без тела; если файл открылся и чтение упало на
+    // середине — заголовки уже ушли, соединение просто рвём (res.destroy),
+    // чтобы клиент не принял обрезанные данные за целый файл.
+    const stream = fs.createReadStream(file);
+    stream.on('error', (err) => {
+      console.log(`[net] ошибка чтения ${file}: ${err.message}`);
+      if (!res.headersSent) {
+        res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end('ошибка чтения файла');
+      } else {
+        res.destroy();
+      }
+    });
+    stream.on('open', () => {
+      res.writeHead(200, { 'content-type': MIME[path.extname(file)] || 'application/octet-stream' });
+    });
+    stream.pipe(res);
   }
 
   async function onFrame(ws, raw) {
@@ -204,6 +228,18 @@ function createNetServer({
     }
   }
 
+  // Литерал IPv6 в заголовке Host/URI ОБЯЗАН быть в квадратных скобках
+  // (RFC 3986) — браузер шлёт 'Host: [::1]:порт', а не '::1:порт'. Без
+  // обёртки адрес Tailscale IPv6 (выдаётся всегда, кроме IPv4) отрезал бы
+  // браузер целиком, оставляя рабочим только заход по localhost. Признак
+  // «это IPv6, а не DNS-имя с портом внутри» — двоеточие в самом имени:
+  // легитимное DNS-имя/allowedHosts-запись их не содержит (формат — см.
+  // комментарий у allowedHosts ниже), так что эвристика безопасна.
+  function withPort(name, boundPort) {
+    const bracketed = name.includes(':') && !name.startsWith('[') ? `[${name}]` : name;
+    return `${bracketed}:${boundPort}`;
+  }
+
   // Белый список Host собирается ОДИН раз, когда становится известен
   // реальный порт (после listen — port:0 отдаёт эфемерный). Источники:
   // сам host конфигурации (кроме 0.0.0.0/:: — «везде», не имя), 127.0.0.1
@@ -212,11 +248,28 @@ function createNetServer({
   // одновременно, а в конфиге записан обычно один адрес: без allowedHosts
   // человек пропишет IP, зайдёт по имени — и получит тот же отказ, который
   // мы чиним, только с другой стороны.
+  //
+  // Формат каждой записи (host и элементы allowedHosts) — ГОЛОЕ имя или
+  // адрес, БЕЗ порта и без квадратных скобок вокруг IPv6 (те добавляются
+  // здесь сами): 'cockpit-desktop.tailXXXX.ts.net', '100.120.245.85',
+  // 'fd7a:115c::1'. Порт в значении ('example.com:9999') не отрезается —
+  // такая запись просто никогда не совпадёт, это на совести того, кто
+  // писал конфиг, а не повод гадать, что имелось в виду.
   function buildHostAllowlist(boundPort) {
     const names = new Set(['127.0.0.1', 'localhost']);
-    if (host && !LISTEN_ANYWHERE.has(host)) names.add(host);
-    for (const extra of allowedHosts || []) { if (extra) names.add(String(extra)); }
-    return new Set([...names].map((n) => `${n.toLowerCase()}:${boundPort}`));
+    // Пробелы по краям и 0.0.0.0/:: — источник МОЛЧАЛИВО мёртвой записи:
+    // валидацию (это просто непустая строка) значение проходит, но никогда
+    // ни с чем не совпадёт. Фильтр общий для host и allowedHosts — раньше
+    // 0.0.0.0 отсекался только для host, а в allowedHosts проходил как есть.
+    const addName = (raw) => {
+      if (!raw) return;
+      const trimmed = String(raw).trim();
+      if (!trimmed || LISTEN_ANYWHERE.has(trimmed)) return;
+      names.add(trimmed);
+    };
+    addName(host);
+    for (const extra of allowedHosts || []) addName(extra);
+    return new Set([...names].map((n) => withPort(n.toLowerCase(), boundPort)));
   }
 
   // Разрешаем подключаться только странице, реально загруженной С ЭТОГО
