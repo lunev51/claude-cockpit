@@ -1,6 +1,17 @@
 'use strict';
 // Оркестрация renderer: вкладки ↔ пул терминалов ↔ адресный IPC.
 
+// ПЕРВЫЙ импорт нарочно — не убирать и не переставлять ниже. api-boot.js
+// внутри ждёт top-level await (или ничего не делает, если мы в Electron и
+// window.api уже собран preload'ом). ES-модули исполняют импортируемые
+// модули ДО тела импортирующего — значит boot() ниже (которая на первой
+// же строке зовёт window.api.config.get()) гарантированно увидит готовый
+// window.api. Раньше этот же await жил в отдельном <script type="module">
+// рядом в index.html — независимый параллельный модуль его не дожидался
+// вообще, и в браузере (не в Electron, где смоук ничего не ловит) app.js
+// стартовал раньше api-boot.js: TypeError на чтении .config у undefined
+// (ревью задачи 6, Critical 1, подтверждено живым Chromium).
+import './api-boot.js';
 import { initTerminal } from './terminal.js';
 import { createTabStore } from './tabs.js';
 import { renderBadge } from './badge.js';

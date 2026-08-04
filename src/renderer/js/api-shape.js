@@ -2,17 +2,25 @@
 // Форма window.api: единый список для сетевого моста. Сверяется с preload.js
 // тестом ниже — расхождение означает метод, который в браузере просто
 // отсутствует и падает в неожиданный момент, а не при загрузке.
+//
+// pack — только там, где preload.js САМ переупаковывает позиционные
+// аргументы renderer в один объект перед ipcRenderer.send/invoke (например
+// `write: (tabId, data) => ipcRenderer.send('term:write', { tabId, data })`).
+// Без этого поля net-api.js отправил бы список ['T1','ls\r'], сервер сделал
+// бы fn(...args) и main-обработчик получил бы 'T1' вместо {tabId,data} —
+// команда пропала бы молча (ревью задачи 6, Critical 2). Имена и порядок
+// полей — дословно из preload.js, не восстановлены по догадке.
 export const API_SHAPE = {
   'config.get': { channel: 'config:get', kind: 'invoke' },
   'config.set': { channel: 'config:set', kind: 'invoke' },
   'tabs.open': { channel: 'tabs:open', kind: 'invoke' },
   'tabs.close': { channel: 'tabs:close', kind: 'invoke' },
   'tabs.chooseFolder': { channel: 'tabs:chooseFolder', kind: 'invoke' },
-  'tabs.markSeen': { channel: 'tabs:seen', kind: 'send' },
-  'term.start': { channel: 'term:start', kind: 'send' },
-  'term.write': { channel: 'term:write', kind: 'send' },
-  'term.resize': { channel: 'term:resize', kind: 'send' },
-  'term.restart': { channel: 'term:restart', kind: 'send' },
+  'tabs.markSeen': { channel: 'tabs:seen', kind: 'send', pack: ['tabId'] },
+  'term.start': { channel: 'term:start', kind: 'send', pack: ['tabId', 'cols', 'rows'] },
+  'term.write': { channel: 'term:write', kind: 'send', pack: ['tabId', 'data'] },
+  'term.resize': { channel: 'term:resize', kind: 'send', pack: ['tabId', 'cols', 'rows'] },
+  'term.restart': { channel: 'term:restart', kind: 'send', pack: ['tabId'] },
   'term.onData': { channel: 'term:data', kind: 'event' },
   'term.onExit': { channel: 'term:exit', kind: 'event' },
   'term.onStarted': { channel: 'term:started', kind: 'event' },
@@ -28,15 +36,15 @@ export const API_SHAPE = {
   'tab.onStatus': { channel: 'tab:status', kind: 'event' },
   'tab.onActivate': { channel: 'tab:activate', kind: 'event' },
   'workspace.get': { channel: 'workspace:get', kind: 'invoke' },
-  'workspace.setActive': { channel: 'workspace:setActive', kind: 'send' },
+  'workspace.setActive': { channel: 'workspace:setActive', kind: 'send', pack: ['tabId'] },
   'workspace.ready': { channel: 'workspace:ready', kind: 'send' },
-  'ghost.save': { channel: 'ghost:save', kind: 'invoke' },
+  'ghost.save': { channel: 'ghost:save', kind: 'invoke', pack: ['tabId', 'text'] },
   'ghost.load': { channel: 'ghost:load', kind: 'invoke' },
-  'attention.update': { channel: 'attention:update', kind: 'send' },
+  'attention.update': { channel: 'attention:update', kind: 'send', pack: ['count', 'dataUrl'] },
   'screenshot.paste': { channel: 'screenshot:paste', kind: 'invoke' },
-  'queue.add': { channel: 'queue:add', kind: 'send' },
-  'queue.remove': { channel: 'queue:remove', kind: 'send' },
-  'queue.clear': { channel: 'queue:clear', kind: 'send' },
+  'queue.add': { channel: 'queue:add', kind: 'send', pack: ['tabId', 'text'] },
+  'queue.remove': { channel: 'queue:remove', kind: 'send', pack: ['tabId', 'index'] },
+  'queue.clear': { channel: 'queue:clear', kind: 'send', pack: ['tabId'] },
   'queue.onChanged': { channel: 'queue:changed', kind: 'event' },
   'history.search': { channel: 'history:search', kind: 'invoke' },
   'history.refresh': { channel: 'history:refresh', kind: 'invoke' },
