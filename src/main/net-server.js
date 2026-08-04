@@ -10,12 +10,9 @@
 // кадр-событие без id. Ничего, кроме JSON, — отлаживается глазами в консоли
 // браузера.
 //
-// Ревью первого раунда нашло, что «эталонный» вариант из брифа падает на
-// живой сети: битый %-escape в адресе роняет весь Electron, префиксные корни
-// не работают на Windows (обратные слэши после normalize против прямых в
-// ключах объекта), тест на traversal ничего не проверял (fetch() сам режет
-// '..' до отправки), а WebSocket принимал подключение с любого сайта.
-// Комментарии ниже — про то, как это закрыто, а не про историю.
+// История правок — в комментариях у конкретных мест, не здесь: первый раунд
+// ревью закрыл traversal/percent-encoding/CORS, второй — падение процесса на
+// занятом порту, отказ подключений с Tailscale-адреса и зависание stop().
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -48,11 +45,18 @@ function splitSegments(p) {
 // единственный источник защиты от traversal: она работает ДО path.join, а
 // не проверяется постфактум строкой startsWith (та проверка добавляла
 // ложное чувство безопасности, но реальной работы не делала).
+//
+// Сегмент с ':' отбрасываем целиком (не как файл, не как проход): на NTFS
+// синтаксис 'файл::$DATA' читает тот же файл через альтернативный поток —
+// за корень это не выводит, но обходит определение MIME-типа по расширению
+// и обойдёт любой будущий фильтр, завязанный на path.extname. Легитимным
+// именам ':' не нужен ни в одном staticRoot этого проекта.
 function collapseSegments(segments) {
   const out = [];
   for (const seg of segments) {
     if (seg === '' || seg === '.') continue;
     if (seg === '..') { if (out.length) out.pop(); continue; }
+    if (seg.includes(':')) return null;
     out.push(seg);
   }
   return out;
@@ -63,7 +67,6 @@ function createNetServer({
 }) {
   let server = null;
   let wss = null;
-  let boundPort = null;
   const clients = new Set();
   const heartbeats = new Map(); // ws → жив ли с прошлого пинга
 
@@ -72,13 +75,21 @@ function createNetServer({
   // пути) даёт на выходе path.join() относительный путь, а старая проверка
   // сравнивала его с path.resolve(root) — абсолютным — и никогда не
   // совпадала: сервер тихо отдавал 404 на всё, без единой ошибки в логе.
-  const roots = Object.fromEntries(
-    Object.entries(staticRoots || {}).map(([prefix, root]) => [prefix, path.resolve(root)]),
-  );
+  //
+  // Сортируем по убыванию длины префикса: без этого порядок ключей в
+  // объекте staticRoots был бы значим — подпапка с именем, совпадающим с
+  // ДРУГИМ префиксом (например '/assets/node_modules' при отдельном корне
+  // '/assets'), могла бы затенить более специфичный префиксный корень,
+  // если он объявлен раньше в переборе. Длинный префикс — всегда более
+  // специфичный, его проверяем первым независимо от порядка объявления.
+  const roots = Object.entries(staticRoots || {})
+    .map(([prefix, root]) => [prefix, path.resolve(root)])
+    .sort((a, b) => b[0].length - a[0].length);
 
   function resolveFile(decodedPath) {
     const clean = collapseSegments(splitSegments(decodedPath.split('?')[0]));
-    for (const [rawPrefix, root] of Object.entries(roots)) {
+    if (clean === null) return null; // ':' в сегменте — потенциальный ADS-обход
+    for (const [rawPrefix, root] of roots) {
       let rest;
       if (rawPrefix === '/') {
         rest = clean;
@@ -87,7 +98,7 @@ function createNetServer({
         // не имеет права подхватить запрос к '/assets-private/...' — это
         // была бы утечка соседнего корня через похожее имя.
         const prefixSegs = collapseSegments(splitSegments(rawPrefix));
-        const matches = prefixSegs.length <= clean.length
+        const matches = prefixSegs && prefixSegs.length <= clean.length
           && prefixSegs.every((seg, i) => clean[i] === seg);
         if (!matches) continue;
         rest = clean.slice(prefixSegs.length);
@@ -130,7 +141,21 @@ function createNetServer({
     if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return;
 
     const hasId = Object.prototype.hasOwnProperty.call(msg, 'id');
-    const reply = (body) => { try { ws.send(JSON.stringify({ id: msg.id, ...body })); } catch { /* сокет ушёл */ } };
+    // Сериализация тела ответа может САМА бросить (BigInt, циклическая
+    // ссылка в результате канала) — такой канал мог исправно работать по
+    // локальному IPC (там structured clone, не JSON), но по сети JSON
+    // единственный формат. Без отдельного try здесь клиент не получил бы
+    // вообще ничего и завис бы на промисе навсегда, хотя протокол обещает
+    // ok:false на любую свою ошибку.
+    const reply = (body) => {
+      let payload;
+      try {
+        payload = JSON.stringify({ id: msg.id, ...body });
+      } catch (err) {
+        payload = JSON.stringify({ id: msg.id, ok: false, error: `результат не сериализуется в JSON: ${err.message}` });
+      }
+      try { ws.send(payload); } catch { /* сокет ушёл */ }
+    };
 
     // Протокол обещает {id, ok:false, error} на любую свою ошибку, а не
     // тишину: браузерный мост держит промис по id, и без ответа он повис бы
@@ -162,17 +187,25 @@ function createNetServer({
   // включая запись в терминал. WebSocket не подчиняется CORS/same-origin
   // сам по себе, это надо проверять руками на этапе апгрейда.
   //
+  // Сверяем Origin с заголовком Host ТОГО ЖЕ запроса, а не со списком,
+  // собранным из host/port конфигурации сервера. Причина: сервер слушает
+  // адрес из конфига (Tailscale IP, задача 7), а браузер на макбуке шлёт
+  // Origin именно с этим адресом — заранее вычисленный список из
+  // '127.0.0.1'/'localhost' его не содержал бы, и легитимный клиент
+  // получал бы 403 (проверено ре-ревьюером: страница грузится, сокет —
+  // нет). Host и Origin у одного и того же запроса браузер всегда
+  // выставляет из одного и того же адреса навигации — совпадение и есть
+  // подтверждение «страницу отдали мы же», при любом host/port/имени.
+  //
   // Origin отсутствует — не браузер (тестовый клиент, будущий нативный
-  // инструмент): пропускаем. Риск именно в случаях, когда Origin ЕСТЬ и он
-  // чужой, — подделать сам заголовок со страницы браузер не даёт.
-  function isAllowedOrigin(origin) {
+  // инструмент): пропускаем. Подделать сам заголовок со страницы браузер
+  // не даёт, риск именно в случаях, когда Origin ЕСТЬ и он чужой.
+  function isAllowedOrigin(origin, requestHost) {
     if (!origin) return true;
-    const allowed = new Set([
-      `http://${host}:${boundPort}`,
-      `http://127.0.0.1:${boundPort}`,
-      `http://localhost:${boundPort}`,
-    ]);
-    return allowed.has(origin);
+    if (!requestHost) return false;
+    let originHost;
+    try { originHost = new URL(origin).host; } catch { return false; }
+    return originHost === requestHost;
   }
 
   return {
@@ -183,7 +216,7 @@ function createNetServer({
           server,
           path: '/ws',
           verifyClient: (info, callback) => {
-            const ok = isAllowedOrigin(info.origin);
+            const ok = isAllowedOrigin(info.origin, info.req.headers.host);
             callback(ok, ok ? undefined : 403, ok ? undefined : 'чужой origin');
           },
         });
@@ -209,18 +242,27 @@ function createNetServer({
         }, 30000);
         heartbeat.unref(); // не держит процесс живым, если забыли позвать stop()
 
-        // Слушатель ошибок ДО успешного listen — только чтобы отклонить
-        // промис старта (например, порт занят). После успешного старта его
-        // обязательно снимаем: иначе он навсегда перехватывает reject уже
-        // разрешённого промиса и глушит все дальнейшие ошибки сервера.
+        // ВАЖНО: WebSocket.Server({server}) сам переизлучает ЛЮБУЮ ошибку
+        // http-сервера как wss.emit('error', err) — см.
+        // ws/lib/websocket-server.js (слушатель ставится в конструкторе,
+        // раньше, чем наш server.on('error') ниже). Без СВОЕГО слушателя
+        // на wss этот 'error' остаётся необработанным на этом, отдельном,
+        // пути — EventEmitter бросает его синхронно, и process падает
+        // ДО того, как успевает сработать server.on('error'). Один и тот
+        // же EADDRINUSE (порт занят — не гипотетический сценарий, у
+        // пользователя уже был конфликт на 48200) иначе валит весь
+        // Electron вместе со всеми pty открытых вкладок, несмотря на,
+        // казалось бы, обработанный reject() ниже.
         const onStartError = (err) => { clearInterval(heartbeat); reject(err); };
         server.on('error', onStartError);
+        wss.on('error', onStartError);
         server.listen(port, host, () => {
           server.removeListener('error', onStartError);
+          wss.removeListener('error', onStartError);
           server.on('error', (err) => console.log(`[net] ошибка сервера: ${err.message}`));
-          boundPort = server.address().port;
+          wss.on('error', (err) => console.log(`[net] ошибка WebSocket-сервера: ${err.message}`));
           server._cockpitHeartbeat = heartbeat; // чтобы stop() мог его погасить
-          resolve({ port: boundPort });
+          resolve({ port: server.address().port });
         });
       });
     },
@@ -235,6 +277,13 @@ function createNetServer({
         // и реагировать на апгрейды даже после того, как http-сервер лёг.
         if (wss) { try { wss.close(); } catch { /* уже закрыт */ } }
         if (!server) { resolve(); return; }
+        // closeAllConnections рвёт ЖИВЫЕ HTTP-соединения, включая
+        // keep-alive: без этого server.close() ждёт, пока браузер сам
+        // отпустит связь, — тумблер «выключить сеть» и выход из Electron
+        // подвисали бы на секунды на каждой открытой вкладке браузера.
+        // Утечки в этом нет (соединение уже не обслуживается), только
+        // задержка завершения.
+        if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
         server.close(() => resolve());
       });
     },
