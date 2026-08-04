@@ -69,3 +69,36 @@ test('окна нет вовсе (сервер без интерфейса) — 
   b.emit('tab:status', {});
   assert.deepStrictEqual(got, ['tab:status']);
 });
+
+// Ре-ревью задачи 3 (мелочь): try/catch вокруг win.webContents.send и
+// [...clients] были заявлены комментариями, но ни один тест их не проверял —
+// мутация, снимающая try/catch (или копию набора), проходила зелёной. Два
+// теста ниже закрывают ровно эти два инварианта.
+test('send в окно бросает — сетевые клиенты всё равно получают событие', () => {
+  const win = fakeWin();
+  win.webContents.send = () => { throw new Error('окно уходит между проверкой и отправкой'); };
+  const b = createBroadcast({ getWindow: () => win });
+  const got = [];
+  b.addClient((c) => got.push(c));
+
+  b.emit('tab:status', { tabId: 'T1' });
+
+  assert.deepStrictEqual(got, ['tab:status'], 'падение send() в окно не должно останавливать рассылку клиентам');
+});
+
+test('клиент отписывает ДРУГОГО клиента прямо во время emit — тот всё равно получает ТЕКУЩЕЕ событие', () => {
+  // [...clients] снимает копию набора ДО обхода: отписка, случившаяся из
+  // колбэка (например, второй клиент решил отвалиться сам или его отписал
+  // первый), не должна вырезать его из уже идущей рассылки — только из
+  // следующей.
+  const b = createBroadcast({ getWindow: () => fakeWin() });
+  const got = [];
+  const second = (c) => got.push(c);
+  b.addClient(() => b.removeClient(second));
+  b.addClient(second);
+
+  b.emit('tab:status', {});
+
+  assert.deepStrictEqual(got, ['tab:status'], 'second должен получить это же событие, несмотря на отписку в процессе');
+  assert.strictEqual(b.clientCount(), 1, 'но на СЛЕДУЮЩИЙ emit second уже не позовётся — отписка сработала');
+});

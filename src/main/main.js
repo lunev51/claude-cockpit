@@ -11,7 +11,7 @@ const {
 } = require('./ipc');
 const { getConfig, isRootConfigCorrupt } = require('./config');
 const { appRoot } = require('./paths');
-const { setWindow, notify } = require('./notify');
+const { setBroadcast, notify } = require('./notify');
 const { createAttention } = require('./attention');
 const { createToaster } = require('./toasts');
 
@@ -241,7 +241,13 @@ app.whenReady().then(() => {
   let rendererErrors = 0;
 
   const win = createWindow();
-  setWindow(win);
+
+  // Рассылка (broadcast.js) появляется только из registerIpc() ниже — до
+  // этого момента переменная нужна как forward-declaration: focusTab
+  // объявляется прямо под этим комментарием (внутри toaster), но реально
+  // зовётся только позже, асинхронно, по клику на Windows-тост — к тому
+  // моменту registerIpc() уже отработает и присвоит сюда настоящий объект.
+  let broadcast = null;
 
   // Task 1 фазы 4: агрегат «сколько вкладок ждут» → overlay-иконка таскбара +
   // заголовок окна. attention.js — чистый модуль без Electron (тестируется
@@ -283,7 +289,13 @@ app.whenReady().then(() => {
       if (win.isMinimized()) win.restore();
       win.show();
       win.focus();
-      win.webContents.send('tab:activate', { tabId });
+      // Ре-ревью задачи 3 (Important 1): раньше был прямой
+      // win.webContents.send — клик по тосту переключал вкладку локально,
+      // но браузерный клиент об этом никогда не узнавал. broadcast к
+      // моменту реального клика уже присвоен (см. комментарий выше про
+      // forward-declaration); null-гард — на случай клика в узком окне до
+      // первого registerIpc() (теоретический, но дешёвый).
+      if (broadcast) broadcast.emit('tab:activate', { tabId });
     },
   });
 
@@ -295,7 +307,12 @@ app.whenReady().then(() => {
     });
   }
 
-  registerIpc(win, { smoke: SMOKE, attention, toaster });
+  // Деструктуризация в скобки: без них `({ broadcast } = ...)` на верхнем
+  // уровне statement распарсился бы как блок кода, не присваивание —
+  // переносим ЗДЕСЬ, а не в объявление, потому что broadcast — уже
+  // объявленная выше переменная (нужна раньше, в focusTab), а не новая.
+  ({ broadcast } = registerIpc(win, { smoke: SMOKE, attention, toaster }));
+  setBroadcast(broadcast);
 
   // Ошибки renderer всегда дублируем в stdout — иначе их не видно при фоновом запуске.
   win.webContents.on('console-message', (eventOrDetails, level, message) => {
