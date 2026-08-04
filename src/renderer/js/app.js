@@ -624,6 +624,117 @@ async function openTab(cwd, {
   return tab;
 }
 
+// --- подключение к УЖЕ живым вкладкам (C1/C2 финального ревью ветки) ---
+//
+// Отличие от openTab() ровно одно и главное: НИ ОДНОГО tabs:open. Вкладка уже
+// существует в менеджере со своим tabId, своим pty и своей сессией Claude —
+// от неё нужен только экран. Раньше этой ветки не было вовсе: любой клиент
+// (браузер с макбука, второе окно, перезагрузка renderer по Ctrl+R при живом
+// main) шёл через оверлей восстановления и звал tabs:open, а тот минтит НОВЫЙ
+// tabId — на ПК поднимался второй `claude --resume <тот же sessionId>`, два
+// процесса писали в один транскрипт и один ghost-файл, манифест удваивался и
+// переживал перезапуск, следующее подключение давало ×4.
+//
+// Передача управления между машинами (кто владеет экраном, кого выселяют) —
+// отдельный план; здесь ровно одно: подключение вместо дублирования.
+async function attachTab(t, { activate = false } = {}) {
+  const container = document.createElement('div');
+  container.className = 'term-view hidden';
+  $('terminal-host').appendChild(container);
+
+  const entry = {
+    view: null,
+    container,
+    lastPtyStatus: '',
+    fontSize: config.terminal.fontSize,
+    // Живой вывод, пришедший ПОКА едет история (см. replayHistory ниже и
+    // диспатч term:data в boot()): пишем его в терминал только ПОСЛЕ истории,
+    // иначе хвост буфера лёг бы поверх более свежих строк и экран показал бы
+    // прошлое как настоящее. null = истории больше не ждём, пишем сразу.
+    pendingOutput: [],
+  };
+  views.set(t.tabId, entry);
+
+  // preludeText НЕ используем: он для ghost-буфера (вчерашний вывод —
+  // приглушённый, с вырезанными escape-последовательностями, с подписью
+  // «сессия поднимается»). Здесь же приезжает ЖИВАЯ история работающего pty —
+  // её надо напечатать как есть, со всеми цветами (см. replayHistory).
+  const view = initTerminal(container, config, {
+    tabId: t.tabId,
+    preludeText: null,
+    onPtyStatus: (s) => {
+      entry.lastPtyStatus = s;
+    },
+    onFontSize: (px) => {
+      entry.fontSize = px;
+    },
+  });
+  entry.view = view;
+
+  // initTerminal внутри зовёт term.start(tabId, cols, rows). На живом процессе
+  // sessions.js/start() не спавнит второй pty, а повторяет 'term:started' —
+  // без этого повтора terminal.js держал бы ввод за флагом alive навсегда
+  // («запускается…» и проглоченные нажатия), см. комментарий в sessions.js.
+  tabStore.add(t);
+  // Статус из менеджера — вкладка сразу встаёт в свою секцию сайдбара
+  // («Ждут тебя»/«Работают»/…), а не ждёт следующего хука Claude Code,
+  // которого на спокойной вкладке может не быть часами.
+  if (t.status) {
+    tabStore.setStatus(t.tabId, t.status, t.subtitle, t.waitingText, t.waitingKind, t.sessionLabel);
+  }
+  refreshConnectBadge(t.tabId);
+  if (activate) activateTab(t.tabId);
+
+  await replayHistory(t.tabId);
+  return t;
+}
+
+// История вывода вкладки (C2 финального ревью): net:buffer есть на сервере с
+// задачи 4, но его никто не звал — подключившийся клиент видел пустой
+// терминал, то есть пункт спеки «видно, на чём остановилась работа» не
+// работал вовсе.
+//
+// Порядок здесь и есть вся суть: сначала печатаем историю, потом — живой
+// вывод, накопленный за время её доставки (entry.pendingOutput). Пустая
+// история — НОРМА (вкладка только создана, вывода ещё не было), а не ошибка.
+// Отказ канала тоже не повод оставить вкладку без экрана: логируем и работаем
+// дальше с живым выводом.
+async function replayHistory(tabId) {
+  const entry = views.get(tabId);
+  if (!entry) return;
+  let history = '';
+  try {
+    history = await window.api.net.buffer(tabId);
+  } catch (err) {
+    console.warn(`[attach] история вкладки ${tabId} не приехала:`, err);
+  }
+  // Вкладку могли закрыть, пока история ехала.
+  const live = views.get(tabId);
+  if (!live || live !== entry) return;
+  const pending = entry.pendingOutput || [];
+  entry.pendingOutput = null; // с этого момента живой вывод идёт напрямую
+  if (typeof history === 'string' && history) entry.view.term.write(history);
+  for (const chunk of pending) entry.view.term.write(chunk);
+}
+
+// Подключение ко всем живым вкладкам подряд. Стаггер здесь не нужен (в
+// отличие от restoreFlow): ни одного нового процесса не поднимается, мы лишь
+// заводим xterm'ы и просим историю. Ошибка на одной вкладке не должна
+// оставить остальные без экрана — тот же принцип, что в restoreFlow.
+async function attachLiveTabs(liveTabs) {
+  let firstAttached = null;
+  for (const t of liveTabs) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      await attachTab(t, { activate: !firstAttached });
+      if (!firstAttached) firstAttached = t;
+    } catch (err) {
+      console.warn(`[attach] не удалось подключиться к вкладке ${t.cwd}:`, err);
+    }
+  }
+  return firstAttached;
+}
+
 function activateTab(tabId) {
   const entry = views.get(tabId);
   if (!entry) return;
@@ -2021,7 +2132,16 @@ async function boot() {
   setInterval(() => redrawUsageViews(), 30000);
 
   // Глобальный диспатч событий терминалов по tabId.
-  window.api.term.onData(({ tabId, data }) => views.get(tabId)?.view.handlers.onData(data));
+  // pendingOutput (C2 финального ревью) — вкладка, к которой мы ТОЛЬКО ЧТО
+  // подключились, ещё ждёт свою историю из net:buffer. Живой вывод, пришедший
+  // в это окно, копим и печатаем ПОСЛЕ истории (см. replayHistory), иначе
+  // хвост буфера лёг бы поверх более свежих строк.
+  window.api.term.onData(({ tabId, data }) => {
+    const entry = views.get(tabId);
+    if (!entry) return;
+    if (entry.pendingOutput) { entry.pendingOutput.push(data); return; }
+    entry.view.handlers.onData(data);
+  });
   window.api.term.onStarted((p) => {
     views.get(p.tabId)?.view.handlers.onStarted(p);
   });
@@ -2143,38 +2263,69 @@ async function boot() {
     for (const tabId of tabStore.order()) refreshTabPr(tabId);
   }, 180000);
 
-  // Манифест воркспейса (Task 3): пуст/отсутствует — старое поведение
-  // (стартовая вкладка из конфига). Непуст — оверлей restore (Task 4).
-  const manifest = await window.api.workspace.get();
-  if (!manifest || !Array.isArray(manifest.tabs) || manifest.tabs.length === 0) {
+  // C1 финального ревью ветки: ПЕРВЫМ делом спрашиваем, есть ли ЖИВЫЕ вкладки
+  // в менеджере, и только потом смотрим на манифест. Манифест — это «что было
+  // вчера», и восстанавливать его имеет смысл ровно тогда, когда сегодня ещё
+  // ничего не работает. Если сессии уже подняты (браузер с макбука, второе
+  // окно, перезагрузка renderer при живом main), любой tabs:open из оверлея
+  // восстановления завёл бы ВТОРУЮ вкладку с новым tabId на ту же сессию
+  // Claude — а следом второй `claude --resume <тот же id>` в тот же
+  // транскрипт. Подключаемся к тому, что есть.
+  //
+  // tabs:list не ответил (старый main, отказ канала) — деградируем в прежнее
+  // поведение: лучше показать оверлей, чем не показать ничего.
+  let liveTabs = [];
+  try {
+    liveTabs = await window.api.tabs.list();
+  } catch (err) {
+    console.warn('[boot] tabs:list не ответил — иду по ветке восстановления:', err);
+  }
+
+  // Оверлея восстановления в этой ветке нет НАМЕРЕННО: восстанавливать нечего,
+  // всё уже работает. Он остаётся ровно для случая, когда живых вкладок ноль.
+  if (Array.isArray(liveTabs) && liveTabs.length) {
     try {
-      await openTab(config.terminal.cwd || '.');
+      await attachLiveTabs(liveTabs);
     } finally {
-      // FIX 2 (carryover 3): try/finally — раньше ready() шёл СРАЗУ после await
-      // openTab(...) без страховки: исключение внутри (например, initTerminal)
-      // обрывало boot() до вызова ready(), и wsync.sync() молчал бы НАВСЕГДА
-      // (ready так и остался бы false до конца сессии) — состав вкладок
-      // переставал сохраняться вообще. Манифеста не было вообще — восстанавливать
-      // нечего, разблокируем sync в любом случае, даже если openTab упал.
+      // Та же страховка, что в ветке пустого манифеста ниже: sync манифеста
+      // разблокируем в любом случае, иначе состав вкладок перестанет
+      // сохраняться до конца сессии (см. workspace-sync.js/markReady).
       window.api.workspace.ready();
     }
   } else {
-    try {
-      showRestoreOverlay(manifest);
-    } catch (err) {
-      // FIX 2 (carryover 3): showRestoreOverlay сама НЕ зовёт ready() —
-      // это делают её колбэки startEmpty/startRestore по решению пользователя
-      // (см. ниже). Если она упадёт ДО того, как повесит эти обработчики
-      // (например, DOM оверлея не найден), ready() больше НИКОГДА не придёт —
-      // тот же эффект заморозки манифеста, что и в ветке выше. Деградируем:
-      // считаем, что восстанавливать нечего (как при отсутствии манифеста).
-      console.warn('[restore] оверлей восстановления не показался:', err);
-      // Fix 11 (ревью): showRestoreOverlay могла успеть показать оверлей
-      // (overlay.classList.remove('hidden')) и упасть уже ПОСЛЕ этого,
-      // внутри своего локального замыкания — без явного скрытия здесь
-      // модалка залипала бы навсегда поверх главной области.
-      $('restore-overlay')?.classList.add('hidden');
-      window.api.workspace.ready();
+    // Манифест воркспейса (Task 3): пуст/отсутствует — старое поведение
+    // (стартовая вкладка из конфига). Непуст — оверлей restore (Task 4).
+    const manifest = await window.api.workspace.get();
+    if (!manifest || !Array.isArray(manifest.tabs) || manifest.tabs.length === 0) {
+      try {
+        await openTab(config.terminal.cwd || '.');
+      } finally {
+        // FIX 2 (carryover 3): try/finally — раньше ready() шёл СРАЗУ после await
+        // openTab(...) без страховки: исключение внутри (например, initTerminal)
+        // обрывало boot() до вызова ready(), и wsync.sync() молчал бы НАВСЕГДА
+        // (ready так и остался бы false до конца сессии) — состав вкладок
+        // переставал сохраняться вообще. Манифеста не было вообще — восстанавливать
+        // нечего, разблокируем sync в любом случае, даже если openTab упал.
+        window.api.workspace.ready();
+      }
+    } else {
+      try {
+        showRestoreOverlay(manifest);
+      } catch (err) {
+        // FIX 2 (carryover 3): showRestoreOverlay сама НЕ зовёт ready() —
+        // это делают её колбэки startEmpty/startRestore по решению пользователя
+        // (см. ниже). Если она упадёт ДО того, как повесит эти обработчики
+        // (например, DOM оверлея не найден), ready() больше НИКОГДА не придёт —
+        // тот же эффект заморозки манифеста, что и в ветке выше. Деградируем:
+        // считаем, что восстанавливать нечего (как при отсутствии манифеста).
+        console.warn('[restore] оверлей восстановления не показался:', err);
+        // Fix 11 (ревью): showRestoreOverlay могла успеть показать оверлей
+        // (overlay.classList.remove('hidden')) и упасть уже ПОСЛЕ этого,
+        // внутри своего локального замыкания — без явного скрытия здесь
+        // модалка залипала бы навсегда поверх главной области.
+        $('restore-overlay')?.classList.add('hidden');
+        window.api.workspace.ready();
+      }
     }
   }
 

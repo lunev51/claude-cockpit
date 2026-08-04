@@ -478,9 +478,32 @@ function createSessionManager({
     }
   }
 
+  // C1 финального ревью ветки (шов с подключением браузера к живым вкладкам):
+  // раньше на живом tab.proc функция молча выходила и НЕ повторяла
+  // 'term:started'. Но renderer держит ввод терминала за флагом alive, который
+  // поднимается ТОЛЬКО этим событием (terminal.js: onPtyStatus('запускается…')
+  // при создании вида, alive=true в handlers.onStarted, и
+  // `term.onData(... if (alive) ...)` в вводе). То есть клиент, ПОДКЛЮЧИВШИЙСЯ
+  // к уже работающей вкладке (второе окно/браузер с макбука/перезагрузка
+  // renderer по Ctrl+R при живом main), получал терминал, который вечно
+  // показывает «запускается…» и глотает каждое нажатие — процесс-то поднят
+  // давно, и своё единственное 'term:started' он отправил задолго до
+  // подключения.
+  //
+  // Повтор безвреден для уже подключённых клиентов: handlers.onStarted
+  // идемпотентен (alive=true, та же строка статуса с тем же pid).
+  //
+  // cols/rows живого pty здесь НАМЕРЕННО не трогаем: у pty один размер на
+  // всех, и согласование размеров между машинами — это эстафета (кто владеет
+  // экраном), отдельный план. Подключение не должно перерисовывать экран под
+  // тем, кто сейчас реально работает за ПК.
   function start(tabId, cols, rows) {
     const tab = tabs.get(tabId);
-    if (!tab || tab.proc) return;
+    if (!tab) return;
+    if (tab.proc) {
+      onEvent('term:started', { tabId, pid: tab.proc.pid });
+      return;
+    }
     tab.cols = cols;
     tab.rows = rows;
     spawn(tab);
@@ -1011,11 +1034,19 @@ function createSessionManager({
     // sessionLabel (живая приёмка 01.08) — «название» сессии; уходит в
     // манифест воркспейса (workspace-sync.js), чтобы утренние восстановленные
     // вкладки были различимы СРАЗУ, не дожидаясь чтения транскрипта.
+    // waitingText (C1 финального ревью ветки) — текст последнего Notification.
+    // Нужен клиенту, ПОДКЛЮЧИВШЕМУСЯ к живым вкладкам (tabs:list): вкладка в
+    // 'waiting' уже задала свой вопрос, следующего хука может не быть часами,
+    // и без этого поля поповер «ответить из сайдбара» показал бы пустоту до
+    // конца ожидания. Поле аддитивное: все потребители list() (workspace-sync,
+    // night-watch, обвязка ipc.js) читают его через деструктуризацию по именам.
     return [...tabs.values()].map(({
-      tabId, cwd, name, alive, status, subtitle, sessionId, ghostId, waitingKind, gen, sessionLabel,
+      tabId, cwd, name, alive, status, subtitle, sessionId, ghostId,
+      waitingKind, waitingText, gen, sessionLabel,
     }) => (
       {
-        tabId, cwd, name, alive, status, subtitle, sessionId, ghostId, waitingKind, gen, sessionLabel,
+        tabId, cwd, name, alive, status, subtitle, sessionId, ghostId,
+        waitingKind, waitingText, gen, sessionLabel,
       }
     ));
   }

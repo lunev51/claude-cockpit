@@ -14,6 +14,9 @@ export const API_SHAPE = {
   'config.get': { channel: 'config:get', kind: 'invoke' },
   'config.set': { channel: 'config:set', kind: 'invoke' },
   'tabs.open': { channel: 'tabs:open', kind: 'invoke' },
+  // C1 финального ревью: список ЖИВЫХ вкладок — без него сетевой клиент не
+  // мог узнать tabId работающих сессий и умел только заводить новые.
+  'tabs.list': { channel: 'tabs:list', kind: 'invoke' },
   'tabs.close': { channel: 'tabs:close', kind: 'invoke' },
   'tabs.chooseFolder': { channel: 'tabs:chooseFolder', kind: 'invoke' },
   'tabs.markSeen': { channel: 'tabs:seen', kind: 'send', pack: ['tabId'] },
@@ -25,6 +28,10 @@ export const API_SHAPE = {
   'term.onExit': { channel: 'term:exit', kind: 'event' },
   'term.onStarted': { channel: 'term:started', kind: 'event' },
   'shell.openExternal': { channel: 'shell:openExternal', kind: 'invoke' },
+  // C2 финального ревью: история вывода вкладки. Канал жил ТОЛЬКО на сервере
+  // (net-server.js), в этой форме его не было — и подключившийся клиент видел
+  // пустой терминал, то есть задача 4 (кольцевой буфер) работала в стол.
+  'net.buffer': { channel: 'net:buffer', kind: 'invoke' },
   'app.onNotice': { channel: 'app:notice', kind: 'event' },
   'app.devtools': { channel: 'app:devtools', kind: 'invoke' },
   'project.connect': { channel: 'project:connect', kind: 'invoke' },

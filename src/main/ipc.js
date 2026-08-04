@@ -1067,6 +1067,27 @@ function dropTabOutputBuffer({ tabId, outputBuffer }) {
 const NET_DEFAULT_HOST = '127.0.0.1';
 const NET_DEFAULT_PORT = 48300;
 
+// Корни статики сетевого сервера: URL-префикс → каталог на диске. Вынесено из
+// registerIpc() отдельной чистой функцией (root — параметр, а не appRoot()
+// внутри) РАДИ ТЕСТА: appRoot() требует живого Electron, а
+// test/renderer-boot-guard.test.js поднимает настоящий сервер на этой самой
+// карте и дёргает каждую ссылку разметки — так «корень /node_modules убрали»
+// и «.js отдают как text/plain» становятся красными, а не зелёными (I1
+// финального ревью: обе диверсии проходили мимо 856 тестов).
+//
+// Состав ровно такой, потому что разметка renderer НЕ правится под сеть:
+// index.html ссылается на ../../node_modules/@xterm/..., css/fonts.css — на
+// ../../../assets/fonts/... Браузер схлопывает '..' сам ещё до отправки, и на
+// провод уходят /node_modules/... и /assets/... — эти два префикса и корень
+// '/' на src/renderer покрывают всё дерево страницы.
+function rendererStaticRoots(root) {
+  return {
+    '/node_modules': path.join(root, 'node_modules'),
+    '/assets': path.join(root, 'assets'),
+    '/': path.join(root, 'src', 'renderer'),
+  };
+}
+
 // M3 (ревью раунда 2, Minor): порт в диапазоне 1..65535, целое число.
 function validPort(n) {
   return Number.isInteger(n) && n > 0 && n < 65536;
@@ -1597,11 +1618,7 @@ function registerIpc(win, opts = {}) {
     registry,
     broadcast,
     outputBuffer,
-    staticRoots: {
-      '/node_modules': path.join(appRoot(), 'node_modules'),
-      '/assets': path.join(appRoot(), 'assets'),
-      '/': path.join(appRoot(), 'src', 'renderer'),
-    },
+    staticRoots: rendererStaticRoots(appRoot()),
     port: netCfg.port,
     host: netCfg.host,
     allowedHosts: netCfg.allowedHosts,
@@ -1728,6 +1745,39 @@ function registerIpc(win, opts = {}) {
     if (!Number.isInteger(count) || count < 0) return;
     attention.update({ count, dataUrl: typeof dataUrl === 'string' ? dataUrl : null });
   });
+
+  // Список ЖИВЫХ вкладок менеджера (C1 финального ревью ветки). До него в
+  // реестре не было НИ ОДНОГО канала, отдающего наружу tabId работающих
+  // сессий: клиент, открывший страницу, знал только манифест воркспейса (что
+  // было ВЧЕРА) и потому мог лишь звать tabs:open — а тот на каждый вызов
+  // минтит НОВЫЙ tabId. Живьём это давало второй `claude --resume <тот же
+  // sessionId>` на каждую вкладку: два процесса на один транскрипт и один
+  // ghost-файл, удвоенный манифест, переживающий перезапуск, и ×4 на
+  // следующем подключении. Срабатывало и на 127.0.0.1, то есть при простом
+  // открытии адреса кокпита на самом ПК.
+  //
+  // Отдаём manager.list() как есть (тот же снимок, что уже уходит в манифест
+  // воркспейса): renderer'у нужны tabId/cwd/name для строки сайдбара и
+  // status/subtitle/waitingKind/waitingText/sessionLabel, чтобы подключённая
+  // вкладка сразу встала в правильную секцию, а не ждала следующего хука.
+  registry.handle('tabs:list', () => manager.list());
+
+  // История вывода вкладки — хвост из output-buffer.js (задача 4). C2
+  // финального ревью: канал существовал ТОЛЬКО внутри net-server.js, в форме
+  // window.api его не было вовсе, и ни app.js, ни terminal.js его не звали —
+  // то есть пункт спеки «подключившийся клиент видит, на чём остановилась
+  // работа» не работал, а весь буфер копился в стол.
+  //
+  // Почему обработчик есть И здесь, и отдельной веткой в net-server.js:
+  // сетевой сервер перехватывает net:buffer ДО реестра (история — свойство
+  // соединения, см. комментарий там), а этот обработчик обслуживает ЛОКАЛЬНЫЙ
+  // путь — перезагрузку renderer (Ctrl+R) при живом main, когда вкладки уже
+  // работают, а xterm в окне только что создан с нуля. Оба читают ОДИН И ТОТ
+  // ЖЕ экземпляр outputBuffer, разойтись им нечем.
+  //
+  // Пустой хвост (вкладка только создана, вывода ещё не было) — нормальный
+  // ответ, а не ошибка: отдаём пустую строку.
+  registry.handle('net:buffer', (tabId) => (typeof tabId === 'string' ? outputBuffer.get(tabId) : ''));
 
   // Регистрация вкладки. cwd обязателен — renderer берёт его из диалога
   // или из конфига; smoke-режим подменяет команду в sessions.js.
@@ -2216,6 +2266,11 @@ module.exports = {
   // без Electron, экспортированы ради собственных юнит-тестов (см. комментарии
   // у их определения выше).
   shouldDetectLimitStop, resumableTabStatus, isSnapshotFreshEnough, USAGE_SNAPSHOT_FRESH_MS,
+  // I1 финального ревью ветки: карта корней статики — чистая функция от корня
+  // приложения, экспортирована ради test/renderer-boot-guard.test.js (он
+  // поднимает НАСТОЯЩИЙ сервер ровно на ней и проверяет каждую ссылку
+  // разметки, а не на копии, разъезжающейся с продом).
+  rendererStaticRoots,
   // Task 2 фазы 9 (голосовой ввод): та же причина — см. комментарий у их
   // определения выше (смоук-гейт тестируется напрямую, без Electron).
   sttTranscribeHandler, sttStatusHandler,

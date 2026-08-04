@@ -10,6 +10,12 @@ contextBridge.exposeInMainWorld('api', {
   },
   tabs: {
     open: (opts) => ipcRenderer.invoke('tabs:open', opts),
+    // Живые вкладки менеджера (C1 финального ревью ветки): renderer при
+    // загрузке спрашивает их ПЕРВЫМИ и, если они есть, ПОДКЛЮЧАЕТСЯ к ним
+    // вместо оверлея восстановления — иначе каждое подключение (браузер с
+    // макбука, второе окно, Ctrl+R при живом main) звало tabs:open и плодило
+    // вторую вкладку с новым tabId на ту же самую сессию Claude.
+    list: () => ipcRenderer.invoke('tabs:list'),
     close: (tabId) => ipcRenderer.invoke('tabs:close', tabId),
     chooseFolder: () => ipcRenderer.invoke('tabs:chooseFolder'),
     // «Я это увидел»: вкладка из «Готово» уезжает в «Наготове» (живая приёмка
@@ -29,6 +35,14 @@ contextBridge.exposeInMainWorld('api', {
   },
   shell: {
     openExternal: (url) => ipcRenderer.invoke('shell:openExternal', url),
+  },
+  net: {
+    // История вывода вкладки (C2 финального ревью ветки): хвост из
+    // output-buffer.js, который подключившийся клиент печатает в свежий xterm
+    // ДО первого живого term:data. В Electron этот путь тоже настоящий:
+    // перезагрузка renderer (Ctrl+R) при живом main оставляет вкладки
+    // работающими, а окно получает пустой терминал.
+    buffer: (tabId) => ipcRenderer.invoke('net:buffer', tabId),
   },
   app: {
     onNotice: (cb) => ipcRenderer.on('app:notice', (_e, n) => cb(n)),
