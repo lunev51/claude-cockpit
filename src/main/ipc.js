@@ -13,6 +13,7 @@ const {
   ipcMain, shell, dialog, app, clipboard, powerSaveBlocker,
 } = require('electron');
 const { createCommandRegistry } = require('./command-registry');
+const { createBroadcast } = require('./broadcast');
 const { getConfig, setConfig } = require('./config');
 const { createPty } = require('./pty');
 const { createSessionManager } = require('./sessions');
@@ -1218,7 +1219,7 @@ function registerIpc(win, opts = {}) {
           waitingText: payload.waitingText,
         });
       }
-      if (!win.isDestroyed()) win.webContents.send(channel, payload);
+      broadcast.emit(channel, payload);
     },
   });
 
@@ -1292,7 +1293,7 @@ function registerIpc(win, opts = {}) {
       if (t) manager.write(tabId, `${t}\r`);
     },
     emit: (event, payload) => {
-      if (!win.isDestroyed()) win.webContents.send(event, payload);
+      broadcast.emit(event, payload);
     },
     powerBlocker: smoke ? createNoopPowerBlocker() : createRealPowerBlocker(),
     journal: withNightToasts(
@@ -1342,9 +1343,7 @@ function registerIpc(win, opts = {}) {
       const key = usageBroadcastKey(snap);
       if (key !== lastBroadcastKey) {
         lastBroadcastKey = key;
-        if (!win.isDestroyed()) {
-          win.webContents.send('usage:update', { limits: snap, spend: lastCcusageResult });
-        }
+        broadcast.emit('usage:update', { limits: snap, spend: lastCcusageResult });
       }
     }, 5000);
     usageMonitorTimer.unref?.();
@@ -1363,11 +1362,9 @@ function registerIpc(win, opts = {}) {
         // (гонка с параллельным usage:refresh) — deferred никогда не
         // затирает настоящие данные.
         if (!(spend && spend.error === 'deferred')) lastCcusageResult = spend;
-        if (!win.isDestroyed()) {
-          win.webContents.send('usage:update', {
-            limits: usagePoller.snapshot(), spend: lastCcusageResult,
-          });
-        }
+        broadcast.emit('usage:update', {
+          limits: usagePoller.snapshot(), spend: lastCcusageResult,
+        });
       } catch { /* ccusage.get сам не бросает; ремень на чужие сбои */ }
     }, CCUSAGE_BOOT_DEFER_MS + 2000);
     deferredSpendTimer.unref?.();
@@ -1382,6 +1379,14 @@ function registerIpc(win, opts = {}) {
   // раз, здесь же, ДО первой регистрации — раньше объявление жило ниже, перед
   // tabs:open, единственной группой, которая тогда его использовала.
   const registry = createCommandRegistry({ ipcMain });
+
+  // Рассылка исходящих событий (broadcast.js) — симметричная половина
+  // реестра выше: реестр сводит ВХОДЯЩИЕ команды в одну точку, broadcast —
+  // ИСХОДЯЩИЕ события. getWindow — функция, а не сам win, потому что win
+  // передаётся в registerIpc() уже готовым, но объявлять зависимость через
+  // геттер дешевле, чем помнить, что где-то выше это единственное место,
+  // которое обязано звать закрытие, а не значение.
+  const broadcast = createBroadcast({ getWindow: () => win });
 
   registry.handle('config:get', () => getConfig());
 
@@ -1872,6 +1877,7 @@ function registerIpc(win, opts = {}) {
   // и был недостижим (см. progress.md, Task 1, отложенный minor). Возврат
   // ничего не ломает: единственный вызывающий (main.js) до сих пор не
   // использовал результат registerIpc() вовсе.
+  ipcMain.handle(`net:tpl`, () => 42);
   return { registry };
 }
 
