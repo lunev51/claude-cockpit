@@ -14,6 +14,7 @@ const {
 } = require('electron');
 const { createCommandRegistry } = require('./command-registry');
 const { createBroadcast } = require('./broadcast');
+const { createOutputBuffer } = require('./output-buffer');
 const { getConfig, setConfig } = require('./config');
 const { createPty } = require('./pty');
 const { createSessionManager } = require('./sessions');
@@ -1178,6 +1179,10 @@ function registerIpc(win, opts = {}) {
     readSessionTitle: (transcriptPath, sessionId) => sessionTitleReader.read(transcriptPath, sessionId),
     onEvent: (channel, payload) => {
       if (smoke && channel === 'term:data') smokeOutput += payload.data;
+      // Задача 4 (буфер вывода): наполняем ТУТ ЖЕ, в том самом месте, где
+      // событие term:data уходит в broadcast.emit ниже, — подключившийся
+      // клиент получает то же самое, что видит окно на ПК, ни байтом меньше.
+      if (channel === 'term:data') outputBuffer.push(payload.tabId, payload.data);
       if (channel === 'tabs:changed') syncWorkspace();
       // Task 2 фазы 8 («Ночная смена») — детект остановки по лимиту. См.
       // подробный комментарий у объявления lastStatusByTab выше по файлу:
@@ -1388,6 +1393,12 @@ function registerIpc(win, opts = {}) {
   // которое обязано звать закрытие, а не значение.
   const broadcast = createBroadcast({ getWindow: () => win });
 
+  // Хвост вывода по вкладкам (output-buffer.js) — то, что отдаётся клиенту
+  // сразу при подключении: сетевой сервер сам xterm не видит, а история
+  // живёт только внутри окна ПК. Наполняется ниже, там же, где событие
+  // term:data уходит в broadcast.emit; чистится на tabs:close.
+  const outputBuffer = createOutputBuffer({});
+
   registry.handle('config:get', () => getConfig());
 
   registry.handle('config:set', (partial) => {
@@ -1546,6 +1557,10 @@ function registerIpc(win, opts = {}) {
     // смены (lastStatusByTab) больше никому не нужна и не должна копиться в
     // памяти навсегда, тот же приём, что toaster.forget()/ghost-файл выше.
     lastStatusByTab.delete(tabId);
+    // Задача 4 (буфер вывода): без drop() буфер закрытой вкладки копится в
+    // памяти до перезапуска кокпита — тот же приём, что toaster.forget()/
+    // lastStatusByTab.delete() выше, только для output-buffer.js.
+    outputBuffer.drop(tabId);
     // M1+M3 (ревью финальной волны): если вкладка ждала сброса ночного лимита
     // (в pending night-watch.js), закрытие должно освободить будильник/блокер
     // немедленно, а не после впустую потраченного цикла ретраев — nightWatch.
