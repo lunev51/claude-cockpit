@@ -15,6 +15,8 @@
 // функции напрямую, с фейковым outputBuffer вместо настоящего.
 const test = require('node:test');
 const assert = require('node:assert');
+const fs = require('node:fs');
+const path = require('node:path');
 const { bufferTermData, dropTabOutputBuffer } = require('../src/main/ipc');
 const { createOutputBuffer } = require('../src/main/output-buffer');
 
@@ -57,4 +59,40 @@ test('dropTabOutputBuffer: закрытие одной вкладки не тр�
   dropTabOutputBuffer({ tabId: 'T1', outputBuffer });
   assert.strictEqual(outputBuffer.get('T1'), '');
   assert.strictEqual(outputBuffer.get('T2'), 'вкладка 2');
+});
+
+// Ре-ревью (Important, НЕ закрыта первым фиксом): предыдущие тесты выше
+// проверяют, что bufferTermData/dropTabOutputBuffer ведут себя верно как
+// САМОСТОЯТЕЛЬНЫЕ функции — но не проверяют, что onEvent/tabs:close в
+// ipc.js их РЕАЛЬНО зовут. Ре-ревьюер продемонстрировал матрицу диверсий:
+// удаление САМОЙ СТРОКИ вызова из onEvent или из tabs:close, а также подмена
+// вызова на захардкоженный tabId — НИ ОДНА не ловилась (809 pass). Приём —
+// тот же, что test/command-registry.coverage.test.js уже использует для
+// похожей проблемы (обработчик зарегистрирован не в реестре, а напрямую в
+// ipcMain): читаем ИСХОДНЫЙ ТЕКСТ ipc.js и требуем, чтобы у каждой функции
+// было МИНИМУМ ДВА вхождения её точной сигнатуры вызова — одно в
+// `function ...(...) {` (определение), второе — в самой строке вызова
+// (`...(...);`). Одно вхождение (осталось только определение) означает, что
+// строку вызова вырезали или подменили на что-то другое (например, на
+// захардкоженный tabId вместо реального payload/tabId) — оба случая меняют
+// точный текст вызова и роняют счётчик обратно до 1.
+const ipcSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'ipc.js'), 'utf8');
+
+function countOccurrences(text, substr) {
+  return text.split(substr).length - 1;
+}
+
+test('проводка: bufferTermData зовётся из onEvent РОВНО с реальными channel/payload/outputBuffer (не только определена)', () => {
+  const signature = 'bufferTermData({ channel, payload, outputBuffer })';
+  const count = countOccurrences(ipcSrc, signature);
+  // 1 = только определение функции (`function bufferTermData({ channel, payload, outputBuffer }) {`)
+  // осталось голым — строку вызова из onEvent вырезали или подменили
+  // (например, на захардкоженный tabId вместо реального payload).
+  assert.ok(count >= 2, `в ipc.js только ${count} вхождение(й) "${signature}" — вызов из onEvent пропал или подменён (диверсии г/е ре-ревью)`);
+});
+
+test('проводка: dropTabOutputBuffer зовётся из tabs:close РОВНО с реальными tabId/outputBuffer (не только определена)', () => {
+  const signature = 'dropTabOutputBuffer({ tabId, outputBuffer })';
+  const count = countOccurrences(ipcSrc, signature);
+  assert.ok(count >= 2, `в ipc.js только ${count} вхождение(й) "${signature}" — вызов из tabs:close пропал или подменён (диверсия д ре-ревью)`);
 });
