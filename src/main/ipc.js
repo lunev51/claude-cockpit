@@ -1029,6 +1029,26 @@ function sttStatusHandler({ smoke, getStt }) {
   }
 }
 
+// Important 1 (ревью задачи 4): наполнение output-buffer.js на term:data и
+// очистка на tabs:close жили ИНЛАЙНОМ прямо внутри onEvent/tabs:close —
+// ревьюер вырезал обе строки и прогнал полный набор: 784 теста, 0 падений.
+// Смысл задачи 4 — не модуль output-buffer.js сам по себе (он покрыт), а
+// именно эти две точки проводки: без них подключившийся клиент видит пустой
+// терминал, и НИЧТО в тестах этого не замечает. Та же причина, что у
+// gitGetHandler/nightToggleHandler/sttStatusHandler и т.д. выше (ipc.js
+// целиком/registerIpc не тестируется под node --test — require('electron')
+// вне настоящего рантайма не даёт объект): логика вынесена в отдельные
+// функции с явными зависимостями, registerIpc() ниже просто зовёт их с
+// реальным outputBuffer — это ТА ЖЕ функция, что исполняется в проде, не
+// копия для теста. См. test/ipc-output-buffer-wiring.test.js.
+function bufferTermData({ channel, payload, outputBuffer }) {
+  if (channel === 'term:data' && payload) outputBuffer.push(payload.tabId, payload.data);
+}
+
+function dropTabOutputBuffer({ tabId, outputBuffer }) {
+  outputBuffer.drop(tabId);
+}
+
 function registerIpc(win, opts = {}) {
   const { smoke = false, attention = null, toaster = null } = opts;
   ipcBootAt = Date.now(); // окно cacheOnly для ccusage — см. usage:get (инцидент 8ГБ)
@@ -1195,7 +1215,9 @@ function registerIpc(win, opts = {}) {
       // Задача 4 (буфер вывода): наполняем ТУТ ЖЕ, в том самом месте, где
       // событие term:data уходит в broadcast.emit ниже, — подключившийся
       // клиент получает то же самое, что видит окно на ПК, ни байтом меньше.
-      if (channel === 'term:data') outputBuffer.push(payload.tabId, payload.data);
+      // bufferTermData вынесена выше (Important 1 ревью) ради собственного
+      // юнит-теста — эта строка зовёт РОВНО её, не копию.
+      bufferTermData({ channel, payload, outputBuffer });
       if (channel === 'tabs:changed') syncWorkspace();
       // Task 2 фазы 8 («Ночная смена») — детект остановки по лимиту. См.
       // подробный комментарий у объявления lastStatusByTab выше по файлу:
@@ -1565,7 +1587,9 @@ function registerIpc(win, opts = {}) {
     // Задача 4 (буфер вывода): без drop() буфер закрытой вкладки копится в
     // памяти до перезапуска кокпита — тот же приём, что toaster.forget()/
     // lastStatusByTab.delete() выше, только для output-buffer.js.
-    outputBuffer.drop(tabId);
+    // dropTabOutputBuffer вынесена выше (Important 1 ревью) ради собственного
+    // юнит-теста — эта строка зовёт РОВНО её, не копию.
+    dropTabOutputBuffer({ tabId, outputBuffer });
     // M1+M3 (ревью финальной волны): если вкладка ждала сброса ночного лимита
     // (в pending night-watch.js), закрытие должно освободить будильник/блокер
     // немедленно, а не после впустую потраченного цикла ретраев — nightWatch.
@@ -1978,6 +2002,9 @@ module.exports = {
   // фазы 7 + «дыра тестов №1», ревью финальной волны, см. комментарии у их
   // определения выше) — не часть публичного API модуля для остального кода.
   gitGetHandler, ghRepoHandler, ghGlobalHandler,
+  // Important 1 (ревью задачи 4): проводка буфера вывода — см. комментарий у
+  // их определения выше и test/ipc-output-buffer-wiring.test.js.
+  bufferTermData, dropTabOutputBuffer,
   historySearchHandler, historyRefreshHandler, createHistoryIndexState, HISTORY_INDEX_TTL_MS,
   recipesListHandler, recipesSavePromptHandler, recipesDeletePromptHandler,
   recipesListWorkspacesHandler, recipesSaveWorkspaceHandler, recipesDeleteWorkspaceHandler,
