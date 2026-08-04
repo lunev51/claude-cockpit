@@ -1877,7 +1877,6 @@ function registerIpc(win, opts = {}) {
   // и был недостижим (см. progress.md, Task 1, отложенный minor). Возврат
   // ничего не ломает: единственный вызывающий (main.js) до сих пор не
   // использовал результат registerIpc() вовсе.
-  ipcMain.handle(`net:tpl`, () => 42);
   return { registry };
 }
 
