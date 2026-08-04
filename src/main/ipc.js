@@ -12,6 +12,10 @@ const { EventEmitter } = require('events');
 const {
   ipcMain, shell, dialog, app, clipboard, powerSaveBlocker,
 } = require('electron');
+const { createCommandRegistry } = require('./command-registry');
+const { createBroadcast } = require('./broadcast');
+const { createOutputBuffer } = require('./output-buffer');
+const { createNetServer } = require('./net-server');
 const { getConfig, setConfig } = require('./config');
 const { createPty } = require('./pty');
 const { createSessionManager } = require('./sessions');
@@ -1026,9 +1030,207 @@ function sttStatusHandler({ smoke, getStt }) {
   }
 }
 
+// Important 1 (ревью задачи 4): наполнение output-buffer.js на term:data и
+// очистка на tabs:close жили ИНЛАЙНОМ прямо внутри onEvent/tabs:close —
+// ревьюер вырезал обе строки и прогнал полный набор: 784 теста, 0 падений.
+// Смысл задачи 4 — не модуль output-buffer.js сам по себе (он покрыт), а
+// именно эти две точки проводки: без них подключившийся клиент видит пустой
+// терминал, и НИЧТО в тестах этого не замечает. Та же причина, что у
+// gitGetHandler/nightToggleHandler/sttStatusHandler и т.д. выше (ipc.js
+// целиком/registerIpc не тестируется под node --test — require('electron')
+// вне настоящего рантайма не даёт объект): логика вынесена в отдельные
+// функции с явными зависимостями, registerIpc() ниже просто зовёт их с
+// реальным outputBuffer — это ТА ЖЕ функция, что исполняется в проде, не
+// копия для теста. См. test/ipc-output-buffer-wiring.test.js.
+function bufferTermData({ channel, payload, outputBuffer }) {
+  if (channel === 'term:data' && payload) outputBuffer.push(payload.tabId, payload.data);
+}
+
+function dropTabOutputBuffer({ tabId, outputBuffer }) {
+  outputBuffer.drop(tabId);
+}
+
+// M1 (ревью раунда 2 задачи 7, Important 1): без аутентификации в этой фазе
+// адрес прослушивания сетевого сервера — ЕДИНСТВЕННАЯ линия обороны кокпита
+// (иначе сервер видел бы любой человек в том же вайфае и мог бы выполнять
+// произвольные команды через реестр — запись в терминал в том числе). Разбор
+// секции net вынесен из инлайна в registerIpc() в отдельную чистую функцию
+// той же причиной, что у bufferTermData/dropTabOutputBuffer выше: до этого
+// фикса живая проверка ревьюера подменила дефолт host на '0.0.0.0' ПРЯМО В
+// ИСТОЧНИКЕ (`typeof netCfg.host === 'string' && netCfg.host ? netCfg.host :
+// '0.0.0.0'`) и весь набор — 828 тестов — остался зелёным: ни один тест не
+// трогал именно эту строку. Дефолты — константы модуля, а не литералы
+// внутри функции: тест на пустой конфиг (см. test/ipc-net-boot.test.js)
+// сравнивает результат с ЛИТЕРАЛОМ '127.0.0.1'/48300, а не с этой
+// константой — иначе изменение константы и тест сдвинулись бы синхронно, и
+// красноты не было бы никогда.
+const NET_DEFAULT_HOST = '127.0.0.1';
+const NET_DEFAULT_PORT = 48300;
+
+// Корни статики сетевого сервера: URL-префикс → каталог на диске. Вынесено из
+// registerIpc() отдельной чистой функцией (root — параметр, а не appRoot()
+// внутри) РАДИ ТЕСТА: appRoot() требует живого Electron, а
+// test/renderer-boot-guard.test.js поднимает настоящий сервер на этой самой
+// карте и дёргает каждую ссылку разметки — так «корень /node_modules убрали»
+// и «.js отдают как text/plain» становятся красными, а не зелёными (I1
+// финального ревью: обе диверсии проходили мимо 856 тестов).
+//
+// Состав ровно такой, потому что разметка renderer НЕ правится под сеть:
+// index.html ссылается на ../../node_modules/@xterm/..., css/fonts.css — на
+// ../../../assets/fonts/... Браузер схлопывает '..' сам ещё до отправки, и на
+// провод уходят /node_modules/... и /assets/... — эти два префикса и корень
+// '/' на src/renderer покрывают всё дерево страницы.
+function rendererStaticRoots(root) {
+  return {
+    '/node_modules': path.join(root, 'node_modules'),
+    '/assets': path.join(root, 'assets'),
+    '/': path.join(root, 'src', 'renderer'),
+  };
+}
+
+// M3 (ревью раунда 2, Minor): порт в диапазоне 1..65535, целое число.
+function validPort(n) {
+  return Number.isInteger(n) && n > 0 && n < 65536;
+}
+
+// netCfg — сырая секция getConfig().net (может отсутствовать, быть null,
+// нести мусор — пользователь правит config.user.json руками). warn —
+// инжектируемый логгер (по умолчанию console.warn), тем же приёмом, что
+// usagePoller/ccusage выше по файлу — тесты подставляют свой сборщик вместо
+// реального console.warn.
+//
+// M3 (ревью раунда 2, Minor): port принимается и числом (обычный путь из
+// config:set/JSON.parse), и строкой — `"port": "48377"` в config.json,
+// написанное рукой, раньше молча откатывалось к дефолту, а стучаться
+// пытались бы в порт, который сервер не слушает. Строка приводится к числу,
+// если результат — целое в допустимом диапазоне (с предупреждением, что
+// применили именно так); иначе — предупреждение и дефолт. host обязан быть
+// непустой строкой; любое другое значение (число, объект, пустая строка) —
+// тоже предупреждение и дефолт, без падения (кокпит обязан подняться на
+// дефолте, а не рухнуть на TypeError из-за опечатки в чужом конфиге).
+function resolveNetConfig(netCfg, warn = (msg) => console.warn(msg)) {
+  const cfg = netCfg && typeof netCfg === 'object' ? netCfg : {};
+
+  let host = NET_DEFAULT_HOST;
+  if (cfg.host !== undefined) {
+    if (typeof cfg.host === 'string' && cfg.host.trim()) {
+      host = cfg.host;
+    } else {
+      warn(`[net] host в конфиге некорректен (${JSON.stringify(cfg.host)}), использую ${NET_DEFAULT_HOST}`);
+    }
+  }
+
+  let port = NET_DEFAULT_PORT;
+  if (cfg.port !== undefined) {
+    if (validPort(cfg.port)) {
+      port = cfg.port;
+    } else if (typeof cfg.port === 'string' && validPort(Number(cfg.port))) {
+      port = Number(cfg.port);
+      warn(`[net] port в конфиге задан строкой ("${cfg.port}"), использую как число ${port}`);
+    } else {
+      warn(`[net] port в конфиге некорректен (${JSON.stringify(cfg.port)}), использую ${NET_DEFAULT_PORT}`);
+    }
+  }
+
+  // allowedHosts (соседняя задача, фикс DNS-rebinding в net-server.js,
+  // раунд 4): доп. имена для белого списка Host — к машине приходят и по
+  // адресу, и по DNS-имени тайлнета одновременно, а host выше хранит
+  // обычно только одно из двух. Разбор не мягче, чем у host/port выше: не
+  // массив — откат к пустому с предупреждением; элементы не строки или
+  // пустые строки — отбрасываются по одному, тоже с предупреждением
+  // (называющим конкретный отброшенный элемент, не просто «что-то не так»).
+  // Валидные элементы не проверяются на формат имени/IP — net-server.js сам
+  // сравнивает их с заголовком Host регистронезависимо, лишний формальный
+  // барьер здесь просто отсеивал бы легитимные варианты записи.
+  let allowedHosts = [];
+  if (cfg.allowedHosts !== undefined) {
+    if (Array.isArray(cfg.allowedHosts)) {
+      const clean = [];
+      for (const item of cfg.allowedHosts) {
+        if (typeof item === 'string' && item.trim()) {
+          clean.push(item);
+        } else {
+          warn(`[net] allowedHosts содержит некорректный элемент (${JSON.stringify(item)}) — отброшен`);
+        }
+      }
+      allowedHosts = clean;
+    } else {
+      warn(`[net] allowedHosts в конфиге некорректен (${JSON.stringify(cfg.allowedHosts)}), использую []`);
+    }
+  }
+
+  return { host, port, allowedHosts };
+}
+
+// M2 (ревью раунда 2, Important 2): раньше сбой netServer.start() ТОЛЬКО
+// логировался в консоль, которую никто не видит при автозапуске ярлыком —
+// самый вероятный сценарий живой приёмки: кокпит стартует РАНЬШЕ, чем
+// Tailscale поднял свой интерфейс на этом ПК, адрес из конфига физически ещё
+// не существует, start() падает с EADDRNOTAVAIL, и без повторов сервер не
+// слушает уже НИКОГДА за всю жизнь процесса — с макбука это выглядит как
+// «сайт не открывается», а на ПК ничем не выражено. Ограниченные повторы
+// дают интерфейсу время подняться (типичный boot-race), но НЕ лечат
+// постоянную недоступность порта (EADDRINUSE — задача 6 уже сделала его
+// безопасным для процесса, но повтором его не решить: порт останется занят
+// и после паузы, кокпит доберёт лимит попыток и всё равно уведомит).
+//
+// setTimer — инжектируемая обёртка над setTimeout, тот же приём, что у
+// createNightWatch({setTimer}) в этом же файле (см. registerIpc ниже) —
+// test/ipc-net-boot.test.js использует фейковый реестр таймеров вместо
+// реального времени, той же формы, что уже применена в night-watch.test.js.
+const NET_START_RETRY_MS = 5000;
+const NET_START_MAX_RETRIES = 6; // ~30с суммарно — с запасом переживает типичный boot-race с поднятием интерфейса Tailscale
+
+function startNetServerWithRetries({
+  start, host, port, notify: notifyFn, setTimer = setTimeout,
+  retryMs = NET_START_RETRY_MS, maxRetries = NET_START_MAX_RETRIES, attempt = 0,
+}) {
+  return start().then(
+    () => {
+      // M4 (ревью раунда 2, Minor): для фичи, весь смысл которой «набери
+      // этот адрес на другом устройстве», адрес обязан появиться в логе —
+      // это первое, что человек будет искать. Печатается ТОЛЬКО на успех.
+      console.log(`[net] слушаю http://${host}:${port}`);
+      return true;
+    },
+    (err) => {
+      if (attempt < maxRetries) {
+        console.log(`[net] сервер не поднялся на ${host}:${port} (${err.message}) — повтор ${attempt + 1}/${maxRetries} через ${Math.round(retryMs / 1000)}с`);
+        return new Promise((resolve) => {
+          const id = setTimer(() => {
+            resolve(startNetServerWithRetries({
+              start, host, port, notify: notifyFn, setTimer, retryMs, maxRetries, attempt: attempt + 1,
+            }));
+          }, retryMs);
+          if (id && typeof id.unref === 'function') id.unref();
+        });
+      }
+      // Тем же каналом, что «config.json повреждён — работаю на дефолтах» в
+      // main.js: человек должен узнать о проблеме ОТ КОКПИТА, а не по
+      // неоткрывающейся странице на другом устройстве.
+      console.log(`[net] сдаюсь после ${maxRetries + 1} попыток: ${err.message}`);
+      notifyFn(`Сетевой сервер кокпита не поднялся на ${host}:${port} (${err.message}). Локальное окно работает, удалённый доступ недоступен.`, 'error');
+      return false;
+    },
+  );
+}
+
 function registerIpc(win, opts = {}) {
   const { smoke = false, attention = null, toaster = null } = opts;
   ipcBootAt = Date.now(); // окно cacheOnly для ccusage — см. usage:get (инцидент 8ГБ)
+
+  // Рассылка исходящих событий (broadcast.js) — симметричная половина
+  // реестра команд ниже: реестр сводит ВХОДЯЩИЕ команды в одну точку,
+  // broadcast — ИСХОДЯЩИЕ события. Объявлена здесь, В САМОМ НАЧАЛЕ функции
+  // (ре-ревью задачи 3, мелочь): manager/nightWatch чуть ниже уже держат
+  // замыкания, которые зовут broadcast.emit — при объявлении константы
+  // ближе к концу функции любой будущий СИНХРОННЫЙ вызов такого замыкания
+  // между их созданием и этой строкой поймал бы ReferenceError (TDZ) на
+  // старте всего приложения. getWindow — функция, а не сам win, потому что
+  // win передаётся в registerIpc() уже готовым, но объявлять зависимость
+  // через геттер дешевле, чем помнить, что где-то выше это единственное
+  // место, которое обязано звать закрытие, а не значение.
+  const broadcast = createBroadcast({ getWindow: () => win });
 
   // Слои usage (Task 3 фазы 5): инстансы создаются ВСЕГДА (конструктор — это
   // просто замыкания над зависимостями, никакого I/O до первого refresh()/get()),
@@ -1176,6 +1378,12 @@ function registerIpc(win, opts = {}) {
     readSessionTitle: (transcriptPath, sessionId) => sessionTitleReader.read(transcriptPath, sessionId),
     onEvent: (channel, payload) => {
       if (smoke && channel === 'term:data') smokeOutput += payload.data;
+      // Задача 4 (буфер вывода): наполняем ТУТ ЖЕ, в том самом месте, где
+      // событие term:data уходит в broadcast.emit ниже, — подключившийся
+      // клиент получает то же самое, что видит окно на ПК, ни байтом меньше.
+      // bufferTermData вынесена выше (Important 1 ревью) ради собственного
+      // юнит-теста — эта строка зовёт РОВНО её, не копию.
+      bufferTermData({ channel, payload, outputBuffer });
       if (channel === 'tabs:changed') syncWorkspace();
       // Task 2 фазы 8 («Ночная смена») — детект остановки по лимиту. См.
       // подробный комментарий у объявления lastStatusByTab выше по файлу:
@@ -1217,7 +1425,7 @@ function registerIpc(win, opts = {}) {
           waitingText: payload.waitingText,
         });
       }
-      if (!win.isDestroyed()) win.webContents.send(channel, payload);
+      broadcast.emit(channel, payload);
     },
   });
 
@@ -1291,7 +1499,7 @@ function registerIpc(win, opts = {}) {
       if (t) manager.write(tabId, `${t}\r`);
     },
     emit: (event, payload) => {
-      if (!win.isDestroyed()) win.webContents.send(event, payload);
+      broadcast.emit(event, payload);
     },
     powerBlocker: smoke ? createNoopPowerBlocker() : createRealPowerBlocker(),
     journal: withNightToasts(
@@ -1341,9 +1549,7 @@ function registerIpc(win, opts = {}) {
       const key = usageBroadcastKey(snap);
       if (key !== lastBroadcastKey) {
         lastBroadcastKey = key;
-        if (!win.isDestroyed()) {
-          win.webContents.send('usage:update', { limits: snap, spend: lastCcusageResult });
-        }
+        broadcast.emit('usage:update', { limits: snap, spend: lastCcusageResult });
       }
     }, 5000);
     usageMonitorTimer.unref?.();
@@ -1362,19 +1568,76 @@ function registerIpc(win, opts = {}) {
         // (гонка с параллельным usage:refresh) — deferred никогда не
         // затирает настоящие данные.
         if (!(spend && spend.error === 'deferred')) lastCcusageResult = spend;
-        if (!win.isDestroyed()) {
-          win.webContents.send('usage:update', {
-            limits: usagePoller.snapshot(), spend: lastCcusageResult,
-          });
-        }
+        broadcast.emit('usage:update', {
+          limits: usagePoller.snapshot(), spend: lastCcusageResult,
+        });
       } catch { /* ccusage.get сам не бросает; ремень на чужие сбои */ }
     }, CCUSAGE_BOOT_DEFER_MS + 2000);
     deferredSpendTimer.unref?.();
   }
 
-  ipcMain.handle('config:get', () => getConfig());
+  // Реестр команд (command-registry.js): каждый обработчик кладётся СРАЗУ в
+  // ipcMain (локальный renderer работает как раньше) и в карту имён (сетевой
+  // транспорт фазы «кокпит по сети» зовёт их по имени канала). Задача 1
+  // перевела на реестр только группу tabs:*, задача 2 — все остальные каналы
+  // без исключения (см. test/command-registry.coverage.test.js: в файле не
+  // должно остаться ни одной прямой регистрации на ipcMain). Создаётся один
+  // раз, здесь же, ДО первой регистрации — раньше объявление жило ниже, перед
+  // tabs:open, единственной группой, которая тогда его использовала.
+  const registry = createCommandRegistry({ ipcMain });
 
-  ipcMain.handle('config:set', (_e, partial) => {
+  // Хвост вывода по вкладкам (output-buffer.js) — то, что отдаётся клиенту
+  // сразу при подключении: сетевой сервер сам xterm не видит, а история
+  // живёт только внутри окна ПК. Наполняется ниже, там же, где событие
+  // term:data уходит в broadcast.emit; чистится на tabs:close.
+  const outputBuffer = createOutputBuffer({});
+
+  // Задача 7 фазы «кокпит по сети»: сам сетевой сервер (net-server.js,
+  // задача 6) — HTTP-статика renderer + WebSocket-мост к реестру команд.
+  // Создаётся здесь, сразу после registry/outputBuffer (оба ему нужны как
+  // параметры), стартует безусловно, тем же приёмом, что startBridge() выше:
+  // сервер поднимается и в smoke (иначе сетевой транспорт вообще не
+  // затрагивается прогоном), просто без внешнего наблюдателя за ним.
+  // Слушаем ТОЛЬКО адрес из конфига, а не 0.0.0.0: на всех интерфейсах
+  // кокпит был бы виден любому в чужом вайфае, а это выполнение произвольных
+  // команд на машине (аутентификации в этой фазе ещё нет, она отдельным
+  // планом). Адрес — из конфига, а не прошит в коде: он принадлежит МАШИНЕ
+  // (конкретный адрес Tailscale этого ПК), а не программе, и меняется при
+  // перевыпуске ключа Tailscale. Дефолт '127.0.0.1' безопасен сам по себе:
+  // не настроив ничего, пользователь получает сервер, доступный только с
+  // этого же ПК. Разбор секции — через resolveNetConfig() (см. её
+  // комментарий выше по файлу) — единая точка, которую покрывает
+  // test/ipc-net-boot.test.js, а не инлайн-тернарники, которые ревью раунда
+  // 2 подменило дефолтом '0.0.0.0' без единого красного теста. allowedHosts
+  // — доп. имена для белого списка Host внутри net-server.js (фикс
+  // DNS-rebinding, соседняя задача, раунд 4): к машине приходят и по
+  // адресу, и по DNS-имени тайлнета одновременно, а host выше хранит
+  // обычно только одно из двух.
+  const netCfg = resolveNetConfig(getConfig().net);
+  const netServer = createNetServer({
+    registry,
+    broadcast,
+    outputBuffer,
+    staticRoots: rendererStaticRoots(appRoot()),
+    port: netCfg.port,
+    host: netCfg.host,
+    allowedHosts: netCfg.allowedHosts,
+  });
+  // startBridge() выше сама ловит ошибки старта и делает фолбэк на эфемерный
+  // порт — у сетевого сервера такого фолбэка нет (адрес важен пользователю
+  // буквально, порт согласован заранее). Вместо голого console.log —
+  // startNetServerWithRetries() (см. её комментарий выше по файлу): не
+  // роняет остальной кокпит при неудаче (локальное окно обязано работать,
+  // даже если сетевой сервер не поднялся), даёт ограниченное число повторов
+  // на случай boot-race с интерфейсом Tailscale и уведомляет notify(), если
+  // сдался — тем же каналом, что «config.json повреждён» в main.js.
+  startNetServerWithRetries({
+    start: () => netServer.start(), host: netCfg.host, port: netCfg.port, notify,
+  });
+
+  registry.handle('config:get', () => getConfig());
+
+  registry.handle('config:set', (partial) => {
     if (!partial || typeof partial !== 'object' || Array.isArray(partial)) {
       throw new TypeError('config:set ожидает plain-object');
     }
@@ -1387,9 +1650,9 @@ function registerIpc(win, opts = {}) {
   // КАЖДОЕ изменение состояния, отдельного IPC для него не требуется. Логика
   // смоук-гейта — в nightToggleHandler()/nightGetHandler() выше по файлу (та
   // же причина, что и у остальных вынесенных хендлеров — см. комментарий там).
-  ipcMain.handle('night:toggle', () => nightToggleHandler({ smoke, nightWatch }));
+  registry.handle('night:toggle', () => nightToggleHandler({ smoke, nightWatch }));
 
-  ipcMain.handle('night:get', () => nightGetHandler({ smoke, nightWatch }));
+  registry.handle('night:get', () => nightGetHandler({ smoke, nightWatch }));
 
   // Task 3 фазы 5 (кольца лимитов): usagePoller.snapshot() — синхронный, без
   // сети. ccusage.get() — лениво: первый usage:get и есть тот самый «первый
@@ -1397,7 +1660,7 @@ function registerIpc(win, opts = {}) {
   // чаще ttlMs (проводить свой отдельный троттлинг здесь не нужно — это уже
   // сделано в модуле). smoke: НИ сети, НИ npx — spend всегда null, ccusage.get()
   // не зовётся вовсе.
-  ipcMain.handle('usage:get', async () => {
+  registry.handle('usage:get', async () => {
     const limits = usagePoller.snapshot();
     if (smoke) return { limits, spend: null };
     // Инцидент 8ГБ (01.08): первые 90с после старта — шторм спавна сессий
@@ -1422,7 +1685,7 @@ function registerIpc(win, opts = {}) {
   // (б) минимальный интервал MANUAL_REFRESH_MIN_INTERVAL_MS (10с) между
   //     РЕАЛЬНО выполненными обновлениями — вызов внутри окна получает текущий
   //     снапшот без единой сетевой/npx операции.
-  ipcMain.handle('usage:refresh', async () => {
+  registry.handle('usage:refresh', async () => {
     if (smoke) return { limits: usagePoller.snapshot(), spend: null };
     if (manualRefreshInFlight) return manualRefreshInFlight;
 
@@ -1457,13 +1720,13 @@ function registerIpc(win, opts = {}) {
     }
   });
 
-  ipcMain.handle('shell:openExternal', (_e, url) => {
+  registry.handle('shell:openExternal', (url) => {
     if (typeof url === 'string' && /^https?:\/\//i.test(url)) shell.openExternal(url);
   });
 
   // Task 4 фазы 4 (палитра команд): «Открыть DevTools» — то же самое, что
   // делает F12 (см. main.js/before-input-event), просто доступное и из палитры.
-  ipcMain.handle('app:devtools', () => {
+  registry.handle('app:devtools', () => {
     if (!win.isDestroyed()) win.webContents.toggleDevTools();
   });
 
@@ -1472,7 +1735,7 @@ function registerIpc(win, opts = {}) {
   // attention — чистый модуль (attention.js), инстанс создаётся в main.js
   // (там же живут nativeImage и win.setOverlayIcon) и прокидывается сюда
   // через opts — ipc.js только маршрутизирует IPC-пейлоад.
-  ipcMain.on('attention:update', (_e, payload) => {
+  registry.on('attention:update', (payload) => {
     if (!attention || !payload || typeof payload !== 'object') return;
     const { count, dataUrl } = payload;
     // Fix (ревью): typeof count !== 'number' пропускал NaN (typeof NaN ===
@@ -1482,6 +1745,39 @@ function registerIpc(win, opts = {}) {
     if (!Number.isInteger(count) || count < 0) return;
     attention.update({ count, dataUrl: typeof dataUrl === 'string' ? dataUrl : null });
   });
+
+  // Список ЖИВЫХ вкладок менеджера (C1 финального ревью ветки). До него в
+  // реестре не было НИ ОДНОГО канала, отдающего наружу tabId работающих
+  // сессий: клиент, открывший страницу, знал только манифест воркспейса (что
+  // было ВЧЕРА) и потому мог лишь звать tabs:open — а тот на каждый вызов
+  // минтит НОВЫЙ tabId. Живьём это давало второй `claude --resume <тот же
+  // sessionId>` на каждую вкладку: два процесса на один транскрипт и один
+  // ghost-файл, удвоенный манифест, переживающий перезапуск, и ×4 на
+  // следующем подключении. Срабатывало и на 127.0.0.1, то есть при простом
+  // открытии адреса кокпита на самом ПК.
+  //
+  // Отдаём manager.list() как есть (тот же снимок, что уже уходит в манифест
+  // воркспейса): renderer'у нужны tabId/cwd/name для строки сайдбара и
+  // status/subtitle/waitingKind/waitingText/sessionLabel, чтобы подключённая
+  // вкладка сразу встала в правильную секцию, а не ждала следующего хука.
+  registry.handle('tabs:list', () => manager.list());
+
+  // История вывода вкладки — хвост из output-buffer.js (задача 4). C2
+  // финального ревью: канал существовал ТОЛЬКО внутри net-server.js, в форме
+  // window.api его не было вовсе, и ни app.js, ни terminal.js его не звали —
+  // то есть пункт спеки «подключившийся клиент видит, на чём остановилась
+  // работа» не работал, а весь буфер копился в стол.
+  //
+  // Почему обработчик есть И здесь, и отдельной веткой в net-server.js:
+  // сетевой сервер перехватывает net:buffer ДО реестра (история — свойство
+  // соединения, см. комментарий там), а этот обработчик обслуживает ЛОКАЛЬНЫЙ
+  // путь — перезагрузку renderer (Ctrl+R) при живом main, когда вкладки уже
+  // работают, а xterm в окне только что создан с нуля. Оба читают ОДИН И ТОТ
+  // ЖЕ экземпляр outputBuffer, разойтись им нечем.
+  //
+  // Пустой хвост (вкладка только создана, вывода ещё не было) — нормальный
+  // ответ, а не ошибка: отдаём пустую строку.
+  registry.handle('net:buffer', (tabId) => (typeof tabId === 'string' ? outputBuffer.get(tabId) : ''));
 
   // Регистрация вкладки. cwd обязателен — renderer берёт его из диалога
   // или из конфига; smoke-режим подменяет команду в sessions.js.
@@ -1495,7 +1791,7 @@ function registerIpc(win, opts = {}) {
   // ghostId (Task 5, ревью finding 1a) — восстановление передаёт исходный id
   // вкладки из манифеста, чтобы не заводить новый ghost-файл при каждом
   // restore и не осиротить старый.
-  ipcMain.handle('tabs:open', (_e, {
+  registry.handle('tabs:open', ({
     cwd, command, args, ghostId, sessionId, sessionLabel,
   } = {}) => {
     if (typeof cwd !== 'string' || !cwd) return null;
@@ -1511,7 +1807,7 @@ function registerIpc(win, opts = {}) {
     });
   });
 
-  ipcMain.handle('tabs:close', (_e, tabId) => {
+  registry.handle('tabs:close', (tabId) => {
     if (typeof tabId !== 'string') return;
     // Резолвим ghostId ДО manager.close (Task 5) — close() удаляет вкладку
     // из менеджера, и list() её больше не найдёт; отдельного ghost:delete
@@ -1530,6 +1826,12 @@ function registerIpc(win, opts = {}) {
     // смены (lastStatusByTab) больше никому не нужна и не должна копиться в
     // памяти навсегда, тот же приём, что toaster.forget()/ghost-файл выше.
     lastStatusByTab.delete(tabId);
+    // Задача 4 (буфер вывода): без drop() буфер закрытой вкладки копится в
+    // памяти до перезапуска кокпита — тот же приём, что toaster.forget()/
+    // lastStatusByTab.delete() выше, только для output-buffer.js.
+    // dropTabOutputBuffer вынесена выше (Important 1 ревью) ради собственного
+    // юнит-теста — эта строка зовёт РОВНО её, не копию.
+    dropTabOutputBuffer({ tabId, outputBuffer });
     // M1+M3 (ревью финальной волны): если вкладка ждала сброса ночного лимита
     // (в pending night-watch.js), закрытие должно освободить будильник/блокер
     // немедленно, а не после впустую потраченного цикла ретраев — nightWatch.
@@ -1547,7 +1849,7 @@ function registerIpc(win, opts = {}) {
   // восстановлении показать «вчерашний вывод» мгновенно, пока живой pty ещё
   // поднимается. Best-effort — ошибка записи не должна ронять приложение.
   // smoke: no-op — headless-прогон не должен трогать userData.
-  ipcMain.handle('ghost:save', (_e, payload) => {
+  registry.handle('ghost:save', (payload) => {
     if (smoke) return;
     if (!payload || typeof payload !== 'object') return;
     const { tabId, text } = payload;
@@ -1576,7 +1878,7 @@ function registerIpc(win, opts = {}) {
     }
   });
 
-  ipcMain.handle('ghost:load', (_e, ghostId) => {
+  registry.handle('ghost:load', (ghostId) => {
     // smoke-гейт для консистентности с ghost:save (ревью, finding 2) —
     // headless-прогон не должен трогать userData.
     if (smoke) return null;
@@ -1592,9 +1894,9 @@ function registerIpc(win, opts = {}) {
   // и репортит активную вкладку при каждом переключении.
   // smoke-изоляция: headless-прогон не должен видеть оверлей restore — иначе
   // он завис бы до таймаута (никто не жмёт Enter/Esc в smoke).
-  ipcMain.handle('workspace:get', () => (smoke ? null : store.load()));
+  registry.handle('workspace:get', () => (smoke ? null : store.load()));
 
-  ipcMain.on('workspace:setActive', (_e, p) => {
+  registry.on('workspace:setActive', (p) => {
     if (p && typeof p.tabId === 'string') {
       activeTabId = p.tabId;
       syncWorkspace();
@@ -1605,7 +1907,7 @@ function registerIpc(win, opts = {}) {
   // реально смотрит на эту вкладку — она уезжает из «Готово» в «Наготове».
   // Гард узкий и живёт в ядре (manager.markSeen): двигаем только 'done', так
   // что лишнее или запоздавшее сообщение безвредно.
-  ipcMain.on('tabs:seen', (_e, p) => {
+  registry.on('tabs:seen', (p) => {
     if (p && typeof p.tabId === 'string') manager.markSeen(p.tabId);
   });
 
@@ -1631,11 +1933,11 @@ function registerIpc(win, opts = {}) {
   // Сама логика (markReady + условный sync) вынесена в wsync.readyAndSync —
   // это чистый (без Electron) код workspace-sync.js, покрытый test/workspace-sync.test.js;
   // ipc.js больше не содержит непокрытой тестами ветки этого хотфикса.
-  ipcMain.on('workspace:ready', () => {
+  registry.on('workspace:ready', () => {
     wsync.readyAndSync(activeTabId);
   });
 
-  ipcMain.handle('tabs:chooseFolder', async () => {
+  registry.handle('tabs:chooseFolder', async () => {
     const result = await dialog.showOpenDialog(win, {
       properties: ['openDirectory', 'createDirectory'],
       title: 'Папка проекта для Claude',
@@ -1658,7 +1960,7 @@ function registerIpc(win, opts = {}) {
   // не обновлялась бы сама, а пользователь не узнал бы, что нужно сделать.
   // notify() — тот же канал app:notice, что main уже использует для других
   // уведомлений (см. main.js) — renderer показывает его тостом (app.js).
-  ipcMain.handle('project:connect', (_e, tabId) => {
+  registry.handle('project:connect', (tabId) => {
     const cwd = tabCwd(tabId);
     if (!cwd) return { connected: false, error: 'вкладка не найдена' };
     const res = connectProject(cwd, hookOpts());
@@ -1668,7 +1970,7 @@ function registerIpc(win, opts = {}) {
     return res;
   });
 
-  ipcMain.handle('project:status', (_e, tabId) => {
+  registry.handle('project:status', (tabId) => {
     const cwd = tabCwd(tabId);
     return { connected: cwd ? isConnected(cwd) : false };
   });
@@ -1680,7 +1982,7 @@ function registerIpc(win, opts = {}) {
   // повтор (кнопка «Обновить» панели), опрокидывает TTL-кэш gitInfo.
   // Сама логика — в gitGetHandler() (см. выше по файлу, п.4 брифа задачи 5
   // фазы 7): вынесена, чтобы смоук-гейт был протестирован без Electron.
-  ipcMain.handle('git:get', async (_e, tabId, opts) => gitGetHandler({
+  registry.handle('git:get', async (tabId, opts) => gitGetHandler({
     smoke, tabId, opts, tabCwd, gitInfo,
   }));
 
@@ -1689,7 +1991,7 @@ function registerIpc(win, opts = {}) {
   // внешние процессы сверх PTY_OK-смоука. force — ручной повтор, опрокидывает
   // TTL-кэш ghInfo. Логика — в ghRepoHandler() выше по файлу (та же причина,
   // что у git:get).
-  ipcMain.handle('gh:repo', async (_e, tabId, opts) => ghRepoHandler({
+  registry.handle('gh:repo', async (tabId, opts) => ghRepoHandler({
     smoke, tabId, opts, tabCwd, ghInfo,
   }));
 
@@ -1697,7 +1999,7 @@ function registerIpc(win, opts = {}) {
   // непрочитанных уведомлений, без привязки к конкретной вкладке (дашборд,
   // Task 4 фазы 6). smoke — тот же гейт, что и gh:repo выше. Логика —
   // в ghGlobalHandler() выше по файлу.
-  ipcMain.handle('gh:global', async (_e, opts) => ghGlobalHandler({ smoke, opts, ghInfo }));
+  registry.handle('gh:global', async (opts) => ghGlobalHandler({ smoke, opts, ghInfo }));
 
   // Task 3 фазы 7 (глобальный поиск истории, Ctrl+Shift+H) + I5 (ревью
   // финальной волны, TTL индекса): смотри search.js (renderer) — оверлей с
@@ -1705,11 +2007,11 @@ function registerIpc(win, opts = {}) {
   // в historySearchHandler()/historyRefreshHandler() выше по файлу (вынесены
   // ради тестируемости смоук-гейта — «дыра тестов №1», ревью финальной
   // волны — и TTL-фикса I5, см. подробные комментарии там).
-  ipcMain.handle('history:search', async (_e, query, opts) => historySearchHandler({
+  registry.handle('history:search', async (query, opts) => historySearchHandler({
     smoke, query, opts, state: historyIndexState, historyIndex,
   }));
 
-  ipcMain.handle('history:refresh', async (_e, opts) => historyRefreshHandler({
+  registry.handle('history:refresh', async (opts) => historyRefreshHandler({
     smoke, opts, state: historyIndexState, historyIndex,
   }));
 
@@ -1724,28 +2026,28 @@ function registerIpc(win, opts = {}) {
   // выше по файлу (та же причина, что historySearchHandler/gitGetHandler —
   // ipc.js целиком не тестируется, а этот канал добавлен в ЭТОЙ ЖЕ ветке
   // фазы 7 с тем же классом смоук-гейта, но остался без единого теста).
-  ipcMain.handle('recipes:list', () => recipesListHandler({ smoke, recipeStore }));
+  registry.handle('recipes:list', () => recipesListHandler({ smoke, recipeStore }));
 
   // Сохранение/удаление рецепта — CRUD-контракт recipes.js целиком (бриф),
   // текущий UI (палитра) сам новые рецепты не создаёт и не удаляет (только
   // читает дефолты + то, что уже лежит в prompts.json) — задел на будущую
   // форму редактирования библиотеки, тот же приём, что history:refresh выше.
   // Логика — в recipesSavePromptHandler()/recipesDeletePromptHandler() выше.
-  ipcMain.handle('recipes:savePrompt', (_e, p) => recipesSavePromptHandler({ smoke, recipe: p, recipeStore }));
+  registry.handle('recipes:savePrompt', (p) => recipesSavePromptHandler({ smoke, recipe: p, recipeStore }));
 
-  ipcMain.handle('recipes:deletePrompt', (_e, id) => recipesDeletePromptHandler({ smoke, id, recipeStore }));
+  registry.handle('recipes:deletePrompt', (id) => recipesDeletePromptHandler({ smoke, id, recipeStore }));
 
   // fillPrompt — чистая текстовая подстановка без единого обращения к диску,
   // смысла гейтить smoke'ом нет (тот же довод, что config:get/shell.openExternal
   // выше по файлу не гейтятся) — просто безвредный no-op на пустых values.
-  ipcMain.handle('recipes:fillPrompt', (_e, text, values) => fillPrompt(text, values));
+  registry.handle('recipes:fillPrompt', (text, values) => fillPrompt(text, values));
 
   // Minor 8 (ревью раунд 1): нормализация переносов строк перед записью в pty —
   // тоже чистая функция без диска, тот же довод, что recipes:fillPrompt выше,
   // не гейтим smoke'ом. Зовётся app.js/runRecipe БЕЗУСЛОВНО (даже без
   // плейсхолдеров), чтобы внутренний \n текста рецепта не ушёл в терминал
   // отдельным Enter (в т.ч. молчаливым подтверждением диалога разрешения).
-  ipcMain.handle('recipes:normalizeForPty', (_e, text) => normalizeForPty(text));
+  registry.handle('recipes:normalizeForPty', (text) => normalizeForPty(text));
 
   // Именованные воркспейсы (Task 4 фазы 7): listWorkspaces/saveWorkspace —
   // палитра читает и пишет их напрямую (действия «Открыть воркспейс: <name>»/
@@ -1756,20 +2058,20 @@ function registerIpc(win, opts = {}) {
   // Дыра тестов №1 (ревью финальной волны): логика — в
   // recipesListWorkspacesHandler()/recipesSaveWorkspaceHandler()/
   // recipesDeleteWorkspaceHandler() выше по файлу (та же причина).
-  ipcMain.handle('recipes:listWorkspaces', () => recipesListWorkspacesHandler({ smoke, recipeStore }));
+  registry.handle('recipes:listWorkspaces', () => recipesListWorkspacesHandler({ smoke, recipeStore }));
 
-  ipcMain.handle('recipes:saveWorkspace', (_e, name, tabs) => recipesSaveWorkspaceHandler({
+  registry.handle('recipes:saveWorkspace', (name, tabs) => recipesSaveWorkspaceHandler({
     smoke, name, tabs, recipeStore,
   }));
 
-  ipcMain.handle('recipes:deleteWorkspace', (_e, id) => recipesDeleteWorkspaceHandler({ smoke, id, recipeStore }));
+  registry.handle('recipes:deleteWorkspace', (id) => recipesDeleteWorkspaceHandler({ smoke, id, recipeStore }));
 
   // Task 4 фазы 4 (вставка скриншотов): cwd вкладки резолвим тем же путём,
   // что project:connect/status — tabCwd (manager.list()). saveClipboardImage —
   // чистый модуль (screenshot.js), clipboard.readImage() инжектируется отсюда.
   // Любая ошибка (в т.ч. пустой буфер, недоступный clipboard) → null — renderer
   // (terminal.js) сам падает на обычную текстовую вставку в этом случае.
-  ipcMain.handle('screenshot:paste', (_e, tabId) => {
+  registry.handle('screenshot:paste', (tabId) => {
     if (typeof tabId !== 'string') return null;
     const cwd = tabCwd(tabId);
     if (!cwd) return null;
@@ -1781,7 +2083,7 @@ function registerIpc(win, opts = {}) {
     }
   });
 
-  ipcMain.on('term:start', (_e, payload) => {
+  registry.on('term:start', (payload) => {
     // Payload может прийти не объектом (null и т.п.) — деструктуризация упала
     // бы через uncaughtException прямо в app.exit(1). Отсекаем заранее.
     if (!payload || typeof payload !== 'object') return;
@@ -1791,13 +2093,13 @@ function registerIpc(win, opts = {}) {
     manager.start(tabId, cols, rows);
   });
 
-  ipcMain.on('term:restart', (_e, payload) => {
+  registry.on('term:restart', (payload) => {
     if (!payload || typeof payload !== 'object') return;
     const { tabId } = payload;
     if (typeof tabId === 'string') manager.restart(tabId);
   });
 
-  ipcMain.on('term:write', (_e, payload) => {
+  registry.on('term:write', (payload) => {
     if (!payload || typeof payload !== 'object') return;
     const { tabId, data } = payload;
     if (typeof tabId !== 'string' || typeof data !== 'string') return;
@@ -1814,7 +2116,7 @@ function registerIpc(win, opts = {}) {
     if (nightWatch && hasRealUserInput(data)) nightWatch.onUserInput(tabId);
   });
 
-  ipcMain.on('term:resize', (_e, payload) => {
+  registry.on('term:resize', (payload) => {
     if (!payload || typeof payload !== 'object') return;
     const { tabId, cols, rows } = payload;
     if (typeof tabId !== 'string') return;
@@ -1826,21 +2128,21 @@ function registerIpc(win, opts = {}) {
   // term:write/term:restart выше — состояние возвращается отдельным событием
   // (queue:changed, генерируется sessions.js и уходит через generic onEvent
   // в начале registerIpc), синхронный ответ invoke() здесь не нужен.
-  ipcMain.on('queue:add', (_e, payload) => {
+  registry.on('queue:add', (payload) => {
     if (!payload || typeof payload !== 'object') return;
     const { tabId, text } = payload;
     if (typeof tabId !== 'string' || typeof text !== 'string') return;
     manager.enqueue(tabId, text);
   });
 
-  ipcMain.on('queue:remove', (_e, payload) => {
+  registry.on('queue:remove', (payload) => {
     if (!payload || typeof payload !== 'object') return;
     const { tabId, index } = payload;
     if (typeof tabId !== 'string' || !Number.isInteger(index)) return;
     manager.removeFromQueue(tabId, index);
   });
 
-  ipcMain.on('queue:clear', (_e, payload) => {
+  registry.on('queue:clear', (payload) => {
     if (!payload || typeof payload !== 'object') return;
     const { tabId } = payload;
     if (typeof tabId !== 'string') return;
@@ -1852,9 +2154,25 @@ function registerIpc(win, opts = {}) {
   // только проводка каналов, вся смоук-логика и создание инстанса (M2,
   // ревью финальной волны: подъём JS-объекта, НЕ сервера — см. getOrCreateStt
   // выше) — внутри самих хендлеров.
-  ipcMain.handle('stt:transcribe', (_e, wav) => sttTranscribeHandler({ smoke, wav, getStt: getOrCreateStt }));
+  registry.handle('stt:transcribe', (wav) => sttTranscribeHandler({ smoke, wav, getStt: getOrCreateStt }));
 
-  ipcMain.handle('stt:status', () => sttStatusHandler({ smoke, getStt: getOrCreateStt }));
+  registry.handle('stt:status', () => sttStatusHandler({ smoke, getStt: getOrCreateStt }));
+
+  // Задачам 5 и 7 (сетевой сервер + мост window.api в браузере) реестр и
+  // рассылка нужны снаружи этой функции — до правки задачи 2 реестр жил
+  // только внутри registerIpc() и был недостижим (см. progress.md, Task 1,
+  // отложенный minor). broadcast добавлен ре-ревью задачи 3 (Important 1):
+  // notify.js/main.js шлют события в обход единой точки, потому что им было
+  // неоткуда её взять — net-server.js (задача 6) уже принимает broadcast
+  // параметром, ждал только этого возврата. Расширение возврата ничего не
+  // ломает: единственный вызывающий (main.js) раньше использовал только
+  // сам факт вызова, не деструктурировал результат вовсе.
+  //
+  // netServer добавлен задачей 7: main.js должен уметь остановить сервер при
+  // выходе (иначе порт остаётся занятым между перезапусками кокпита) — тем
+  // же приёмом, что и broadcast выше, единственный способ отдать наружу
+  // объект, созданный ВНУТРИ этой функции.
+  return { registry, broadcast, netServer };
 }
 
 // Форсирует немедленную запись манифеста (debounce workspace.js иначе может
@@ -1931,6 +2249,9 @@ module.exports = {
   // фазы 7 + «дыра тестов №1», ревью финальной волны, см. комментарии у их
   // определения выше) — не часть публичного API модуля для остального кода.
   gitGetHandler, ghRepoHandler, ghGlobalHandler,
+  // Important 1 (ревью задачи 4): проводка буфера вывода — см. комментарий у
+  // их определения выше и test/ipc-output-buffer-wiring.test.js.
+  bufferTermData, dropTabOutputBuffer,
   historySearchHandler, historyRefreshHandler, createHistoryIndexState, HISTORY_INDEX_TTL_MS,
   recipesListHandler, recipesSavePromptHandler, recipesDeletePromptHandler,
   recipesListWorkspacesHandler, recipesSaveWorkspaceHandler, recipesDeleteWorkspaceHandler,
@@ -1945,6 +2266,11 @@ module.exports = {
   // без Electron, экспортированы ради собственных юнит-тестов (см. комментарии
   // у их определения выше).
   shouldDetectLimitStop, resumableTabStatus, isSnapshotFreshEnough, USAGE_SNAPSHOT_FRESH_MS,
+  // I1 финального ревью ветки: карта корней статики — чистая функция от корня
+  // приложения, экспортирована ради test/renderer-boot-guard.test.js (он
+  // поднимает НАСТОЯЩИЙ сервер ровно на ней и проверяет каждую ссылку
+  // разметки, а не на копии, разъезжающейся с продом).
+  rendererStaticRoots,
   // Task 2 фазы 9 (голосовой ввод): та же причина — см. комментарий у их
   // определения выше (смоук-гейт тестируется напрямую, без Electron).
   sttTranscribeHandler, sttStatusHandler,
@@ -1952,4 +2278,9 @@ module.exports = {
   // обвязки (их контракт с ядром сверялся ревью дословно) — экспортированы
   // ради теста против ЛОКАЛЬНОГО http-сервера (loopback, не сеть).
   sttHttpGet, sttHttpPost,
+  // M1/M2 (ревью раунда 2 задачи 7): разбор net-конфига и повторы старта
+  // сетевого сервера — чистые функции без Electron, экспортированы ради
+  // собственных юнит-тестов (см. комментарии у их определения выше и
+  // test/ipc-net-boot.test.js).
+  resolveNetConfig, startNetServerWithRetries,
 };

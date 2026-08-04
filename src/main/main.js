@@ -11,11 +11,22 @@ const {
 } = require('./ipc');
 const { getConfig, isRootConfigCorrupt } = require('./config');
 const { appRoot } = require('./paths');
-const { setWindow, notify } = require('./notify');
+const { setBroadcast, notify } = require('./notify');
 const { createAttention } = require('./attention');
 const { createToaster } = require('./toasts');
 
 const SMOKE = process.argv.includes('--smoke');
+
+// Задача 7 фазы «кокпит по сети»: ссылка на сетевой сервер (net-server.js),
+// который registerIpc() создаёт и стартует внутри app.whenReady() ниже.
+// Объявлена здесь, НА УРОВНЕ МОДУЛЯ (а не внутри whenReady, как broadcast
+// чуть ниже по файлу) — обработчики выхода (window-all-closed/before-quit/
+// uncaughtException) объявлены СНАРУЖИ whenReady().then() и должны видеть
+// эту переменную, чтобы остановить сервер и освободить порт при закрытии
+// кокпита. null до первого успешного registerIpc() — эти же обработчики
+// теоретически могут сработать раньше (например, uncaughtException в самом
+// начале старта), гард `if (netServer)` ниже на этот случай.
+let netServer = null;
 
 // Вторая копия дерётся за манифест воркспейса — разрешаем одну.
 // В smoke-режиме блокировку не берём (гоняется параллельно с dev-окном).
@@ -241,7 +252,13 @@ app.whenReady().then(() => {
   let rendererErrors = 0;
 
   const win = createWindow();
-  setWindow(win);
+
+  // Рассылка (broadcast.js) появляется только из registerIpc() ниже — до
+  // этого момента переменная нужна как forward-declaration: focusTab
+  // объявляется прямо под этим комментарием (внутри toaster), но реально
+  // зовётся только позже, асинхронно, по клику на Windows-тост — к тому
+  // моменту registerIpc() уже отработает и присвоит сюда настоящий объект.
+  let broadcast = null;
 
   // Task 1 фазы 4: агрегат «сколько вкладок ждут» → overlay-иконка таскбара +
   // заголовок окна. attention.js — чистый модуль без Electron (тестируется
@@ -283,7 +300,13 @@ app.whenReady().then(() => {
       if (win.isMinimized()) win.restore();
       win.show();
       win.focus();
-      win.webContents.send('tab:activate', { tabId });
+      // Ре-ревью задачи 3 (Important 1): раньше был прямой
+      // win.webContents.send — клик по тосту переключал вкладку локально,
+      // но браузерный клиент об этом никогда не узнавал. broadcast к
+      // моменту реального клика уже присвоен (см. комментарий выше про
+      // forward-declaration); null-гард — на случай клика в узком окне до
+      // первого registerIpc() (теоретический, но дешёвый).
+      if (broadcast) broadcast.emit('tab:activate', { tabId });
     },
   });
 
@@ -295,7 +318,12 @@ app.whenReady().then(() => {
     });
   }
 
-  registerIpc(win, { smoke: SMOKE, attention, toaster });
+  // Деструктуризация в скобки: без них `({ broadcast } = ...)` на верхнем
+  // уровне statement распарсился бы как блок кода, не присваивание —
+  // переносим ЗДЕСЬ, а не в объявление, потому что broadcast — уже
+  // объявленная выше переменная (нужна раньше, в focusTab), а не новая.
+  ({ broadcast, netServer } = registerIpc(win, { smoke: SMOKE, attention, toaster }));
+  setBroadcast(broadcast);
 
   // Ошибки renderer всегда дублируем в stdout — иначе их не видно при фоновом запуске.
   win.webContents.on('console-message', (eventOrDetails, level, message) => {
@@ -375,17 +403,25 @@ app.whenReady().then(() => {
 app.on('window-all-closed', () => {
   flushWorkspace();
   disposeSessions();
+  // Задача 7: гасим сетевой сервер здесь же, рядом с disposeSessions() —
+  // без этого порт (48300 по умолчанию) остаётся занятым процессом Electron
+  // до его полного завершения, и повторный npm start до этого момента падал
+  // бы на EADDRINUSE. Гард на случай, если выход случился раньше, чем
+  // registerIpc() успел создать сервер.
+  if (netServer) netServer.stop();
   app.quit();
 });
 
 app.on('before-quit', () => {
   flushWorkspace();
   disposeSessions();
+  if (netServer) netServer.stop();
 });
 
 process.on('uncaughtException', (e) => {
   console.error(e);
   flushWorkspace();
   disposeSessions();
+  if (netServer) netServer.stop();
   app.exit(1);
 });

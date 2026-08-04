@@ -127,6 +127,12 @@
        overflow'ом сайдбара; createDashboard/createPeek стиля не требует —
        app.js сам наполняет/чистит этот контейнер (см. showToast). -->
   <div id="toast-root"></div>
+  <!-- Выбор транспорта живёт не здесь отдельным <script>, а первым импортом
+       ВНУТРИ app.js (см. src/renderer/js/app.js) — независимый параллельный
+       <script type="module"> НЕ дожидается top-level await соседнего модуля
+       (ревью задачи 6, Critical 1: боевая проверка в Chromium показала
+       BOOT_FAILED — app.js стартовал раньше, чем api-boot.js успевал
+       собрать window.api). Импорт же — дожидается. -->
   <script type="module" src="./js/app.js"></script>
 </body>
 </html>
