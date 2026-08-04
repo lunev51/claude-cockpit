@@ -163,6 +163,85 @@ test('рестарт УЖЕ мёртвой вкладки отдаёт ей но
   assert.ok(factory.spawned[1].killed, 'закрытие вкладки обязано убить её процесс, а не оставить осиротевшим');
 });
 
+// Important 1 (ре-ревью фикс-волны): собственный фикс ветки не был покрыт —
+// диверсия «убрать переизлучение term:started для уже живого процесса»
+// оставляла все 866 тестов зелёными, хотя живьём без неё ввод в подключённом
+// терминале мёртв навсегда: terminal.js поднимает флаг alive ТОЛЬКО по этому
+// событию, а живой процесс своё единственное term:started отправил задолго до
+// подключения клиента.
+test('повторный start на ЖИВОМ процессе переизлучает term:started с тем же pid и не спавнит второй pty', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  const pid = factory.spawned[0].pid;
+  const startedBefore = events.filter((e) => e.channel === 'term:started').length;
+  assert.strictEqual(startedBefore, 1);
+
+  // Ровно то, что делает подключившийся клиент: свой initTerminal со своими
+  // размерами зовёт term.start на вкладке, которая уже работает.
+  mgr.start(a.tabId, 100, 40);
+
+  assert.strictEqual(factory.spawned.length, 1, 'второй pty на живой вкладке — это и есть дублирование сессии');
+  const started = events.filter((e) => e.channel === 'term:started');
+  assert.strictEqual(started.length, startedBefore + 1, 'без повторного term:started подключённый терминал навсегда остаётся «запускается…» и глотает ввод');
+  assert.deepStrictEqual(started[started.length - 1].payload, { tabId: a.tabId, pid });
+  // Размер живого pty повторный start не трогает — согласование размеров это
+  // эстафета, отдельный план (см. комментарий у start()).
+  assert.strictEqual(factory.spawned[0].cols, undefined, 'resize живого pty из повторного start не вызывается');
+  // И ввод по-прежнему доходит до ТОГО ЖЕ процесса.
+  mgr.write(a.tabId, 'после подключения');
+  assert.deepStrictEqual(factory.spawned[0].written, ['после подключения']);
+});
+
+// Important 2 (ре-ревью фикс-волны): разрушительная половина бага жила слоем
+// ниже renderer-гарда. Мёртвая вкладка с ПРИВЯЗАННОЙ сессией + прямой вызов
+// start() (старый закешированный renderer, будущий вызывающий, тест) давал
+// спавн БЕЗ --resume — сессия терялась. restart() в том же положении резюмит.
+test('start для вкладки без процесса, но с привязанной сессией, ПРОДОЛЖАЕТ её (--resume), а не заводит новую', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.bindSession(a.tabId, 'sess-живая');
+  factory.spawned[0].opts.onExit(0); // процесс умер сам — вкладка мертва, сессия известна
+  assert.strictEqual(mgr.list()[0].alive, false);
+  assert.strictEqual(mgr.list()[0].sessionId, 'sess-живая');
+
+  mgr.start(a.tabId, 80, 24); // прямой запуск МИМО renderer-гарда
+
+  assert.strictEqual(factory.spawned.length, 2);
+  assert.deepStrictEqual(
+    factory.spawned[1].opts.args,
+    ['--resume', 'sess-живая'],
+    'спавн без --resume поднимает чистую сессию, а прежняя работа остаётся только в транскрипте',
+  );
+});
+
+test('start НЕ подменяет решение, которое уже принял restart() (pendingExtraArgs не перетирается)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.bindSession(a.tabId, 'sess-первая');
+  // Провал резюма: спавн с оверрайдом умер, SessionStart не пришёл → sessionId
+  // обнуляется, restart() сознательно уходит на голые args (не зацикливаемся).
+  mgr.restart(a.tabId); // спавн #2 с --resume sess-первая
+  assert.deepStrictEqual(factory.spawned[1].opts.args, ['--resume', 'sess-первая']);
+});
+
+test('start на восстановленной вкладке не дублирует --resume (флаг первого спавна остаётся за spawn())', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha', sessionId: 'sess-из-манифеста' });
+  mgr.start(a.tabId, 80, 24);
+  assert.deepStrictEqual(
+    factory.spawned[0].opts.args,
+    ['--resume', 'sess-из-манифеста'],
+    'ровно один --resume, а не два подряд',
+  );
+});
+
 // Обратная сторона того же гарда: синхронный exit ИЗ САМОЙ ФАБРИКИ (процесс
 // умер, не успев родиться) по-прежнему не должен «воскрешать» вкладку.
 test('синхронный exit из фабрики не воскрешает вкладку — гард сохраняет исходный смысл', () => {
@@ -189,6 +268,53 @@ test('синхронный exit из фабрики не воскрешает в
   assert.strictEqual(mgr.list()[0].alive, false, 'умерший внутри фабрики процесс не должен считаться живым');
   assert.strictEqual(statusOf(events, a.tabId).status, 'dead');
   assert.strictEqual(events.filter((e) => e.channel === 'term:started').length, 0);
+});
+
+// Стык, который трогает правка сброса устаревшего 'dead': вкладка УЖЕ мертва,
+// и новый процесс тоже умирает прямо внутри фабрики. Сброс статуса не должен
+// превратиться в «воскрешение» — гард обязан сработать на смерти ЭТОГО
+// спавна, а не на памяти о прошлой.
+//
+// Путь именно через start(), а не restart(): restart() всегда уходит с
+// оверрайдом (--resume), а мертворождённый оверрайд — это штатный провал
+// резюма, на который отвечает АВТО-ВОССТАНОВЛЕНИЕ (спавн чистой сессии
+// немедленно, см. тесты ниже). Смешивать два механизма в одном тесте значит
+// проверять не то: здесь нужен голый спавн без оверрайда.
+test('запуск мёртвой вкладки, когда новый процесс умирает ПРЯМО В ФАБРИКЕ, вкладку не воскрешает', () => {
+  const events = [];
+  const spawned = [];
+  const factory = (opts) => {
+    const proc = {
+      opts, written: [], killed: false, pid: 1000 + spawned.length, write() {}, resize() {}, kill() { this.killed = true; },
+    };
+    spawned.push(proc);
+    // Первый спавн живёт, второй умирает внутри фабрики.
+    if (spawned.length === 2) opts.onExit(1);
+    return proc;
+  };
+  const mgr = createSessionManager({
+    ptyFactory: factory,
+    getTermConfig: () => ({ command: 'claude', args: [], useConpty: true, useConptyDll: true }),
+    onEvent: (channel, payload) => events.push({ channel, payload }),
+    now: () => 0,
+    stuckAfterMs: 1000,
+  });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' }); // сессии нет — start() пойдёт голыми args
+  mgr.start(a.tabId, 80, 24);
+  spawned[0].opts.onExit(0); // естественная смерть — вкладка 'dead'
+  assert.strictEqual(statusOf(events, a.tabId).status, 'dead');
+
+  const startedBefore = events.filter((e) => e.channel === 'term:started').length;
+  mgr.start(a.tabId, 80, 24); // спавн #2 умирает внутри фабрики
+
+  assert.strictEqual(spawned.length, 2, 'без оверрайда авто-восстановление не при чём — третьего спавна быть не должно');
+  assert.strictEqual(mgr.list()[0].alive, false, 'процесс умер внутри фабрики — вкладка не может считаться живой');
+  assert.strictEqual(statusOf(events, a.tabId).status, 'dead');
+  assert.strictEqual(
+    events.filter((e) => e.channel === 'term:started').length,
+    startedBefore,
+    'term:started на мертворождённый процесс разблокировал бы ввод в никуда',
+  );
 });
 
 test('close убивает pty и удаляет вкладку; disposeAll убивает всё', () => {
