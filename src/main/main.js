@@ -17,6 +17,17 @@ const { createToaster } = require('./toasts');
 
 const SMOKE = process.argv.includes('--smoke');
 
+// Задача 7 фазы «кокпит по сети»: ссылка на сетевой сервер (net-server.js),
+// который registerIpc() создаёт и стартует внутри app.whenReady() ниже.
+// Объявлена здесь, НА УРОВНЕ МОДУЛЯ (а не внутри whenReady, как broadcast
+// чуть ниже по файлу) — обработчики выхода (window-all-closed/before-quit/
+// uncaughtException) объявлены СНАРУЖИ whenReady().then() и должны видеть
+// эту переменную, чтобы остановить сервер и освободить порт при закрытии
+// кокпита. null до первого успешного registerIpc() — эти же обработчики
+// теоретически могут сработать раньше (например, uncaughtException в самом
+// начале старта), гард `if (netServer)` ниже на этот случай.
+let netServer = null;
+
 // Вторая копия дерётся за манифест воркспейса — разрешаем одну.
 // В smoke-режиме блокировку не берём (гоняется параллельно с dev-окном).
 if (!SMOKE && !app.requestSingleInstanceLock()) {
@@ -311,7 +322,7 @@ app.whenReady().then(() => {
   // уровне statement распарсился бы как блок кода, не присваивание —
   // переносим ЗДЕСЬ, а не в объявление, потому что broadcast — уже
   // объявленная выше переменная (нужна раньше, в focusTab), а не новая.
-  ({ broadcast } = registerIpc(win, { smoke: SMOKE, attention, toaster }));
+  ({ broadcast, netServer } = registerIpc(win, { smoke: SMOKE, attention, toaster }));
   setBroadcast(broadcast);
 
   // Ошибки renderer всегда дублируем в stdout — иначе их не видно при фоновом запуске.
@@ -392,17 +403,25 @@ app.whenReady().then(() => {
 app.on('window-all-closed', () => {
   flushWorkspace();
   disposeSessions();
+  // Задача 7: гасим сетевой сервер здесь же, рядом с disposeSessions() —
+  // без этого порт (48300 по умолчанию) остаётся занятым процессом Electron
+  // до его полного завершения, и повторный npm start до этого момента падал
+  // бы на EADDRINUSE. Гард на случай, если выход случился раньше, чем
+  // registerIpc() успел создать сервер.
+  if (netServer) netServer.stop();
   app.quit();
 });
 
 app.on('before-quit', () => {
   flushWorkspace();
   disposeSessions();
+  if (netServer) netServer.stop();
 });
 
 process.on('uncaughtException', (e) => {
   console.error(e);
   flushWorkspace();
   disposeSessions();
+  if (netServer) netServer.stop();
   app.exit(1);
 });

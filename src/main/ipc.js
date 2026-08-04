@@ -15,6 +15,7 @@ const {
 const { createCommandRegistry } = require('./command-registry');
 const { createBroadcast } = require('./broadcast');
 const { createOutputBuffer } = require('./output-buffer');
+const { createNetServer } = require('./net-server');
 const { getConfig, setConfig } = require('./config');
 const { createPty } = require('./pty');
 const { createSessionManager } = require('./sessions');
@@ -1426,6 +1427,41 @@ function registerIpc(win, opts = {}) {
   // term:data уходит в broadcast.emit; чистится на tabs:close.
   const outputBuffer = createOutputBuffer({});
 
+  // Задача 7 фазы «кокпит по сети»: сам сетевой сервер (net-server.js,
+  // задача 6) — HTTP-статика renderer + WebSocket-мост к реестру команд.
+  // Создаётся здесь, сразу после registry/outputBuffer (оба ему нужны как
+  // параметры), стартует безусловно, тем же приёмом, что startBridge() выше:
+  // сервер поднимается и в smoke (иначе сетевой транспорт вообще не
+  // затрагивается прогоном), просто без внешнего наблюдателя за ним.
+  // Слушаем ТОЛЬКО адрес из конфига, а не 0.0.0.0: на всех интерфейсах
+  // кокпит был бы виден любому в чужом вайфае, а это выполнение произвольных
+  // команд на машине (аутентификации в этой фазе ещё нет, она отдельным
+  // планом). Адрес — из конфига, а не прошит в коде: он принадлежит МАШИНЕ
+  // (конкретный адрес Tailscale этого ПК), а не программе, и меняется при
+  // перевыпуске ключа Tailscale. Дефолт '127.0.0.1' безопасен сам по себе:
+  // не настроив ничего, пользователь получает сервер, доступный только с
+  // этого же ПК.
+  const netCfg = getConfig().net || {};
+  const netServer = createNetServer({
+    registry,
+    broadcast,
+    outputBuffer,
+    staticRoots: {
+      '/node_modules': path.join(appRoot(), 'node_modules'),
+      '/assets': path.join(appRoot(), 'assets'),
+      '/': path.join(appRoot(), 'src', 'renderer'),
+    },
+    port: typeof netCfg.port === 'number' ? netCfg.port : 48300,
+    host: typeof netCfg.host === 'string' && netCfg.host ? netCfg.host : '127.0.0.1',
+  });
+  // startBridge() выше сама ловит ошибки старта и делает фолбэк на эфемерный
+  // порт — у сетевого сервера такого фолбэка нет (адрес важен пользователю
+  // буквально, порт согласован заранее), поэтому здесь просто логируем сбой,
+  // не роняя остальной кокпит: локальное окно обязано работать, даже если
+  // сетевой сервер не поднялся (известная находка ревью задачи 6 — падение
+  // процесса при занятом порте — чинится отдельно, не этой задачей).
+  netServer.start().catch((err) => console.log(`[net] сервер не поднялся: ${err.message}`));
+
   registry.handle('config:get', () => getConfig());
 
   registry.handle('config:set', (partial) => {
@@ -1925,7 +1961,12 @@ function registerIpc(win, opts = {}) {
   // параметром, ждал только этого возврата. Расширение возврата ничего не
   // ломает: единственный вызывающий (main.js) раньше использовал только
   // сам факт вызова, не деструктурировал результат вовсе.
-  return { registry, broadcast };
+  //
+  // netServer добавлен задачей 7: main.js должен уметь остановить сервер при
+  // выходе (иначе порт остаётся занятым между перезапусками кокпита) — тем
+  // же приёмом, что и broadcast выше, единственный способ отдать наружу
+  // объект, созданный ВНУТРИ этой функции.
+  return { registry, broadcast, netServer };
 }
 
 // Форсирует немедленную запись манифеста (debounce workspace.js иначе может
