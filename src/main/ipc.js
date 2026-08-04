@@ -1050,6 +1050,123 @@ function dropTabOutputBuffer({ tabId, outputBuffer }) {
   outputBuffer.drop(tabId);
 }
 
+// M1 (ревью раунда 2 задачи 7, Important 1): без аутентификации в этой фазе
+// адрес прослушивания сетевого сервера — ЕДИНСТВЕННАЯ линия обороны кокпита
+// (иначе сервер видел бы любой человек в том же вайфае и мог бы выполнять
+// произвольные команды через реестр — запись в терминал в том числе). Разбор
+// секции net вынесен из инлайна в registerIpc() в отдельную чистую функцию
+// той же причиной, что у bufferTermData/dropTabOutputBuffer выше: до этого
+// фикса живая проверка ревьюера подменила дефолт host на '0.0.0.0' ПРЯМО В
+// ИСТОЧНИКЕ (`typeof netCfg.host === 'string' && netCfg.host ? netCfg.host :
+// '0.0.0.0'`) и весь набор — 828 тестов — остался зелёным: ни один тест не
+// трогал именно эту строку. Дефолты — константы модуля, а не литералы
+// внутри функции: тест на пустой конфиг (см. test/ipc-net-boot.test.js)
+// сравнивает результат с ЛИТЕРАЛОМ '127.0.0.1'/48300, а не с этой
+// константой — иначе изменение константы и тест сдвинулись бы синхронно, и
+// красноты не было бы никогда.
+const NET_DEFAULT_HOST = '127.0.0.1';
+const NET_DEFAULT_PORT = 48300;
+
+// M3 (ревью раунда 2, Minor): порт в диапазоне 1..65535, целое число.
+function validPort(n) {
+  return Number.isInteger(n) && n > 0 && n < 65536;
+}
+
+// netCfg — сырая секция getConfig().net (может отсутствовать, быть null,
+// нести мусор — пользователь правит config.user.json руками). warn —
+// инжектируемый логгер (по умолчанию console.warn), тем же приёмом, что
+// usagePoller/ccusage выше по файлу — тесты подставляют свой сборщик вместо
+// реального console.warn.
+//
+// M3 (ревью раунда 2, Minor): port принимается и числом (обычный путь из
+// config:set/JSON.parse), и строкой — `"port": "48377"` в config.json,
+// написанное рукой, раньше молча откатывалось к дефолту, а стучаться
+// пытались бы в порт, который сервер не слушает. Строка приводится к числу,
+// если результат — целое в допустимом диапазоне (с предупреждением, что
+// применили именно так); иначе — предупреждение и дефолт. host обязан быть
+// непустой строкой; любое другое значение (число, объект, пустая строка) —
+// тоже предупреждение и дефолт, без падения (кокпит обязан подняться на
+// дефолте, а не рухнуть на TypeError из-за опечатки в чужом конфиге).
+function resolveNetConfig(netCfg, warn = (msg) => console.warn(msg)) {
+  const cfg = netCfg && typeof netCfg === 'object' ? netCfg : {};
+
+  let host = NET_DEFAULT_HOST;
+  if (cfg.host !== undefined) {
+    if (typeof cfg.host === 'string' && cfg.host.trim()) {
+      host = cfg.host;
+    } else {
+      warn(`[net] host в конфиге некорректен (${JSON.stringify(cfg.host)}), использую ${NET_DEFAULT_HOST}`);
+    }
+  }
+
+  let port = NET_DEFAULT_PORT;
+  if (cfg.port !== undefined) {
+    if (validPort(cfg.port)) {
+      port = cfg.port;
+    } else if (typeof cfg.port === 'string' && validPort(Number(cfg.port))) {
+      port = Number(cfg.port);
+      warn(`[net] port в конфиге задан строкой ("${cfg.port}"), использую как число ${port}`);
+    } else {
+      warn(`[net] port в конфиге некорректен (${JSON.stringify(cfg.port)}), использую ${NET_DEFAULT_PORT}`);
+    }
+  }
+
+  return { host, port };
+}
+
+// M2 (ревью раунда 2, Important 2): раньше сбой netServer.start() ТОЛЬКО
+// логировался в консоль, которую никто не видит при автозапуске ярлыком —
+// самый вероятный сценарий живой приёмки: кокпит стартует РАНЬШЕ, чем
+// Tailscale поднял свой интерфейс на этом ПК, адрес из конфига физически ещё
+// не существует, start() падает с EADDRNOTAVAIL, и без повторов сервер не
+// слушает уже НИКОГДА за всю жизнь процесса — с макбука это выглядит как
+// «сайт не открывается», а на ПК ничем не выражено. Ограниченные повторы
+// дают интерфейсу время подняться (типичный boot-race), но НЕ лечат
+// постоянную недоступность порта (EADDRINUSE — задача 6 уже сделала его
+// безопасным для процесса, но повтором его не решить: порт останется занят
+// и после паузы, кокпит доберёт лимит попыток и всё равно уведомит).
+//
+// setTimer — инжектируемая обёртка над setTimeout, тот же приём, что у
+// createNightWatch({setTimer}) в этом же файле (см. registerIpc ниже) —
+// test/ipc-net-boot.test.js использует фейковый реестр таймеров вместо
+// реального времени, той же формы, что уже применена в night-watch.test.js.
+const NET_START_RETRY_MS = 5000;
+const NET_START_MAX_RETRIES = 6; // ~30с суммарно — с запасом переживает типичный boot-race с поднятием интерфейса Tailscale
+
+function startNetServerWithRetries({
+  start, host, port, notify: notifyFn, setTimer = setTimeout,
+  retryMs = NET_START_RETRY_MS, maxRetries = NET_START_MAX_RETRIES, attempt = 0,
+}) {
+  return start().then(
+    () => {
+      // M4 (ревью раунда 2, Minor): для фичи, весь смысл которой «набери
+      // этот адрес на другом устройстве», адрес обязан появиться в логе —
+      // это первое, что человек будет искать. Печатается ТОЛЬКО на успех.
+      console.log(`[net] слушаю http://${host}:${port}`);
+      return true;
+    },
+    (err) => {
+      if (attempt < maxRetries) {
+        console.log(`[net] сервер не поднялся на ${host}:${port} (${err.message}) — повтор ${attempt + 1}/${maxRetries} через ${Math.round(retryMs / 1000)}с`);
+        return new Promise((resolve) => {
+          const id = setTimer(() => {
+            resolve(startNetServerWithRetries({
+              start, host, port, notify: notifyFn, setTimer, retryMs, maxRetries, attempt: attempt + 1,
+            }));
+          }, retryMs);
+          if (id && typeof id.unref === 'function') id.unref();
+        });
+      }
+      // Тем же каналом, что «config.json повреждён — работаю на дефолтах» в
+      // main.js: человек должен узнать о проблеме ОТ КОКПИТА, а не по
+      // неоткрывающейся странице на другом устройстве.
+      console.log(`[net] сдаюсь после ${maxRetries + 1} попыток: ${err.message}`);
+      notifyFn(`Сетевой сервер кокпита не поднялся на ${host}:${port} (${err.message}). Локальное окно работает, удалённый доступ недоступен.`, 'error');
+      return false;
+    },
+  );
+}
+
 function registerIpc(win, opts = {}) {
   const { smoke = false, attention = null, toaster = null } = opts;
   ipcBootAt = Date.now(); // окно cacheOnly для ccusage — см. usage:get (инцидент 8ГБ)
@@ -1440,8 +1557,11 @@ function registerIpc(win, opts = {}) {
   // (конкретный адрес Tailscale этого ПК), а не программе, и меняется при
   // перевыпуске ключа Tailscale. Дефолт '127.0.0.1' безопасен сам по себе:
   // не настроив ничего, пользователь получает сервер, доступный только с
-  // этого же ПК.
-  const netCfg = getConfig().net || {};
+  // этого же ПК. Разбор секции — через resolveNetConfig() (см. её
+  // комментарий выше по файлу) — единая точка, которую покрывает
+  // test/ipc-net-boot.test.js, а не инлайн-тернарники, которые ревью раунда
+  // 2 подменило дефолтом '0.0.0.0' без единого красного теста.
+  const netCfg = resolveNetConfig(getConfig().net);
   const netServer = createNetServer({
     registry,
     broadcast,
@@ -1451,16 +1571,20 @@ function registerIpc(win, opts = {}) {
       '/assets': path.join(appRoot(), 'assets'),
       '/': path.join(appRoot(), 'src', 'renderer'),
     },
-    port: typeof netCfg.port === 'number' ? netCfg.port : 48300,
-    host: typeof netCfg.host === 'string' && netCfg.host ? netCfg.host : '127.0.0.1',
+    port: netCfg.port,
+    host: netCfg.host,
   });
   // startBridge() выше сама ловит ошибки старта и делает фолбэк на эфемерный
   // порт — у сетевого сервера такого фолбэка нет (адрес важен пользователю
-  // буквально, порт согласован заранее), поэтому здесь просто логируем сбой,
-  // не роняя остальной кокпит: локальное окно обязано работать, даже если
-  // сетевой сервер не поднялся (известная находка ревью задачи 6 — падение
-  // процесса при занятом порте — чинится отдельно, не этой задачей).
-  netServer.start().catch((err) => console.log(`[net] сервер не поднялся: ${err.message}`));
+  // буквально, порт согласован заранее). Вместо голого console.log —
+  // startNetServerWithRetries() (см. её комментарий выше по файлу): не
+  // роняет остальной кокпит при неудаче (локальное окно обязано работать,
+  // даже если сетевой сервер не поднялся), даёт ограниченное число повторов
+  // на случай boot-race с интерфейсом Tailscale и уведомляет notify(), если
+  // сдался — тем же каналом, что «config.json повреждён» в main.js.
+  startNetServerWithRetries({
+    start: () => netServer.start(), host: netCfg.host, port: netCfg.port, notify,
+  });
 
   registry.handle('config:get', () => getConfig());
 
@@ -2067,4 +2191,9 @@ module.exports = {
   // обвязки (их контракт с ядром сверялся ревью дословно) — экспортированы
   // ради теста против ЛОКАЛЬНОГО http-сервера (loopback, не сеть).
   sttHttpGet, sttHttpPost,
+  // M1/M2 (ревью раунда 2 задачи 7): разбор net-конфига и повторы старта
+  // сетевого сервера — чистые функции без Electron, экспортированы ради
+  // собственных юнит-тестов (см. комментарии у их определения выше и
+  // test/ipc-net-boot.test.js).
+  resolveNetConfig, startNetServerWithRetries,
 };
