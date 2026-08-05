@@ -260,14 +260,31 @@ export function initTerminal(container, config, {
       return true;
     }
 
-    // Ctrl+Shift+V — вставить из буфера обмена. Task 4 фазы 4: сначала пробуем
-    // скриншот — screenshot:paste смотрит cwd этой вкладки и решает, картинка
-    // в буфере или нет (renderer напрямую этого не узнает, Clipboard API из
-    // текста картинку не отличает). Путь вставляем БЕЗ \r — пользователь сам
-    // допишет остаток строки и отправит. null (не картинка) или ошибка IPC —
-    // падаем на прежнюю текстовую вставку.
-    if (ev.ctrlKey && ev.shiftKey && !ev.altKey && !ev.metaKey
+    // Вставка из буфера обмена. Task 4 фазы 4: сначала пробуем скриншот —
+    // screenshot:paste смотрит cwd этой вкладки и решает, картинка в буфере
+    // или нет (renderer напрямую этого не узнает, Clipboard API из текста
+    // картинку не отличает). Путь вставляем БЕЗ \r — пользователь сам допишет
+    // остаток строки и отправит. null (не картинка) или ошибка IPC — падаем
+    // на прежнюю текстовую вставку.
+    //
+    // Ctrl+V (без Shift) добавлен 05.08 по жалобе пользователя. По умолчанию
+    // xterm поступает как классический терминал: шлёт Ctrl+V в pty
+    // управляющим символом (0x16, literal-next), и вставки не происходит.
+    // Привычка же у человека из редакторов и Claude Code Desktop — там Ctrl+V
+    // вставляет. Ctrl+Shift+V остаётся, он привычен из терминалов.
+    // Цена: 0x16 в pty больше не отправить с клавиатуры. Это осознанно —
+    // literal-next в Claude Code не используется, а вставка нужна постоянно.
+    if (ev.ctrlKey && !ev.altKey && !ev.metaKey
         && (ev.key === 'V' || ev.key === 'v' || ev.code === 'KeyV')) {
+      // Браузер на макбуке получает страницу по http:// — а Clipboard API живёт
+      // только в защищённом контексте (https или localhost), там
+      // navigator.clipboard попросту undefined. Перехватывать в такой среде
+      // нельзя: мы бы отменили ЕДИНСТВЕННЫЙ рабочий путь. Возврат false без
+      // preventDefault означает «xterm, не трогай эту клавишу» — браузер
+      // вставит сам, а xterm поймает готовое событие paste на своей textarea.
+      // (Пока не сделан HTTPS через Tailscale Serve — это план 4 — так и
+      // работает вставка на удалённой машине.)
+      if (!navigator.clipboard || !navigator.clipboard.readText) return false;
       ev.preventDefault();
       window.api.screenshot.paste(tabId)
         .catch(() => null)
@@ -282,7 +299,10 @@ export function initTerminal(container, config, {
           }
           navigator.clipboard.readText()
             .then((text) => { if (text) term.paste(text); })
-            .catch(() => {});
+            // Молчать здесь нельзя: ровно так вставка и умерла незаметно —
+            // обработчик разрешений отклонял clipboard-read, а .catch(() => {})
+            // прятал NotAllowedError. Теперь отказ виден хотя бы в консоли.
+            .catch((err) => console.warn('[вставка] буфер обмена недоступен:', err && err.message));
         });
       return false;
     }

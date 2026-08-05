@@ -14,6 +14,7 @@ const { appRoot } = require('./paths');
 const { setBroadcast, notify } = require('./notify');
 const { buildTrayModel } = require('./tray-menu');
 const { buildLoginItem, isAutostartOn } = require('./autostart');
+const { decidePermission } = require('./permissions');
 const { createAttention } = require('./attention');
 const { createToaster } = require('./toasts');
 
@@ -163,10 +164,21 @@ function createWindow() {
   // запрос кокпита никогда не попадёт в mediaTypes.includes('video') — а вот
   // гипотетическая веб-страница/будущий код, попросившие видео, получат
   // отказ, даже если permission по имени совпал с 'media'.
+  // 05.08: тот же обработчик убивал ВСТАВКУ. Он разрешал ровно микрофон, а
+  // Ctrl+Shift+V и вставка правым кликом читают буфер через
+  // navigator.clipboard.readText() — то есть просят 'clipboard-read' и
+  // получали NotAllowedError. Замер отдельным Electron-приложением: с этим
+  // обработчиком «Read permission denied», без него буфер читается. Решение
+  // (какие имена разрешать) вынесено в permissions.js под тест — список
+  // должен меняться осознанно, а не правкой условия по месту.
   win.webContents.session.setPermissionRequestHandler(
-    (_wc, permission, cb, details) => cb(
-      permission === 'media' && !details?.mediaTypes?.includes('video'),
-    ),
+    (_wc, permission, cb, details) => cb(decidePermission(permission, details)),
+  );
+  // Синхронная проверка: Chromium спрашивает ею, например, при обращении к
+  // navigator.permissions и при части путей Clipboard API. Без неё Electron
+  // применяет собственные умолчания, и запрос мог бы пройти мимо решения выше.
+  win.webContents.session.setPermissionCheckHandler(
+    (_wc, permission) => decidePermission(permission, undefined),
   );
 
   // --- Сохранение состояния с debounce 500мс ---
