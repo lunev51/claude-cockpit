@@ -1,0 +1,66 @@
+'use strict';
+// Кто сейчас за рулём. У pty один размер на всех клиентов, поэтому
+// одновременных хозяев быть не может — эксклюзивность убирает целый слой
+// согласования колонок и строк.
+//
+// Уход владельца НЕ передаёт управление: закрытая крышка макбука не должна
+// разворачивать окно на ПК посреди ночи. Управление меняется только явным
+// захватом — открытием страницы в браузере или показом окна на ПК.
+// onChange({owner, previous, size}) — управление сменило хозяина.
+// onPresence({owner, online}) — тот же хозяин пропал со связи или вернулся.
+// Второе НЕ смена владельца: окно ПК не должно разворачиваться от того, что
+// на макбуке закрыли крышку. Но знать об этом надо всем — раньше drop менял
+// только внутренний флаг, и строка «(не на связи)» в трее и на заглушке была
+// недостижима в проде, хотя тесты на неё были зелёные.
+function createOwnership({ onChange, onPresence } = {}) {
+  let owner = 'local';
+  let online = true;
+  // Размер помним ПО ВЛАДЕЛЬЦУ: окно ПК на весь экран и браузер на макбуке —
+  // это два разных терминала. Возврат управления часто происходит без нового
+  // размера (main.js забирает его при показе окна, когда renderer ещё не
+  // успел сказать своё слово), и подставить туда чужой размер значило бы
+  // перерисовать Claude Code в ширине другой машины на каждом возврате.
+  const sizes = new Map();
+
+  function claim(who, nextSize) {
+    if (nextSize) sizes.set(who, { cols: nextSize.cols, rows: nextSize.rows });
+    if (who === owner) {
+      // Тот же хозяин вернулся после обрыва — смены владельца нет, но факт
+      // «снова на связи» касается всех: у остальных клиентов на заглушке и в
+      // трее висит «не на связи».
+      const wasOffline = !online;
+      online = true;
+      if (wasOffline && typeof onPresence === 'function') onPresence({ owner, online: true });
+      return false;
+    }
+    const previous = owner;
+    owner = who;
+    online = true;
+    // Размер НОВОГО владельца, не прежнего: именно под него переразмеривается
+    // pty. Незнакомый клиент без размера отдаёт null — лучше не трогать pty
+    // вовсе, чем натянуть на него чужую раскладку (см. applyHandoffSize).
+    if (typeof onChange === 'function') onChange({ owner, previous, size: sizes.get(who) || null });
+    return true;
+  }
+
+  function drop(who) {
+    if (who !== owner) return false;
+    // Владельца НЕ меняем: обрыв связи не равен потере управления (закрытая
+    // крышка макбука не должна разворачивать окно на ПК посреди ночи).
+    const wasOnline = online;
+    online = false;
+    if (wasOnline && typeof onPresence === 'function') onPresence({ owner, online: false });
+    return true;
+  }
+
+  return {
+    owner: () => owner,
+    size: () => sizes.get(owner) || null,
+    ownerOnline: () => online,
+    canWrite: (who) => who === owner,
+    claim,
+    drop,
+  };
+}
+
+module.exports = { createOwnership };

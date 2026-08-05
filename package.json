@@ -12,7 +12,7 @@
   "scripts": {
     "start": "electron .",
     "smoke": "electron . --smoke",
-    "test": "node --test",
+    "test": "node --test --test-timeout=30000",
     "postinstall": "cd node_modules/@homebridge/node-pty-prebuilt-multiarch && npx prebuild-install --runtime electron --target 29.4.6",
     "dist": "electron-builder --win --x64"
   },

@@ -77,6 +77,16 @@
           <span id="limit-5h" title="5-часовое окно"></span>
         </div>
       </div>
+      <!-- Эстафета (план 2): заглушка «управление на другой машине». Внутри
+           #main (position:relative), как и остальные оверлеи. По z-index (31)
+           она ВЫШЕ оверлея восстановления (30) и НИЖЕ дашборда/поиска/палитры:
+           действия под заглушкой, чтение над ней — разбор обеих живых проверок
+           см. в app.css у .handoff-curtain. -->
+      <div id="handoff-curtain" class="handoff-curtain">
+        <div class="curtain-title"></div>
+        <div class="curtain-hint"></div>
+        <button id="curtain-take" class="curtain-take">Забрать управление себе</button>
+      </div>
       <div id="restore-overlay" class="hidden">
         <div class="restore-card">
           <div class="restore-title">Восстановить воркспейс?</div>

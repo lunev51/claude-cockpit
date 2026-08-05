@@ -23,6 +23,8 @@ const { createNetServer } = require('../src/main/net-server');
 const { createCommandRegistry } = require('../src/main/command-registry');
 const { createBroadcast } = require('../src/main/broadcast');
 const { createOutputBuffer } = require('../src/main/output-buffer');
+const { createOwnership } = require('../src/main/ownership');
+const { isWriteChannel } = require('../src/main/write-channels');
 
 const fakeIpcMain = () => ({ handle: () => {}, on: () => {} });
 
@@ -625,4 +627,202 @@ test('ошибка чтения ПОСЛЕ открытия файла (обры
   // Заголовки (200) уже ушли к моменту ошибки — по протоколу соединение
   // должно оборваться, а не тихо закрыться так, будто файл дошёл целиком.
   await assert.rejects(() => fetch(`http://127.0.0.1:${port}/index.html`).then((r) => r.text()));
+});
+
+// --- Эстафета управления: личность клиента, захват, отказ ------------------
+// Сервер — единственный, кто знает, ЧЕЙ это сокет: реестр получил бы кадр без
+// личности и не отличил бы захват макбуком от захвата локальным окном.
+
+// makeServer из этого файла не знает про эстафету — собираем отдельный,
+// с гардом и владением, ровно как их собирает ipc.js в проде.
+function makeHandoffServer() {
+  const ownership = createOwnership({});
+  const registry = createCommandRegistry({
+    ipcMain: fakeIpcMain(),
+    guard: ({ channel, who }) => !isWriteChannel(channel) || ownership.canWrite(who),
+  });
+  const written = [];
+  registry.handle('term:write', (payload) => { written.push(payload); return 'ок'; });
+  registry.handle('usage:get', () => ({ спент: 1 }));
+  const server = createNetServer({
+    registry,
+    ownership,
+    broadcast: createBroadcast({ getWindow: () => null }),
+    outputBuffer: createOutputBuffer({}),
+    staticRoots: { '/': path.join(__dirname, '..', 'src', 'renderer') },
+    port: 0,
+    host: '127.0.0.1',
+  });
+  activeServers.push(server);
+  return { server, ownership, written };
+}
+
+// Кадры копятся С МОМЕНТА создания сокета, а не с момента подписки в теле
+// теста. Так надо именно здесь: 'net:hello' сервер шлёт сразу при
+// подключении, и он успевает приехать РАНЬШЕ, чем тест подпишется. Причина
+// не в скорости сети, а в очередях Node: ws эмитит 'message' из
+// process.nextTick, а продолжение `await open(...)` — микротаска промиса,
+// она выполняется ПОЗЖЕ nextTick. Обычный nextFrame() (ws.once('message'))
+// первый кадр в этой гонке терял бы и ждал следующего вечно — прогон висел
+// бы, а не краснел. Общий open()/nextFrame выше не трогаем: у остальных
+// тестов такой гонки нет, а менять их поведение задача не просит.
+function openBuffered(url) {
+  const ws = new WebSocket(url);
+  const queue = [];
+  let waiting = null;
+  ws.on('message', (raw) => {
+    const frame = JSON.parse(raw);
+    if (waiting) { const resolve = waiting; waiting = null; resolve(frame); return; }
+    queue.push(frame);
+  });
+  ws.takeFrame = () => (queue.length
+    ? Promise.resolve(queue.shift())
+    : new Promise((resolve) => { waiting = resolve; }));
+  return new Promise((resolve, reject) => {
+    ws.once('open', () => resolve(ws));
+    ws.once('unexpected-response', (_req, res) => reject(Object.assign(new Error('апгрейд отклонён'), { statusCode: res.statusCode })));
+    ws.once('error', reject);
+  });
+}
+const takeFrame = (ws) => ws.takeFrame();
+
+const ask = (ws, frame) => {
+  const answer = takeFrame(ws);
+  ws.send(JSON.stringify(frame));
+  return answer;
+};
+
+// --- Адрес для человека (находка ревью: address() не был покрыт вовсе) ------
+// Пункт меню трея существует ровно затем, чтобы человек взял адрес и открыл
+// его на макбуке. Мутации «address() всегда null» и «address() без реального
+// порта» раньше обе оставались зелёными.
+
+test('до старта адреса нет, после старта он с РЕАЛЬНЫМ портом', async () => {
+  const { server } = makeServer();
+  assert.strictEqual(server.address(), null, 'сервер не слушает — адреса не существует');
+  const { port } = await server.start();
+  assert.strictEqual(server.address(), `http://127.0.0.1:${port}`);
+  // port:0 отдаёт эфемерный порт — в адресе обязан быть он, а не ноль.
+  assert.ok(!server.address().endsWith(':0'));
+  await server.stop();
+  assert.strictEqual(server.address(), null, 'после остановки адрес снова пуст');
+});
+
+test('литерал IPv6 в адресе берётся в скобки', async () => {
+  const { server } = makeServer({ host: '::1' });
+  await server.start();
+  assert.match(server.address(), /^http:\/\/\[::1\]:\d+$/);
+});
+
+test('«слушаю везде» подменяется адресом, который можно открыть с другой машины', async () => {
+  // 0.0.0.0 — не имя, а «на всех интерфейсах»: на макбуке такой адрес
+  // бесполезен, а клик по строке трея открыл бы его в браузере.
+  const { server } = makeServer({
+    host: '0.0.0.0',
+    allowedHosts: ['revision-pc.tailb86363.ts.net', '100.120.245.85'],
+  });
+  const { port } = await server.start();
+  assert.strictEqual(server.address(), `http://revision-pc.tailb86363.ts.net:${port}`);
+});
+
+test('«слушаю везде» без подсказок — честный localhost, а не 0.0.0.0', async () => {
+  const { server } = makeServer({ host: '0.0.0.0', allowedHosts: [] });
+  const { port } = await server.start();
+  assert.strictEqual(server.address(), `http://127.0.0.1:${port}`);
+});
+
+test('клиент узнаёт своё имя сразу после подключения', async () => {
+  const { server } = makeHandoffServer();
+  const { port } = await server.start();
+  const ws = await openBuffered(`ws://127.0.0.1:${port}/ws`);
+  const hello = await takeFrame(ws);
+  assert.strictEqual(hello.event, 'net:hello');
+  assert.strictEqual(typeof hello.payload.clientId, 'string');
+  assert.ok(hello.payload.clientId.length > 0);
+  ws.close();
+});
+
+test('сервер без ownership не шлёт net:hello — старый клиент видит ровно то же, что и раньше', async () => {
+  // Эстафета необязательна: в тестах и в сборках без сети createNetServer
+  // зовут без ownership. Лишний кадр сразу после подключения сдвинул бы
+  // ПЕРВЫЙ кадр у всех, кто просто ждёт ответ на свою команду. Проверяем
+  // буферизованным сокетом (ничего не теряется), иначе тест был бы зелёным
+  // просто потому, что кадр не успел приехать.
+  const { server } = makeServer();
+  const { port } = await server.start();
+  const ws = await openBuffered(`ws://127.0.0.1:${port}/ws`);
+  ws.send(JSON.stringify({ id: 1, channel: 'эхо', args: ['первый'] }));
+  assert.deepStrictEqual(await takeFrame(ws), { id: 1, ok: true, result: { эхо: 'первый' } });
+  ws.close();
+});
+
+test('без управления запись отклоняется, а чтение проходит', async () => {
+  const { server, written } = makeHandoffServer();
+  const { port } = await server.start();
+  const ws = await openBuffered(`ws://127.0.0.1:${port}/ws`);
+  await takeFrame(ws); // net:hello
+
+  const denied = await ask(ws, { id: 1, channel: 'term:write', args: [{ tabId: 'T1', data: 'ls\r' }] });
+  assert.strictEqual(denied.ok, false);
+  assert.strictEqual(denied.denied, true);
+  assert.deepStrictEqual(written, [], 'до захвата ни один байт не имеет права дойти до pty');
+
+  const read = await ask(ws, { id: 2, channel: 'usage:get', args: [] });
+  assert.strictEqual(read.ok, true, 'чтение доступно и без управления — иначе заглушка слепая');
+  ws.close();
+});
+
+test('после захвата тот же клиент пишет свободно', async () => {
+  const { server, ownership, written } = makeHandoffServer();
+  const { port } = await server.start();
+  const ws = await openBuffered(`ws://127.0.0.1:${port}/ws`);
+  const hello = await takeFrame(ws);
+
+  const claimed = await ask(ws, { id: 1, channel: 'owner:claim', args: [{ cols: 90, rows: 30 }] });
+  assert.strictEqual(claimed.ok, true);
+  assert.strictEqual(claimed.result.owner, hello.payload.clientId);
+  assert.strictEqual(claimed.result.self, hello.payload.clientId);
+  assert.deepStrictEqual(ownership.size(), { cols: 90, rows: 30 });
+
+  const ok = await ask(ws, { id: 2, channel: 'term:write', args: [{ tabId: 'T1', data: 'ls\r' }] });
+  assert.strictEqual(ok.ok, true);
+  assert.deepStrictEqual(written, [{ tabId: 'T1', data: 'ls\r' }]);
+  ws.close();
+});
+
+test('второй клиент забирает управление у первого', async () => {
+  const { server, written } = makeHandoffServer();
+  const { port } = await server.start();
+  const a = await openBuffered(`ws://127.0.0.1:${port}/ws`);
+  await takeFrame(a);
+  await ask(a, { id: 1, channel: 'owner:claim', args: [{ cols: 80, rows: 24 }] });
+
+  const b = await openBuffered(`ws://127.0.0.1:${port}/ws`);
+  await takeFrame(b);
+  await ask(b, { id: 1, channel: 'owner:claim', args: [{ cols: 120, rows: 40 }] });
+
+  const denied = await ask(a, { id: 2, channel: 'term:write', args: [{ tabId: 'T1', data: 'вредное' }] });
+  assert.strictEqual(denied.ok, false);
+  assert.deepStrictEqual(written, [], 'потерявший управление больше не пишет');
+  a.close();
+  b.close();
+});
+
+test('уход клиента не отдаёт управление обратно локальному окну', async () => {
+  const { server, ownership } = makeHandoffServer();
+  const { port } = await server.start();
+  const ws = await openBuffered(`ws://127.0.0.1:${port}/ws`);
+  const hello = await takeFrame(ws);
+  await ask(ws, { id: 1, channel: 'owner:claim', args: [{ cols: 80, rows: 24 }] });
+
+  const gone = new Promise((resolve) => ws.on('close', resolve));
+  ws.close();
+  await gone;
+  // Сокет закрывается асинхронно и на стороне сервера — ждём, пока он это заметит.
+  const deadline = Date.now() + 2000;
+  while (ownership.ownerOnline() && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  assert.strictEqual(ownership.owner(), hello.payload.clientId, 'обрыв ≠ потеря управления');
+  assert.strictEqual(ownership.ownerOnline(), false);
 });

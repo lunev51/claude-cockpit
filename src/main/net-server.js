@@ -84,14 +84,20 @@ function splitPrefixSegments(prefix) {
 // сервер слушает шире всего.
 const LISTEN_ANYWHERE = new Set(['0.0.0.0', '::', '::0']);
 
+// ownership — необязательный параметр: без него сервер работает ровно как
+// раньше (эстафеты нет, каждый кадр идёт в реестр как есть).
 function createNetServer({
-  registry, broadcast, outputBuffer, staticRoots, port = 48300, host = '127.0.0.1', allowedHosts = [],
+  registry, ownership, broadcast, outputBuffer, staticRoots, port = 48300, host = '127.0.0.1', allowedHosts = [],
 }) {
   let server = null;
   let wss = null;
   let hostAllowlist = null; // Set<'имя:порт'> в нижнем регистре — заполняется после listen()
   const clients = new Set();
   const heartbeats = new Map(); // ws → жив ли с прошлого пинга
+  // Имя клиента живёт ровно столько, сколько сокет: переподключившийся
+  // макбук — НОВЫЙ клиент и захватывает управление заново. Считать его тем
+  // же было бы неверно (браузер мог быть закрыт и открыт на другой машине).
+  let nextClientId = 1;
 
   // Корни приводим к абсолютному виду ОДИН раз, здесь. Если этого не
   // сделать, относительный root (например 'src/renderer' вместо полного
@@ -179,7 +185,7 @@ function createNetServer({
     stream.pipe(res);
   }
 
-  async function onFrame(ws, raw) {
+  async function onFrame(ws, raw, clientId) {
     let msg;
     // Битый кадр не имеет права ронять сервер: на другом конце браузер,
     // который может прислать что угодно при обрыве. Если распарсить вообще
@@ -217,14 +223,28 @@ function createNetServer({
     }
     const args = Array.isArray(msg.args) ? msg.args : [];
     try {
-      // net:buffer обслуживает сервер, а не реестр: история — свойство
-      // соединения, локальному окну она не нужна (у него свой xterm).
-      const result = msg.channel === 'net:buffer'
-        ? outputBuffer.get(args[0])
-        : await registry.call(msg.channel, args);
+      let result;
+      if (msg.channel === 'net:buffer') {
+        // net:buffer обслуживает сервер, а не реестр: история — свойство
+        // соединения, локальному окну она не нужна (у него свой xterm).
+        result = outputBuffer.get(args[0]);
+      } else if (msg.channel === 'owner:claim' || msg.channel === 'owner:get') {
+        // Тот же случай, что и net:buffer: только сервер знает, ЧЕЙ это
+        // сокет. Реестр получил бы кадр без личности и не смог бы отличить
+        // захват макбуком от захвата локальным окном.
+        if (!ownership) throw new Error('эстафета не подключена');
+        if (msg.channel === 'owner:claim') ownership.claim(clientId, args[0]);
+        result = { owner: ownership.owner(), self: clientId, online: ownership.ownerOnline() };
+      } else {
+        result = await registry.call(msg.channel, args, clientId);
+      }
       reply({ ok: true, result: result === undefined ? null : result });
     } catch (err) {
-      reply({ ok: false, error: String((err && err.message) || err) });
+      // denied — штатный отказ эстафеты, а не поломка: браузерный мост по
+      // этому полю молчит вместо показа ошибки (спека: отклонение молчаливое).
+      const body = { ok: false, error: String((err && err.message) || err) };
+      if (err && err.denied) body.denied = true;
+      reply(body);
     }
   }
 
@@ -316,14 +336,32 @@ function createNetServer({
           },
         });
         wss.on('connection', (ws) => {
+          const clientId = `c${nextClientId}`;
+          nextClientId += 1;
           const send = (event, payload) => ws.send(JSON.stringify({ event, payload }));
           clients.add(ws);
           heartbeats.set(ws, true);
           broadcast.addClient(send);
-          ws.on('message', (raw) => onFrame(ws, raw));
+          // Своё имя клиент обязан узнать ДО первого кадра: без него он не
+          // может понять, у него сейчас управление или у соседа. Без эстафеты
+          // (ownership не передан) имя не значит ничего, и лишний кадр сразу
+          // после подключения менял бы наблюдаемое поведение старых клиентов —
+          // поэтому молчим: сервер без ownership работает ровно как раньше.
+          if (ownership) {
+            try { send('net:hello', { clientId }); } catch { /* сокет ушёл сразу */ }
+          }
+          ws.on('message', (raw) => onFrame(ws, raw, clientId));
           ws.on('pong', () => heartbeats.set(ws, true));
-          ws.on('close', () => { clients.delete(ws); heartbeats.delete(ws); broadcast.removeClient(send); });
-          ws.on('error', () => { clients.delete(ws); heartbeats.delete(ws); broadcast.removeClient(send); });
+          const forget = () => {
+            clients.delete(ws);
+            heartbeats.delete(ws);
+            broadcast.removeClient(send);
+            // Ушедший владелец управление НЕ теряет (спека: обрыв ≠ потеря),
+            // ownership.drop лишь помечает его офлайн.
+            if (ownership) ownership.drop(clientId);
+          };
+          ws.on('close', forget);
+          ws.on('error', forget);
         });
         // Полуоткрытые соединения (закрыли крышку макбука посреди сессии)
         // иначе не обнаруживаются до таймаута TCP — вкладка выглядела бы
@@ -381,6 +419,25 @@ function createNetServer({
       });
     },
     clientCount: () => clients.size,
+    // Адрес для меню трея и для показа человеку: сервер знает и реальный порт
+    // (при port:0 он эфемерный), и то, поднялся ли он вообще.
+    //
+    // Отдельный случай — '0.0.0.0'/'::' в конфиге: это не имя машины, а «слушаю
+    // на всех интерфейсах». Такой адрес на макбуке бесполезен, а пункт меню
+    // существует ровно затем, чтобы человек его оттуда взял (и клик по строке
+    // открыл бы http://0.0.0.0:порт в браузере). Подставляем первое имя из
+    // allowedHosts — это ровно те имена, по которым к нам и приходят, — а если
+    // и их нет, честный localhost: он хотя бы работает на этой машине.
+    address: () => {
+      if (!server || !server.listening) return null;
+      const boundPort = server.address().port;
+      let name = host;
+      if (LISTEN_ANYWHERE.has(String(host).trim())) {
+        const hint = (allowedHosts || []).map((h) => String(h).trim()).find(Boolean);
+        name = hint || '127.0.0.1';
+      }
+      return `http://${name.includes(':') && !name.startsWith('[') ? `[${name}]` : name}:${boundPort}`;
+    },
   };
 }
 

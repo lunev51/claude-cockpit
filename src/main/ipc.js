@@ -16,6 +16,8 @@ const { createCommandRegistry } = require('./command-registry');
 const { createBroadcast } = require('./broadcast');
 const { createOutputBuffer } = require('./output-buffer');
 const { createNetServer } = require('./net-server');
+const { createOwnership } = require('./ownership');
+const { isWriteChannel } = require('./write-channels');
 const { getConfig, setConfig } = require('./config');
 const { createPty } = require('./pty');
 const { createSessionManager } = require('./sessions');
@@ -1050,6 +1052,61 @@ function dropTabOutputBuffer({ tabId, outputBuffer }) {
   outputBuffer.drop(tabId);
 }
 
+// Эстафета: у pty один размер на всех, поэтому терминал подгоняется под того,
+// кто сейчас за рулём, — один раз, в момент пересадки. Все вкладки рисуются в
+// одну и ту же область окна, значит и размер у них общий: подогнать только
+// активную — оставить остальные в чужой раскладке.
+//
+// Кривой размер ХУЖЕ прежнего: ConPTY на нулевых колонках ломает перерисовку
+// Claude Code. Вынесена наружу ради собственного теста (тот же приём, что у
+// bufferTermData выше) — см. test/ipc-handoff-wiring.test.js.
+function applyHandoffSize({ manager, size }) {
+  if (!size || !(size.cols > 0) || !(size.rows > 0)) return;
+  for (const tab of manager.list()) manager.resize(tab.id, size.cols, size.rows);
+}
+
+// Вся проводка эстафеты одним куском: владение + гард записи. Вынесена из
+// registerIpc НЕ ради красоты — ревью показало, что непокрытая проводка
+// исчезает бесследно: семь мутаций подряд (гард пускает всех, переразмер
+// убран, события не рассылаются, ownership не доезжает до сетевого сервера)
+// оставляли все 918 тестов зелёными. Здесь она зовётся тем же кодом, что и в
+// проде, и проверяется напрямую — см. test/ipc-handoff-wiring.test.js.
+//
+// Побочные эффекты обёрнуты поштучно: на локальном пути claim прилетает из
+// обработчика клика по значку в трее, и любое исключение оттуда попадает в
+// process.on('uncaughtException') → app.exit(1). Клик по трею не имеет права
+// убивать приложение, а сбой одного эффекта — глушить остальные.
+function createHandoffWiring({ manager, broadcast, onOwnerChange }) {
+  const safely = (what, fn) => {
+    try {
+      fn();
+    } catch (err) {
+      console.warn(`[эстафета] ${what}: ${err && err.message}`);
+    }
+  };
+
+  const ownership = createOwnership({
+    onChange: ({ owner, size }) => {
+      safely('переразмер терминала', () => applyHandoffSize({ manager, size }));
+      safely('рассылка смены владельца', () => broadcast.emit('owner:changed', { owner, online: ownership.ownerOnline() }));
+      safely('уведомление окна', () => {
+        if (typeof onOwnerChange === 'function') onOwnerChange(owner);
+      });
+    },
+    // Пропал со связи или вернулся — владельца не меняем, окно не трогаем,
+    // но клиенты и трей обязаны это показать.
+    onPresence: ({ owner, online }) => {
+      safely('рассылка присутствия', () => broadcast.emit('owner:changed', { owner, online }));
+    },
+  });
+
+  // Чтение доступно всем — иначе заглушка на неактивной машине была бы слепой.
+  // Запись только владельцу. Оба транспорта приходят сюда, путей в обход нет.
+  const guard = ({ channel, who }) => !isWriteChannel(channel) || ownership.canWrite(who);
+
+  return { ownership, guard };
+}
+
 // M1 (ревью раунда 2 задачи 7, Important 1): без аутентификации в этой фазе
 // адрес прослушивания сетевого сервера — ЕДИНСТВЕННАЯ линия обороны кокпита
 // (иначе сервер видел бы любой человек в том же вайфае и мог бы выполнять
@@ -1216,7 +1273,13 @@ function startNetServerWithRetries({
 }
 
 function registerIpc(win, opts = {}) {
-  const { smoke = false, attention = null, toaster = null } = opts;
+  const {
+    smoke = false, attention = null, toaster = null,
+    // Смена владельца управления: main.js прячет и показывает по нему окно и
+    // перерисовывает трей. Необязателен — без него эстафета работает, просто
+    // окно никуда не девается (так ведут себя тесты и smoke).
+    onOwnerChange = null,
+  } = opts;
   ipcBootAt = Date.now(); // окно cacheOnly для ccusage — см. usage:get (инцидент 8ГБ)
 
   // Рассылка исходящих событий (broadcast.js) — симметричная половина
@@ -1584,7 +1647,15 @@ function registerIpc(win, opts = {}) {
   // должно остаться ни одной прямой регистрации на ipcMain). Создаётся один
   // раз, здесь же, ДО первой регистрации — раньше объявление жило ниже, перед
   // tabs:open, единственной группой, которая тогда его использовала.
-  const registry = createCommandRegistry({ ipcMain });
+  // Эстафета: один хозяин в каждый момент (спека «Кокпит по сети»). Владение
+  // живёт в чистом модуле ownership.js, проводка — в createHandoffWiring выше
+  // (она же под тестом). Создаётся ПОСЛЕ manager (onChange его дёргает) и ДО
+  // реестра (гард нужен реестру уже при сборке).
+  const { ownership, guard: handoffGuard } = createHandoffWiring({
+    manager, broadcast, onOwnerChange,
+  });
+
+  const registry = createCommandRegistry({ ipcMain, guard: handoffGuard });
 
   // Хвост вывода по вкладкам (output-buffer.js) — то, что отдаётся клиенту
   // сразу при подключении: сетевой сервер сам xterm не видит, а история
@@ -1618,6 +1689,10 @@ function registerIpc(win, opts = {}) {
     registry,
     broadcast,
     outputBuffer,
+    // Эстафета: сервер помечает каждый кадр именем сокета и обслуживает захват
+    // управления — реестр получил бы кадр без личности и не отличил бы макбук
+    // от локального окна.
+    ownership,
     staticRoots: rendererStaticRoots(appRoot()),
     port: netCfg.port,
     host: netCfg.host,
@@ -1778,6 +1853,18 @@ function registerIpc(win, opts = {}) {
   // Пустой хвост (вкладка только создана, вывода ещё не было) — нормальный
   // ответ, а не ошибка: отдаём пустую строку.
   registry.handle('net:buffer', (tabId) => (typeof tabId === 'string' ? outputBuffer.get(tabId) : ''));
+
+  // Эстафета, локальная половина. Окно ПК захватывает управление своим
+  // размером терминала — тот же путь, что у браузера, отличается только
+  // личность ('local' против имени сокета). Сетевую половину обслуживает
+  // net-server.js: только он знает, ЧЕЙ пришёл кадр.
+  registry.handle('owner:claim', (size) => {
+    ownership.claim('local', size);
+    return { owner: ownership.owner(), self: 'local', online: ownership.ownerOnline() };
+  });
+  registry.handle('owner:get', () => (
+    { owner: ownership.owner(), self: 'local', online: ownership.ownerOnline() }
+  ));
 
   // Регистрация вкладки. cwd обязателен — renderer берёт его из диалога
   // или из конфига; smoke-режим подменяет команду в sessions.js.
@@ -2172,7 +2259,11 @@ function registerIpc(win, opts = {}) {
   // выходе (иначе порт остаётся занятым между перезапусками кокпита) — тем
   // же приёмом, что и broadcast выше, единственный способ отдать наружу
   // объект, созданный ВНУТРИ этой функции.
-  return { registry, broadcast, netServer };
+  // ownership добавлен планом 2: main.js спрашивает у него владельца и статус
+  // связи, когда перерисовывает меню трея.
+  return {
+    registry, broadcast, netServer, ownership,
+  };
 }
 
 // Форсирует немедленную запись манифеста (debounce workspace.js иначе может
@@ -2252,6 +2343,11 @@ module.exports = {
   // Important 1 (ревью задачи 4): проводка буфера вывода — см. комментарий у
   // их определения выше и test/ipc-output-buffer-wiring.test.js.
   bufferTermData, dropTabOutputBuffer,
+  // План 2: переразмер pty при пересадке управления и вся проводка эстафеты
+  // (владение + гард записи) — см. test/ipc-handoff-wiring.test.js. Проводка
+  // экспортируется не для чужого кода, а чтобы её вообще можно было проверить:
+  // непокрытой она бесследно исчезала под мутациями.
+  applyHandoffSize, createHandoffWiring,
   historySearchHandler, historyRefreshHandler, createHistoryIndexState, HISTORY_INDEX_TTL_MS,
   recipesListHandler, recipesSavePromptHandler, recipesDeletePromptHandler,
   recipesListWorkspacesHandler, recipesSaveWorkspaceHandler, recipesDeleteWorkspaceHandler,

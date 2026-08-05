@@ -177,8 +177,15 @@ export function createSearch({ root, api, onOpenResult }) {
       console.warn(`[search] у сессии ${entry.sessionId} не разрешился cwd — открыть вкладку невозможно`);
       return;
     }
+    // I2 ре-ревью: onOpenResult ОТКРЫВАЕТ ВКЛАДКУ, то есть возвращает промис —
+    // синхронный try/catch его reject не видел вовсе, и отказ канала (у
+    // невладельца tabs:open отклоняет гард) уходил в unhandled rejection: с
+    // точки зрения человека оверлей просто закрывался и не происходило ничего.
+    // Promise.resolve — потому что колбэк вправе быть и синхронным.
     try {
-      onOpenResult(entry.cwd, entry.sessionId);
+      Promise.resolve(onOpenResult(entry.cwd, entry.sessionId)).catch((err) => {
+        console.warn('[search] не удалось открыть результат:', err);
+      });
     } catch (err) {
       console.warn('[search] не удалось открыть результат:', err);
     }
