@@ -77,3 +77,103 @@ test('ошибка внутри обработчика доезжает до в�
   reg.handle('плохая:команда', async () => { throw new Error('внутри рвануло'); });
   await assert.rejects(() => reg.call('плохая:команда', []), /внутри рвануло/);
 });
+
+// --- Эстафета: гард записи -------------------------------------------------
+// Гард стоит ЗДЕСЬ, а не в транспортах: локальный ipcMain и сетевой сокет оба
+// приходят в реестр, и это единственная точка, где их нельзя развести по
+// разным правилам. Тесты проверяют оба пути, потому что сломать можно любой.
+
+test('гард отклоняет запись от того, у кого нет управления', async () => {
+  const seen = [];
+  const reg = createCommandRegistry({
+    ipcMain: fakeIpcMain(),
+    guard: ({ channel, who }) => !(channel === 'term:write' && who !== 'local'),
+  });
+  reg.handle('term:write', (payload) => { seen.push(payload); return 'ок'; });
+
+  assert.strictEqual(await reg.call('term:write', ['от локального'], 'local'), 'ок');
+  await assert.rejects(
+    () => reg.call('term:write', ['от чужого'], 'c1'),
+    (err) => err.denied === true,
+  );
+  assert.deepStrictEqual(seen, ['от локального'], 'обработчик не должен был увидеть чужой вызов');
+});
+
+test('who по умолчанию — локальное окно', async () => {
+  const reg = createCommandRegistry({
+    ipcMain: fakeIpcMain(),
+    guard: ({ who }) => who === 'local',
+  });
+  reg.handle('term:write', () => 'ок');
+  assert.strictEqual(await reg.call('term:write', ['x']), 'ок');
+});
+
+test('локальный invoke при отказе возвращает null, а не бросает в окно', async () => {
+  const ipc = fakeIpcMain();
+  const reg = createCommandRegistry({ ipcMain: ipc, guard: () => false });
+  let called = false;
+  reg.handle('term:write', () => { called = true; return 'ок'; });
+
+  const result = await ipc.handled.get('term:write')({ sender: 'фиктивное событие' }, 'нагрузка');
+  assert.strictEqual(result, null);
+  assert.strictEqual(called, false, 'отказ обязан случиться ДО обработчика, а не после');
+});
+
+test('локальный send при отказе молчит', () => {
+  const ipc = fakeIpcMain();
+  const reg = createCommandRegistry({ ipcMain: ipc, guard: () => false });
+  let called = false;
+  reg.on('term:write', () => { called = true; });
+
+  ipc.oned.get('term:write')({ sender: 'фиктивное событие' }, 'нагрузка');
+  assert.strictEqual(called, false);
+});
+
+test('гард спрашивают на КАЖДЫЙ вызов, а не один раз при регистрации', async () => {
+  // Владение меняется в рантайме: клиент, которому только что отказали,
+  // через секунду может стать хозяином. Гард, опрошенный при handle(),
+  // навсегда заморозил бы первое решение.
+  let owner = 'local';
+  const reg = createCommandRegistry({
+    ipcMain: fakeIpcMain(),
+    guard: ({ who }) => who === owner,
+  });
+  reg.handle('term:write', () => 'ок');
+
+  await assert.rejects(() => reg.call('term:write', ['x'], 'c1'), (err) => err.denied === true);
+  owner = 'c1';
+  assert.strictEqual(await reg.call('term:write', ['x'], 'c1'), 'ок');
+});
+
+test('гард видит имя канала — иначе он не отличит чтение от записи', async () => {
+  const asked = [];
+  const reg = createCommandRegistry({
+    ipcMain: fakeIpcMain(),
+    guard: ({ channel, who }) => { asked.push({ channel, who }); return true; },
+  });
+  reg.handle('usage:get', () => 'ок');
+  await reg.call('usage:get', [], 'c1');
+  assert.deepStrictEqual(asked, [{ channel: 'usage:get', who: 'c1' }]);
+});
+
+test('без guard реестр работает как раньше', async () => {
+  const reg = createCommandRegistry({ ipcMain: fakeIpcMain() });
+  reg.handle('term:write', () => 'ок');
+  assert.strictEqual(await reg.call('term:write', ['x'], 'кто-угодно'), 'ок');
+});
+
+test('отказ отличается от поломки: у него есть denied', async () => {
+  // Сетевой транспорт по этому полю решает, показывать ошибку человеку или
+  // промолчать (спека: отклонение молчаливое). Разбор текста сообщения был бы
+  // хрупким — поле обязано быть.
+  const reg = createCommandRegistry({ ipcMain: fakeIpcMain(), guard: () => false });
+  reg.handle('term:write', () => 'ок');
+  reg.handle('рвётся', () => { throw new Error('внутри рвануло'); });
+
+  const denied = await reg.call('term:write', [], 'c1').catch((e) => e);
+  assert.strictEqual(denied.denied, true);
+
+  const broken = await createCommandRegistry({ ipcMain: fakeIpcMain() })
+    .call('нет:такой', []).catch((e) => e);
+  assert.strictEqual(broken.denied, undefined, 'обычная ошибка не должна выглядеть отказом эстафеты');
+});

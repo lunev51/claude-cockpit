@@ -456,21 +456,21 @@ test('who по умолчанию — локальное окно', async () => 
 });
 
 test('локальный invoke при отказе возвращает null, а не бросает в окно', async () => {
-  const ipcMain = fakeIpcMain();
-  const registry = createCommandRegistry({ ipcMain, guard: () => false });
+  const ipc = fakeIpcMain();
+  const registry = createCommandRegistry({ ipcMain: ipc, guard: () => false });
   let called = false;
   registry.handle('term:write', () => { called = true; return 'ок'; });
-  const result = await ipcMain.invokeHandler('term:write', {}, 'полезная нагрузка');
+  const result = await ipc.handled.get('term:write')({ sender: 'фиктивное событие' }, 'нагрузка');
   assert.strictEqual(result, null);
-  assert.strictEqual(called, false);
+  assert.strictEqual(called, false, 'отказ обязан случиться ДО обработчика, а не после');
 });
 
 test('локальный send при отказе молчит', () => {
-  const ipcMain = fakeIpcMain();
-  const registry = createCommandRegistry({ ipcMain, guard: () => false });
+  const ipc = fakeIpcMain();
+  const registry = createCommandRegistry({ ipcMain: ipc, guard: () => false });
   let called = false;
-  registry.on('term:data', () => { called = true; });
-  ipcMain.sendHandler('term:data', {}, 'полезная нагрузка');
+  registry.on('term:write', () => { called = true; });
+  ipc.oned.get('term:write')({ sender: 'фиктивное событие' }, 'нагрузка');
   assert.strictEqual(called, false);
 });
 
@@ -481,24 +481,9 @@ test('без guard реестр работает как раньше', async () 
 });
 ```
 
-Если в файле нет `fakeIpcMain` с возможностью вызвать зарегистрированный обработчик —
-добавить вверху файла:
-
-```js
-// Поддельный ipcMain, который УМЕЕТ позвать зарегистрированный обработчик:
-// без этого локальный путь (окно ПК) остался бы непокрытым, а именно на нём
-// живёт половина гарда.
-function fakeIpcMain() {
-  const invoke = new Map();
-  const send = new Map();
-  return {
-    handle: (ch, fn) => invoke.set(ch, fn),
-    on: (ch, fn) => send.set(ch, fn),
-    invokeHandler: (ch, ...args) => invoke.get(ch)(...args),
-    sendHandler: (ch, ...args) => send.get(ch)(...args),
-  };
-}
-```
+`fakeIpcMain` в этом файле уже есть (`test/command-registry.test.js:8`) и отдаёт карты
+`handled` / `oned` — через них тесты выше и зовут зарегистрированные обработчики.
+Второй такой хелпер не заводить.
 
 - [ ] **Шаг 2: убедиться, что тест падает**
 
