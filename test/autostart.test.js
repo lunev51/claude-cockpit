@@ -79,6 +79,56 @@ test('пункт есть, но отключён в диспетчере зад�
   }), false);
 });
 
+// --- I3 (ре-ревью): признаки должны РАСХОДИТЬСЯ, иначе приоритет не проверен ---
+// Ревьюер заменил первую ветку (executableWillLaunchAtLogin) на `if (false)` —
+// и весь test/autostart.test.js остался зелёным, потому что ни в одном
+// случае выше executableWillLaunchAtLogin не расходится с тем, что даёт
+// разбор launchItems/openAtLogin: либо оба говорят одно и то же, либо
+// launchItems пуст и функция всё равно проваливается туда же через
+// openAtLogin. Ниже — случаи, где первый признак единственный источник
+// правды, а остальные два врут в другую сторону.
+
+test('I3: executableWillLaunchAtLogin=true перевешивает launchItems/openAtLogin, говорящие "выключено"', () => {
+  // Реальная форма ответа Windows с нашим --hidden (см. разбор в autostart.js):
+  // Windows запустит exe, но и launchItems, и openAtLogin утверждают обратное.
+  // Если приоритет сломан (первая ветка отключена), функция провалится в
+  // разбор launchItems и наврёт "выключено" — ровно тот баг, который чинили.
+  const settings = {
+    openAtLogin: false,
+    executableWillLaunchAtLogin: true,
+    launchItems: [{
+      name: 'com.lunev.claude-cockpit',
+      path: 'C:\\proj\\node_modules\\electron\\dist\\electron.exe',
+      args: ['C:\\proj'],
+      scope: 'user',
+      enabled: false,
+    }],
+  };
+  assert.strictEqual(isAutostartOn(settings), true,
+    'executableWillLaunchAtLogin честный признак — он обязан победить, даже когда остальные два врут');
+});
+
+test('I3: executableWillLaunchAtLogin=false перевешивает launchItems/openAtLogin, говорящие "включено"', () => {
+  // Обратный случай: Windows точно НЕ запустит exe (например, StartupApproved
+  // деактивировала запись так, что Electron этого не видит иначе), а
+  // launchItems и openAtLogin говорят "включено". Честный признак обязан
+  // победить и здесь — иначе галочка в трее покажет "включено" для записи,
+  // которая реально не сработает.
+  const settings = {
+    openAtLogin: true,
+    executableWillLaunchAtLogin: false,
+    launchItems: [{
+      name: 'com.lunev.claude-cockpit',
+      path: 'C:\\proj\\node_modules\\electron\\dist\\electron.exe',
+      args: ['C:\\proj'],
+      scope: 'user',
+      enabled: true,
+    }],
+  };
+  assert.strictEqual(isAutostartOn(settings), false,
+    'executableWillLaunchAtLogin честный признак — он обязан победить, даже когда остальные два врут');
+});
+
 test('без Windows-полей решает openAtLogin', () => {
   // macOS/Linux: executableWillLaunchAtLogin там нет вовсе, launchItems тоже.
   assert.strictEqual(isAutostartOn({ openAtLogin: true }), true);

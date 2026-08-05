@@ -45,6 +45,14 @@ let hideExplained = false;
 // объявленного здесь, на уровне модуля. Ссылка присваивается там же, где
 // функция создаётся; null до этого момента.
 let revealWindow = null;
+// Minor 2 (ре-ревью): revealWindow пуст первые секунды старта (пока не
+// отработал app.whenReady()). Вторая копия, запущенная в это окно, раньше
+// молча ничего не делала — second-instance стреляет сразу, revealWindow ещё
+// null, `if (revealWindow) revealWindow();` пропускал вызов без следа, и
+// человек, нажавший ярлык второй раз, не видел вообще ничего. Взводим флаг
+// «окно попросили показать» и разбираем его сразу же, как revealWindow
+// станет доступен (см. присваивание revealWindow ниже, внутри whenReady).
+let pendingReveal = false;
 
 // Вторая копия дерётся за манифест воркспейса — разрешаем одну.
 // В smoke-режиме блокировку не берём (гоняется параллельно с dev-окном).
@@ -69,7 +77,12 @@ app.on('second-instance', () => {
   // естественный жест «кокпит пропал, запущу ярлык ещё раз» не делал ровным
   // счётом ничего. Зовём тот же showWindow, что и клик по трею: он и
   // показывает окно, и забирает управление обратно на локальную машину.
+  //
+  // Minor 2: если это случилось раньше app.whenReady() (revealWindow ещё
+  // null), не теряем запрос — откладываем его флагом и разбираем сразу после
+  // присваивания revealWindow ниже.
   if (revealWindow) revealWindow();
+  else pendingReveal = true;
 });
 
 // --- Персист состояния окна (userData/window-state.json) ---
@@ -378,7 +391,21 @@ app.whenReady().then(() => {
   // остаётся сбоем одного действия, а не концом процесса.
   const guarded = (label, fn) => (...args) => {
     try {
-      return fn(...args);
+      const result = fn(...args);
+      // Minor 1 (ре-ревью): trayClick('address') зовёт shell.openExternal(),
+      // который возвращает промис. Его reject раньше уходил мимо этого
+      // try/catch в unhandledRejection — в Node >=15 это uncaughtException
+      // (см. process.on('uncaughtException') в конце файла) -> app.exit(1).
+      // Клик по пункту меню трея молча убивал всё приложение вместе с живыми
+      // pty — ровно то, от чего guarded должен был защищать. Ловим и промис,
+      // не только синхронные исключения; fn при этом обязана вернуть промис
+      // наружу (см. trayClick ниже), иначе здесь ловить нечего.
+      if (result && typeof result.then === 'function') {
+        result.catch((err) => {
+          console.error(`[tray] сбой (${label}): ${(err && err.stack) || err}`);
+        });
+      }
+      return result;
     } catch (err) {
       console.error(`[tray] сбой (${label}): ${(err && err.stack) || err}`);
       return undefined;
@@ -401,6 +428,13 @@ app.whenReady().then(() => {
   // Тот же показ окна нужен обработчику second-instance на уровне модуля
   // (повторный запуск ярлыка) — см. комментарий у revealWindow выше.
   revealWindow = showWindow;
+  // Minor 2: запрос на показ мог прийти ДО этой строки (вторая копия
+  // стартовала в первую же секунду после первой) — pendingReveal его
+  // запомнил, разбираем немедленно, как только revealWindow стал рабочим.
+  if (pendingReveal) {
+    pendingReveal = false;
+    revealWindow();
+  }
 
   const hideWindow = guarded('скрытие окна', () => {
     if (win.isDestroyed() || !win.isVisible()) return;
@@ -433,9 +467,12 @@ app.whenReady().then(() => {
     if (id === 'show') showWindow();
     else if (id === 'address') {
       const address = netServer ? netServer.address() : null;
-      if (address) shell.openExternal(address);
+      // Minor 1: возвращаем промис shell.openExternal() наружу, чтобы guarded
+      // выше мог поймать его reject — если fn его не вернёт, ловить нечего.
+      if (address) return shell.openExternal(address);
     } else if (id === 'autostart') toggleAutostart();
     else if (id === 'quit') { quitting = true; app.quit(); }
+    return undefined;
   });
 
   const refreshTray = guarded('перерисовка трея', () => {
