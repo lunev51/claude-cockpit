@@ -988,6 +988,15 @@ function showToast(text, level = 'info') {
   setTimeout(() => el.remove(), TOAST_TTL_MS);
 }
 
+// Тост из модуля, который про DOM ничего не знает и импортировать app.js не
+// может (api-boot.js грузится ПЕРВЫМ, до всего остального, — циклический
+// импорт). Единственный такой случай сегодня: браузер отказался открыть
+// ссылку попапом (см. api-boot.js/openExternal).
+window.addEventListener('cockpit:toast', (e) => {
+  const detail = (e && e.detail) || {};
+  if (typeof detail.text === 'string') showToast(detail.text, detail.level);
+});
+
 // C1 (ревью финальной волны фазы 7, критично): единый гард перед записью
 // команды/текста + '\r' в pty вкладки — если целевая вкладка сейчас 'waiting'
 // (ждёт ответа на диалог разрешения Claude Code), завершающий '\r' молча
@@ -2101,8 +2110,15 @@ function rememberClaimIntent(weOwn) {
 }
 
 // C2 ре-ревью: была ли ЭТА загрузка автоматической (api-boot.js перезагрузил
-// страницу сам, когда кокпит снова ответил). Метку сразу снимаем: следующая,
-// уже ручная, F5 обязана считаться намерением человека сесть за руль.
+// страницу сам, когда кокпит снова ответил). Метку сразу снимаем — она про
+// одну конкретную загрузку, а не про вкладку.
+//
+// Уточнение (M3 второго ре-ревью): снятая метка НЕ означает, что следующая
+// загрузка заберёт руль. У вкладки-зрителя остаётся второй тормоз — память о
+// роли (intent в sessionStorage), и он сильнее: страница не отличает ручную F5
+// от восстановления вкладок браузером после краша, а ошибиться в эту сторону
+// дешевле (клик по кнопке на заглушке) , чем в обратную (у человека за ПК молча
+// отбирают управление). Разбор — в handoff-view.js/shouldClaimOnLoad.
 function takeAutoReloadMark() {
   try {
     const mark = window.sessionStorage.getItem(RELOAD_MARK_KEY);
@@ -2212,14 +2228,34 @@ async function resumeInputAfterClaim() {
 // C1 ре-ревью: если при загрузке мы были зрителем без единой живой вкладки,
 // подъём воркспейса ждал именно этого момента (см. bootWorkspace) — иначе
 // человек, забравший управление, оставался с пустым сайдбаром.
+//
+// Зовётся ДВУМЯ путями сразу, и это намеренно: своим захватом (claimControl) и
+// событием owner:changed — второе приходит и когда руль вернулся без нашего
+// участия (показ окна ПК из трея, уход соседа). Ре-ревью замерило, что на
+// явном захвате срабатывают оба: main рассылает owner:changed синхронно внутри
+// обработчика owner:claim, то есть broadcast обгоняет ответ на invoke, и в
+// сокет уходили три tabs:list вместо одного. Вреда сегодня нет (bootWorkspace
+// гасит флаг первой строкой), но «случится ровно один раз» держалось на
+// порядке ответов, а не на коде. Держим оба пути — они разной природы — и
+// делаем сам проход одноразовым: повторный вызов дожидается уже идущего.
+let controlGainedRun = null;
 async function afterControlGained() {
-  await resumeInputAfterClaim();
-  if (!workspaceBootPending) return;
+  if (controlGainedRun) return controlGainedRun;
+  controlGainedRun = (async () => {
+    await resumeInputAfterClaim();
+    if (!workspaceBootPending) return;
+    try {
+      await bootWorkspace();
+    } catch (err) {
+      console.warn('[boot] подъём воркспейса после получения управления не удался:', err);
+    }
+  })();
   try {
-    await bootWorkspace();
-  } catch (err) {
-    console.warn('[boot] подъём воркспейса после получения управления не удался:', err);
+    await controlGainedRun;
+  } finally {
+    controlGainedRun = null;
   }
+  return undefined;
 }
 
 // Управление ушло к соседу, пока мы решали вопрос восстановления. Оверлей

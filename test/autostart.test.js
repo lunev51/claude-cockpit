@@ -55,6 +55,36 @@ test('запись в реестре есть: openAtLogin врёт false, че�
     'на openAtLogin полагаться нельзя: галочка вечно выглядела выключенной, и выключить автозапуск было невозможно');
 });
 
+// M1 (второе ре-ревью): запасная ветка launchItems тоже была непокрыта — её
+// мутация (`items.some(() => true)`, то есть «любая запись = включено»)
+// оставляла прогон зелёным. Нужна сборка БЕЗ executableWillLaunchAtLogin,
+// иначе до этой ветки исполнение не доходит вовсе.
+test('без executableWillLaunchAtLogin решает enabled записи, а не её наличие', () => {
+  const base = {
+    name: 'com.lunev.claude-cockpit',
+    path: 'C:\\proj\\node_modules\\electron\\dist\\electron.exe',
+    args: ['C:\\proj'],
+    scope: 'user',
+  };
+  // Запись есть, но деактивирована в диспетчере задач: Windows кокпит НЕ
+  // запустит, и галочка обязана быть снята — само наличие записи ничего не значит.
+  assert.strictEqual(isAutostartOn({
+    openAtLogin: true,
+    launchItems: [{ ...base, enabled: false }],
+  }), false, 'деактивированная запись — это выключенный автозапуск');
+
+  assert.strictEqual(isAutostartOn({
+    openAtLogin: false,
+    launchItems: [{ ...base, enabled: true }],
+  }), true, 'живая запись — включённый, даже когда openAtLogin врёт false');
+
+  // Несколько записей: одна деактивирована, одна живая — автозапуск состоится.
+  assert.strictEqual(isAutostartOn({
+    openAtLogin: false,
+    launchItems: [{ ...base, enabled: false }, { ...base, enabled: true }],
+  }), true);
+});
+
 test('записи в реестре нет — выключено', () => {
   assert.strictEqual(isAutostartOn({
     openAtLogin: false,

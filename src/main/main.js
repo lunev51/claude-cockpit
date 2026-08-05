@@ -428,13 +428,6 @@ app.whenReady().then(() => {
   // Тот же показ окна нужен обработчику second-instance на уровне модуля
   // (повторный запуск ярлыка) — см. комментарий у revealWindow выше.
   revealWindow = showWindow;
-  // Minor 2: запрос на показ мог прийти ДО этой строки (вторая копия
-  // стартовала в первую же секунду после первой) — pendingReveal его
-  // запомнил, разбираем немедленно, как только revealWindow стал рабочим.
-  if (pendingReveal) {
-    pendingReveal = false;
-    revealWindow();
-  }
 
   const hideWindow = guarded('скрытие окна', () => {
     if (win.isDestroyed() || !win.isVisible()) return;
@@ -518,6 +511,18 @@ app.whenReady().then(() => {
   tray = new Tray(nativeImage.createFromPath(path.join(appRoot(), 'assets', 'tray-local.ico')));
   tray.on('click', () => showWindow());
   refreshTray();
+
+  // Minor 2: запрос на показ окна мог прийти ДО готовности (вторая копия
+  // стартовала в первую же секунду после первой) — pendingReveal его запомнил.
+  // Разбираем здесь, а не сразу после присвоения revealWindow (M4 второго
+  // ре-ревью): showWindow заканчивается захватом управления, а ownership
+  // рождается только в registerIpc выше. Раньше на этом пути захват молча
+  // пропускался — вреда не было (владелец по умолчанию и так 'local'), но
+  // правило «показ окна = возврат управления» на нём не выполнялось.
+  if (pendingReveal) {
+    pendingReveal = false;
+    showWindow();
+  }
 
   // I7 (ревью): здесь стоял ОДИН setTimeout(refreshTray, 3000). А сетевой
   // сервер поднимается с повторами — 6 попыток по 5с (startNetServerWithRetries

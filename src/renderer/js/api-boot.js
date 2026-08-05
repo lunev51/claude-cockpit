@@ -137,8 +137,26 @@ if (!window.api) {
   // window.open нельзя пускать javascript:/data: — ссылка приезжает из чужого
   // вывода терминала. noopener обязателен: без него открытая страница получает
   // window.opener на кокпит.
+  //
+  // Заблокированный попап (M2 ре-ревью) иначе не оставляет НИ ОДНОГО следа:
+  // с noopener window.open по спеке всегда возвращает null, так что отличить
+  // «открылось» от «браузер запретил» по возвращённому значению нельзя.
+  // Сегодня все вызовы идут прямо из клика и блокировщик их пропускает, но
+  // любой будущий вызов из таймера или промиса отвалился бы молча. Поэтому
+  // спрашиваем у браузера, считает ли он момент пользовательским, и если нет —
+  // говорим человеку, а не делаем вид, что открыли.
   api.shell.openExternal = async (url) => {
     if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return;
+    const activation = navigator.userActivation;
+    if (activation && activation.isActive === false) {
+      window.dispatchEvent(new CustomEvent('cockpit:toast', {
+        detail: { text: 'браузер не дал открыть ссылку — она в буфере обмена', level: 'warn' },
+      }));
+      try {
+        await navigator.clipboard.writeText(url);
+      } catch { /* буфер тоже могут не дать — тогда остаётся только текст тоста */ }
+      return;
+    }
     window.open(url, '_blank', 'noopener');
   };
   window.api = api;
