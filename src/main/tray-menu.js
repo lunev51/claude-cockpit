@@ -2,8 +2,11 @@
 // Что показывает трей. Чистый модуль: Electron собирает по этому описанию
 // настоящее Menu, но решение «какой пункт, какая иконка, какой текст»
 // принимается здесь и проверяется node --test.
+// netStarting — «сервер ещё имеет право подняться» (он стартует с повторами,
+// см. startNetServerWithRetries в ipc.js). Без него единственной альтернативой
+// адресу было «Сеть недоступна» — неправда в первые полминуты после запуска.
 function buildTrayModel({
-  owner, online, address, autostart,
+  owner, online, address, autostart, netStarting = false,
 }) {
   const local = owner === 'local';
   let status;
@@ -18,7 +21,11 @@ function buildTrayModel({
       { id: 'status', label: status, enabled: false },
       address
         ? { id: 'address', label: address, enabled: true }
-        : { id: 'address', label: 'Сеть недоступна', enabled: false },
+        : {
+          id: 'address',
+          label: netStarting ? 'Сеть поднимается…' : 'Сеть недоступна',
+          enabled: false,
+        },
       { type: 'separator' },
       { id: 'show', label: 'Показать окно' },
       {

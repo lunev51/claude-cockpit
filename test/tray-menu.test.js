@@ -48,3 +48,24 @@ test('сеть не поднялась — строка адреса это го
   assert.match(item.label, /сеть недоступна/i);
   assert.strictEqual(item.enabled, false);
 });
+
+test('сеть ещё поднимается — трей не выдаёт это за отказ', () => {
+  // I7 (ревью): сервер стартует с повторами (6 попыток по 5с), штатно встаёт
+  // на 5-25-й секунде. Всё это время «Сеть недоступна» — неправда.
+  const model = buildTrayModel({
+    owner: 'local', online: true, address: null, autostart: false, netStarting: true,
+  });
+  const item = model.items.find((i) => i.id === 'address');
+  assert.match(item.label, /поднима/i);
+  assert.doesNotMatch(item.label, /недоступна/i);
+  assert.strictEqual(item.enabled, false);
+});
+
+test('адрес есть — netStarting уже не влияет', () => {
+  const model = buildTrayModel({
+    owner: 'local', online: true, address: 'http://x:1', autostart: false, netStarting: true,
+  });
+  const item = model.items.find((i) => i.id === 'address');
+  assert.strictEqual(item.label, 'http://x:1');
+  assert.strictEqual(item.enabled, true);
+});

@@ -13,7 +13,7 @@ const { getConfig, isRootConfigCorrupt } = require('./config');
 const { appRoot } = require('./paths');
 const { setBroadcast, notify } = require('./notify');
 const { buildTrayModel } = require('./tray-menu');
-const { buildLoginItem } = require('./autostart');
+const { buildLoginItem, isAutostartOn } = require('./autostart');
 const { createAttention } = require('./attention');
 const { createToaster } = require('./toasts');
 
@@ -40,18 +40,36 @@ let quitting = false;
 // Первое скрытие окна объясняем один раз за запуск: без этого пропажа окна из
 // панели задач и Alt+Tab выглядит как «приложение закрылось само».
 let hideExplained = false;
+// Показ окна умеет только замыкание внутри whenReady (ему нужны и win, и
+// ownership), а звать его надо и снаружи — из обработчика second-instance,
+// объявленного здесь, на уровне модуля. Ссылка присваивается там же, где
+// функция создаётся; null до этого момента.
+let revealWindow = null;
 
 // Вторая копия дерётся за манифест воркспейса — разрешаем одну.
 // В smoke-режиме блокировку не берём (гоняется параллельно с dev-окном).
+//
+// C2 (ревью): `return` здесь обязателен. app.quit() НЕ прерывает выполнение
+// модуля — он лишь ставит выход в очередь, а до неё вторая копия успевала
+// пройти app.whenReady() ЦЕЛИКОМ: поднимала свои pty, лезла в общий манифест
+// воркспейса и пыталась занять тот же порт (в её логе ревьюер видел
+// `[net] сервер не поднялся ... (EADDRINUSE) — повтор 1/6`). CommonJS
+// оборачивает файл в функцию, поэтому возврат на верхнем уровне легален и
+// обрывает инициализацию на первой же строке: вторая копия только шлёт
+// сигнал первой (его обрабатывает second-instance ниже) и умирает.
 if (!SMOKE && !app.requestSingleInstanceLock()) {
   app.quit();
+  return;
 }
+
 app.on('second-instance', () => {
-  const win = BrowserWindow.getAllWindows()[0];
-  if (win) {
-    if (win.isMinimized()) win.restore();
-    win.focus();
-  }
+  // C2: раньше здесь были только restore()+focus(). С тех пор как крестик
+  // ПРЯЧЕТ окно (задача 6), спрятанное окно не является свёрнутым — restore()
+  // его не возвращает, focus() невидимому окну ничего не даёт, и самый
+  // естественный жест «кокпит пропал, запущу ярлык ещё раз» не делал ровным
+  // счётом ничего. Зовём тот же showWindow, что и клик по трею: он и
+  // показывает окно, и забирает управление обратно на локальную машину.
+  if (revealWindow) revealWindow();
 });
 
 // --- Персист состояния окна (userData/window-state.json) ---
@@ -345,8 +363,29 @@ app.whenReady().then(() => {
   // Владение управлением приезжает из registerIpc ниже; функции объявлены до
   // него, потому что onOwnerChange ссылается на них в момент вызова.
   let ownership = null;
+  // I7 (ревью): «сервер ещё имеет право подняться». Взводится сразу, гаснет,
+  // когда адрес появился или когда ждать больше нечего (см. probeNetAddress
+  // ниже) — до тех пор трей не выдаёт нормальный старт за отказ сети.
+  let netStarting = true;
 
-  function showWindow() {
+  // I6 (ревью): любое исключение внутри обработчика события Electron (клик по
+  // значку трея, пункт меню, смена владельца управления) не остаётся внутри
+  // обработчика — оно улетает наверх, в process.on('uncaughtException') в
+  // конце этого файла, а тот делает app.exit(1). То есть один сбой в
+  // побочных эффектах (например, ownership.claim() внутри showWindow) молча
+  // убивал бы весь кокпит вместе с живыми pty — от клика по значку в трее.
+  // Оборачиваем все точки входа со своей стороны: сбой попадает в лог и
+  // остаётся сбоем одного действия, а не концом процесса.
+  const guarded = (label, fn) => (...args) => {
+    try {
+      return fn(...args);
+    } catch (err) {
+      console.error(`[tray] сбой (${label}): ${(err && err.stack) || err}`);
+      return undefined;
+    }
+  };
+
+  const showWindow = guarded('показ окна', () => {
     if (win.isDestroyed()) return;
     if (win.isMinimized()) win.restore();
     win.show();
@@ -358,9 +397,12 @@ app.whenReady().then(() => {
     // Размер не передаём — ownership помнит его по владельцу, а renderer
     // уточнит своим term:resize сразу после показа окна.
     if (ownership) ownership.claim('local');
-  }
+  });
+  // Тот же показ окна нужен обработчику second-instance на уровне модуля
+  // (повторный запуск ярлыка) — см. комментарий у revealWindow выше.
+  revealWindow = showWindow;
 
-  function hideWindow() {
+  const hideWindow = guarded('скрытие окна', () => {
     if (win.isDestroyed() || !win.isVisible()) return;
     win.hide();
     if (hideExplained || !Notification.isSupported()) return;
@@ -369,10 +411,15 @@ app.whenReady().then(() => {
       title: 'Cockpit свёрнут в трей',
       body: 'Управление ушло на другую машину. Значок в трее вернёт окно.',
     }).show();
-  }
+  });
 
-  function toggleAutostart() {
-    const enabled = app.getLoginItemSettings().openAtLogin;
+  const toggleAutostart = guarded('переключение автозапуска', () => {
+    // C3 (ревью): читать app.getLoginItemSettings().openAtLogin НАПРЯМУЮ
+    // нельзя — на Windows он равен false даже при живой записи в реестре (см.
+    // разбор в autostart.js). Из-за этого toggleAutostart каждый раз видел
+    // «выключено» и каждый раз ВКЛЮЧАЛ: выключить автозапуск из меню трея
+    // было невозможно в принципе, а галочка всегда выглядела снятой.
+    const enabled = isAutostartOn(app.getLoginItemSettings());
     app.setLoginItemSettings({
       openAtLogin: !enabled,
       ...buildLoginItem({
@@ -380,18 +427,18 @@ app.whenReady().then(() => {
       }),
     });
     refreshTray();
-  }
+  });
 
-  function trayClick(id) {
+  const trayClick = guarded('пункт меню трея', (id) => {
     if (id === 'show') showWindow();
     else if (id === 'address') {
       const address = netServer ? netServer.address() : null;
       if (address) shell.openExternal(address);
     } else if (id === 'autostart') toggleAutostart();
     else if (id === 'quit') { quitting = true; app.quit(); }
-  }
+  });
 
-  function refreshTray() {
+  const refreshTray = guarded('перерисовка трея', () => {
     if (!tray || tray.isDestroyed()) return;
     const model = buildTrayModel({
       owner: ownership ? ownership.owner() : 'local',
@@ -400,7 +447,8 @@ app.whenReady().then(() => {
       // а после неудачного старта сервер может подняться позже, с повторной
       // попытки (startNetServerWithRetries в ipc.js).
       address: netServer ? netServer.address() : null,
-      autostart: app.getLoginItemSettings().openAtLogin,
+      netStarting,
+      autostart: isAutostartOn(app.getLoginItemSettings()),
     });
     tray.setImage(path.join(appRoot(), 'assets', model.icon));
     tray.setToolTip(model.tooltip);
@@ -411,7 +459,7 @@ app.whenReady().then(() => {
       entry.click = () => trayClick(item.id);
       return entry;
     })));
-  }
+  });
 
   // Деструктуризация в скобки: без них `({ broadcast } = ...)` на верхнем
   // уровне statement распарсился бы как блок кода, не присваивание —
@@ -431,12 +479,36 @@ app.whenReady().then(() => {
   // Трей создаём ПОСЛЕ registerIpc: refreshTray спрашивает и владельца, и
   // адрес сервера, а оба рождаются там.
   tray = new Tray(nativeImage.createFromPath(path.join(appRoot(), 'assets', 'tray-local.ico')));
-  tray.on('click', showWindow);
+  tray.on('click', () => showWindow());
   refreshTray();
-  // Сервер мог не успеть занять порт к этому моменту (или поднимается с
-  // ретраями) — обновляем строку адреса, когда он появится. Одноразово, без
-  // поллинга: дальше меню перерисовывается на каждой смене владельца.
-  setTimeout(refreshTray, 3000).unref();
+
+  // I7 (ревью): здесь стоял ОДИН setTimeout(refreshTray, 3000). А сетевой
+  // сервер поднимается с повторами — 6 попыток по 5с (startNetServerWithRetries
+  // в ipc.js), то есть штатно встаёт на 5-25-й секунде, если проиграл гонку с
+  // поднятием интерфейса Tailscale. Всё это время в трее висело «Сеть
+  // недоступна», и чинилось это только следующей перерисовкой — то есть когда
+  // кто-нибудь заберёт управление. Для фичи, весь смысл которой «набери этот
+  // адрес на другом устройстве», это и есть отказ.
+  //
+  // Ждём ровно столько, сколько сервер вправе подниматься (плюс запас), и
+  // прекращаем сразу, как адрес появился: это трей, а не монитор — вечного
+  // поллинга здесь нет. Проба сама по себе дешёвая (server.listening), тяжёлый
+  // refreshTray с чтением реестра зовётся только на реальном изменении.
+  const NET_PROBE_MS = 2000;
+  const netWaitUntil = Date.now() + 70000; // 6 повторов * 5с + запас на сам listen
+  function probeNetAddress() {
+    if (!tray || tray.isDestroyed()) return;
+    const address = netServer ? netServer.address() : null;
+    if (!address && Date.now() < netWaitUntil) {
+      setTimeout(probeNetAddress, NET_PROBE_MS).unref();
+      return;
+    }
+    // Либо адрес появился, либо ждать больше нечего: и то, и другое — конец
+    // ожидания, дальше строка адреса честна без всякого опроса.
+    netStarting = false;
+    refreshTray();
+  }
+  setTimeout(probeNetAddress, NET_PROBE_MS).unref();
 
   // Ошибки renderer всегда дублируем в stdout — иначе их не видно при фоновом запуске.
   win.webContents.on('console-message', (eventOrDetails, level, message) => {
@@ -513,7 +585,22 @@ app.whenReady().then(() => {
   }
 });
 
+// Minor (ревью): tray.destroy() не звался ни на одном пути выхода. На Windows
+// значок мёртвого процесса остаётся в трее призраком до тех пор, пока по нему
+// не проведут мышью — оболочка убирает такие значки лениво. Идемпотентно:
+// зовётся из всех трёх обработчиков выхода ниже, любой из которых может
+// сработать первым (и не сработать вовсе — например, при app.exit() в смоуке,
+// где трея и нет).
+function destroyTray() {
+  if (!tray) return;
+  try {
+    if (!tray.isDestroyed()) tray.destroy();
+  } catch { /* значок уже снят — не повод падать на выходе */ }
+  tray = null;
+}
+
 app.on('window-all-closed', () => {
+  destroyTray();
   flushWorkspace();
   disposeSessions();
   // Задача 7: гасим сетевой сервер здесь же, рядом с disposeSessions() —
@@ -531,6 +618,7 @@ app.on('before-quit', () => {
   // иначе приложение просто не закроется и человек будет снимать его
   // диспетчером задач.
   quitting = true;
+  destroyTray();
   flushWorkspace();
   disposeSessions();
   if (netServer) netServer.stop();
@@ -538,6 +626,7 @@ app.on('before-quit', () => {
 
 process.on('uncaughtException', (e) => {
   console.error(e);
+  destroyTray();
   flushWorkspace();
   disposeSessions();
   if (netServer) netServer.stop();
