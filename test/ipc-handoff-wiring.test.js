@@ -162,43 +162,67 @@ test('сбой побочного эффекта не отменяет смен�
 const fs = require('node:fs');
 const path = require('node:path');
 
-function ipcSourceLines() {
+// Первая редакция этого стража была ХОЛОСТОЙ на трёх мутациях (ре-ревью):
+// `guard: () => true` прямо в реестре, удалённый `ownership` из возврата
+// registerIpc и переименованная переменная в деструктуризации — всё проходило
+// зелёным. Причина в том, что проверки искали ПРИЗНАКИ (слово `guard:`,
+// «где-то есть return с ownership») по всему файлу, а не связь между
+// объявлением и использованием внутри самой registerIpc. Тот же класс ошибки,
+// ради которого страж и писался: проверка, которая выглядит проверкой.
+//
+// Теперь: вырезаем ТЕЛО registerIpc, вытаскиваем настоящее имя переменной из
+// деструктуризации и требуем, чтобы именно оно приехало в реестр.
+function registerIpcBody() {
   const text = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'ipc.js'), 'utf8');
-  // Строки-комментарии выкидываем: в этом файле про эстафету написано много,
+  const lines = text.split('\n');
+  const start = lines.findIndex((line) => line.startsWith('function registerIpc('));
+  assert.ok(start >= 0, 'в ipc.js больше нет функции registerIpc — страж потерял цель');
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i += 1) {
+    if (/^(function |module\.exports)/.test(lines[i])) { end = i; break; }
+  }
+  // Строки-комментарии выкидываем: про эстафету в этом файле написано много,
   // и упоминание в тексте не должно сходить за живой код.
-  return text.split('\n').filter((line) => !line.trim().startsWith('//'));
+  return lines.slice(start, end).filter((line) => !line.trim().startsWith('//')).join('\n');
 }
 
-test('registerIpc действительно собирает эстафету, а не только объявляет её', () => {
-  const lines = ipcSourceLines();
-  const has = (re) => lines.some((line) => re.test(line));
+test('registerIpc собирает эстафету и отдаёт гард РЕАЛЬНОМУ реестру', () => {
+  const body = registerIpcBody();
 
-  assert.ok(has(/createHandoffWiring\(\{/), 'проводка эстафеты не собирается вовсе');
-  assert.ok(
-    has(/ownership.*guard.*=.*createHandoffWiring|guard:\s*handoffGuard/),
-    'результат проводки не разбирается: гард и владение никуда не попадают',
-  );
-  assert.ok(
-    has(/createCommandRegistry\(\{\s*ipcMain,\s*guard:/),
-    'реестр команд собран БЕЗ гарда — запись разрешена всем',
+  const wiring = body.match(/const\s*\{\s*ownership\s*,\s*guard:\s*(\w+)\s*\}\s*=\s*createHandoffWiring\(/);
+  assert.ok(wiring, 'registerIpc не собирает проводку эстафеты (createHandoffWiring)');
+
+  const guardName = wiring[1];
+  const registry = body.match(/createCommandRegistry\(\{([^}]*)\}\)/);
+  assert.ok(registry, 'реестр команд в registerIpc не собирается вовсе');
+  assert.match(
+    registry[1],
+    new RegExp(`guard:\\s*${guardName}\\b`),
+    `реестр получает не тот гард: ожидали ${guardName} из проводки эстафеты, а там ${registry[1].trim()}`,
   );
 });
 
 test('ownership доезжает до сетевого сервера и наружу, в main.js', () => {
-  const lines = ipcSourceLines();
-  const joined = lines.join('\n');
+  const body = registerIpcBody();
 
   // Без этого сетевой клиент не сможет ни захватить управление, ни получить
   // отказ: сервер обслуживает owner:claim сам и знает, чей пришёл кадр.
+  const netServer = body.match(/createNetServer\(\{([\s\S]*?)\n\s*\}\)/);
+  assert.ok(netServer, 'сетевой сервер в registerIpc не создаётся');
   assert.match(
-    joined,
-    /createNetServer\(\{[^}]*\bownership,/s,
+    netServer[1],
+    /\bownership\b/,
     'ownership не передан в createNetServer — сетевая половина эстафеты мертва',
   );
-  // main.js спрашивает у него владельца и статус связи, когда рисует трей.
+
+  // Возврат ИМЕННО registerIpc, а не любой return в файле: раньше проверку
+  // удовлетворял `return { ownership, guard }` внутри самой createHandoffWiring.
+  const returns = [...body.matchAll(/return \{[\s\S]*?\};/g)];
+  assert.ok(returns.length > 0, 'registerIpc ничего не возвращает');
+  const last = returns[returns.length - 1][0];
   assert.match(
-    joined,
-    /return \{[^}]*\bownership,?\s*[^}]*\};/s,
+    last,
+    /\bownership\b/,
     'registerIpc не отдаёт ownership наружу — трею нечего показывать',
   );
 });
