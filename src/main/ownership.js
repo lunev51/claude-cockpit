@@ -6,7 +6,13 @@
 // Уход владельца НЕ передаёт управление: закрытая крышка макбука не должна
 // разворачивать окно на ПК посреди ночи. Управление меняется только явным
 // захватом — открытием страницы в браузере или показом окна на ПК.
-function createOwnership({ onChange } = {}) {
+// onChange({owner, previous, size}) — управление сменило хозяина.
+// onPresence({owner, online}) — тот же хозяин пропал со связи или вернулся.
+// Второе НЕ смена владельца: окно ПК не должно разворачиваться от того, что
+// на макбуке закрыли крышку. Но знать об этом надо всем — раньше drop менял
+// только внутренний флаг, и строка «(не на связи)» в трее и на заглушке была
+// недостижима в проде, хотя тесты на неё были зелёные.
+function createOwnership({ onChange, onPresence } = {}) {
   let owner = 'local';
   let online = true;
   // Размер помним ПО ВЛАДЕЛЬЦУ: окно ПК на весь экран и браузер на макбуке —
@@ -19,9 +25,12 @@ function createOwnership({ onChange } = {}) {
   function claim(who, nextSize) {
     if (nextSize) sizes.set(who, { cols: nextSize.cols, rows: nextSize.rows });
     if (who === owner) {
-      // Тот же хозяин вернулся после обрыва — событие не нужно, но офлайн
-      // снимаем: интерфейс показывает «владелец не на связи».
+      // Тот же хозяин вернулся после обрыва — смены владельца нет, но факт
+      // «снова на связи» касается всех: у остальных клиентов на заглушке и в
+      // трее висит «не на связи».
+      const wasOffline = !online;
       online = true;
+      if (wasOffline && typeof onPresence === 'function') onPresence({ owner, online: true });
       return false;
     }
     const previous = owner;
@@ -36,7 +45,11 @@ function createOwnership({ onChange } = {}) {
 
   function drop(who) {
     if (who !== owner) return false;
+    // Владельца НЕ меняем: обрыв связи не равен потере управления (закрытая
+    // крышка макбука не должна разворачивать окно на ПК посреди ночи).
+    const wasOnline = online;
     online = false;
+    if (wasOnline && typeof onPresence === 'function') onPresence({ owner, online: false });
     return true;
   }
 

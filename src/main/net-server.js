@@ -421,9 +421,23 @@ function createNetServer({
     clientCount: () => clients.size,
     // Адрес для меню трея и для показа человеку: сервер знает и реальный порт
     // (при port:0 он эфемерный), и то, поднялся ли он вообще.
-    address: () => (server && server.listening
-      ? `http://${host.includes(':') ? `[${host}]` : host}:${server.address().port}`
-      : null),
+    //
+    // Отдельный случай — '0.0.0.0'/'::' в конфиге: это не имя машины, а «слушаю
+    // на всех интерфейсах». Такой адрес на макбуке бесполезен, а пункт меню
+    // существует ровно затем, чтобы человек его оттуда взял (и клик по строке
+    // открыл бы http://0.0.0.0:порт в браузере). Подставляем первое имя из
+    // allowedHosts — это ровно те имена, по которым к нам и приходят, — а если
+    // и их нет, честный localhost: он хотя бы работает на этой машине.
+    address: () => {
+      if (!server || !server.listening) return null;
+      const boundPort = server.address().port;
+      let name = host;
+      if (LISTEN_ANYWHERE.has(String(host).trim())) {
+        const hint = (allowedHosts || []).map((h) => String(h).trim()).find(Boolean);
+        name = hint || '127.0.0.1';
+      }
+      return `http://${name.includes(':') && !name.startsWith('[') ? `[${name}]` : name}:${boundPort}`;
+    },
   };
 }
 

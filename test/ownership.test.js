@@ -129,6 +129,46 @@ test('onChange получает размер НОВОГО владельца, а
   });
 });
 
+test('уход и возвращение владельца — отдельное событие, не смена владельца', () => {
+  // Раньше drop менял только внутренний флаг, наружу не выходило ничего: строка
+  // трея «(не на связи)» и тот же текст на заглушке были в проде недостижимы,
+  // хотя тесты на них проходили. Тесты, стерегущие мёртвый код.
+  const changes = [];
+  const presence = [];
+  const own = createOwnership({
+    onChange: (info) => changes.push(info),
+    onPresence: (info) => presence.push(info),
+  });
+
+  own.claim('c1', { cols: 80, rows: 24 });
+  assert.deepStrictEqual(presence, [], 'захват — это onChange, не присутствие');
+
+  own.drop('c1');
+  assert.deepStrictEqual(presence, [{ owner: 'c1', online: false }]);
+  assert.strictEqual(changes.length, 1, 'владелец не менялся');
+
+  own.claim('c1');
+  assert.deepStrictEqual(presence[1], { owner: 'c1', online: true }, 'вернулся — сказать надо');
+  assert.strictEqual(changes.length, 1);
+});
+
+test('повторный drop молчит — сообщать не о чем', () => {
+  const presence = [];
+  const own = createOwnership({ onPresence: (info) => presence.push(info) });
+  own.claim('c1', { cols: 80, rows: 24 });
+  own.drop('c1');
+  own.drop('c1');
+  assert.strictEqual(presence.length, 1, 'второй обрыв того же клиента — не новость');
+});
+
+test('уход не владельца не рождает событие присутствия', () => {
+  const presence = [];
+  const own = createOwnership({ onPresence: (info) => presence.push(info) });
+  own.claim('c1', { cols: 80, rows: 24 });
+  own.drop('c2');
+  assert.deepStrictEqual(presence, []);
+});
+
 test('createOwnership работает без onChange', () => {
   const own = createOwnership();
   assert.strictEqual(own.claim('c1', { cols: 80, rows: 24 }), true);

@@ -692,6 +692,45 @@ const ask = (ws, frame) => {
   return answer;
 };
 
+// --- Адрес для человека (находка ревью: address() не был покрыт вовсе) ------
+// Пункт меню трея существует ровно затем, чтобы человек взял адрес и открыл
+// его на макбуке. Мутации «address() всегда null» и «address() без реального
+// порта» раньше обе оставались зелёными.
+
+test('до старта адреса нет, после старта он с РЕАЛЬНЫМ портом', async () => {
+  const { server } = makeServer();
+  assert.strictEqual(server.address(), null, 'сервер не слушает — адреса не существует');
+  const { port } = await server.start();
+  assert.strictEqual(server.address(), `http://127.0.0.1:${port}`);
+  // port:0 отдаёт эфемерный порт — в адресе обязан быть он, а не ноль.
+  assert.ok(!server.address().endsWith(':0'));
+  await server.stop();
+  assert.strictEqual(server.address(), null, 'после остановки адрес снова пуст');
+});
+
+test('литерал IPv6 в адресе берётся в скобки', async () => {
+  const { server } = makeServer({ host: '::1' });
+  await server.start();
+  assert.match(server.address(), /^http:\/\/\[::1\]:\d+$/);
+});
+
+test('«слушаю везде» подменяется адресом, который можно открыть с другой машины', async () => {
+  // 0.0.0.0 — не имя, а «на всех интерфейсах»: на макбуке такой адрес
+  // бесполезен, а клик по строке трея открыл бы его в браузере.
+  const { server } = makeServer({
+    host: '0.0.0.0',
+    allowedHosts: ['revision-pc.tailb86363.ts.net', '100.120.245.85'],
+  });
+  const { port } = await server.start();
+  assert.strictEqual(server.address(), `http://revision-pc.tailb86363.ts.net:${port}`);
+});
+
+test('«слушаю везде» без подсказок — честный localhost, а не 0.0.0.0', async () => {
+  const { server } = makeServer({ host: '0.0.0.0', allowedHosts: [] });
+  const { port } = await server.start();
+  assert.strictEqual(server.address(), `http://127.0.0.1:${port}`);
+});
+
 test('клиент узнаёт своё имя сразу после подключения', async () => {
   const { server } = makeHandoffServer();
   const { port } = await server.start();

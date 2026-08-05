@@ -1065,6 +1065,48 @@ function applyHandoffSize({ manager, size }) {
   for (const tab of manager.list()) manager.resize(tab.id, size.cols, size.rows);
 }
 
+// Вся проводка эстафеты одним куском: владение + гард записи. Вынесена из
+// registerIpc НЕ ради красоты — ревью показало, что непокрытая проводка
+// исчезает бесследно: семь мутаций подряд (гард пускает всех, переразмер
+// убран, события не рассылаются, ownership не доезжает до сетевого сервера)
+// оставляли все 918 тестов зелёными. Здесь она зовётся тем же кодом, что и в
+// проде, и проверяется напрямую — см. test/ipc-handoff-wiring.test.js.
+//
+// Побочные эффекты обёрнуты поштучно: на локальном пути claim прилетает из
+// обработчика клика по значку в трее, и любое исключение оттуда попадает в
+// process.on('uncaughtException') → app.exit(1). Клик по трею не имеет права
+// убивать приложение, а сбой одного эффекта — глушить остальные.
+function createHandoffWiring({ manager, broadcast, onOwnerChange }) {
+  const safely = (what, fn) => {
+    try {
+      fn();
+    } catch (err) {
+      console.warn(`[эстафета] ${what}: ${err && err.message}`);
+    }
+  };
+
+  const ownership = createOwnership({
+    onChange: ({ owner, size }) => {
+      safely('переразмер терминала', () => applyHandoffSize({ manager, size }));
+      safely('рассылка смены владельца', () => broadcast.emit('owner:changed', { owner, online: ownership.ownerOnline() }));
+      safely('уведомление окна', () => {
+        if (typeof onOwnerChange === 'function') onOwnerChange(owner);
+      });
+    },
+    // Пропал со связи или вернулся — владельца не меняем, окно не трогаем,
+    // но клиенты и трей обязаны это показать.
+    onPresence: ({ owner, online }) => {
+      safely('рассылка присутствия', () => broadcast.emit('owner:changed', { owner, online }));
+    },
+  });
+
+  // Чтение доступно всем — иначе заглушка на неактивной машине была бы слепой.
+  // Запись только владельцу. Оба транспорта приходят сюда, путей в обход нет.
+  const guard = ({ channel, who }) => !isWriteChannel(channel) || ownership.canWrite(who);
+
+  return { ownership, guard };
+}
+
 // M1 (ревью раунда 2 задачи 7, Important 1): без аутентификации в этой фазе
 // адрес прослушивания сетевого сервера — ЕДИНСТВЕННАЯ линия обороны кокпита
 // (иначе сервер видел бы любой человек в том же вайфае и мог бы выполнять
@@ -1606,24 +1648,14 @@ function registerIpc(win, opts = {}) {
   // раз, здесь же, ДО первой регистрации — раньше объявление жило ниже, перед
   // tabs:open, единственной группой, которая тогда его использовала.
   // Эстафета: один хозяин в каждый момент (спека «Кокпит по сети»). Владение
-  // живёт в чистом модуле ownership.js, здесь — только проводка к настоящим
-  // pty, окну и клиентам. Создаётся ПОСЛЕ manager (onChange его дёргает) и ДО
+  // живёт в чистом модуле ownership.js, проводка — в createHandoffWiring выше
+  // (она же под тестом). Создаётся ПОСЛЕ manager (onChange его дёргает) и ДО
   // реестра (гард нужен реестру уже при сборке).
-  const ownership = createOwnership({
-    onChange: ({ owner, size }) => {
-      applyHandoffSize({ manager, size });
-      broadcast.emit('owner:changed', { owner, online: ownership.ownerOnline() });
-      if (typeof onOwnerChange === 'function') onOwnerChange(owner);
-    },
+  const { ownership, guard: handoffGuard } = createHandoffWiring({
+    manager, broadcast, onOwnerChange,
   });
 
-  const registry = createCommandRegistry({
-    ipcMain,
-    // Чтение доступно всем — иначе заглушка на неактивной машине была бы
-    // слепой. Запись только владельцу. Оба транспорта приходят сюда, путей в
-    // обход нет.
-    guard: ({ channel, who }) => !isWriteChannel(channel) || ownership.canWrite(who),
-  });
+  const registry = createCommandRegistry({ ipcMain, guard: handoffGuard });
 
   // Хвост вывода по вкладкам (output-buffer.js) — то, что отдаётся клиенту
   // сразу при подключении: сетевой сервер сам xterm не видит, а история
@@ -2311,9 +2343,11 @@ module.exports = {
   // Important 1 (ревью задачи 4): проводка буфера вывода — см. комментарий у
   // их определения выше и test/ipc-output-buffer-wiring.test.js.
   bufferTermData, dropTabOutputBuffer,
-  // План 2: переразмер pty при пересадке управления — см.
-  // test/ipc-handoff-wiring.test.js.
-  applyHandoffSize,
+  // План 2: переразмер pty при пересадке управления и вся проводка эстафеты
+  // (владение + гард записи) — см. test/ipc-handoff-wiring.test.js. Проводка
+  // экспортируется не для чужого кода, а чтобы её вообще можно было проверить:
+  // непокрытой она бесследно исчезала под мутациями.
+  applyHandoffSize, createHandoffWiring,
   historySearchHandler, historyRefreshHandler, createHistoryIndexState, HISTORY_INDEX_TTL_MS,
   recipesListHandler, recipesSavePromptHandler, recipesDeletePromptHandler,
   recipesListWorkspacesHandler, recipesSaveWorkspaceHandler, recipesDeleteWorkspaceHandler,

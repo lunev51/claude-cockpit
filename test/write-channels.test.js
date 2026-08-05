@@ -27,6 +27,41 @@ test('ввод в терминал требует управления, чтен
   assert.strictEqual(isWriteChannel('tabs:list'), false);
 });
 
+test('невладелец не портит данные и настройки владельца', () => {
+  // Ревью нашло это живьём: config:set от невладельца возвращал ok:true и
+  // менял конфиг, а через terminal.command подменяется команда, которой
+  // владелец поднимет следующую вкладку.
+  assert.strictEqual(isWriteChannel('config:set'), true);
+  assert.strictEqual(isWriteChannel('recipes:deletePrompt'), true);
+  assert.strictEqual(isWriteChannel('recipes:deleteWorkspace'), true);
+  assert.strictEqual(isWriteChannel('recipes:savePrompt'), true);
+  assert.strictEqual(isWriteChannel('recipes:saveWorkspace'), true);
+  // Переписывает .claude/settings.json в проекте владельца.
+  assert.strictEqual(isWriteChannel('project:connect'), true);
+  // Ночная смена сама вбрасывает промпты в чужие вкладки.
+  assert.strictEqual(isWriteChannel('night:toggle'), true);
+});
+
+test('невладелец не открывает окон на машине владельца', () => {
+  // Системный диалог выбора папки открывался бы поверх окна, которое в этот
+  // момент спрятано в трей, — модалка там, где никого нет.
+  assert.strictEqual(isWriteChannel('tabs:chooseFolder'), true);
+  assert.strictEqual(isWriteChannel('shell:openExternal'), true);
+  assert.strictEqual(isWriteChannel('app:devtools'), true);
+});
+
+test('чтение остаётся свободным — иначе заглушка слепая', () => {
+  // Это ровно то, ради чего невладельцу вообще показывают интерфейс.
+  for (const channel of [
+    'config:get', 'tabs:list', 'net:buffer', 'usage:get', 'usage:refresh',
+    'night:get', 'git:get', 'gh:repo', 'gh:global', 'history:search',
+    'recipes:list', 'recipes:listWorkspaces', 'workspace:get', 'project:status',
+    'ghost:load', 'stt:status', 'tabs:seen',
+  ]) {
+    assert.strictEqual(isWriteChannel(channel), false, `${channel} должен быть свободен`);
+  }
+});
+
 test('захват управления невладельцу не запрещён — иначе его не забрать', () => {
   assert.strictEqual(isWriteChannel('owner:claim'), false);
   assert.strictEqual(isWriteChannel('owner:get'), false);
