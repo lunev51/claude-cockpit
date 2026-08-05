@@ -57,16 +57,7 @@
            #main (см. app.css/#main-row). Контент строит diffpanel.js
            программно один раз при boot() (см. app.js). -->
       <div id="main-row">
-        <div id="terminal-host">
-          <!-- Эстафета (план 2): заглушка поверх терминалов, когда управление
-               на другой машине. Внутри #terminal-host, а не #main — панель
-               диффа под ней остаётся читаемой, накрыт только ввод. -->
-          <div id="handoff-curtain" class="handoff-curtain">
-            <div class="curtain-title"></div>
-            <div class="curtain-hint"></div>
-            <button id="curtain-take" class="curtain-take">Забрать управление себе</button>
-          </div>
-        </div>
+        <div id="terminal-host"></div>
         <div id="diff-panel" class="hidden"></div>
       </div>
       <!-- Task 1 фазы 7 (очередь промптов): строка чипов очереди и поле
@@ -85,6 +76,17 @@
         <div id="action-right">
           <span id="limit-5h" title="5-часовое окно"></span>
         </div>
+      </div>
+      <!-- Эстафета (план 2): заглушка «управление на другой машине». Внутри
+           #main (position:relative), как и остальные оверлеи, и ВЫШЕ них по
+           z-index. Живая проверка показала, зачем: заглушка внутри
+           #terminal-host лежала ниже оверлея восстановления — невладелец мог
+           нажать «Восстановить», получить молчаливый отказ гарда и не понять,
+           почему ничего не произошло. -->
+      <div id="handoff-curtain" class="handoff-curtain">
+        <div class="curtain-title"></div>
+        <div class="curtain-hint"></div>
+        <button id="curtain-take" class="curtain-take">Забрать управление себе</button>
       </div>
       <div id="restore-overlay" class="hidden">
         <div class="restore-card">
