@@ -44,6 +44,27 @@ contextBridge.exposeInMainWorld('api', {
     // работающими, а окно получает пустой терминал.
     buffer: (tabId) => ipcRenderer.invoke('net:buffer', tabId),
   },
+  owner: {
+    // Эстафета (план 2 фазы «кокпит по сети»): управление в каждый момент у
+    // одного клиента — окна ПК или одного браузера. Захват без подтверждений:
+    // показал окно / открыл страницу — забрал.
+    //
+    // claim шлёт ОДИН объект {cols,rows}: сетевая половина (api-shape.js) для
+    // этого канала помечена pack:['cols','rows'], иначе по сети уехал бы
+    // позиционный список и main получил бы число вместо размера.
+    claim: (cols, rows) => ipcRenderer.invoke('owner:claim', { cols, rows }),
+    get: () => ipcRenderer.invoke('owner:get'),
+    onChanged: (cb) => ipcRenderer.on('owner:changed', (_e, p) => cb(p)),
+    // net:hello бывает только у сетевого клиента — окно ПК своё имя знает
+    // заранее ('local'). Подписка тем не менее настоящая, а не заглушка:
+    // форма api сверяется с этим файлом построчно (test/net-api.test.js), и
+    // метод без ipcRenderer выглядел бы для сверки отсутствующим. Событие в
+    // Electron просто никогда не приходит.
+    onHello: (cb) => ipcRenderer.on('net:hello', (_e, p) => cb(p)),
+    // Обратная сторона: main просит окно захватить управление, когда его
+    // показали из трея. Размер знает только renderer.
+    onReclaim: (cb) => ipcRenderer.on('owner:reclaim', () => cb()),
+  },
   app: {
     onNotice: (cb) => ipcRenderer.on('app:notice', (_e, n) => cb(n)),
     // Task 4 фазы 4 (палитра команд): «Открыть DevTools» — main зовёт

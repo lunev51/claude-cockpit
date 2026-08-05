@@ -13,6 +13,7 @@
 // (ревью задачи 6, Critical 1, подтверждено живым Chromium).
 import './api-boot.js';
 import { initTerminal } from './terminal.js';
+import { curtainState, selfId } from './handoff-view.js';
 import { createTabStore } from './tabs.js';
 import { renderBadge } from './badge.js';
 import { createPeek } from './peek.js';
@@ -1625,6 +1626,12 @@ function overlayFlags() {
     // restoreOverlaySkip не null ровно пока оверлей restore на экране и
     // решение по восстановлению ещё не принято (см. showRestoreOverlay).
     restore: !!restoreOverlaySkip,
+    // План 2: заглушка эстафеты накрывает терминал, пока управление на другой
+    // машине. Регистрируется здесь по тому же правилу, что и остальные
+    // оверлеи (дыра I1): без этого вкладка под заглушкой считалась бы
+    // прочитанной (seen.js) и Ctrl+Q открывал бы поле ввода под ней —
+    // невидимо и без всякого смысла, писать всё равно нельзя.
+    handoff: curtainState(ownerState).visible,
   };
 }
 
@@ -1981,6 +1988,44 @@ function showRestoreOverlay(manifest) {
   // пусто» (та же ветка, что и Esc/кнопка «Начать пусто»), а не как молчаливая
   // запись на диск в обход нерешённого restore.
   restoreOverlaySkip = startEmpty;
+}
+
+// --- Эстафета управления (план 2 фазы «кокпит по сети») -------------------
+// Управление в каждый момент у одного клиента: окна ПК или одного браузера.
+// Решение «показывать ли заглушку» живёт в чистом handoff-view.js (он под
+// тестами), здесь — только DOM и разговор с main.
+let ownerState = { owner: null, self: 'local', online: true };
+
+// Размер берём у терминала активной вкладки: pty переразмеривается ровно под
+// того, кто за рулём. Вкладок может не быть вовсе (пустой кокпит) — тогда
+// захват всё равно обязан пройти, отсюда запасной размер.
+function termSize() {
+  const term = views.get(tabStore?.activeId)?.view?.term;
+  return term ? { cols: term.cols, rows: term.rows } : { cols: 80, rows: 24 };
+}
+
+function renderCurtain() {
+  const el = $('handoff-curtain');
+  if (!el) return;
+  const state = curtainState(ownerState);
+  el.classList.toggle('visible', state.visible);
+  el.querySelector('.curtain-title').textContent = state.title;
+  el.querySelector('.curtain-hint').textContent = state.hint;
+}
+
+async function claimControl() {
+  const { cols, rows } = termSize();
+  try {
+    const state = await window.api.owner.claim(cols, rows);
+    // null приходит, когда main отклонил вызов гардом (такого для owner:claim
+    // быть не должно — канал свободный), а undefined — если ответа нет вовсе.
+    if (state) ownerState = { ...ownerState, ...state };
+  } catch (err) {
+    // Обрыв связи посреди захвата — не повод ронять интерфейс: следующее
+    // owner:changed или переподключение всё поправят.
+    console.warn('[эстафета] захват не удался:', err.message);
+  }
+  renderCurtain();
 }
 
 async function boot() {
@@ -2363,6 +2408,28 @@ async function boot() {
     console.warn(`[notice] ${text}`);
     showToast(text, level);
   });
+
+  // --- Эстафета: подписки и первый захват ---
+  // Своё имя сетевой клиент узнаёт из net:hello сразу после подключения; окно
+  // ПК этого события не получает и остаётся 'local'.
+  window.api.owner.onHello((p) => {
+    ownerState = { ...ownerState, self: selfId(p || {}) };
+    renderCurtain();
+  });
+  window.api.owner.onChanged((p) => {
+    ownerState = { ...ownerState, ...p };
+    renderCurtain();
+  });
+  // main показал окно из трея и просит забрать управление обратно: размер
+  // знает только эта сторона.
+  window.api.owner.onReclaim(() => { claimControl(); });
+  $('curtain-take')?.addEventListener('click', () => { claimControl(); });
+
+  // Открыли страницу — забрали управление. Подтверждений нет намеренно
+  // (спека: правило «последний открывший владеет»). Захват идёт ПОСЛЕ
+  // восстановления вкладок выше, чтобы уехал реальный размер терминала, а не
+  // запасной.
+  await claimControl();
 }
 
 // Необработанный reject/throw внутри boot() раньше гас молча — приложение
