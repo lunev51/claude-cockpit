@@ -30,6 +30,20 @@ export function onLinkChange(fn) {
   linkWatchers.push(fn);
 }
 
+// C2 ре-ревью: перезагрузка после обрыва (reconnectLoop ниже) — НЕ «человек
+// открыл страницу», и захват управления при такой загрузке отбирал руль у
+// живого ПК (handoff-view.js/shouldClaimOnLoad, там же вся цепочка). Метка
+// живёт в sessionStorage: она обязана пережить ИМЕННО перезагрузку и умереть
+// вместе со вкладкой. Читается ровно один раз (app.js/takeAutoReloadMark) —
+// иначе следующая, уже ручная, F5 сошла бы за автоматическую.
+export const RELOAD_MARK_KEY = 'cockpit.autoReload';
+
+// sessionStorage может бросить (file://, приватный режим с выключенным
+// хранилищем) — потеря метки не повод не переподключаться вовсе.
+function markAutoReload() {
+  try { window.sessionStorage.setItem(RELOAD_MARK_KEY, '1'); } catch { /* переживём */ }
+}
+
 function setLink(patch) {
   Object.assign(linkState, patch);
   for (const fn of linkWatchers) {
@@ -71,6 +85,8 @@ function reconnectLoop(url) {
       settled = true;
       setLink({ online: true });
       try { probe.close(); } catch { /* всё равно перезагружаемся */ }
+      // Метку ставим ДО reload: после него этот код уже не выполнится.
+      markAutoReload();
       window.location.reload();
     }, { once: true });
     probe.addEventListener('error', fail, { once: true });
@@ -107,6 +123,24 @@ if (!window.api) {
       reject(new Error('не удалось подключиться к серверу кокпита'));
     }, { once: true });
   });
-  window.api = createNetApi({ socket, shape: API_SHAPE });
+  const api = createNetApi({ socket, shape: API_SHAPE });
+  // I1 ре-ревью: shell:openExternal — канал ПИШУЩИЙ (он открывает браузер на
+  // машине владельца, окно которой в этот момент спрятано в трей), и после
+  // сужения прав невладельца клик по строке дашборда, по бейджу PR и по ссылке
+  // в терминале давал у зрителя unhandled rejection и ничего больше. Но
+  // человек в браузере хочет открыть ссылку У СЕБЯ — а для этого сетевому
+  // клиенту чужое разрешение не нужно вовсе: он и так браузер. Подменяем метод
+  // ЗДЕСЬ, на единственной границе «мы не в Electron»: в окне ПК всё остаётся
+  // как было (там window.api собирает preload и эта ветка не выполняется).
+  //
+  // Проверка схемы — та же, что в main (ipc.js/shell:openExternal): в
+  // window.open нельзя пускать javascript:/data: — ссылка приезжает из чужого
+  // вывода терминала. noopener обязателен: без него открытая страница получает
+  // window.opener на кокпит.
+  api.shell.openExternal = async (url) => {
+    if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return;
+    window.open(url, '_blank', 'noopener');
+  };
+  window.api = api;
   watchLink(socket, socket.url);
 }

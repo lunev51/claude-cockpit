@@ -19,7 +19,10 @@ import './api-boot.js';
 // top-level await из первой строки сохраняются. linkState/onLinkChange (I3
 // ревью): в браузере api-boot.js сам переподключается с нарастающим
 // интервалом, а интерфейс обязан показать обрыв, а не замереть молча.
-import { linkState, onLinkChange } from './api-boot.js';
+// RELOAD_MARK_KEY (C2 ре-ревью): метка «страницу перезагрузил не человек, а
+// сам клиент после обрыва» — ставится там же, где живёт reload (api-boot.js),
+// читается здесь ровно один раз (takeAutoReloadMark ниже).
+import { linkState, onLinkChange, RELOAD_MARK_KEY } from './api-boot.js';
 import { initTerminal } from './terminal.js';
 import {
   curtainState, selfId, controlBlock, shouldClaimOnLoad,
@@ -110,6 +113,15 @@ let peekedTabId = null;
 // этого крючка пользователь мог открыть вкладку мимо оверлея, пока решение
 // по восстановлению ещё не принято (см. btn-new-tab ниже и showRestoreOverlay).
 let restoreOverlaySkip = null;
+// C1 ре-ревью: снять оверлей restore, НЕ приняв решения — руль ушёл к соседу, и
+// решает теперь он. null, если оверлея на экране нет. Отдельно от
+// restoreOverlaySkip: тот означает «решение принято, начинаем пусто» (и зовёт
+// workspace:ready), а здесь решение как раз откладывается.
+let restoreOverlayDismiss = null;
+// C1 ре-ревью: подъём воркспейса отложен — мы невладелец, а поднимать вкладки
+// (tabs:open) имеет право только тот, кто за рулём. Доигрывается в
+// afterControlGained(), как только управление окажется у нас.
+let workspaceBootPending = false;
 // Task 3 фазы 5 (кольца лимитов): последний известный ответ usage:get/
 // usage:refresh/usage:update — {limits, spend}. null до первого разрешившегося
 // usage.get() (см. boot()); redrawLimits() сама терпит null (rings.js рисует
@@ -1980,6 +1992,7 @@ function showRestoreOverlay(manifest) {
   function startEmpty() {
     detach();
     restoreOverlaySkip = null; // FIX 3: решение принято — крючок для btn-new-tab больше не нужен
+    restoreOverlayDismiss = null;
     overlay.classList.add('hidden');
     // Манифест НЕ трогаем — следующее открытие/закрытие вкладки перепишет
     // его естественным образом (syncWorkspace в main реагирует на tabs:changed).
@@ -1991,6 +2004,7 @@ function showRestoreOverlay(manifest) {
   function startRestore() {
     detach();
     restoreOverlaySkip = null; // FIX 3: решение принято (восстанавливаем) — крючок больше не нужен
+    restoreOverlayDismiss = null;
     const chosen = manifest.tabs
       .map((t, i) => ({ t, i }))
       .filter(({ i }) => checkboxes[i].checked);
@@ -2051,6 +2065,19 @@ function showRestoreOverlay(manifest) {
   // пусто» (та же ветка, что и Esc/кнопка «Начать пусто»), а не как молчаливая
   // запись на диск в обход нерешённого restore.
   restoreOverlaySkip = startEmpty;
+  // C1 ре-ревью: и второй крючок — «убрать оверлей, решения не принимая».
+  // Зовётся, когда управление уходит к соседу (afterControlLost): решение по
+  // восстановлению принимает тот, кто за рулём, а брошенная на экране кнопка
+  // «Восстановить» подняла бы дубли вкладок поверх уже поднятых соседом.
+  // workspace:ready отсюда НЕ зовём намеренно: восстановление не завершено, а
+  // разблокировать запись манифеста в main имеет право только тот, кто принял
+  // решение (её и разблокирует новый владелец своей веткой).
+  restoreOverlayDismiss = () => {
+    detach();
+    restoreOverlaySkip = null;
+    restoreOverlayDismiss = null;
+    overlay.classList.add('hidden');
+  };
 }
 
 // --- Эстафета управления (план 2 фазы «кокпит по сети») -------------------
@@ -2071,6 +2098,17 @@ function readClaimIntent() {
 
 function rememberClaimIntent(weOwn) {
   try { window.sessionStorage.setItem(CLAIM_INTENT_KEY, weOwn ? 'claim' : 'view'); } catch { /* переживём */ }
+}
+
+// C2 ре-ревью: была ли ЭТА загрузка автоматической (api-boot.js перезагрузил
+// страницу сам, когда кокпит снова ответил). Метку сразу снимаем: следующая,
+// уже ручная, F5 обязана считаться намерением человека сесть за руль.
+function takeAutoReloadMark() {
+  try {
+    const mark = window.sessionStorage.getItem(RELOAD_MARK_KEY);
+    window.sessionStorage.removeItem(RELOAD_MARK_KEY);
+    return mark === '1';
+  } catch { return false; }
 }
 
 // Всё, что нужно чистым решателям handoff-view.js: владелец + наша личность +
@@ -2136,7 +2174,15 @@ function renderCurtain() {
     document.activeElement?.blur?.();
     if (take && !take.disabled) take.focus();
   } else if (tabStore?.activeId) {
-    views.get(tabStore.activeId)?.view.focus();
+    // Minor ре-ревью: раньше снятие заглушки уводило фокус в терминал
+    // БЕЗУСЛОВНО. Дашборд и поиск истории невладельцу разрешены намеренно
+    // («чтение свободно»), и возврат управления выдёргивал бы фокус из их
+    // полей прямо во время набора. Забираем фокус, только если он никому не
+    // нужен: либо припаркован на body, либо стоит на самой заглушке (её мы
+    // сфокусировали сами кнопкой «Забрать управление», и она сейчас уходит).
+    const active = document.activeElement;
+    const parked = !active || active === document.body || el.contains(active);
+    if (parked) views.get(tabStore.activeId)?.view.focus();
   }
 }
 
@@ -2162,6 +2208,32 @@ async function resumeInputAfterClaim() {
   }
 }
 
+// Управление пришло к нам — и разблокировкой ввода дело не ограничивается.
+// C1 ре-ревью: если при загрузке мы были зрителем без единой живой вкладки,
+// подъём воркспейса ждал именно этого момента (см. bootWorkspace) — иначе
+// человек, забравший управление, оставался с пустым сайдбаром.
+async function afterControlGained() {
+  await resumeInputAfterClaim();
+  if (!workspaceBootPending) return;
+  try {
+    await bootWorkspace();
+  } catch (err) {
+    console.warn('[boot] подъём воркспейса после получения управления не удался:', err);
+  }
+}
+
+// Управление ушло к соседу, пока мы решали вопрос восстановления. Оверлей
+// restore обязан уйти вместе с рулём: решение принимает тот, кто за рулём, а
+// оставленная кнопка «Восстановить» подняла бы ВТОРЫЕ вкладки на те же
+// sessionId уже после того, как их поднял новый владелец (второй
+// `claude --resume <тот же id>` в один транскрипт). Решение не потеряно —
+// доиграем его, когда руль вернётся.
+function afterControlLost() {
+  if (!restoreOverlayDismiss) return;
+  restoreOverlayDismiss();
+  workspaceBootPending = true;
+}
+
 async function claimControl() {
   const { cols, rows } = termSize();
   const hadControl = hasControl();
@@ -2176,7 +2248,7 @@ async function claimControl() {
     console.warn('[эстафета] захват не удался:', err.message);
   }
   renderCurtain();
-  if (!hadControl && hasControl()) await resumeInputAfterClaim();
+  if (!hadControl && hasControl()) await afterControlGained();
 }
 
 // M1 ревью: net:hello уходил в пустой список подписчиков (сервер шлёт его в
@@ -2208,10 +2280,114 @@ function bindLinkState() {
   });
 }
 
+// Чем занять окно: подключиться к живым вкладкам либо решить вопрос
+// восстановления вчерашнего состава. Вынесено из boot() отдельной функцией
+// (C1 ре-ревью), потому что играется НЕ ТОЛЬКО при загрузке: зритель без
+// живых вкладок откладывает эту работу до момента, когда получит управление.
+async function bootWorkspace() {
+  workspaceBootPending = false;
+
+  // C1 финального ревью ветки: ПЕРВЫМ делом спрашиваем, есть ли ЖИВЫЕ вкладки
+  // в менеджере, и только потом смотрим на манифест. Манифест — это «что было
+  // вчера», и восстанавливать его имеет смысл ровно тогда, когда сегодня ещё
+  // ничего не работает. Если сессии уже подняты (браузер с макбука, второе
+  // окно, перезагрузка renderer при живом main), любой tabs:open из оверлея
+  // восстановления завёл бы ВТОРУЮ вкладку с новым tabId на ту же сессию
+  // Claude — а следом второй `claude --resume <тот же id>` в тот же
+  // транскрипт. Подключаемся к тому, что есть.
+  //
+  // tabs:list не ответил (старый main, отказ канала) — деградируем в прежнее
+  // поведение: лучше показать оверлей, чем не показать ничего.
+  let liveTabs = [];
+  try {
+    liveTabs = await window.api.tabs.list();
+  } catch (err) {
+    console.warn('[boot] tabs:list не ответил — иду по ветке восстановления:', err);
+  }
+
+  // Оверлея восстановления в этой ветке нет НАМЕРЕННО: восстанавливать нечего,
+  // всё уже работает. Он остаётся ровно для случая, когда живых вкладок ноль.
+  // Это же — единственный путь, которым вкладки достаются зрителю: чтение
+  // (tabs:list, net:buffer) свободно, разрешения соседа для него не нужно.
+  if (Array.isArray(liveTabs) && liveTabs.length) {
+    try {
+      await attachLiveTabs(liveTabs);
+    } finally {
+      // Та же страховка, что в ветке пустого манифеста ниже: sync манифеста
+      // разблокируем в любом случае, иначе состав вкладок перестанет
+      // сохраняться до конца сессии (см. workspace-sync.js/markReady).
+      window.api.workspace.ready();
+    }
+    return;
+  }
+
+  // C1 ре-ревью. Живых вкладок нет — дальше речь о том, поднимать ли вчерашние,
+  // а это ПИШУЩЕЕ решение (tabs:open), и принимает его тот, кто за рулём.
+  // Раньше зрителю показывали оверлей восстановления «под заглушкой», но
+  // решает-то другой клиент, и погасить этот оверлей было нечем: события
+  // «вкладку открыли/закрыли» в форме api нет вовсе. Живая цепочка ревьюера:
+  // зритель загрузился → владелец нажал «Начать пусто» → у зрителя оверлей жив
+  // → зритель забрал управление → заглушка ушла, а кнопка «Восстановить»
+  // осталась кликабельной над пустым сайдбаром; клик по ней при выборе
+  // владельца «Восстановить» завёл бы ВТОРЫЕ вкладки на те же sessionId.
+  //
+  // Поэтому: зрителю оверлея нет вовсе, а работа откладывается до получения
+  // управления (afterControlGained). Тогда мы пройдём здесь заново — и живые
+  // вкладки, если сосед их успел поднять, заберём ровно тем же tabs:list →
+  // attach, что и любой обычный клиент.
+  //
+  // workspace:ready в этой ветке НЕ зовём намеренно: гейт манифеста в main
+  // общий (workspace-sync.js), и разблокировать запись имеет право только тот,
+  // кто принял решение по восстановлению, — иначе стаггер восстановления у
+  // соседа писал бы на диск неполный состав вкладок на каждом шаге.
+  if (!hasControl()) {
+    workspaceBootPending = true;
+    return;
+  }
+
+  // Манифест воркспейса (Task 3): пуст/отсутствует — старое поведение
+  // (стартовая вкладка из конфига). Непуст — оверлей restore (Task 4).
+  const manifest = await window.api.workspace.get();
+  if (!manifest || !Array.isArray(manifest.tabs) || manifest.tabs.length === 0) {
+    try {
+      await openTab(config.terminal.cwd || '.');
+    } finally {
+      // FIX 2 (carryover 3): try/finally — раньше ready() шёл СРАЗУ после await
+      // openTab(...) без страховки: исключение внутри (например, initTerminal)
+      // обрывало boot() до вызова ready(), и wsync.sync() молчал бы НАВСЕГДА
+      // (ready так и остался бы false до конца сессии) — состав вкладок
+      // переставал сохраняться вообще. Манифеста не было вообще — восстанавливать
+      // нечего, разблокируем sync в любом случае, даже если openTab упал.
+      window.api.workspace.ready();
+    }
+    return;
+  }
+  try {
+    showRestoreOverlay(manifest);
+  } catch (err) {
+    // FIX 2 (carryover 3): showRestoreOverlay сама НЕ зовёт ready() —
+    // это делают её колбэки startEmpty/startRestore по решению пользователя
+    // (см. ниже). Если она упадёт ДО того, как повесит эти обработчики
+    // (например, DOM оверлея не найден), ready() больше НИКОГДА не придёт —
+    // тот же эффект заморозки манифеста. Деградируем: считаем, что
+    // восстанавливать нечего (как при отсутствии манифеста).
+    console.warn('[restore] оверлей восстановления не показался:', err);
+    // Fix 11 (ревью): showRestoreOverlay могла успеть показать оверлей
+    // (overlay.classList.remove('hidden')) и упасть уже ПОСЛЕ этого,
+    // внутри своего локального замыкания — без явного скрытия здесь
+    // модалка залипала бы навсегда поверх главной области.
+    $('restore-overlay')?.classList.add('hidden');
+    window.api.workspace.ready();
+  }
+}
+
 async function boot() {
   // Память вкладки о своей роли читается ДО первого renderCurtain(): тот же
   // ключ он и перезаписывает (см. rememberClaimIntent).
   const claimIntent = readClaimIntent();
+  // C2 ре-ревью: и метка «эту загрузку затеял не человек» — тоже до первого
+  // возможного reload'а (снимается чтением, см. takeAutoReloadMark).
+  const autoReloaded = takeAutoReloadMark();
 
   // --- Эстафета: подписки, личность и владелец — САМЫМ ПЕРВЫМ делом ---------
   //
@@ -2235,7 +2411,10 @@ async function boot() {
     renderCurtain();
     // Управление вернулось не нашим захватом, а извне (показ окна ПК из трея,
     // уход соседа) — ввод в терминалах всё равно надо разблокировать.
-    if (!hadControl && hasControl()) resumeInputAfterClaim();
+    if (!hadControl && hasControl()) afterControlGained();
+    // И обратная сторона (C1 ре-ревью): руль забрал сосед — незакрытый оверлей
+    // восстановления у нас больше не наш вопрос.
+    else if (hadControl && !hasControl()) afterControlLost();
   });
   $('curtain-take')?.addEventListener('click', () => { claimControl(); });
   bindLinkState();
@@ -2243,8 +2422,12 @@ async function boot() {
 
   // Захват при загрузке — НЕ безусловный (Critical соседнего ревью): окно ПК
   // при автозапуске отбирало управление у макбука обратно и вылезало на экран.
-  // Решение — в чистом shouldClaimOnLoad (handoff-view.js).
-  if (shouldClaimOnLoad({ ...ownerState, intent: claimIntent })) await claimControl();
+  // C2 ре-ревью: и браузерная вкладка при АВТОМАТИЧЕСКОЙ перезагрузке после
+  // обрыва тоже не забирает руль у живого соседа. Решение — в чистом
+  // shouldClaimOnLoad (handoff-view.js); ownerState несёт owner/self/online.
+  if (shouldClaimOnLoad({
+    ...ownerState, intent: claimIntent, reloaded: autoReloaded,
+  })) await claimControl();
 
   config = await window.api.config.get();
 
@@ -2338,9 +2521,21 @@ async function boot() {
   historySearch = createSearch({
     root: $('search-root'),
     api: window.api,
+    //
+    // I2 ре-ревью: сам поиск невладельцу открыт намеренно (чтение свободно), а
+    // вот открытие вкладки — запись: tabs:open у него отклонит гард. Раньше
+    // оверлей просто закрывался и не происходило НИЧЕГО, кроме unhandled
+    // rejection в консоли. Отказ обязан быть видимым — та же requireControl,
+    // что и у остальных пишущих действий; и reject openTab ловим здесь, потому
+    // что синхронный try/catch в search.js/openAt его не видит.
     onOpenResult: (cwd, sessionId) => {
+      if (!requireControl('Открыть найденную сессию')) return null;
       if (restoreOverlaySkip) restoreOverlaySkip();
-      return openTab(cwd, { sessionId });
+      return openTab(cwd, { sessionId }).catch((err) => {
+        console.warn('[search] не удалось открыть найденную сессию:', err);
+        showToast(`Открыть найденную сессию не удалось: ${err.message}`, 'error');
+        return null;
+      });
     },
   });
 
@@ -2552,89 +2747,7 @@ async function boot() {
     for (const tabId of tabStore.order()) refreshTabPr(tabId);
   }, 180000);
 
-  // C1 финального ревью ветки: ПЕРВЫМ делом спрашиваем, есть ли ЖИВЫЕ вкладки
-  // в менеджере, и только потом смотрим на манифест. Манифест — это «что было
-  // вчера», и восстанавливать его имеет смысл ровно тогда, когда сегодня ещё
-  // ничего не работает. Если сессии уже подняты (браузер с макбука, второе
-  // окно, перезагрузка renderer при живом main), любой tabs:open из оверлея
-  // восстановления завёл бы ВТОРУЮ вкладку с новым tabId на ту же сессию
-  // Claude — а следом второй `claude --resume <тот же id>` в тот же
-  // транскрипт. Подключаемся к тому, что есть.
-  //
-  // tabs:list не ответил (старый main, отказ канала) — деградируем в прежнее
-  // поведение: лучше показать оверлей, чем не показать ничего.
-  let liveTabs = [];
-  try {
-    liveTabs = await window.api.tabs.list();
-  } catch (err) {
-    console.warn('[boot] tabs:list не ответил — иду по ветке восстановления:', err);
-  }
-
-  // Оверлея восстановления в этой ветке нет НАМЕРЕННО: восстанавливать нечего,
-  // всё уже работает. Он остаётся ровно для случая, когда живых вкладок ноль.
-  if (Array.isArray(liveTabs) && liveTabs.length) {
-    try {
-      await attachLiveTabs(liveTabs);
-    } finally {
-      // Та же страховка, что в ветке пустого манифеста ниже: sync манифеста
-      // разблокируем в любом случае, иначе состав вкладок перестанет
-      // сохраняться до конца сессии (см. workspace-sync.js/markReady).
-      window.api.workspace.ready();
-    }
-  } else if (!hasControl()) {
-    // Управление у соседа: восстанавливать вкладки — это писать (tabs:open), и
-    // гард отклонил бы каждую. Раньше отказ прилетал исключением из openTab и
-    // ронял ВЕСЬ остаток boot() (подписки эстафеты стояли ниже — невладелец не
-    // получал даже заглушки). Оверлей restore при этом показываем: он лежит
-    // ПОД заглушкой (z-index 30 против 31) и дождётся человека, который
-    // заберёт управление себе.
-    const manifest = await window.api.workspace.get();
-    if (manifest && Array.isArray(manifest.tabs) && manifest.tabs.length) {
-      try {
-        showRestoreOverlay(manifest);
-      } catch (err) {
-        console.warn('[restore] оверлей восстановления не показался:', err);
-        $('restore-overlay')?.classList.add('hidden');
-      }
-    }
-    // workspace:ready НЕ зовём: разблокировать sync манифеста имеет право
-    // только тот, кто принял решение по восстановлению.
-  } else {
-    // Манифест воркспейса (Task 3): пуст/отсутствует — старое поведение
-    // (стартовая вкладка из конфига). Непуст — оверлей restore (Task 4).
-    const manifest = await window.api.workspace.get();
-    if (!manifest || !Array.isArray(manifest.tabs) || manifest.tabs.length === 0) {
-      try {
-        await openTab(config.terminal.cwd || '.');
-      } finally {
-        // FIX 2 (carryover 3): try/finally — раньше ready() шёл СРАЗУ после await
-        // openTab(...) без страховки: исключение внутри (например, initTerminal)
-        // обрывало boot() до вызова ready(), и wsync.sync() молчал бы НАВСЕГДА
-        // (ready так и остался бы false до конца сессии) — состав вкладок
-        // переставал сохраняться вообще. Манифеста не было вообще — восстанавливать
-        // нечего, разблокируем sync в любом случае, даже если openTab упал.
-        window.api.workspace.ready();
-      }
-    } else {
-      try {
-        showRestoreOverlay(manifest);
-      } catch (err) {
-        // FIX 2 (carryover 3): showRestoreOverlay сама НЕ зовёт ready() —
-        // это делают её колбэки startEmpty/startRestore по решению пользователя
-        // (см. ниже). Если она упадёт ДО того, как повесит эти обработчики
-        // (например, DOM оверлея не найден), ready() больше НИКОГДА не придёт —
-        // тот же эффект заморозки манифеста, что и в ветке выше. Деградируем:
-        // считаем, что восстанавливать нечего (как при отсутствии манифеста).
-        console.warn('[restore] оверлей восстановления не показался:', err);
-        // Fix 11 (ревью): showRestoreOverlay могла успеть показать оверлей
-        // (overlay.classList.remove('hidden')) и упасть уже ПОСЛЕ этого,
-        // внутри своего локального замыкания — без явного скрытия здесь
-        // модалка залипала бы навсегда поверх главной области.
-        $('restore-overlay')?.classList.add('hidden');
-        window.api.workspace.ready();
-      }
-    }
-  }
+  await bootWorkspace();
 
   // Находка 4б (ревью фазы 6): раньше это был единственный потребитель
   // app:notice — и он ТОЛЬКО логировал в консоль, ни один визуальный сигнал

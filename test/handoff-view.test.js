@@ -129,6 +129,91 @@ test('shouldClaimOnLoad: зритель после переподключени�
   // Страница перезагружается сама, когда кокпит поднялся заново. Без памяти о
   // роли вкладка-зритель отобрала бы управление у ПК на каждом обрыве.
   assert.strictEqual(shouldClaimOnLoad({ owner: 'local', self: 'c9', intent: 'view' }), false);
-  // А владелец, потерявший связь, должен вернуть себе руль сам.
-  assert.strictEqual(shouldClaimOnLoad({ owner: 'c1', self: 'c9', intent: 'claim' }), true);
+});
+
+// --- C2 ре-ревью: автоперезагрузка — это НЕ «человек открыл страницу» --------
+//
+// Живьём: кокпит убили и подняли при открытой вкладке браузера — вкладка
+// переподключилась, забрала управление, и окно ПК спряталось в трей (main.js
+// на смену владельца зовёт hideWindow). Достаточно было забытой вкладки на
+// спящем макбуке. intent закрывал только половину: 'claim' и null (память не
+// доехала, sessionStorage чист, вкладка после краша браузера) уходили в
+// «браузер всегда забирает».
+
+test('shouldClaimOnLoad: автоперезагрузка НЕ забирает руль у живого владельца', async () => {
+  const { shouldClaimOnLoad } = await import(url);
+  // self после перезагрузки ВСЕГДА новый (cN+1) — сравнение с прежним собой не
+  // работает, и решение принимается только по владельцу.
+  assert.strictEqual(
+    shouldClaimOnLoad({
+      owner: 'local', self: 'c9', online: true, intent: 'claim', reloaded: true,
+    }),
+    false,
+    'за рулём живой сосед — ждём человека, а не отбираем окно у ПК',
+  );
+  assert.strictEqual(
+    shouldClaimOnLoad({
+      owner: 'c1', self: 'c9', online: true, intent: null, reloaded: true,
+    }),
+    false,
+    'память о роли не доехала — это не повод считать перезагрузку намерением',
+  );
+});
+
+test('shouldClaimOnLoad: после автоперезагрузки руль берём, только если за ним никого', async () => {
+  const { shouldClaimOnLoad } = await import(url);
+  // Владелец числится, но сам потерял связь: у него тот же обрыв, что и у нас.
+  assert.strictEqual(
+    shouldClaimOnLoad({
+      owner: 'c1', self: 'c9', online: false, intent: 'claim', reloaded: true,
+    }),
+    true,
+    'владелец офлайн — руль свободен, иначе бывший владелец не вернёт себе управление сам',
+  );
+  // Владельца не назвал никто.
+  assert.strictEqual(
+    shouldClaimOnLoad({
+      owner: null, self: 'c9', online: true, intent: 'view', reloaded: true,
+    }),
+    true,
+  );
+  // Мы и так за рулём (теоретически: тот же id уцелел) — захват освежит размер.
+  assert.strictEqual(
+    shouldClaimOnLoad({
+      owner: 'c9', self: 'c9', online: true, intent: 'claim', reloaded: true,
+    }),
+    true,
+  );
+});
+
+test('shouldClaimOnLoad: человек, открывший страницу, руль забирает', async () => {
+  const { shouldClaimOnLoad } = await import(url);
+  // Правило спеки «последний открывший владеет» — ровно этот случай, и он
+  // отличается от перезагрузки только флагом reloaded.
+  assert.strictEqual(
+    shouldClaimOnLoad({
+      owner: 'local', self: 'c9', online: true, intent: null, reloaded: false,
+    }),
+    true,
+  );
+});
+
+test('shouldClaimOnLoad: окно ПК не забирает руль даже у пропавшего соседа', async () => {
+  const { shouldClaimOnLoad } = await import(url);
+  // Смена владельца на 'local' разворачивает окно на экран (main.js/showWindow) —
+  // при автозапуске это происходило бы само собой. Окно ПК берёт руль явно,
+  // показом из трея.
+  assert.strictEqual(
+    shouldClaimOnLoad({
+      owner: 'c2', self: 'local', online: false, intent: 'claim', reloaded: false,
+    }),
+    false,
+  );
+});
+
+test('shouldClaimOnLoad: reloaded/online по умолчанию — прежнее поведение', async () => {
+  const { shouldClaimOnLoad } = await import(url);
+  // Старые вызовы без новых полей: браузер, открытый человеком, забирает руль.
+  assert.strictEqual(shouldClaimOnLoad({ owner: 'local', self: 'c1' }), true);
+  assert.strictEqual(shouldClaimOnLoad({ owner: 'c2', self: 'local' }), false);
 });
