@@ -41,9 +41,6 @@ export const API_SHAPE = {
   // Только для сетевого клиента: имя, под которым его знает сервер. В Electron
   // такого события не бывает — preload подставляет заглушку.
   'owner.onHello': { channel: 'net:hello', kind: 'event' },
-  // Зеркально: только для окна ПК (main шлёт при показе из трея). Подписка в
-  // браузере безвредна — событие туда не приходит.
-  'owner.onReclaim': { channel: 'owner:reclaim', kind: 'event' },
   'app.onNotice': { channel: 'app:notice', kind: 'event' },
   'app.devtools': { channel: 'app:devtools', kind: 'invoke' },
   'project.connect': { channel: 'project:connect', kind: 'invoke' },

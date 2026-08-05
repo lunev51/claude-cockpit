@@ -4,7 +4,7 @@
 const fs = require('fs');
 const path = require('path');
 const {
-  app, BrowserWindow, screen, Menu, nativeImage, Notification,
+  app, BrowserWindow, screen, Menu, Tray, shell, nativeImage, Notification,
 } = require('electron');
 const {
   registerIpc, disposeSessions, getSmokeOutput, flushWorkspace, getActiveTabId,
@@ -12,6 +12,8 @@ const {
 const { getConfig, isRootConfigCorrupt } = require('./config');
 const { appRoot } = require('./paths');
 const { setBroadcast, notify } = require('./notify');
+const { buildTrayModel } = require('./tray-menu');
+const { buildLoginItem } = require('./autostart');
 const { createAttention } = require('./attention');
 const { createToaster } = require('./toasts');
 
@@ -27,6 +29,17 @@ const SMOKE = process.argv.includes('--smoke');
 // теоретически могут сработать раньше (например, uncaughtException в самом
 // начале старта), гард `if (netServer)` ниже на этот случай.
 let netServer = null;
+
+// План 2 фазы «кокпит по сети»: трей и намерение выйти. Крестик теперь ПРЯЧЕТ
+// окно — кокпит обязан пережить уход от компьютера, иначе с макбука не к чему
+// подключаться. Настоящий выход возможен только через меню трея и отличается
+// ровно этим флагом; он же взводится в before-quit, чтобы любой другой путь
+// выхода (app.quit() откуда угодно) не упёрся в preventDefault на close.
+let tray = null;
+let quitting = false;
+// Первое скрытие окна объясняем один раз за запуск: без этого пропажа окна из
+// панели задач и Alt+Tab выглядит как «приложение закрылось само».
+let hideExplained = false;
 
 // Вторая копия дерётся за манифест воркспейса — разрешаем одну.
 // В smoke-режиме блокировку не берём (гоняется параллельно с dev-окном).
@@ -71,6 +84,9 @@ function createWindow() {
   const winOpts = {
     width,
     height,
+    // --hidden ставит автозапуск: при входе в Windows кокпит поднимается в
+    // трей и восстанавливает вкладки, но на экран не лезет.
+    show: !process.argv.includes('--hidden'),
     minWidth: 900,
     minHeight: 600,
     backgroundColor: '#0F0F0F',
@@ -139,9 +155,16 @@ function createWindow() {
   }
   win.on('resize', scheduleSave);
   win.on('move', scheduleSave);
-  win.on('close', () => {
+  win.on('close', (e) => {
     if (saveTimer) clearTimeout(saveTimer);
     saveState();
+    // Выход — только из меню трея (или любым путём, который прошёл через
+    // before-quit). Всё остальное прячет окно: закрытый крестиком кокпит
+    // оставил бы удалённого клиента без единой живой вкладки.
+    if (!quitting) {
+      e.preventDefault();
+      win.hide();
+    }
   });
 
   // --- Безопасность: терминал рендерит недоверенный вывод ---
@@ -318,12 +341,102 @@ app.whenReady().then(() => {
     });
   }
 
+  // --- Эстафета и трей (план 2) ---
+  // Владение управлением приезжает из registerIpc ниже; функции объявлены до
+  // него, потому что onOwnerChange ссылается на них в момент вызова.
+  let ownership = null;
+
+  function showWindow() {
+    if (win.isDestroyed()) return;
+    if (win.isMinimized()) win.restore();
+    win.show();
+    win.focus();
+    // Показ окна = возврат управления. Захватываем ПРЯМО здесь, а не просьбой
+    // к renderer: событие ушло бы через broadcast всем клиентам сразу (прямой
+    // webContents.send в обход broadcast запрещён и стережётся тестом), и
+    // браузер на макбуке отобрал бы управление обратно тем же кадром.
+    // Размер не передаём — ownership помнит его по владельцу, а renderer
+    // уточнит своим term:resize сразу после показа окна.
+    if (ownership) ownership.claim('local');
+  }
+
+  function hideWindow() {
+    if (win.isDestroyed() || !win.isVisible()) return;
+    win.hide();
+    if (hideExplained || !Notification.isSupported()) return;
+    hideExplained = true;
+    new Notification({
+      title: 'Cockpit свёрнут в трей',
+      body: 'Управление ушло на другую машину. Значок в трее вернёт окно.',
+    }).show();
+  }
+
+  function toggleAutostart() {
+    const enabled = app.getLoginItemSettings().openAtLogin;
+    app.setLoginItemSettings({
+      openAtLogin: !enabled,
+      ...buildLoginItem({
+        packaged: app.isPackaged, execPath: process.execPath, appRoot: appRoot(),
+      }),
+    });
+    refreshTray();
+  }
+
+  function trayClick(id) {
+    if (id === 'show') showWindow();
+    else if (id === 'address') {
+      const address = netServer ? netServer.address() : null;
+      if (address) shell.openExternal(address);
+    } else if (id === 'autostart') toggleAutostart();
+    else if (id === 'quit') { quitting = true; app.quit(); }
+  }
+
+  function refreshTray() {
+    if (!tray || tray.isDestroyed()) return;
+    const model = buildTrayModel({
+      owner: ownership ? ownership.owner() : 'local',
+      online: ownership ? ownership.ownerOnline() : true,
+      // Адрес спрашиваем у самого сервера каждый раз: при port:0 он эфемерный,
+      // а после неудачного старта сервер может подняться позже, с повторной
+      // попытки (startNetServerWithRetries в ipc.js).
+      address: netServer ? netServer.address() : null,
+      autostart: app.getLoginItemSettings().openAtLogin,
+    });
+    tray.setImage(path.join(appRoot(), 'assets', model.icon));
+    tray.setToolTip(model.tooltip);
+    tray.setContextMenu(Menu.buildFromTemplate(model.items.map((item) => {
+      if (item.type === 'separator') return { type: 'separator' };
+      const entry = { label: item.label, enabled: item.enabled !== false };
+      if (item.type === 'checkbox') { entry.type = 'checkbox'; entry.checked = item.checked; }
+      entry.click = () => trayClick(item.id);
+      return entry;
+    })));
+  }
+
   // Деструктуризация в скобки: без них `({ broadcast } = ...)` на верхнем
   // уровне statement распарсился бы как блок кода, не присваивание —
   // переносим ЗДЕСЬ, а не в объявление, потому что broadcast — уже
   // объявленная выше переменная (нужна раньше, в focusTab), а не новая.
-  ({ broadcast, netServer } = registerIpc(win, { smoke: SMOKE, attention, toaster }));
+  ({ broadcast, netServer, ownership } = registerIpc(win, {
+    smoke: SMOKE,
+    attention,
+    toaster,
+    onOwnerChange: (owner) => {
+      if (owner === 'local') showWindow(); else hideWindow();
+      refreshTray();
+    },
+  }));
   setBroadcast(broadcast);
+
+  // Трей создаём ПОСЛЕ registerIpc: refreshTray спрашивает и владельца, и
+  // адрес сервера, а оба рождаются там.
+  tray = new Tray(nativeImage.createFromPath(path.join(appRoot(), 'assets', 'tray-local.ico')));
+  tray.on('click', showWindow);
+  refreshTray();
+  // Сервер мог не успеть занять порт к этому моменту (или поднимается с
+  // ретраями) — обновляем строку адреса, когда он появится. Одноразово, без
+  // поллинга: дальше меню перерисовывается на каждой смене владельца.
+  setTimeout(refreshTray, 3000).unref();
 
   // Ошибки renderer всегда дублируем в stdout — иначе их не видно при фоновом запуске.
   win.webContents.on('console-message', (eventOrDetails, level, message) => {
@@ -413,6 +526,11 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+  // Любой путь выхода (меню трея, app.quit() из чужого кода, завершение
+  // сеанса Windows) обязан пройти мимо preventDefault в win.on('close') —
+  // иначе приложение просто не закроется и человек будет снимать его
+  // диспетчером задач.
+  quitting = true;
   flushWorkspace();
   disposeSessions();
   if (netServer) netServer.stop();

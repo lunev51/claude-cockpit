@@ -2420,9 +2420,6 @@ async function boot() {
     ownerState = { ...ownerState, ...p };
     renderCurtain();
   });
-  // main показал окно из трея и просит забрать управление обратно: размер
-  // знает только эта сторона.
-  window.api.owner.onReclaim(() => { claimControl(); });
   $('curtain-take')?.addEventListener('click', () => { claimControl(); });
 
   // Открыли страницу — забрали управление. Подтверждений нет намеренно

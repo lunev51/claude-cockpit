@@ -43,10 +43,15 @@ test('повторный захват тем же клиентом не собы
   assert.deepStrictEqual(own.size(), { cols: 100, rows: 30 });
 });
 
-test('захват без размера сохраняет прежний размер', () => {
+test('повторный захват без размера сохраняет СВОЙ прежний размер', () => {
+  // Тест раньше утверждал обратное — что захват без размера наследует размер
+  // предыдущего владельца. Так и было задумано в первой редакции плана, пока
+  // не выяснилось, что возврат управления на ПК происходит именно без размера
+  // (main.js забирает его при показе окна) и наследование натягивало бы на
+  // терминал ширину макбука.
   const { own } = make();
   own.claim('c1', { cols: 80, rows: 24 });
-  own.claim('local');
+  own.claim('c1');
   assert.deepStrictEqual(own.size(), { cols: 80, rows: 24 });
 });
 
@@ -85,6 +90,41 @@ test('локальное окно забирает управление обра
   assert.strictEqual(own.owner(), 'local');
   assert.strictEqual(own.ownerOnline(), true);
   assert.deepStrictEqual(changes[1], {
+    owner: 'local', previous: 'c1', size: { cols: 200, rows: 50 },
+  });
+});
+
+test('размер помнится ПО ВЛАДЕЛЬЦУ — вернувшийся получает свой, а не чужой', () => {
+  // Окно ПК на весь экран и браузер на макбуке — это два разных размера.
+  // main.js забирает управление обратно БЕЗ размера (renderer в этот момент
+  // ещё не успел сказать своё слово), и подставить сюда размер макбука
+  // означало бы перерисовать Claude Code в чужой ширине на каждом возврате.
+  const { own } = make();
+  own.claim('local', { cols: 200, rows: 50 });
+  own.claim('c1', { cols: 80, rows: 24 });
+  assert.deepStrictEqual(own.size(), { cols: 80, rows: 24 });
+
+  own.claim('local');
+  assert.deepStrictEqual(own.size(), { cols: 200, rows: 50 }, 'вернулся размер окна ПК');
+
+  own.claim('c1');
+  assert.deepStrictEqual(own.size(), { cols: 80, rows: 24 }, 'и размер макбука тоже свой');
+});
+
+test('незнакомый владелец без размера не тащит чужой', () => {
+  const { own, changes } = make();
+  own.claim('local', { cols: 200, rows: 50 });
+  own.claim('c9');
+  assert.strictEqual(own.size(), null, 'о размере c9 мы ничего не знаем — лучше ничего, чем чужое');
+  assert.strictEqual(changes[changes.length - 1].size, null);
+});
+
+test('onChange получает размер НОВОГО владельца, а не прежнего', () => {
+  const { own, changes } = make();
+  own.claim('local', { cols: 200, rows: 50 });
+  own.claim('c1', { cols: 80, rows: 24 });
+  own.claim('local');
+  assert.deepStrictEqual(changes[changes.length - 1], {
     owner: 'local', previous: 'c1', size: { cols: 200, rows: 50 },
   });
 });

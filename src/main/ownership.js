@@ -9,10 +9,15 @@
 function createOwnership({ onChange } = {}) {
   let owner = 'local';
   let online = true;
-  let size = null;
+  // Размер помним ПО ВЛАДЕЛЬЦУ: окно ПК на весь экран и браузер на макбуке —
+  // это два разных терминала. Возврат управления часто происходит без нового
+  // размера (main.js забирает его при показе окна, когда renderer ещё не
+  // успел сказать своё слово), и подставить туда чужой размер значило бы
+  // перерисовать Claude Code в ширине другой машины на каждом возврате.
+  const sizes = new Map();
 
   function claim(who, nextSize) {
-    if (nextSize) size = { cols: nextSize.cols, rows: nextSize.rows };
+    if (nextSize) sizes.set(who, { cols: nextSize.cols, rows: nextSize.rows });
     if (who === owner) {
       // Тот же хозяин вернулся после обрыва — событие не нужно, но офлайн
       // снимаем: интерфейс показывает «владелец не на связи».
@@ -22,7 +27,10 @@ function createOwnership({ onChange } = {}) {
     const previous = owner;
     owner = who;
     online = true;
-    if (typeof onChange === 'function') onChange({ owner, previous, size });
+    // Размер НОВОГО владельца, не прежнего: именно под него переразмеривается
+    // pty. Незнакомый клиент без размера отдаёт null — лучше не трогать pty
+    // вовсе, чем натянуть на него чужую раскладку (см. applyHandoffSize).
+    if (typeof onChange === 'function') onChange({ owner, previous, size: sizes.get(who) || null });
     return true;
   }
 
@@ -34,7 +42,7 @@ function createOwnership({ onChange } = {}) {
 
   return {
     owner: () => owner,
-    size: () => size,
+    size: () => sizes.get(owner) || null,
     ownerOnline: () => online,
     canWrite: (who) => who === owner,
     claim,

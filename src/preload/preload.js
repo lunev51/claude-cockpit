@@ -61,9 +61,6 @@ contextBridge.exposeInMainWorld('api', {
     // метод без ipcRenderer выглядел бы для сверки отсутствующим. Событие в
     // Electron просто никогда не приходит.
     onHello: (cb) => ipcRenderer.on('net:hello', (_e, p) => cb(p)),
-    // Обратная сторона: main просит окно захватить управление, когда его
-    // показали из трея. Размер знает только renderer.
-    onReclaim: (cb) => ipcRenderer.on('owner:reclaim', () => cb()),
   },
   app: {
     onNotice: (cb) => ipcRenderer.on('app:notice', (_e, n) => cb(n)),
