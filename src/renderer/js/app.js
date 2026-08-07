@@ -31,6 +31,7 @@ import { createTabStore } from './tabs.js';
 import { renderBadge } from './badge.js';
 import { createPeek } from './peek.js';
 import { createPalette } from './palette.js';
+import { createBrowse } from './browse.js';
 import { createDashboard } from './dashboard.js';
 import { renderRings } from './rings.js';
 import { createDiffPanel } from './diffpanel.js';
@@ -65,6 +66,12 @@ let peek = null;
 // Task 4 фазы 4: палитра команд (Ctrl+P) — createPalette сама владеет своим
 // DOM-оверлеем (см. palette.js), здесь только держим ссылку для bindHotkeys.
 let palette = null;
+// План 3: файловый обзор (Ctrl+O и кнопка «+ Проект») — createBrowse сама
+// владеет своим DOM (см. browse.js), здесь только ссылка. Один и тот же экран
+// в окне на ПК и в браузере на макбуке: системный диалог выбора папки при
+// удалённой работе открылся бы на машине, где никого нет, да ещё поверх окна,
+// спрятанного в трей.
+let browse = null;
 // Task 4 фазы 5: дашборд лимитов и расходов — createDashboard сама владеет
 // своим DOM (см. dashboard.js), здесь только держим ссылку для bindHotkeys/
 // панели действий/палитры и для проброса свежих usage-снапшотов, пока открыт.
@@ -1279,6 +1286,26 @@ async function newProject() {
   // модальный, и человек за ПК получал бы его в лицо неизвестно от кого).
   // Дальше tabs:open всё равно отклонился бы. Не зовём то, что заведомо
   // отклонится, и говорим почему.
+  // План 3: вместо системного диалога — свой обзор, одинаковый в окне и в
+  // браузере. Гард управления здесь СНЯТ намеренно: сам обзор — это чтение,
+  // листать каталоги может и зритель. Отказ невладельцу выдаёт кнопка
+  // «Открыть сессию здесь» внутри обзора (см. onOpenHere в boot).
+  await browse.open(browseStartPath());
+}
+
+// Откуда открывать обзор. Без этого он стартовал бы от корня диска (живая
+// проверка задачи 4): пусто → фолбэк на 'C:\\'. Полезнее начинать рядом с тем,
+// над чем человек работает, — папка активной вкладки почти всегда соседствует
+// с той, которую он собирается открыть. Нет вкладок — пусть решает сам обзор
+// (он помнит последнюю посещённую папку за сеанс).
+function browseStartPath() {
+  const info = tabStore?.peekInfo(tabStore.activeId);
+  return (info && info.cwd) || '';
+}
+
+// Прежний путь «+ Проект» через системный диалог — оставлен точкой входа для
+// кнопки «Системное окно» внутри обзора (только в окне на ПК).
+async function newProjectViaSystemDialog() {
   if (!requireControl('Новый проект')) return;
   // Fix 5 (ревью): restoreOverlaySkip() раньше звался ДО chooseFolder() —
   // отмена системного диалога папки гасила оверлей без единой вкладки и без
@@ -1699,6 +1726,10 @@ function overlayFlags() {
     // прочитанной (seen.js) и Ctrl+Q открывал бы поле ввода под ней —
     // невидимо и без всякого смысла, писать всё равно нельзя.
     handoff: curtainState(handoffInputs()).visible,
+    // План 3: файловый обзор — такой же модальный слой, как палитра. Без
+    // регистрации Ctrl+Q развернул бы поле очереди невидимо под ним, а вкладка
+    // под открытым обзором считалась бы прочитанной (seen.js).
+    browse: !!browse?.isOpen(),
   };
 }
 
@@ -1751,6 +1782,22 @@ function bindHotkeys() {
       // валиден.
       if (palette.isOpen()) palette.close();
       else palette.open(views.get(tabStore.activeId)?.view);
+      return;
+    }
+    // Ctrl+O — файловый обзор (план 3): выбор папки для новой сессии. Тот же
+    // паттерн preventDefault/stopPropagation, что у Ctrl+P выше, иначе xterm
+    // получил бы 'o'/'O' в активный терминал.
+    //
+    // Гарда управления здесь НЕТ намеренно: листать каталоги — чтение, оно
+    // доступно и зрителю. Отказ выдаст кнопка «Открыть сессию здесь» внутри.
+    // А вот открывать обзор поверх другого модального слоя нельзя — он ляжет
+    // под ним (ровно тот класс дыры, что уже ловили с заглушкой эстафеты).
+    if (ev.ctrlKey && !ev.shiftKey && !ev.altKey
+        && (ev.key === 'o' || ev.key === 'O' || ev.code === 'KeyO')) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (browse?.isOpen()) browse.close();
+      else if (!otherOverlayOpen('browse')) browse?.open(browseStartPath());
       return;
     }
     // Ctrl+D — дашборд лимитов и расходов (Task 4 фазы 5), тот же паттерн, что
@@ -2526,6 +2573,29 @@ async function boot() {
   palette = createPalette({
     root: $('palette-root'),
     getActions: buildPaletteActions,
+  });
+
+  // План 3: файловый обзор вместо системного диалога выбора папки. Экран один
+  // и тот же в окне на ПК и в браузере — разница только в кнопке «Системное
+  // окно», которой в браузере нет (показать её негде, а канал tabs:chooseFolder
+  // открыл бы модалку на машине владельца, спрятанной в трей).
+  browse = createBrowse({
+    onOpenHere: (cwd) => {
+      // Заведение вкладки — пишущее действие: у невладельца оно отклонится
+      // гардом эстафеты, поэтому спрашиваем заранее и говорим словами, а не
+      // роняем в молчаливый unhandled rejection.
+      if (!requireControl('Открыть сессию здесь')) return;
+      // Тот же крючок, что у «+ Проект» до этой правки: открытие вкладки —
+      // неявный отказ от восстановления воркспейса, если оно ещё не решено.
+      if (restoreOverlaySkip) restoreOverlaySkip();
+      openTab(cwd);
+    },
+    // Прежний путь целиком, без копии его логики: гард управления, диалог,
+    // крючок restore и открытие вкладки — всё уже написано и отревьюжено.
+    onSystemDialog: () => newProjectViaSystemDialog(),
+    // window.__cockpitNetClient ставит сетевой мост (api-boot.js) — он
+    // выполняется только в браузере, в Electron его ветка не работает вовсе.
+    isElectron: !window.__cockpitNetClient,
   });
 
   // Task 4 фазы 5: дашборд лимитов и расходов (Ctrl+D). getData читает тот же

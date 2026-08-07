@@ -23,8 +23,31 @@ export function createBrowse({ onOpenHere, onSystemDialog, isElectron = true }) 
   const isOpen = () => !!root.firstChild;
 
   async function render(dirPath) {
-    const res = await window.api.fs.list(dirPath);
-    if (res && res.path) current = res.path;
+    // Отказ канала — не то же самое, что отказ файловой системы. В окне на ПК
+    // fs:list не реджектится вовсе, а у сетевого клиента при оборванном сокете
+    // он бросает — и без этого перехвата open() падал бы необработанным
+    // отказом, оверлей просто не появлялся, и человек не понимал бы, почему
+    // «+ Проект» ничего не делает (находка живой проверки задачи 4).
+    // Дальше рисуем обычным путём: пустой список плюс строка ошибки — ровно
+    // так же выглядит папка без прав.
+    let res;
+    try {
+      res = await window.api.fs.list(dirPath);
+    } catch (err) {
+      res = {
+        path: typeof dirPath === 'string' ? dirPath : '',
+        parent: null,
+        entries: [],
+        truncated: false,
+        error: `не удалось прочитать папку: ${(err && err.message) || 'нет связи с кокпитом'}`,
+      };
+    }
+    if (!res || typeof res !== 'object') {
+      res = {
+        path: '', parent: null, entries: [], truncated: false, error: 'кокпит не ответил',
+      };
+    }
+    if (res.path) current = res.path;
 
     const [live, workspaces, drives] = await Promise.all([
       window.api.tabs.list().catch(() => []),
