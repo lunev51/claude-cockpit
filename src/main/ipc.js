@@ -17,6 +17,7 @@ const { createBroadcast } = require('./broadcast');
 const { createOutputBuffer } = require('./output-buffer');
 const { createNetServer } = require('./net-server');
 const { createOwnership } = require('./ownership');
+const { listDir, listDrives } = require('./fs-browse');
 const { isWriteChannel } = require('./write-channels');
 const { getConfig, setConfig } = require('./config');
 const { createPty } = require('./pty');
@@ -2023,6 +2024,12 @@ function registerIpc(win, opts = {}) {
   registry.on('workspace:ready', () => {
     wsync.readyAndSync(activeTabId);
   });
+
+  // Файловый обзор (план 3): свой экран выбора папки, общий для окна на ПК и
+  // браузера на макбуке. Ограничение в 1000 записей, сортировка и тексты
+  // ошибок живут в fs-browse.js под тестами — здесь только проводка.
+  registry.handle('fs:list', (dirPath) => listDir(dirPath));
+  registry.handle('fs:drives', () => listDrives());
 
   registry.handle('tabs:chooseFolder', async () => {
     const result = await dialog.showOpenDialog(win, {
