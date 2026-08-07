@@ -402,7 +402,24 @@ export function initTerminal(container, config, {
   };
   term.focus();
   return {
-    term, search, setFontSize, focus: () => term.focus(), openSearch, handlers,
+    term,
+    search,
+    setFontSize,
+    focus: () => term.focus(),
+    openSearch,
+    handlers,
+    // Пересчитать геометрию и сообщить её pty ПРИНУДИТЕЛЬНО. ResizeObserver
+    // выше срабатывает только когда меняется сам контейнер, а при возврате
+    // управления с другой машины он не меняется вовсе: окно то же, размеры те
+    // же. При этом pty всё это время стоял в размере макбука, и весь вывод
+    // Claude Code форматировался под него — в окне ПК картинка разъезжалась,
+    // и лечилось это лишь ручным ресайзом окна (живая жалоба 05.08).
+    // Возвращает применённый размер, чтобы вызывающий мог его залогировать.
+    refit: () => {
+      fit.fit();
+      window.api.term.resize(tabId, term.cols, term.rows);
+      return { cols: term.cols, rows: term.rows };
+    },
     // Ghost-снимок буфера (Task 5): scrollback:2000 — достаточно контекста для
     // «о чём мы говорили», не раздувая ghost-файл на диске.
     serialize: () => serializeAddon.serialize({ scrollback: 2000 }),
