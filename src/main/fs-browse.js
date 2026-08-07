@@ -296,6 +296,18 @@ async function listDir(dirPath, {
   });
   if (typeof dirPath !== 'string' || !dirPath.trim()) return empty('путь не указан');
 
+  // I-1 финального ре-ревью: '\\сервер' без имени шары Windows UNC-корнем не
+  // считает, и path.resolve достраивает к нему букву ТЕКУЩЕГО диска. Живой
+  // замер: fs:list('\\Users') отдавал содержимое C:\Users с error=null — то
+  // есть локальная папка показывалась как содержимое сервера, с активной
+  // кнопкой «Открыть сессию здесь». Отказываем ДО resolve и говорим, чего не
+  // хватает: перечислить шары сервера мы всё равно не умеем (для этого нужен
+  // не readdir, а обход сети).
+  const bare = dirPath.trim().replace(/\//g, '\\');
+  if (/^\\{2,}[^\\]+\\*$/.test(bare)) {
+    return empty('укажите имя шары: \\\\сервер\\шара — список шар сервера кокпит не показывает');
+  }
+
   const abs = path.resolve(dirPath);
   let got;
   try {
@@ -353,6 +365,13 @@ const canOpen = async (root) => {
 // Перебор букв дешевле любого внешнего вызова (wmic/powershell) и не зависит
 // от локали вывода.
 //
+// Набор дисков меняется редко (флешку втыкают не каждую секунду), а обзор
+// спрашивает его на каждую навигацию — кэша хватает, чтобы переходы по папкам
+// вообще перестали трогать файловую систему. hung — буквы, чья проба брошена
+// по таймауту и всё ещё висит в пуле.
+const DRIVES_CACHE_MS = 30000;
+const driveState = { cache: null, hung: new Set() };
+
 // Пробы асинхронные по той же причине, что и listDir: existsSync на букве
 // отключённого сетевого диска или пустого картридера замораживал весь главный
 // процесс — только теперь на ровном месте, без всякого ввода от человека.
@@ -360,7 +379,27 @@ async function listDrives({
   timeoutMs = DRIVES_TIMEOUT_MS,
   probe = canOpen,
   concurrency = DRIVE_PROBE_CONCURRENCY,
+  drives = driveState,
+  now = Date.now,
+  ttlMs = DRIVES_CACHE_MS,
 } = {}) {
+  // I-2 финального ре-ревью. Обзор зовёт этот список на КАЖДУЮ навигацию, а
+  // проба по таймауту БРОСАЕТСЯ: слот отпускается, но операция висит в пуле
+  // libuv до конца SMB (~21 с). Потоков четыре, и замер показал: три брошенные
+  // безвредны, четвёртая вешает живое локальное чтение на 20 секунд. То есть
+  // одной отвалившейся сетевой буквы и четырёх переходов по папкам хватало,
+  // чтобы вернуть заморозку целиком — без единого сетевого пути от человека.
+  //
+  // Лечим с двух сторон: набор дисков меняется редко, поэтому короткий кэш
+  // (навигации перестают трогать файловую систему вовсе), и буква, чья
+  // прошлая проба ещё висит, повторно не пробуется — именно так брошенные
+  // операции и копились.
+  if (drives.cache && now() - drives.cache.at < ttlMs) return drives.cache.list;
+  // Состояние может прийти частичным (в тестах — намеренно): достраиваем, а не
+  // падаем. Набор висящих букв обязан быть общим между вызовами, иначе вся
+  // защита от повторной пробы теряет смысл.
+  if (!drives.hung) drives.hung = new Set();
+
   const letters = [];
   for (let code = 'A'.charCodeAt(0); code <= 'Z'.charCodeAt(0); code += 1) {
     letters.push(`${String.fromCharCode(code)}:\\`);
@@ -379,8 +418,19 @@ async function listDrives({
       const i = next;
       if (i >= letters.length) return;
       next += 1;
+      // Её прошлая проба всё ещё держит поток пула — второй такой же ничего не
+      // узнает, только отнимет ещё один поток у остального приложения.
+      if (drives.hung.has(letters[i])) continue;
       try {
-        const ok = await withTimeout(probe(letters[i]), timeoutMs);
+        const started = probe(letters[i]);
+        const ok = await withTimeout(started, timeoutMs);
+        if (ok === TIMED_OUT) {
+          // Бросаем — но помним, что бросили, и снимаем отметку, когда проба
+          // наконец завершится сама.
+          drives.hung.add(letters[i]);
+          const forget = () => drives.hung.delete(letters[i]);
+          Promise.resolve(started).then(forget, forget);
+        }
         // TIMED_OUT — это Symbol, он истинный: сравнивать надо с ним самим, иначе
         // не ответившая буква попала бы в список как существующая.
         if (ok !== TIMED_OUT && ok) found[i] = letters[i];
@@ -395,7 +445,9 @@ async function listDrives({
   };
   const size = Math.max(1, Math.min(concurrency, letters.length));
   await Promise.all(Array.from({ length: size }, () => worker()));
-  return found.filter(Boolean);
+  const list = found.filter(Boolean);
+  drives.cache = { at: now(), list };
+  return list;
 }
 
 module.exports = {

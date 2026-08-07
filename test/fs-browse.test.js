@@ -122,6 +122,77 @@ test('короткий каталог не помечается обрезанн
   assert.strictEqual((await listDir(root, { limit: 1000 })).truncated, false);
 });
 
+// I-1 финального ре-ревью: '\\сервер' без имени шары Windows за UNC-корень не
+// считает, и path.resolve достраивает к нему букву ТЕКУЩЕГО диска. Живой замер
+// через канал приложения: fs:list('\\Users') вернул path="C:\Users", 14 записей
+// и error=null — то есть содержимое локальной папки показывалось в ответ на
+// запрос сервера, вместе с активной кнопкой «Открыть сессию здесь». Renderer
+// эту форму уже понимает (browse-view.js), а main её молча подменял.
+test('\\\\сервер без шары не превращается в локальную папку', async () => {
+  const res = await listDir('\\\\Users');
+  assert.notStrictEqual(res.path, path.resolve('\\Users'), 'путь не должен резолвиться в локальный');
+  assert.deepStrictEqual(res.entries, [], 'содержимое локальной папки здесь показывать нельзя');
+  assert.ok(res.error, 'должен быть понятный отказ');
+  assert.match(res.error, /шар|сервер/i, 'текст обязан объяснять, чего не хватает');
+});
+
+// I-2 финального ре-ревью: обзор зовёт fs:drives на КАЖДУЮ навигацию, а проба
+// буквы по таймауту бросается — слот отпускается, но операция висит в пуле
+// libuv до конца SMB. Пул из четырёх потоков; замер ревьюера: три брошенные
+// операции безвредны, четвёртая вешает живое локальное чтение на 20 036 мс.
+// Достаточно ОДНОЙ отвалившейся сетевой буквы (выключенный VPN, спящий NAS) и
+// четырёх переходов по папкам — и заморозка возвращается целиком, без единого
+// сетевого пути от человека.
+test('повторные вызовы не пробуют буквы заново — набор дисков кэшируется', async () => {
+  let probes = 0;
+  const probe = async (letter) => { probes += 1; return letter === 'C:\\'; };
+  const drives = { cache: null };
+
+  const first = await listDrives({ probe, drives });
+  const after = probes;
+  const second = await listDrives({ probe, drives });
+
+  assert.deepStrictEqual(first, ['C:\\']);
+  assert.deepStrictEqual(second, first, 'ответ тот же');
+  assert.strictEqual(probes, after, 'второй вызов не должен трогать файловую систему вовсе');
+});
+
+test('буква, чья проба ещё висит, повторно не пробуется', async () => {
+  // Именно так брошенные пробы и копятся: каждая навигация отправляла в пул
+  // новую пробу той же мёртвой буквы.
+  let probes = 0;
+  const hang = new Promise(() => {}); // никогда не завершается — как мёртвый SMB
+  const probe = async (letter) => {
+    probes += 1;
+    if (letter === 'Z:\\') return hang;
+    return letter === 'C:\\';
+  };
+  const drives = { cache: null };
+
+  await listDrives({ probe, drives, timeoutMs: 20 });
+  const afterFirst = probes;
+  // Кэш обходим явно: проверяем защиту от повторной пробы, а не кэш.
+  drives.cache = null;
+  await listDrives({ probe, drives, timeoutMs: 20 });
+
+  // Во втором проходе пробуются 25 букв из 26: Z: пропущена, её прошлая проба
+  // всё ещё держит поток пула и второй такой же ничего не узнает.
+  assert.strictEqual(
+    probes, afterFirst + 25,
+    'Z: пробовать заново нельзя, пока висит прошлая проба',
+  );
+});
+
+test('\\\\сервер\\шара остаётся рабочей формой', async () => {
+  // Проверяем, что запрет не задел нормальный UNC: читать его мы по-прежнему
+  // пробуем (недостижимый ответит своей ошибкой, а не «укажите шару»).
+  const res = await listDir('\\\\192.0.2.77\\share', {
+    timeoutMs: 50,
+    readdir: async () => { throw Object.assign(new Error('нет сети'), { code: 'ENOENT' }); },
+  });
+  assert.ok(!/шар/i.test(res.error || ''), `форма с шарой не должна отвергаться: ${res.error}`);
+});
+
 test('несуществующая папка — понятный текст, а не исключение', async () => {
   const missing = path.join(os.tmpdir(), 'нет-такой-папки-12345');
   const res = await listDir(missing);
