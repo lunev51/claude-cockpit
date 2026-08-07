@@ -1792,12 +1792,18 @@ function bindHotkeys() {
     // доступно и зрителю. Отказ выдаст кнопка «Открыть сессию здесь» внутри.
     // А вот открывать обзор поверх другого модального слоя нельзя — он ляжет
     // под ним (ровно тот класс дыры, что уже ловили с заглушкой эстафеты).
+    //
+    // I2 ревью: заглушка эстафеты тоже зарегистрирована в overlayFlags, и
+    // из-за неё Ctrl+O у зрителя становился тихим no-op — при том что кнопка
+    // «+ Проект» обзор открывала (он рисуется слоем 60, выше заглушки 31).
+    // Две точки входа в один экран вели себя противоположно. Заглушку из
+    // проверки исключаем: обзор поверх неё — ровно то, что задумано.
     if (ev.ctrlKey && !ev.shiftKey && !ev.altKey
         && (ev.key === 'o' || ev.key === 'O' || ev.code === 'KeyO')) {
       ev.preventDefault();
       ev.stopPropagation();
       if (browse?.isOpen()) browse.close();
-      else if (!otherOverlayOpen('browse')) browse?.open(browseStartPath());
+      else if (!otherOverlayOpen('browse', 'handoff')) browse?.open(browseStartPath());
       return;
     }
     // Ctrl+D — дашборд лимитов и расходов (Task 4 фазы 5), тот же паттерн, что

@@ -44,6 +44,97 @@ test('папка с открытой вкладкой помечена', async (
   assert.strictEqual(marked[2].open, false, 'файл не бывает открытой вкладкой');
 });
 
+// --- Находки ревью плана 3 -------------------------------------------------
+
+test('пометка работает в КОРНЕ диска', async () => {
+  // I3 ревью: currentPath = 'C:\\' даёт при склейке 'C:\\\\games' (двойной
+  // разделитель), и сравнение не сходилось. Корень диска — штатная точка
+  // входа: слева есть панель «Диски», человек попадает туда одним кликом.
+  const { markOpen } = await import(url);
+  const marked = markOpen(
+    [{ name: 'games', dir: true }],
+    'C:\\',
+    ['C:\\games'],
+  );
+  assert.strictEqual(marked[0].open, true, 'в корне диска пометка обязана работать так же');
+});
+
+test('пометка не путает одноимённые папки в разных родителях', async () => {
+  // I5 ревью (мутация): сравнение по «cwd содержит имя» проходило тесты, хотя
+  // помечало бы helper в ЛЮБОЙ папке, где рядом лежит одноимённая.
+  const { markOpen } = await import(url);
+  const marked = markOpen(
+    [{ name: 'helper', dir: true }],
+    'C:\\Users\\Другой',
+    ['C:\\Users\\Lunev\\helper'],
+  );
+  assert.strictEqual(marked[0].open, false, 'открыта другая helper, не эта');
+});
+
+test('файл не помечается открытым, даже если путь совпал', async () => {
+  // I5 ревью (мутация): убрать проверку `e.dir` — и тест оставался зелёным,
+  // потому что в фикстуре файл и открытая вкладка совпасть не могли в принципе.
+  const { markOpen } = await import(url);
+  const marked = markOpen(
+    [{ name: 'helper', dir: false }],
+    'C:\\Users\\Lunev',
+    ['C:\\Users\\Lunev\\helper'],
+  );
+  assert.strictEqual(marked[0].open, false, 'вкладка живёт в папке, а не в файле');
+});
+
+test('крошки понимают сетевой путь UNC', async () => {
+  // I4 ревью: '\\\\srv\\share\\dir' разбирался как обычный путь, и первая
+  // крошка вела в 'srv\\', который разрешался относительно рабочей папки
+  // главного процесса кокпита — то есть уводил в постороннее место.
+  // Попасть на UNC можно прямо из строки ввода: normalizeInput('//srv/share')
+  // честно даёт '\\\\srv\\share'.
+  const { crumbs } = await import(url);
+  assert.deepStrictEqual(crumbs('\\\\srv\\share\\dir'), [
+    { name: '\\\\srv\\share', path: '\\\\srv\\share' },
+    { name: 'dir', path: '\\\\srv\\share\\dir' },
+  ]);
+});
+
+test('пометка работает и в корне сетевой шары', async () => {
+  const { markOpen } = await import(url);
+  const marked = markOpen(
+    [{ name: 'проект', dir: true }],
+    '\\\\srv\\share',
+    ['\\\\srv\\share\\проект'],
+  );
+  assert.strictEqual(marked[0].open, true);
+});
+
+test('недавние не двоятся из-за регистра и хвостового слеша', async () => {
+  // I5 ревью (мутация): ключ дедупа без toLowerCase/среза слеша проходил тесты.
+  const { recentFolders } = await import(url);
+  const res = recentFolders({
+    tabs: [
+      { cwd: 'C:\\Users\\Lunev\\helper' },
+      { cwd: 'c:\\users\\lunev\\helper\\' },
+      { cwd: 'C:\\Users\\Lunev\\akto' },
+    ],
+  });
+  assert.deepStrictEqual(res.map((r) => r.path), [
+    'C:\\Users\\Lunev\\helper',
+    'C:\\Users\\Lunev\\akto',
+  ], 'одна и та же папка в разном написании — одна строка');
+});
+
+test('недавние честно обрезаются по limit', async () => {
+  // I5 ревью (мутация): убрать break по limit — тест оставался зелёным, потому
+  // что уникальных путей было ровно столько же, сколько limit.
+  const { recentFolders } = await import(url);
+  const res = recentFolders({
+    tabs: [
+      { cwd: 'C:\\a' }, { cwd: 'C:\\b' }, { cwd: 'C:\\c' }, { cwd: 'C:\\d' },
+    ],
+    limit: 2,
+  });
+  assert.deepStrictEqual(res.map((r) => r.path), ['C:\\a', 'C:\\b']);
+});
+
 test('пометка не зависит от регистра и хвостового слеша', async () => {
   const { markOpen } = await import(url);
   const marked = markOpen(
