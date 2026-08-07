@@ -14,9 +14,23 @@ const SEP = '\\';
 // относительно рабочей папки главного процесса кокпита, то есть уводила в
 // постороннее место. Попасть на UNC можно прямо из строки ввода —
 // normalizeInput('//srv/share') честно даёт '\\srv\share'.
+// Имя шары необязательно: '\\srv' — нормальный первый шаг, в проводнике так
+// смотрят список шар сервера. I-2 ре-ревью: раньше эта форма не подходила под
+// «два сегмента», уходила в обычную ветку и давала крошку 'srv\', а
+// path.resolve('srv\') разрешает её ОТНОСИТЕЛЬНО рабочей папки главного
+// процесса кокпита — то есть содержимое локальной папки показывалось как
+// содержимое сервера, вместе с кнопкой «Открыть сессию здесь».
+//
+// Возвращаем и корень, и сколько символов он занял В ИСХОДНОЙ строке: считать
+// срез по длине нормализованного корня нельзя, сдвоенный разделитель внутри
+// ('\\srv\\share') сдвигал бы его и рождал лишнюю крошку (M-2 ре-ревью).
 function uncRoot(dirPath) {
-  const m = String(dirPath).match(/^[/\\]{2}([^/\\]+)[/\\]+([^/\\]+)/);
-  return m ? `${SEP}${SEP}${m[1]}${SEP}${m[2]}` : null;
+  const m = String(dirPath).match(/^[/\\]{2}([^/\\]+)(?:[/\\]+([^/\\]+))?/);
+  if (!m) return null;
+  const root = m[2]
+    ? `${SEP}${SEP}${m[1]}${SEP}${m[2]}`
+    : `${SEP}${SEP}${m[1]}`;
+  return { root, matched: m[0].length };
 }
 
 // 'C:\\Users\\Lunev' → [{name:'C:',path:'C:\\'}, {name:'Users',…}, …]
@@ -25,10 +39,12 @@ export function crumbs(dirPath) {
 
   const unc = uncRoot(dirPath);
   if (unc) {
-    // Корень шары — одна неделимая крошка, дальше обычные сегменты.
-    const rest = dirPath.slice(unc.length).replace(/[/\\]+$/, '').split(/[/\\]+/).filter(Boolean);
-    const out = [{ name: unc, path: unc }];
-    let acc = unc;
+    // Корень шары (или сам сервер) — одна неделимая крошка, дальше обычные
+    // сегменты. Срез по matched, а не по длине корня: в исходной строке могли
+    // быть сдвоенные разделители.
+    const rest = dirPath.slice(unc.matched).replace(/[/\\]+$/, '').split(/[/\\]+/).filter(Boolean);
+    const out = [{ name: unc.root, path: unc.root }];
+    let acc = unc.root;
     for (const part of rest) {
       acc = `${acc}${SEP}${part}`;
       out.push({ name: part, path: acc });
