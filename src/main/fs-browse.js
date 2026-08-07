@@ -14,6 +14,22 @@
 // сервера, ни трея, ни захвата управления (он в той же очереди). Злого умысла
 // для этого не нужно: спящий NAS или выключенный VPN дают тот же эффект, когда
 // человек вставляет \\nas\share в строку пути.
+//
+// РАУНД 2 (ре-ревью C-1). Асинхронность освободила главный поток, но заморозка
+// не исчезла — она переехала в пул libuv. Пул общий на весь процесс, потоков в
+// нём по умолчанию ЧЕТЫРЕ, и там же живут history:search и чтение
+// транскриптов. Таймаут ниже отвечает человеку, но саму операцию НЕ отменяет:
+// зависший readdir держит свой поток до собственного таймаута SMB. Замер на
+// запущенном приложении (порт 48314, свежие адреса TEST-NET-1):
+//
+//   БАЗА   fs:list(живая)      9 мс   error=null entries=3
+//   1 UNC  fs:list(живая)      1 мс   error=null entries=3   <- один зависший безвреден
+//   4 UNC  fs:list(живая)   5006 мс   «папка не отвечает»    <- ЛОЖЬ про живую папку
+//   4 UNC  fs:drives        1502 мс   []                     <- дисков нет
+//   4 UNC  history:search  17815 мс
+//
+// То есть ограничивать надо не время ответа, а ЧИСЛО ОДНОВРЕМЕННО ВИСЯЩИХ
+// чтений — этим и заняты дорожки (lanes) ниже.
 const fsp = require('fs').promises;
 const path = require('path');
 
@@ -35,16 +51,45 @@ const DEFAULT_TIMEOUT_MS = 5000;
 // диск просто не покажется, и это лучше, чем ждать его полторы секунды.
 const DRIVES_TIMEOUT_MS = 1500;
 
+// Сколько чтений каталога модуль имеет право держать в пуле ОДНОВРЕМЕННО.
+//
+// Сеть — одно. Ровно этот уровень замером признан безвредным: при одном
+// зависшем UNC живая папка отвечала за 1 мс, а список дисков был полон.
+// Второй сетевой путь в пул уже не уходит: пока первый не вернулся, отвечаем
+// человеку текстом, а поток пула не тратим вовсе.
+//
+// Диск — два, и дорожка у него ОТДЕЛЬНАЯ. Отдельная — это и есть суть фикса:
+// одна общая очередь на всё просто переносит заморозку из пула в очередь, и
+// живая C:\Users по-прежнему ждала бы мёртвый \\nas. Два, а не один, потому
+// что буква сетевого диска (Z: → \\nas\share) от локальной синтаксически
+// неотличима и умеет висеть так же: второй слот оставляет живым буквам дорогу
+// мимо зависшей.
+//
+// Итого потолок незавершённых чтений модуля — три из четырёх потоков пула, и
+// это ХУДШИЙ случай (две зависшие буквы одновременно). В сценарии ре-ревью
+// (висит только сеть) занят один поток, три свободны — history:search и
+// транскрипты продолжают работать.
+const MAX_NET_READS = 1;
+const MAX_DISK_READS = 2;
+
+// Пробы букв в listDrives идут через собственный диспетчер, а не все 26 разом:
+// иначе отсчёт их таймаута начинается в момент ПОСТАНОВКИ задачи, а не старта,
+// и живая буква выбывает из списка, так и не начав проверяться (вторая часть
+// находки C-1: `4 UNC fs:drives 1502 мс []` — C: не дождалась очереди в пуле).
+const DRIVE_PROBE_CONCURRENCY = 4;
+
 // Предел пути в обычных Win32-функциях. Длиннее — только через префикс \\?\.
 const MAX_PATH = 260;
 
 const TIMED_OUT = Symbol('таймаут');
 
+const NET_LANE = 'сеть';
+const DISK_LANE = 'диск';
+
 // Асинхронное чтение освобождает ГЛАВНЫЙ поток, но не отменяет саму операцию:
 // зависший вызов продолжает держать поток пула libuv (по умолчанию их 4), пока
 // SMB не сдастся сам. Таймаут здесь — про «ответить человеку вовремя», а не про
-// освобождение ресурса; поэтому он и короткий, и поэтому цена ошибки клиента
-// теперь — один поток пула на несколько секунд вместо всего приложения.
+// освобождение ресурса; за ресурс отвечают дорожки ниже.
 function withTimeout(promise, ms) {
   let timer;
   const alarm = new Promise((resolve) => {
@@ -59,6 +104,152 @@ function withTimeout(promise, ms) {
 }
 
 const forHumans = (ms) => (ms >= 1000 ? `${Math.round(ms / 1000)} с` : `${ms} мс`);
+
+// ---------------------------------------------------------------------------
+// Дорожки: очередь на N одновременных чтений, слот держится до НАСТОЯЩЕГО
+// конца вызова, а не до нашего таймаута. Отпустить слот по таймауту значило бы
+// вернуться к исходной болезни: место в очереди освободилось, а поток пула
+// по-прежнему занят, и следующий вызов отнимает ещё один.
+// ---------------------------------------------------------------------------
+
+// Состояние вынесено в объект, а не в модульные переменные, чтобы тест мог
+// взять СВОЮ песочницу: зависшее чтение слот не отдаёт никогда (оно на то и
+// зависшее), и на общем состоянии один такой тест испортил бы все следующие.
+function createGate() {
+  return { lanes: new Map(), reads: new Map() };
+}
+
+const defaultGate = createGate();
+
+function laneOf(gate, name, limit) {
+  let lane = gate.lanes.get(name);
+  if (!lane) {
+    lane = { name, limit, running: 0, hung: 0, waiters: [], stuck: [] };
+    gate.lanes.set(name, lane);
+  }
+  lane.limit = limit;
+  return lane;
+}
+
+function release(lane) {
+  // Слот не «освобождается», а переходит следующему в очереди: между shift() и
+  // повторным захватом нет ни одного await, поэтому чужой вызов не успеет
+  // вклиниться и превысить потолок.
+  const next = lane.waiters.shift();
+  if (next) { next.resolve(true); return; }
+  lane.running -= 1;
+}
+
+// Ожидание слота, когда свободного нет. Свободный слот берётся СИНХРОННО в
+// guardedReaddir и сюда не заходит — см. комментарий там, это не оптимизация.
+function waitForSlot(lane, waitMs) {
+  const ticket = {};
+  const wait = new Promise((resolve) => { ticket.resolve = resolve; });
+  lane.waiters.push(ticket);
+  return withTimeout(wait, waitMs).then((res) => {
+    if (res !== TIMED_OUT) return true;
+    const i = lane.waiters.indexOf(ticket);
+    if (i >= 0) { lane.waiters.splice(i, 1); return false; }
+    // Нас разбудили ровно в тот момент, когда сработал таймаут: слот уже наш и
+    // его надо вернуть, иначе он потеряется навсегда.
+    release(lane);
+    return false;
+  });
+}
+
+// Ответ человеку, когда до чтения дело не дошло. Врать «папка не отвечает»
+// здесь нельзя: эту папку мы не спрашивали, а сломано совсем другое.
+function busyText(lane, waitedMs) {
+  const rule = `одновременных чтений (${lane.name}) — не больше ${lane.limit}`;
+  if (lane.stuck.length) return `не пробовали читать: ${lane.stuck[0]} не отвечает, ${rule}`;
+  return `не пробовали читать: очередь занята, ${rule} (ждали ${forHumans(waitedMs)})`;
+}
+
+// \\server\share — сеть. \\?\C:\... и \\.\PhysicalDrive0 начинаются так же, но
+// сетью не являются: расширенная форма сетевого пути пишется \\?\UNC\server\share.
+function looksNetwork(abs) {
+  if (!abs.startsWith('\\\\')) return false;
+  if (abs.startsWith('\\\\.\\')) return false;
+  if (abs.startsWith('\\\\?\\')) return abs.slice(4, 8).toUpperCase() === 'UNC\\';
+  return true;
+}
+
+// Само чтение: слот дорожки уже взят, вернуть его обязаны мы.
+function startRead({ gate, lane, abs, readdir, timeoutMs }) {
+  let done = false;
+  let hung = false;
+  const started = Promise.resolve().then(() => readdir(abs));
+  // Запись в reads делается ДО первого await — иначе второй клик по тому же
+  // пути успевал проскочить мимо неё (см. guardedReaddir).
+  gate.reads.set(abs, started);
+  const finish = () => {
+    if (done) return;
+    done = true;
+    if (hung) {
+      lane.hung -= 1;
+      const i = lane.stuck.indexOf(abs);
+      if (i >= 0) lane.stuck.splice(i, 1);
+    }
+    gate.reads.delete(abs);
+    release(lane);
+  };
+  // Обработчик на started ставим СРАЗУ и на оба исхода: он и отпускает слот,
+  // и заодно снимает вопрос необработанного отказа, если наш await уже ушёл
+  // по таймауту.
+  started.then(finish, finish);
+
+  return withTimeout(started, timeoutMs).then((raw) => {
+    if (raw === TIMED_OUT) {
+      // Между проверкой и записью нет await — значит finish() не мог влезть в
+      // середину и счётчики не разъедутся.
+      if (!done) { hung = true; lane.hung += 1; lane.stuck.push(abs); }
+      return { timedOut: true };
+    }
+    return { raw };
+  });
+}
+
+// Одно чтение под охраной дорожки. Возвращает {raw} | {timedOut} | {busy},
+// исключения файловой системы пробрасывает как есть — их разбирает listDir.
+async function guardedReaddir({ gate, abs, readdir, timeoutMs, netLimit, diskLimit }) {
+  // Этот же путь уже читается — присоединяемся к идущему вызову. Второй
+  // readdir не ускорит ответ ни на миллисекунду, зато займёт ещё один поток
+  // пула ровно на те же двадцать секунд. Человек, который жмёт «+ Проект»
+  // три раза подряд (индикатора загрузки в обзоре нет, ограничения на
+  // повторное открытие тоже), получит один и тот же ответ на все три клика.
+  const already = gate.reads.get(abs);
+  if (already) {
+    const shared = await withTimeout(already, timeoutMs);
+    return shared === TIMED_OUT ? { timedOut: true } : { raw: shared };
+  }
+
+  const net = looksNetwork(abs);
+  const lane = laneOf(gate, net ? NET_LANE : DISK_LANE, net ? netLimit : diskLimit);
+  // Свободный слот берём СИНХРОННО, без единого await по дороге. Это не
+  // микрооптимизация: два клика подряд приходят в один тик, и если между
+  // проверкой потолка и записью в reads вклинится микротаск, оба запроса
+  // решат, что путь свободен, — потолок дорожки станет декоративным ровно в
+  // том сценарии, ради которого он написан.
+  if (lane.running < lane.limit) {
+    lane.running += 1;
+    return startRead({ gate, lane, abs, readdir, timeoutMs });
+  }
+  // Все занятые слоты уже признаны зависшими — ждать нечего. Продержать
+  // человека полный таймаут, чтобы сказать ровно то же самое, было бы просто
+  // медленнее: именно так выглядит повторный клик по недостижимому пути.
+  if (lane.hung >= lane.running) return { busy: busyText(lane, 0) };
+
+  const waitStarted = Date.now();
+  if (!await waitForSlot(lane, timeoutMs)) return { busy: busyText(lane, Date.now() - waitStarted) };
+  // Пока стояли в очереди, этот же путь мог начать читать кто-то другой.
+  const meanwhile = gate.reads.get(abs);
+  if (meanwhile) {
+    release(lane);
+    const shared = await withTimeout(meanwhile, timeoutMs);
+    return shared === TIMED_OUT ? { timedOut: true } : { raw: shared };
+  }
+  return startRead({ gate, lane, abs, readdir, timeoutMs });
+}
 
 // \\?\ отключает разбор пути Win32 целиком, в том числе предел MAX_PATH. Форма
 // для UNC отдельная: \\server\share → \\?\UNC\server\share.
@@ -89,6 +280,11 @@ async function missingReason(abs, timeoutMs) {
 async function listDir(dirPath, {
   limit = DEFAULT_LIMIT,
   timeoutMs = DEFAULT_TIMEOUT_MS,
+  netLimit = MAX_NET_READS,
+  diskLimit = MAX_DISK_READS,
+  // Общая на процесс очередь чтений: у ipc.js она одна на все окна и на всех
+  // сетевых клиентов — потолок имеет смысл только тогда, когда он общий.
+  gate = defaultGate,
   // readdir подменяется ТОЛЬКО в тестах и только чтобы изобразить зависание:
   // настоящий недостижимый UNC держал бы поток пула ещё двадцать секунд после
   // конца теста, и node --test не смог бы выйти. Живая проверка на
@@ -101,9 +297,9 @@ async function listDir(dirPath, {
   if (typeof dirPath !== 'string' || !dirPath.trim()) return empty('путь не указан');
 
   const abs = path.resolve(dirPath);
-  let raw;
+  let got;
   try {
-    raw = await withTimeout(readdir(abs), timeoutMs);
+    got = await guardedReaddir({ gate, abs, readdir, timeoutMs, netLimit, diskLimit });
   } catch (err) {
     // Права, отсутствие, файл вместо каталога — всё это нормальные ответы
     // файловой системы, а не повод ронять процесс с необработанным исключением.
@@ -114,9 +310,11 @@ async function listDir(dirPath, {
   }
   // Ответа нет — но это не «пусто» и не «нет такой папки»: человеку надо
   // сказать именно то, что произошло, иначе он будет чинить не то.
-  if (raw === TIMED_OUT) return empty(`папка не отвечает (нет ответа за ${forHumans(timeoutMs)})`);
+  if (got.timedOut) return empty(`папка не отвечает (нет ответа за ${forHumans(timeoutMs)})`);
+  // А это и вовсе не про эту папку: до чтения не дошло.
+  if (got.busy) return empty(got.busy);
 
-  const entries = raw
+  const entries = got.raw
     .map((d) => ({ name: d.name, dir: d.isDirectory() }))
     // Папки первыми: человек сюда пришёл выбирать папку, файлы — только
     // ориентир. Внутри группы — по алфавиту без учёта регистра, иначе
@@ -158,26 +356,50 @@ const canOpen = async (root) => {
 // Пробы асинхронные по той же причине, что и listDir: existsSync на букве
 // отключённого сетевого диска или пустого картридера замораживал весь главный
 // процесс — только теперь на ровном месте, без всякого ввода от человека.
-async function listDrives({ timeoutMs = DRIVES_TIMEOUT_MS, probe = canOpen } = {}) {
+async function listDrives({
+  timeoutMs = DRIVES_TIMEOUT_MS,
+  probe = canOpen,
+  concurrency = DRIVE_PROBE_CONCURRENCY,
+} = {}) {
   const letters = [];
   for (let code = 'A'.charCodeAt(0); code <= 'Z'.charCodeAt(0); code += 1) {
     letters.push(`${String.fromCharCode(code)}:\\`);
   }
-  // Все 26 проб идут ПАРАЛЛЕЛЬНО: последовательный перебор с таймаутом на
-  // каждую в худшем случае стоил бы 26 таймаутов подряд.
-  const found = await Promise.all(letters.map(async (root) => {
-    try {
-      const ok = await withTimeout(probe(root), timeoutMs);
-      // TIMED_OUT — это Symbol, он истинный: сравнивать надо с ним самим, иначе
-      // не ответившая буква попала бы в список как существующая.
-      return (ok !== TIMED_OUT && ok) ? root : null;
-    } catch {
-      return null;
+  const found = new Array(letters.length).fill(null);
+  let next = 0;
+  // Пробы идут ПАЧКАМИ, а не все 26 разом (и уж точно не по одной:
+  // последовательный перебор с таймаутом на каждую в худшем случае стоил бы 26
+  // таймаутов подряд). Разом было хуже, чем кажется: буква, отправленная в
+  // пул, где все потоки заняты, тратила свои полторы секунды СТОЯ В ОЧЕРЕДИ и
+  // выбывала из списка, ни разу не проверившись, — так живая C: и пропала из
+  // замера. Здесь отсчёт начинается на строке probe() ниже, то есть с момента
+  // старта самой пробы.
+  const worker = async () => {
+    for (;;) {
+      const i = next;
+      if (i >= letters.length) return;
+      next += 1;
+      try {
+        const ok = await withTimeout(probe(letters[i]), timeoutMs);
+        // TIMED_OUT — это Symbol, он истинный: сравнивать надо с ним самим, иначе
+        // не ответившая буква попала бы в список как существующая.
+        if (ok !== TIMED_OUT && ok) found[i] = letters[i];
+      } catch {
+        // нет диска или он не отвечает — просто не показываем
+      }
+      // Слот занимает следующая буква, даже если предыдущая ещё висит в пуле:
+      // одна мёртвая буква не имеет права спрятать все остальные (в отличие от
+      // listDir, где висящий слот держится до конца, — там цена ошибки выше:
+      // путь произвольный и приходит от клиента, а букв всего 26 и они свои).
     }
-  }));
+  };
+  const size = Math.max(1, Math.min(concurrency, letters.length));
+  await Promise.all(Array.from({ length: size }, () => worker()));
   return found.filter(Boolean);
 }
 
 module.exports = {
-  listDir, listDrives, DEFAULT_LIMIT, DEFAULT_TIMEOUT_MS,
+  listDir, listDrives, createGate,
+  DEFAULT_LIMIT, DEFAULT_TIMEOUT_MS, DRIVES_TIMEOUT_MS,
+  MAX_NET_READS, MAX_DISK_READS, DRIVE_PROBE_CONCURRENCY,
 };

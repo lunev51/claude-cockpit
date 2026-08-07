@@ -7,16 +7,40 @@
 // probe). Настоящий недостижимый UNC держал бы поток libuv двадцать секунд, и
 // node --test не смог бы выйти, пока тот не отвалится по таймауту SMB. Живая
 // проверка на \\192.0.2.1\share делается отдельно, на запущенном приложении.
-const { test } = require('node:test');
+const { test, after } = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
-const { listDir, listDrives } = require('../src/main/fs-browse');
+const { listDir, listDrives, createGate } = require('../src/main/fs-browse');
+
+// Каждый mkdtemp регистрируется здесь и удаляется в конце файла. Раньше тесты
+// этого не делали, и в TEMP от одного этого файла накопилось 317 каталогов
+// (находка M-3 ре-ревью): прогон тестов не имеет права мусорить на диске
+// владельца.
+const TEMP_ROOTS = [];
+
+function tempRoot(prefix) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  TEMP_ROOTS.push(root);
+  return root;
+}
+
+after(() => {
+  for (const root of TEMP_ROOTS) {
+    // Уборка не имеет права ронять прогон: часть каталогов тесты уже удалили
+    // сами, у одного менялась ACL, ещё один длиннее MAX_PATH и снимается
+    // только через префикс \\?\.
+    try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* уже нет или занят */ }
+    if (process.platform === 'win32' && fs.existsSync(`\\\\?\\${root}`)) {
+      try { fs.rmSync(`\\\\?\\${root}`, { recursive: true, force: true }); } catch { /* и так сойдёт */ }
+    }
+  }
+});
 
 function makeTree() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cockpit-browse-'));
+  const root = tempRoot('cockpit-browse-');
   fs.mkdirSync(path.join(root, 'zebra'));
   fs.mkdirSync(path.join(root, 'Alpha'));
   // 'apple' и 'Beta' стоят здесь не для красоты: при сравнении по кодам
@@ -37,6 +61,7 @@ function makeTree() {
 
 // Зависшее чтение: промис, который не разрешится никогда.
 const hangs = () => new Promise(() => {});
+const delay = (ms) => new Promise((r) => { setTimeout(r, ms).unref?.(); });
 
 test('папки идут первыми, потом файлы, внутри — по алфавиту без учёта регистра', async () => {
   const root = makeTree();
@@ -72,7 +97,7 @@ test('путь нормализуется: слеши, точки, хвосто�
 });
 
 test('длинный каталог режется и честно об этом сообщает', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cockpit-big-'));
+  const root = tempRoot('cockpit-big-');
   for (let i = 0; i < 25; i += 1) fs.mkdirSync(path.join(root, `dir-${String(i).padStart(3, '0')}`));
   const res = await listDir(root, { limit: 10 });
   assert.strictEqual(res.entries.length, 10);
@@ -85,7 +110,7 @@ test('ровно limit записей — это ещё не обрезка', as
   // Граница: при '>=' вместо '>' каталог из ровно limit имён помечался бы
   // обрезанным, хотя не потеряно ни одной записи, и человек видел бы
   // «показано не всё» на полном списке.
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cockpit-edge-'));
+  const root = tempRoot('cockpit-edge-');
   for (let i = 0; i < 10; i += 1) fs.mkdirSync(path.join(root, `dir-${i}`));
   const res = await listDir(root, { limit: 10 });
   assert.strictEqual(res.entries.length, 10);
@@ -119,7 +144,7 @@ test('нет доступа — так и говорим, а не «не уда�
   // Настоящий каталог без прав: создаём свой и вешаем запрещающую ACL. Брать
   // системный (C:\System Volume Information) нельзя — под админом он читается,
   // и тест молча превратился бы в пустышку.
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cockpit-acl-'));
+  const root = tempRoot('cockpit-acl-');
   const denied = path.join(root, 'denied');
   fs.mkdirSync(denied);
   fs.writeFileSync(path.join(denied, 'inside.txt'), 'x');
@@ -152,8 +177,11 @@ test('не отвечающая папка отдаёт ошибку по тай
   // Это главный дефект C1 в миниатюре: недостижимый UNC (спящий NAS,
   // выключенный VPN) отвечал только через ~21 секунду, и всё это время
   // главный процесс не обслуживал НИ ОДИН другой вызов.
+  //
+  // Своя песочница-очередь (gate): зависшее чтение слот не отдаёт никогда, и
+  // на общей очереди этот тест занял бы сетевую дорожку до конца прогона.
   const started = Date.now();
-  const res = await listDir('\\\\192.0.2.1\\share', { timeoutMs: 50, readdir: hangs });
+  const res = await listDir('\\\\192.0.2.1\\share', { gate: createGate(), timeoutMs: 50, readdir: hangs });
   const elapsed = Date.now() - started;
   assert.ok(elapsed < 2000, `ответ обязан прийти по таймауту, а пришёл через ${elapsed} мс`);
   assert.deepStrictEqual(res.entries, []);
@@ -168,7 +196,7 @@ test('путь длиннее 260 символов не выдаём за нес
   // читает. Подменённый readdir изображает машину, где они выключены: там
   // Windows отвечает тем же ENOENT, что и на отсутствующую папку, и текст
   // «папки не существует» отправлял бы человека искать несуществующую причину.
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cockpit-long-'));
+  const root = tempRoot('cockpit-long-');
   const seg = 'y'.repeat(60);
   let deep = root;
   for (let i = 0; i < 5; i += 1) deep = path.join(deep, `${seg}${i}`);
@@ -186,6 +214,97 @@ test('путь длиннее 260 символов не выдаём за нес
   } finally {
     fs.rmSync(`\\\\?\\${root}`, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// C-1 (ре-ревью): заморозка переехала в пул libuv. Таймаут отвечает человеку,
+// но операцию не отменяет — зависший readdir держит поток пула (их 4) до
+// собственного таймаута SMB. Замер на запущенном приложении: один зависший UNC
+// безвреден (живая папка — 1 мс), четыре съедают пул целиком, и приложение
+// уверенно врёт про живую локальную папку и отдаёт пустой список дисков.
+// Значит, ограничивать надо число ОДНОВРЕМЕННО ВИСЯЩИХ чтений.
+// ---------------------------------------------------------------------------
+
+test('сетевые пути читаются по одному: второй недостижимый в пул не уходит', async () => {
+  const gate = createGate();
+  let calls = 0;
+  const readdir = () => { calls += 1; return hangs(); };
+  const first = listDir('\\\\192.0.2.1\\a', { gate, timeoutMs: 80, readdir });
+  const second = await listDir('\\\\192.0.2.2\\b', { gate, timeoutMs: 80, readdir });
+
+  assert.strictEqual(calls, 1, 'второй путь обязан остаться в очереди, а не занять ещё один поток пула');
+  assert.deepStrictEqual(second.entries, []);
+  assert.match(second.error, /не пробовали читать/, 'про непрочитанную папку нельзя говорить «не отвечает»');
+  assert.match((await first).error, /не отвеча/, 'первый честно дождался своего таймаута');
+});
+
+test('зависшая сеть не мешает читать живую локальную папку', async () => {
+  // Ровно та ложь, которую поймал замер: «4 UNC → fs:list(живая) 5006 мс,
+  // папка не отвечает». Общая очередь на всё её не лечит, а лишь переносит из
+  // пула в очередь, поэтому дорожки у сети и у диска разные.
+  const gate = createGate();
+  const root = makeTree();
+  const hanging = listDir('\\\\192.0.2.1\\share', { gate, timeoutMs: 300, readdir: hangs });
+
+  const started = Date.now();
+  const local = await listDir(root, { gate, timeoutMs: 300 });
+  const elapsed = Date.now() - started;
+
+  assert.strictEqual(local.error, null, 'живая папка обязана читаться, пока висит сеть');
+  assert.strictEqual(local.entries.length, 10);
+  assert.ok(elapsed < 200, `живая папка обязана отвечать сразу, а ответила через ${elapsed} мс`);
+  await hanging;
+});
+
+test('повторный клик по тому же пути не добавляет второго висящего вызова', async () => {
+  // В обзоре нет ни индикатора загрузки, ни запрета на повторное открытие:
+  // человек жмёт «+ Проект» несколько раз подряд по одному и тому же адресу.
+  const gate = createGate();
+  let calls = 0;
+  const readdir = () => { calls += 1; return hangs(); };
+  const p = '\\\\192.0.2.1\\share';
+  const [a, b, c] = await Promise.all([
+    listDir(p, { gate, timeoutMs: 80, readdir }),
+    listDir(p, { gate, timeoutMs: 80, readdir }),
+    listDir(p, { gate, timeoutMs: 80, readdir }),
+  ]);
+  assert.strictEqual(calls, 1, 'три клика по одному пути — один вызов в пул');
+  for (const res of [a, b, c]) {
+    assert.match(res.error, /не отвеча/, 'присоединившийся получает тот же ответ, а не «очередь занята»');
+  }
+});
+
+test('повторный клик по зависшему пути получает отказ сразу, а не через таймаут', async () => {
+  const gate = createGate();
+  const first = listDir('\\\\192.0.2.1\\a', { gate, timeoutMs: 60, readdir: hangs });
+  assert.match((await first).error, /не отвеча/);
+
+  const started = Date.now();
+  const second = await listDir('\\\\192.0.2.2\\b', { gate, timeoutMs: 5000, readdir: hangs });
+  const elapsed = Date.now() - started;
+
+  assert.ok(elapsed < 1000, `ждать нечего — отказ обязан прийти сразу, а пришёл через ${elapsed} мс`);
+  assert.ok(second.error.includes('192.0.2.1'), `в отказе называем виновника, а не спрошенный путь: ${second.error}`);
+});
+
+test('слот возвращается, когда зависшее чтение всё-таки ответило', async () => {
+  // Восстановление: в замере приложение оживало через 24,5 с — ровно тогда,
+  // когда SMB сдавался сам. Дорожка обязана открыться в этот же момент, а не
+  // остаться закрытой навсегда.
+  const gate = createGate();
+  let unblock;
+  const readdir = (p) => (p.includes('192.0.2.1')
+    ? new Promise((resolve) => { unblock = resolve; })
+    : Promise.resolve([]));
+
+  assert.match((await listDir('\\\\192.0.2.1\\a', { gate, timeoutMs: 40, readdir })).error, /не отвеча/);
+  assert.match((await listDir('\\\\192.0.2.2\\b', { gate, timeoutMs: 40, readdir })).error, /не пробовали/);
+
+  unblock([]); // SMB наконец сдался
+  await new Promise((resolve) => { setImmediate(resolve); });
+
+  const revived = await listDir('\\\\192.0.2.2\\b', { gate, timeoutMs: 40, readdir });
+  assert.strictEqual(revived.error, null, 'дорожка обязана открыться, как только зависший вызов вернулся');
 });
 
 test('диски: непустой список, каждый существует', async () => {
@@ -209,4 +328,37 @@ test('не отвечающая буква диска не задерживае�
   const elapsed = Date.now() - started;
   assert.ok(elapsed < 2000, `перебор букв обязан уложиться в таймаут, а занял ${elapsed} мс`);
   assert.deepStrictEqual(drives, ['C:\\'], 'зависшая буква просто не показывается');
+});
+
+test('таймаут буквы отсчитывается от старта пробы, а не от постановки в очередь', async () => {
+  // Вторая половина C-1: «4 UNC → fs:drives 1502 мс, []». Живая C: не пропала
+  // и не зависла — она простояла свои полторы секунды В ОЧЕРЕДИ пула и выбыла,
+  // так и не начав проверяться. Здесь очередь заведомо длиннее таймаута: A: и
+  // B: висят, до C: очередь доходит не раньше 120-й миллисекунды, а бюджет у
+  // пробы — 60 мс. При отсчёте «с постановки» C: не попала бы в список.
+  const drives = await listDrives({
+    timeoutMs: 60,
+    concurrency: 1,
+    probe: (root) => {
+      if (root === 'A:\\' || root === 'B:\\') return hangs();
+      if (root === 'C:\\') return delay(30).then(() => true);
+      return Promise.resolve(false);
+    },
+  });
+  assert.deepStrictEqual(drives, ['C:\\'], 'живая буква обязана дождаться очереди и попасть в список');
+});
+
+test('потолок сетевых чтений работает и на общей очереди, без песочницы', async () => {
+  // Проводка: ipc.js зовёт listDir БЕЗ опций. Если очередь создавать на каждый
+  // вызов заново, все проверки выше остаются зелёными, а приложение —
+  // сломанным. Тест НАМЕРЕННО оставляет сетевую дорожку общей очереди занятой
+  // навсегда (зависшее чтение слот не отдаёт), поэтому он последний в файле, а
+  // все остальные сетевые тесты работают на своих песочницах.
+  let calls = 0;
+  const readdir = () => { calls += 1; return hangs(); };
+  const first = listDir('\\\\192.0.2.250\\a', { timeoutMs: 60, readdir });
+  const second = await listDir('\\\\192.0.2.251\\b', { timeoutMs: 60, readdir });
+  assert.strictEqual(calls, 1, 'общая очередь обязана быть одна на весь процесс');
+  assert.match(second.error, /не пробовали читать/);
+  await first;
 });
