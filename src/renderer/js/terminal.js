@@ -1,5 +1,10 @@
 // Терминал на xterm.js. UMD-сборки подключены в index.html,
 // поэтому берём глобали window.Terminal и window.FitAddon (не import).
+//
+// copyText — своё копирование с запасным путём: на странице по http (браузер на
+// макбуке) Clipboard API не существует, и прямой вызов writeText там падал
+// синхронно, мимо .catch (см. clipboard.js).
+import { copyText } from './clipboard.js';
 
 // Тема терминала v2: нейтральный чёрный + ANSI-палитра Warp default_dark (MIT).
 const THEME = {
@@ -201,10 +206,15 @@ export function initTerminal(container, config, {
   });
 
   // --- копирование выделения в буфер обмена (copyOnSelect) ---
+  //
+  // copyText вместо navigator.clipboard.writeText напрямую (жалоба 09.08: с
+  // макбука нельзя скопировать текст). На странице по http Clipboard API не
+  // существует вовсе, и прежний вызов обращался к свойству undefined —
+  // исключение синхронное, .catch() его не ловил, копирование падало молча.
   if (cfg.copyOnSelect) {
     term.onSelectionChange(() => {
       const sel = term.getSelection();
-      if (sel) navigator.clipboard.writeText(sel).catch(() => {});
+      if (sel) copyText(sel);
     });
   }
 
@@ -212,7 +222,7 @@ export function initTerminal(container, config, {
   container.addEventListener('contextmenu', (ev) => {
     ev.preventDefault();
     if (term.hasSelection()) {
-      navigator.clipboard.writeText(term.getSelection()).catch(() => {});
+      copyText(term.getSelection());
       term.clearSelection();
     } else if (cfg.rightClickPaste) {
       navigator.clipboard.readText()
@@ -248,15 +258,20 @@ export function initTerminal(container, config, {
       return false;
     }
 
-    // Ctrl+Shift+C — копировать выделение.
-    if (ev.ctrlKey && ev.shiftKey && !ev.altKey && !ev.metaKey
+    // Ctrl+Shift+C — копировать выделение. И Cmd+C для макбука: там Ctrl+C
+    // остаётся прерыванием (SIGINT), как в любом терминале, а копирование
+    // человек жмёт командной клавишей. Раньше эта комбинация не
+    // обрабатывалась вовсе — xterm держит выделение своё, а не документа,
+    // поэтому браузеру на Cmd+C копировать было нечего.
+    if (((ev.ctrlKey && ev.shiftKey) || (ev.metaKey && !ev.ctrlKey)) && !ev.altKey
         && (ev.key === 'C' || ev.key === 'c' || ev.code === 'KeyC')) {
       const sel = term.getSelection();
       if (sel) {
-        navigator.clipboard.writeText(sel).catch(() => {});
+        copyText(sel);
         ev.preventDefault();
         return false;
       }
+      // Выделения нет — не мешаем: Cmd+C без выделения человек жмёт не нам.
       return true;
     }
 
