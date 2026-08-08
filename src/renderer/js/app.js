@@ -32,6 +32,7 @@ import { renderBadge } from './badge.js';
 import { createPeek } from './peek.js';
 import { createPalette } from './palette.js';
 import { createBrowse } from './browse.js';
+import { diffTabs } from './tabs-sync.js';
 import { createDashboard } from './dashboard.js';
 import { renderRings } from './rings.js';
 import { createDiffPanel } from './diffpanel.js';
@@ -778,12 +779,84 @@ async function replayHistory(tabId) {
 //
 // Ошибка на одной вкладке не должна оставить остальные без экрана — тот же
 // принцип, что в restoreFlow.
-async function attachLiveTabs(liveTabs) {
+// Разобрать экран вкладки, которой больше нет в main. ТОЛЬКО интерфейс: сам
+// tabs:close уже случился (либо у нас, либо у соседа — тогда мы узнали об этом
+// событием tabs:changed). Вынесено из closeTab, чтобы у обоих путей была одна
+// уборка: половинчатая оставляет то осиротевший xterm, то строку в сайдбаре.
+function detachTabLocal(tabId) {
+  const entry = views.get(tabId);
+  if (entry) {
+    entry.view.dispose(); // отключает ResizeObserver и сам term (Task 6)
+    entry.container.remove();
+    views.delete(tabId);
+  }
+  // Task 1 фазы 7: локальное зеркало server-side очереди (main уже почистил
+  // свою половину внутри manager.close(), см. tabs:close в ipc.js) — без
+  // этого закрытая вкладка (tabId никогда не переиспользуется, это UUID)
+  // копилась бы в queueByTab до конца сессии кокпита.
+  queueByTab.delete(tabId);
+  // Fix 8 / Task 5 carryover: закрытая вкладка больше не может «ждать» —
+  // раньше это гарантировалось отдельным waitingTabs.delete(tabId) здесь же;
+  // теперь это следует структурно из tabStore.remove(tabId) — строка (и её
+  // r.status) исчезает из rows ДО того, как ниже вызывается waitingCount().
+  tabStore.remove(tabId);
+  updateTitlebarAlert();
+  pushAttention();
+  // Task 3 фазы 4 (peek): закрытая вкладка не должна оставлять поповер,
+  // указывающий на уже мёртвый tabId (закрытие вкладки — не единственный, но
+  // реальный путь «из-под» открытого peek).
+  if (peekedTabId === tabId) {
+    peek?.hide();
+    peekedTabId = null;
+  }
+}
+
+// Состав вкладок изменился — свериться с main и догнать разницу.
+//
+// Живая жалоба 08.08: «открыл новую сессию на маке, вернулся на компьютер — её
+// там нет, хотя она даже не пустая». Событие tabs:changed main рассылал всем
+// клиентам с самого начала фазы, но подписки не было: состав вкладок расходился
+// между машинами до перезагрузки страницы.
+//
+// Решение «кого добавить, кого убрать» живёт в чистом tabs-sync.js под тестами.
+// Здесь — только применение. Вкладки соседа подключаем БЕЗ активации: человек
+// смотрит на свою, и перебрасывать его на чужую новую сессию нельзя.
+let tabsSyncRun = null;
+async function syncTabsFromMain() {
+  // Одноразовость: событий может прийти несколько подряд (открытие вкладки —
+  // это два tabs:changed: сама вкладка и привязка сессии), а каждый заход
+  // ходит в main и заводит xterm'ы.
+  if (tabsSyncRun) return tabsSyncRun;
+  tabsSyncRun = (async () => {
+    let live;
+    try {
+      live = await window.api.tabs.list();
+    } catch (err) {
+      // Обрыв связи: разбирать экран по неответу нельзя (см. diffTabs).
+      console.warn('[вкладки] сверка не удалась:', err.message);
+      return;
+    }
+    const { add, remove, changed } = diffTabs(live, [...views.keys()]);
+    if (!changed) return;
+    for (const tabId of remove) detachTabLocal(tabId);
+    if (add.length) await attachLiveTabs(add, { activate: false });
+  })();
+  try {
+    await tabsSyncRun;
+  } finally {
+    tabsSyncRun = null;
+  }
+  return undefined;
+}
+
+async function attachLiveTabs(liveTabs, { activate = true } = {}) {
   let firstAttached = null;
   for (const t of liveTabs) {
     try {
+      // activate:false — путь сверки составов: вкладку завёл сосед, и
+      // перебрасывать человека на неё нельзя, он смотрит на свою.
       // eslint-disable-next-line no-await-in-loop
-      await attachTab(t, { activate: !firstAttached });
+      await attachTab(t, { activate: activate && !firstAttached });
       if (!firstAttached) firstAttached = t;
     } catch (err) {
       console.warn(`[attach] не удалось подключиться к вкладке ${t.cwd}:`, err);
@@ -908,28 +981,7 @@ async function closeTab(tabId) {
     showToast('Вкладку закрыть не удалось — попробуй ещё раз', 'warn');
     return;
   }
-  entry.view.dispose(); // отключает ResizeObserver и сам term (Task 6)
-  entry.container.remove();
-  views.delete(tabId);
-  // Task 1 фазы 7: локальное зеркало server-side очереди (main уже почистил
-  // свою половину внутри manager.close(), см. tabs:close в ipc.js) — без
-  // этого закрытая вкладка (tabId никогда не переиспользуется, это UUID)
-  // копилась бы в queueByTab до конца сессии кокпита.
-  queueByTab.delete(tabId);
-  // Fix 8 / Task 5 carryover: закрытая вкладка больше не может «ждать» —
-  // раньше это гарантировалось отдельным waitingTabs.delete(tabId) здесь же;
-  // теперь это следует структурно из tabStore.remove(tabId) — строка (и её
-  // r.status) исчезает из rows ДО того, как ниже вызывается waitingCount().
-  tabStore.remove(tabId);
-  updateTitlebarAlert();
-  pushAttention();
-  // Task 3 фазы 4 (peek): закрытая вкладка не должна оставлять поповер,
-  // указывающий на уже мёртвый tabId (закрытие вкладки — не единственный, но
-  // реальный путь «из-под» открытого peek).
-  if (peekedTabId === tabId) {
-    peek?.hide();
-    peekedTabId = null;
-  }
+  detachTabLocal(tabId);
   // Переключаемся на соседнюю вкладку, только если закрыли активную —
   // закрытие фоновой вкладки не должно перебивать фокус пользователя.
   if (!wasActive) return;
@@ -2790,6 +2842,11 @@ async function boot() {
   // сама тихо игнорирует неизвестный/уже закрытый tabId (views.get → undefined
   // → return), так что здесь ничего дополнительно проверять не нужно.
   window.api.tab.onActivate(({ tabId }) => activateTab(tabId));
+
+  // Состав вкладок изменился — у нас, у соседа или автоматикой. Живая жалоба
+  // 08.08: сессия, заведённая с макбука, на ПК не появлялась вовсе, хотя main
+  // рассылал это событие всем клиентам с начала фазы — подписки не было.
+  window.api.tabs.onChanged(() => { syncTabsFromMain(); });
 
   // Статусы приходят из хуков Claude Code (sessions.js) — единый источник,
   // term:started/term:exit статус больше не выставляют (был двойной источник).

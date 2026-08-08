@@ -52,6 +52,11 @@ export const API_SHAPE = {
   'git.onChanged': { channel: 'git:changed', kind: 'event' },
   'gh.repo': { channel: 'gh:repo', kind: 'invoke' },
   'gh.global': { channel: 'gh:global', kind: 'invoke' },
+  // Состав вкладок изменился (у кого угодно: у нас, у соседа, автоматикой).
+  // Живая жалоба 08.08: сессия, заведённая с макбука, на ПК не появлялась —
+  // событие main рассылал всем с начала фазы, а формы api для него не было,
+  // и интерфейс просто не подписывался.
+  'tabs.onChanged': { channel: 'tabs:changed', kind: 'event' },
   'tab.onStatus': { channel: 'tab:status', kind: 'event' },
   'tab.onActivate': { channel: 'tab:activate', kind: 'event' },
   'workspace.get': { channel: 'workspace:get', kind: 'invoke' },
