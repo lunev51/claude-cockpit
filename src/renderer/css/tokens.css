@@ -28,6 +28,15 @@
   --radius-l: 6px;
 
   --font-ui: 'Inter', 'Segoe UI', sans-serif;
-  /* DM Mono отменён 27.07: нет кириллицы. Берём тот же шрифт, что и терминал. */
-  --font-mono: 'JetBrainsMono NF', 'JetBrains Mono', 'Cascadia Mono', Consolas, monospace;
+  /* DM Mono отменён 27.07: нет кириллицы. Берём тот же шрифт, что и терминал.
+     Имён несколько намеренно: один и тот же Nerd Font называется по-разному в
+     зависимости от того, как его поставили. 'JetBrainsMono NF' — вариант с
+     этой машины (Windows), 'JetBrainsMono Nerd Font' — то же семейство на
+     macOS. Без второго имени браузер на маке не находил НИ ОДНОГО шрифта из
+     списка (Cascadia и Consolas там тоже нет), падал на системный monospace, а
+     в нём нет приватной области Unicode — значки статус-бара Claude Code
+     выходили пустыми прямоугольниками. */
+  --font-mono: 'JetBrainsMono NF', 'JetBrainsMono Nerd Font', 'JetBrainsMono Nerd Font Mono',
+    'JetBrains Mono', 'MesloLGS NF', 'Hack Nerd Font', 'SF Mono', Menlo,
+    'Cascadia Mono', Consolas, monospace;
 }

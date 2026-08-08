@@ -4,7 +4,7 @@
     "args": [],
     "cwd": "C:\\Users\\Lunev\\helper",
     "fontSize": 14,
-    "fontFamily": "\"JetBrainsMono NF\", \"Cascadia Mono\", Consolas, monospace",
+    "fontFamily": "\"JetBrainsMono NF\", \"JetBrainsMono Nerd Font\", \"JetBrainsMono Nerd Font Mono\", \"JetBrains Mono\", \"MesloLGS NF\", \"Hack Nerd Font\", \"SF Mono\", Menlo, \"Cascadia Mono\", Consolas, monospace",
     "scrollback": 5000,
     "copyOnSelect": true,
     "rightClickPaste": true,
