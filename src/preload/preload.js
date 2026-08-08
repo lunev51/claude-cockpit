@@ -23,6 +23,10 @@ contextBridge.exposeInMainWorld('api', {
     // что только он знает, что показано на экране и есть ли у окна фокус;
     // ядро на этом сообщении лишь двигает статус и гардит его (markSeen).
     markSeen: (tabId) => ipcRenderer.send('tabs:seen', { tabId }),
+    // Состав вкладок изменился — у нас, у соседа или автоматикой. Само событие
+    // main рассылает с начала фазы «кокпит по сети» (sessions.js), но подписки
+    // на него не было: сессия, заведённая с макбука, на ПК не появлялась.
+    onChanged: (cb) => ipcRenderer.on('tabs:changed', () => cb()),
   },
   term: {
     start: (tabId, cols, rows) => ipcRenderer.send('term:start', { tabId, cols, rows }),
