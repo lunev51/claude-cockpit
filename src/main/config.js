@@ -13,7 +13,17 @@ const DEFAULTS = {
     args: [],
     cwd: '',
     fontSize: 14,
-    fontFamily: '"JetBrainsMono NF", "Cascadia Mono", Consolas, monospace',
+    // Имён несколько намеренно (жалоба 08.08: на макбуке вместо значков
+    // статус-бара Claude Code — пустые прямоугольники). Один и тот же Nerd
+    // Font называется по-разному в зависимости от способа установки:
+    // 'JetBrainsMono NF' — как стоит на этой машине (Windows),
+    // 'JetBrainsMono Nerd Font' — то же семейство на macOS. Ни Cascadia Mono,
+    // ни Consolas на маке нет вовсе, поэтому браузер не находил НИ ОДНОГО
+    // шрифта из прежнего списка и падал на системный monospace (Menlo), где
+    // приватной области Unicode нет — отсюда прямоугольники.
+    // Окно на ПК это не задевает: первым идёт то же имя, что и раньше
+    // (замерено: в Electron все значки рисуются).
+    fontFamily: '"JetBrainsMono NF", "JetBrainsMono Nerd Font", "JetBrainsMono Nerd Font Mono", "JetBrains Mono", "MesloLGS NF", "Hack Nerd Font", "SF Mono", Menlo, "Cascadia Mono", Consolas, monospace',
     scrollback: 5000,
     copyOnSelect: true,
     rightClickPaste: true,
