@@ -32,6 +32,9 @@ export const API_SHAPE = {
   // (net-server.js), в этой форме его не было — и подключившийся клиент видел
   // пустой терминал, то есть задача 4 (кольцевой буфер) работала в стол.
   'net.buffer': { channel: 'net:buffer', kind: 'invoke' },
+  // Файловый обзор (план 3): каталоги читает main, renderer только рисует.
+  'fs.list': { channel: 'fs:list', kind: 'invoke' },
+  'fs.drives': { channel: 'fs:drives', kind: 'invoke' },
   // Эстафета (план 2). pack ОБЯЗАТЕЛЕН для claim: без него net-api.js отправит
   // позиционный список [cols, rows], сервер возьмёт args[0] — и захват получит
   // ЧИСЛО вместо размера. Ровно этот класс ошибки был Critical 2 задачи 6.

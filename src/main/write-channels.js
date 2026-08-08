@@ -45,6 +45,11 @@ const FREE_CHANNELS = new Set([
   'config:get',
   'tabs:list', 'tabs:seen',
   'net:buffer',
+  // Файловый обзор (план 3): чтение каталогов и список дисков. Скрывать имена
+  // папок от того, кто уже внутри, бессмысленно — у него есть терминал.
+  // Заведение вкладки из обзора идёт отдельной командой tabs:open, и она
+  // пишущая.
+  'fs:list', 'fs:drives',
   'project:status',
   'git:get', 'gh:repo', 'gh:global',
   'workspace:get', 'workspace:ready',
