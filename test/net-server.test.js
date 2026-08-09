@@ -311,6 +311,79 @@ test('относительный root не превращает раздачу �
   assert.strictEqual(res.status, 200, `относительный root '${relative}' не сработал`);
 });
 
+test('сбой fs при поиске файла не роняет процесс', async (t) => {
+  // Ревью 09.08: `fs.existsSync(abs) && fs.statSync(abs).isFile()` — две
+  // проверки подряд без единого try. Между ними файл может исчезнуть
+  // (пересборка renderer, npm install поверх node_modules, антивирус), а на
+  // Windows statSync умеет бросать EPERM и на существующем файле. Исключение
+  // вылетает из обработчика запроса, а это НЕ локальная ошибка: main.js
+  // ловит её в process.on('uncaughtException') и делает app.exit(1) — один
+  // HTTP-запрос в неудачный момент убивает кокпит со всеми живыми pty.
+  //
+  // Тот же класс в этом файле чинили дважды (битый %-escape и ошибка потока
+  // чтения); поиск файла оставался последним незакрытым путём.
+  //
+  // Подменяем сам statSync: смоделировать гонку или EPERM на живой ФС
+  // надёжно нельзя, а промах теста здесь стоит упавшего приложения.
+  const { server } = makeServer();
+  const { port } = await server.start();
+  t.mock.method(fs, 'statSync', () => {
+    throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' });
+  });
+  const res = await fetch(`http://127.0.0.1:${port}/index.html`);
+  // Ответ обязан прийти хоть какой-то: сервер жив, ошибка обработана.
+  assert.ok(res.status === 404 || res.status === 500, `ждали честный отказ, получили ${res.status}`);
+  t.mock.restoreAll();
+  // И сервер продолжает работать: следующий запрос отдаёт страницу как обычно.
+  const after = await fetch(`http://127.0.0.1:${port}/index.html`);
+  assert.strictEqual(after.status, 200, 'после сбоя fs сервер перестал отдавать статику');
+});
+
+test('каталог не выдаётся за файл', async () => {
+  // Мутационная проверка фикса 09.08 показала дыру: снять `stat.isFile()` —
+  // и весь прогон остаётся зелёным. Без этой проверки запрос к каталогу
+  // (/js, /css) возвращал бы путь каталога как найденный файл, а дальше
+  // createReadStream отдавал бы EISDIR уже в поток — вместо честного 404
+  // человек получал бы 500 на ровном месте.
+  const { server } = makeServer();
+  const { port } = await server.start();
+  const res = await fetch(`http://127.0.0.1:${port}/js`);
+  assert.strictEqual(res.status, 404, `каталог должен быть 404, пришло ${res.status}`);
+});
+
+test('сбой fs на одном корне не обрывает поиск в остальных', async (t) => {
+  // Ревью фикса: с одним корнем «пробуем следующий» и «сдаёмся сразу»
+  // неразличимы — мутация continue → return null осталась бы зелёной. А
+  // обещание в комментарии кода именно такое: сбой на корне равен «файла тут
+  // нет», не «файла нет нигде». Проверяем на двух корнях: statSync бросает
+  // EPERM только для первого, живой файл лежит во втором.
+  // Перебор корней срабатывает, когда один префикс вложен в другой: запрос
+  // /assets/ok.txt сначала проверяется в корне префикса '/assets' (он длиннее
+  // и идёт первым), и лишь потом — в корне '/' по пути assets/ok.txt.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cockpit-roots-'));
+  const closed = path.join(dir, 'closed');
+  const open = path.join(dir, 'open');
+  fs.mkdirSync(closed);
+  fs.mkdirSync(path.join(open, 'assets'), { recursive: true });
+  fs.writeFileSync(path.join(open, 'assets', 'ok.txt'), 'нашёлся во втором корне', 'utf8');
+
+  const { server } = makeServer({ staticRoots: { '/assets': closed, '/': open } });
+  const { port } = await server.start();
+  const realStat = fs.statSync;
+  t.mock.method(fs, 'statSync', (p, ...rest) => {
+    if (String(p).startsWith(closed)) {
+      throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' });
+    }
+    return realStat(p, ...rest);
+  });
+  const res = await fetch(`http://127.0.0.1:${port}/assets/ok.txt`);
+  const body = await res.text();
+  t.mock.restoreAll();
+  fs.rmSync(dir, { recursive: true, force: true });
+  assert.strictEqual(res.status, 200, 'сбой первого корня похоронил поиск во втором');
+  assert.match(body, /нашёлся во втором корне/);
+});
+
 test('префикс с двоеточием в конфиге не ломает раздачу остальных корней', async () => {
   // ':' в САМОМ ПУТИ ЗАПРОСА блокируется целиком как защита от NTFS ADS
   // (index.html::$DATA) — значит запрос, которому нужен буквальный ':' в
