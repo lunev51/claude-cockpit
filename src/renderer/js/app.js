@@ -295,6 +295,36 @@ function renderActionBar() {
   nightBtn.addEventListener('mousedown', (e) => e.preventDefault());
   nightBtn.addEventListener('click', () => toggleNight());
   host.appendChild(nightBtn);
+  // Просьба 09.08: перезапуск сессии кнопкой, чтобы не жать Ctrl+Shift+R
+  // каждый раз. Делает РОВНО то же самое — тот же канал term:restart, что у
+  // хоткея и у действия палитры; отдельной логики перезапуска не заводим.
+  //
+  // Канал пишущий: у клиента без управления он отклонится гардом эстафеты,
+  // поэтому спрашиваем заранее и отвечаем словами, а не молчанием.
+  const restartBtn = document.createElement('button');
+  restartBtn.type = 'button';
+  restartBtn.id = 'btn-restart';
+  restartBtn.className = 'action-btn';
+  restartBtn.textContent = '⟳';
+  restartBtn.title = 'Перезапустить сессию активной вкладки (Ctrl+Shift+R)';
+  restartBtn.addEventListener('mousedown', (e) => e.preventDefault());
+  restartBtn.addEventListener('click', () => {
+    const id = tabStore.activeId;
+    // Молча не выходим: живая проверка показала случай, когда активной вкладки
+    // нет (например, вкладки приехали синхронизацией от соседа — они
+    // подключаются БЕЗ активации), и кнопка не делала ровно ничего. В этой
+    // фазе молчаливый отказ уже трижды выглядел как поломка.
+    if (!id) {
+      showToast('Перезапустить нечего: нет активной вкладки', 'warn');
+      return;
+    }
+    if (!requireControl('Перезапустить сессию')) return;
+    window.api.term.restart(id);
+    // Фокус обратно в терминал: перезапущенная сессия должна принимать ввод
+    // сразу, без лишнего клика (тот же приём, что у слэш-команд ниже).
+    views.get(id)?.view.focus();
+  });
+  host.appendChild(restartBtn);
   // deepMerge (config.js) при частичном оверрайде массива объектом даёт
   // {0:…,1:…} вместо массива — Array.isArray отсекает такой и любой другой
   // некорректный actionBar.commands, чтобы не уронить boot() на итерации.
