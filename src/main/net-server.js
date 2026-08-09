@@ -84,10 +84,38 @@ function splitPrefixSegments(prefix) {
 // сервер слушает шире всего.
 const LISTEN_ANYWHERE = new Set(['0.0.0.0', '::', '::0']);
 
+// Потолок размера ВХОДЯЩЕГО кадра. Библиотека ws по умолчанию разрешает
+// 100 МиБ — на машине с 8 ГБ ОЗУ это неприемлемо: один кадр держит в памяти
+// сырой буфер, его копию строкой и результат JSON.parse, то есть кратно
+// больше самого кадра. Отправить такой может и сбойный клиент, и честная
+// вставка гигантского текста в терминал браузера.
+//
+// 16 МиБ выбраны с запасом к самому тяжёлому ЗАКОННОМУ кадру.
+// Самый тяжёлый — ghost:save: снимок скроллбека вкладки, serialize({scrollback:
+// 2000}) в terminal.js, то есть 2000 строк с escape-последовательностями
+// (главный ограничитель — GHOST_MAX_BYTES в ipc.js режет уже принятое до
+// 512 КБ). Реальный тяжёлый буфер — единицы МБ; патологический (truecolor на
+// каждую клетку) подходит к потолку вплотную, и это осознанно: обрыв такого
+// кадра не теряет работу, а своп теряет всю машину. Второй по весу —
+// вставка текста в term:write.
+//
+// Голосовой WAV в расчёт НЕ входит: по сети он не ездит вовсе (JSON.stringify
+// от ArrayBuffer даёт {}), это отдельная поломка голоса в браузере — см.
+// docs/review-fable-2026-08-09.md.
+//
+// Превышение не теряет работу: ws закрывает соединение кодом 1009, клиент
+// переподключается сам (reconnectLoop в api-boot.js) и добирает пропущенный
+// вывод через net:buffer — тот же путь, что при любом обрыве связи.
+const MAX_FRAME_BYTES = 16 * 1024 * 1024;
+
 // ownership — необязательный параметр: без него сервер работает ровно как
 // раньше (эстафеты нет, каждый кадр идёт в реестр как есть).
+// maxFrameBytes вынесен в параметры ради теста: слать настоящие 16 МиБ, чтобы
+// проверить потолок, — само по себе то расточительство, от которого потолок и
+// защищает.
 function createNetServer({
   registry, ownership, broadcast, outputBuffer, staticRoots, port = 48300, host = '127.0.0.1', allowedHosts = [],
+  maxFrameBytes = MAX_FRAME_BYTES,
 }) {
   let server = null;
   let wss = null;
@@ -358,6 +386,7 @@ function createNetServer({
         wss = new WebSocket.Server({
           server,
           path: '/ws',
+          maxPayload: maxFrameBytes,
           verifyClient: (info, callback) => {
             const ok = isAllowedOrigin(info.origin, info.req.headers.host);
             callback(ok, ok ? undefined : 403, ok ? undefined : 'чужой origin/host');
@@ -469,4 +498,7 @@ function createNetServer({
   };
 }
 
-module.exports = { createNetServer };
+// MAX_FRAME_BYTES экспортируется ради теста: без него мутация «вернуть дефолт
+// 100 МиБ» проходила незамеченной — тесты задают потолок явным параметром, а
+// само значение по умолчанию не проверял никто.
+module.exports = { createNetServer, MAX_FRAME_BYTES };
