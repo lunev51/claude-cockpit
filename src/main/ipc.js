@@ -1061,9 +1061,16 @@ function dropTabOutputBuffer({ tabId, outputBuffer }) {
 // Кривой размер ХУЖЕ прежнего: ConPTY на нулевых колонках ломает перерисовку
 // Claude Code. Вынесена наружу ради собственного теста (тот же приём, что у
 // bufferTermData выше) — см. test/ipc-handoff-wiring.test.js.
+// Поле называется tabId — так его отдаёт manager.list() (sessions.js). Здесь
+// стояло tab.id, то есть undefined на каждой вкладке: переразмер при пересадке
+// не срабатывал НИ РАЗУ с самого появления эстафеты, и держалось это на тесте,
+// который кормил функцию фикстурой {id: 'T1'} — формой, которой в проде нет.
+// Живой замер (09.08): фоновая вкладка после возврата руля оставалась в
+// размере ушедшего клиента (140 колонок при окне на 105), чинилась только
+// переключением на неё — ResizeObserver в terminal.js слал term:resize сам.
 function applyHandoffSize({ manager, size }) {
   if (!size || !(size.cols > 0) || !(size.rows > 0)) return;
-  for (const tab of manager.list()) manager.resize(tab.id, size.cols, size.rows);
+  for (const tab of manager.list()) manager.resize(tab.tabId, size.cols, size.rows);
 }
 
 // Вся проводка эстафеты одним куском: владение + гард записи. Вынесена из
