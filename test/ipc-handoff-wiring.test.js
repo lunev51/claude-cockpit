@@ -6,8 +6,18 @@
 const { test } = require('node:test');
 const assert = require('node:assert');
 const { applyHandoffSize } = require('../src/main/ipc');
+const { createSessionManager } = require('../src/main/sessions');
 
+// Форма вкладки здесь ОБЯЗАНА совпадать с manager.list() из sessions.js —
+// поле называется tabId. Фикстура с чужим именем ключа однажды уже сделала
+// главный тест этого файла холостым: applyHandoffSize читал tab.id, фикстура
+// его же и подсовывала, а прод молча ресайзил undefined.
 function fakeManager(tabs) {
+  for (const t of tabs) {
+    if (!t || typeof t.tabId !== 'string') {
+      throw new Error('фикстура вкладки без tabId — она разъехалась с manager.list() из sessions.js');
+    }
+  }
   const calls = [];
   return {
     calls,
@@ -16,23 +26,67 @@ function fakeManager(tabs) {
   };
 }
 
+// НАСТОЯЩИЙ менеджер сессий с фейковой фабрикой pty — тот же приём, что в
+// test/sessions.test.js. Нужен здесь именно настоящий: главный тест ниже
+// раньше кормил applyHandoffSize фикстурой {id: 'T1'}, а прод отдаёт {tabId},
+// и функция молча ресайзила undefined. Тест был зелёным, переразмер при
+// пересадке не работал ни разу — поймать это могла только настоящая форма
+// списка (живой замер 09.08: фоновая вкладка оставалась в размере ушедшего).
+function realManager() {
+  const spawned = [];
+  const ptyFactory = (opts) => {
+    const proc = {
+      opts,
+      pid: 1000 + spawned.length,
+      cols: null,
+      rows: null,
+      write() {},
+      resize(c, r) { this.cols = c; this.rows = r; },
+      kill() {},
+      onData() {},
+      onExit() {},
+    };
+    spawned.push(proc);
+    return proc;
+  };
+  const mgr = createSessionManager({
+    ptyFactory,
+    getTermConfig: () => ({ command: 'claude', args: [], useConpty: true, useConptyDll: true }),
+    onEvent: () => {},
+    now: () => 0,
+  });
+  return { mgr, spawned };
+}
+
 test('смена владельца переразмеривает ВСЕ живые вкладки под его терминал', () => {
   // Все вкладки рисуются в одну и ту же область окна, значит размер у них
   // общий: подогнать только активную — оставить остальные в чужой раскладке,
   // и Claude Code в них перерисуется криво при первом же переключении.
-  const manager = fakeManager([{ id: 'T1' }, { id: 'T2' }, { id: 'T3' }]);
-  applyHandoffSize({ manager, size: { cols: 120, rows: 40 } });
-  assert.deepStrictEqual(manager.calls, [
-    { tabId: 'T1', cols: 120, rows: 40 },
-    { tabId: 'T2', cols: 120, rows: 40 },
-    { tabId: 'T3', cols: 120, rows: 40 },
-  ]);
+  //
+  // Проверяем на настоящем менеджере и по настоящему следствию — размеру,
+  // доехавшему до самого pty. Так тест не может разъехаться с формой списка.
+  const { mgr, spawned } = realManager();
+  const ids = ['A', 'B', 'C'].map((name) => mgr.open({ cwd: `C:\\${name}` }).tabId);
+  for (const tabId of ids) mgr.start(tabId, 80, 24);
+  assert.strictEqual(spawned.length, 3, 'фейковая фабрика pty не отработала — тест проверял бы пустоту');
+
+  applyHandoffSize({ manager: mgr, size: { cols: 120, rows: 40 } });
+
+  assert.deepStrictEqual(
+    spawned.map((p) => ({ cols: p.cols, rows: p.rows })),
+    [
+      { cols: 120, rows: 40 },
+      { cols: 120, rows: 40 },
+      { cols: 120, rows: 40 },
+    ],
+    'размер нового владельца доехал не до всех pty: вкладки, кроме активной, остались в чужой раскладке',
+  );
 });
 
 test('без размера не трогаем ничего', () => {
   // Кривой размер ХУЖЕ прежнего: ConPTY на нулевых колонках ломает
   // перерисовку Claude Code, и вкладка остаётся с мусором на экране.
-  const manager = fakeManager([{ id: 'T1' }]);
+  const manager = fakeManager([{ tabId: 'T1' }]);
   applyHandoffSize({ manager, size: null });
   applyHandoffSize({ manager, size: undefined });
   applyHandoffSize({ manager, size: { cols: 0, rows: 0 } });
@@ -58,7 +112,7 @@ test('вкладок нет — не падаем', () => {
 
 const { createHandoffWiring } = require('../src/main/ipc');
 
-function makeWiring(tabs = [{ id: 'T1' }, { id: 'T2' }]) {
+function makeWiring(tabs = [{ tabId: 'T1' }, { tabId: 'T2' }]) {
   const manager = fakeManager(tabs);
   const events = [];
   const owners = [];
@@ -245,7 +299,7 @@ test('ownership доезжает до сетевого сервера и нар�
 
 test('createHandoffWiring не требует необязательных зависимостей', () => {
   const { ownership, guard } = createHandoffWiring({
-    manager: fakeManager([{ id: 'T1' }]),
+    manager: fakeManager([{ tabId: 'T1' }]),
     broadcast: { emit: () => {} },
   });
   assert.doesNotThrow(() => ownership.claim('c1', { cols: 80, rows: 24 }));

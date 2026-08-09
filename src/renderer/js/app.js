@@ -2451,7 +2451,31 @@ function afterControlLost() {
   workspaceBootPending = true;
 }
 
+// Захват уезжает с размером НАШЕГО терминала, и main подгоняет под него все
+// живые pty (applyHandoffSize). Если активной вкладки нет, termSize() отдаёт
+// запасные 80×24 — и они применились бы ко ВСЕМ сессиям: широкое окно, а
+// Claude Code перерисован в 80 колонок. А активной вкладки закономерно НЕ
+// бывает у того, кому вкладки приехали синхронизацией (их завёл сосед —
+// syncTabsFromMain подключает без активации, чтобы не дёргать человека).
+//
+// Поэтому перед захватом показываем вкладку: размер становится настоящим, и
+// человек, забравший управление, видит терминал, а не пустой экран.
+function ensureActiveTabForHandoff() {
+  if (views.has(tabStore?.activeId)) return;
+  const first = [...views.keys()][0];
+  if (!first) return; // вкладок нет вовсе — запасной размер безвреден, ресайзить нечего
+  activateTab(first);
+  // refit синхронно: activateTab только показывает контейнер, а term.cols до
+  // пересчёта остаётся прежним — в claim уехал бы размер скрытого терминала.
+  try {
+    views.get(first)?.view.refit();
+  } catch (err) {
+    console.warn('[эстафета] пересчёт размера показанной вкладки не удался:', err && err.message);
+  }
+}
+
 async function claimControl() {
+  ensureActiveTabForHandoff();
   const { cols, rows } = termSize();
   const hadControl = hasControl();
   try {
