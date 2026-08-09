@@ -19,7 +19,7 @@ const os = require('node:os');
 const net = require('node:net');
 const { EventEmitter } = require('node:events');
 const WebSocket = require('ws');
-const { createNetServer } = require('../src/main/net-server');
+const { createNetServer, MAX_FRAME_BYTES } = require('../src/main/net-server');
 const { createCommandRegistry } = require('../src/main/command-registry');
 const { createBroadcast } = require('../src/main/broadcast');
 const { createOutputBuffer } = require('../src/main/output-buffer');
@@ -337,6 +337,74 @@ test('сбой fs при поиске файла не роняет процес�
   // И сервер продолжает работать: следующий запрос отдаёт страницу как обычно.
   const after = await fetch(`http://127.0.0.1:${port}/index.html`);
   assert.strictEqual(after.status, 200, 'после сбоя fs сервер перестал отдавать статику');
+});
+
+test('кадр больше потолка рвёт соединение, а не съедает память', async () => {
+  // Ревью 09.08: maxPayload не задавался, и действовал дефолт ws — 100 МиБ.
+  // Один кадр держит в памяти сырой буфер, его копию строкой и результат
+  // JSON.parse, то есть кратно больше самого кадра; на машине с 8 ГБ это
+  // прямой путь в своп. Потолок проверяем маленьким значением — слать
+  // настоящие 16 МиБ ради теста значило бы делать ровно то, от чего защита.
+  const { server } = makeServer({ maxFrameBytes: 1024 });
+  const { port } = await server.start();
+  const ws = await open(`ws://127.0.0.1:${port}/ws`);
+  const closed = new Promise((resolve) => ws.on('close', (code) => resolve(code)));
+  ws.send(JSON.stringify({ id: 1, channel: 'эхо', args: ['x'.repeat(4096)] }));
+  const code = await closed;
+  assert.strictEqual(code, 1009, `ждали 1009 (кадр слишком велик), пришло ${code}`);
+
+  // Сервер жив: следующий клиент работает как обычно — обрыв касается только
+  // нарушителя, а он переподключается сам (reconnectLoop в api-boot.js).
+  const again = await open(`ws://127.0.0.1:${port}/ws`);
+  again.send(JSON.stringify({ id: 2, channel: 'эхо', args: ['привет'] }));
+  assert.deepStrictEqual(await nextFrame(again), { id: 2, ok: true, result: { эхо: 'привет' } });
+  again.close();
+});
+
+test('параметр потолка по умолчанию берёт именно эту константу', () => {
+  // Ревью фикса: поведенческие тесты задают потолок явным параметром, а
+  // диапазонный смотрит только на константу — значит подмена ДЕФОЛТА
+  // ПАРАМЕТРА (maxFrameBytes = 100 МиБ при нетронутой константе) осталась бы
+  // зелёной. Проверить это поведением значило бы слать по сети 16 МиБ, то
+  // есть делать ровно то, от чего защищает потолок. Отсюда страж по
+  // исходнику — тот же приём, что у broadcast-guard и renderer-boot-guard.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'net-server.js'), 'utf8');
+  assert.match(
+    src,
+    /maxFrameBytes\s*=\s*MAX_FRAME_BYTES\b/,
+    'дефолт параметра maxFrameBytes больше не равен MAX_FRAME_BYTES: сервер в проде может слушать '
+    + 'с потолком, которого не видит ни один тест',
+  );
+});
+
+test('потолок по умолчанию заметно ниже дефолта ws и выше законных кадров', () => {
+  // Мутационная проверка показала: тесты выше задают потолок параметром, а
+  // само значение по умолчанию не проверял никто — «вернуть 100 МиБ» проходило
+  // зелёным. Границы обоснованы: сверху — дефолт ws, ради которого всё
+  // затевалось; снизу — самый тяжёлый законный кадр (ghost:save, снимок
+  // скроллбека на 2000 строк; GHOST_MAX_BYTES режет уже принятое до 512 КБ).
+  assert.ok(
+    MAX_FRAME_BYTES < 100 * 1024 * 1024,
+    `потолок ${MAX_FRAME_BYTES} — это дефолт ws или выше, то есть защиты нет`,
+  );
+  assert.ok(
+    MAX_FRAME_BYTES >= 4 * 1024 * 1024,
+    `потолок ${MAX_FRAME_BYTES} слишком низкий: снимок буфера вкладки начнёт рвать связь`,
+  );
+});
+
+test('кадр в пределах потолка проходит как обычно', async () => {
+  // Обратная сторона: потолок не должен резать законные крупные кадры
+  // (снимок буфера вкладки — самый тяжёлый из них).
+  const { server } = makeServer({ maxFrameBytes: 1024 * 1024 });
+  const { port } = await server.start();
+  const ws = await open(`ws://127.0.0.1:${port}/ws`);
+  const big = 'я'.repeat(200 * 1024); // ~400 КБ в UTF-8, заведомо ниже потолка
+  ws.send(JSON.stringify({ id: 7, channel: 'эхо', args: [big] }));
+  const frame = await nextFrame(ws);
+  assert.strictEqual(frame.ok, true, 'законный крупный кадр не должен отвергаться');
+  assert.strictEqual(frame.result['эхо'].length, big.length);
+  ws.close();
 });
 
 test('каталог не выдаётся за файл', async () => {
