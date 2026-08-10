@@ -157,8 +157,15 @@ function getConfig() {
   // рантайме. Патч здесь (а не в ipc.js) кладёт ключ в эффективный конфиг —
   // тост «см. stt.stackRoots в конфиге» ссылается на то, что пользователь
   // реально может увидеть через config:get.
+  //
+  // Ревью 09.08 (B8): здесь вторым элементом стоял путь с конкретной машины
+  // конкретного человека — `C:\Users\<имя>\...`. В публичном репозитории это
+  // и утечка структуры чужого диска, и мёртвая проверка существования у всех
+  // остальных. Дополнительные корни — свойство МАШИНЫ, а не программы, и им
+  // место в config.user.json (механизм оверлея ровно для этого и есть — тот
+  // же довод, что у net.host).
   if (!Array.isArray(cached.stt.stackRoots) || !cached.stt.stackRoots.length) {
-    cached.stt.stackRoots = [appRoot(), 'C:\\Users\\Lunev\\AssistClaude\\claude-companion'];
+    cached.stt.stackRoots = [appRoot()];
   }
   return cached;
 }

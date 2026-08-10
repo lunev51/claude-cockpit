@@ -80,6 +80,13 @@ contextBridge.exposeInMainWorld('api', {
     // win.webContents.toggleDevTools() (то же самое, что F12 в main.js).
     devtools: () => ipcRenderer.invoke('app:devtools'),
   },
+  // Видимость окна ПК: спрашиваем у main, потому что document.hidden здесь
+  // ненадёжен (backgroundThrottling:false, автозапуск с --hidden) — см.
+  // комментарий у этих каналов в api-shape.js.
+  window: {
+    isVisible: () => ipcRenderer.invoke('window:visible'),
+    onVisibility: (cb) => ipcRenderer.on('window:visibility', (_e, p) => cb(p)),
+  },
   project: {
     connect: (tabId) => ipcRenderer.invoke('project:connect', tabId),
     status: (tabId) => ipcRenderer.invoke('project:status', tabId),

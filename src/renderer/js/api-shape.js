@@ -46,6 +46,14 @@ export const API_SHAPE = {
   'owner.onHello': { channel: 'net:hello', kind: 'event' },
   'app.onNotice': { channel: 'app:notice', kind: 'event' },
   'app.devtools': { channel: 'app:devtools', kind: 'invoke' },
+  // Видимость ОКНА ПК (ревью 09.08, B7). Нужна, потому что document.hidden в
+  // этом окне ненадёжен: оно создаётся с backgroundThrottling:false, и по
+  // документации Electron состояние остаётся visible даже когда окно скрыто,
+  // а автозапуск с --hidden (show:false) и вовсе даёт visible у окна, которое
+  // человек ни разу не видел. Сетевому клиенту это событие не про него — у
+  // браузера есть собственный document.hidden.
+  'window.isVisible': { channel: 'window:visible', kind: 'invoke' },
+  'window.onVisibility': { channel: 'window:visibility', kind: 'event' },
   'project.connect': { channel: 'project:connect', kind: 'invoke' },
   'project.status': { channel: 'project:status', kind: 'invoke' },
   'git.get': { channel: 'git:get', kind: 'invoke' },
