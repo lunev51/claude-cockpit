@@ -22,25 +22,46 @@ const url = pathToFileURL(
 ).href;
 
 // Минимальный поддельный документ: ровно то, чем пользуется запасной путь.
-function fakeDoc({ execOk = true } = {}) {
-  const calls = { created: [], appended: 0, removed: 0, exec: [], selected: 0 };
-  return {
+// activeElement/contains добавлены под возврат фокуса (ревью 09.08, B2): без
+// них ветка восстановления не исполнялась вовсе, и мутация «захватить фокус
+// ПОСЛЕ area.focus()» — то есть запомнить само временное поле и потерять
+// настоящего владельца — оставалась зелёной.
+function fakeDoc({ execOk = true, activeElement = null, живВDOM = true } = {}) {
+  const calls = {
+    created: [], appended: 0, removed: 0, exec: [], selected: 0, restored: 0,
+  };
+  const doc = {
     calls,
+    activeElement,
     createElement(tag) {
       calls.created.push(tag);
-      return {
+      const area = {
         style: {},
         value: '',
         setAttribute() {},
-        focus() {},
+        focus() { doc.activeElement = area; },
         select() { calls.selected += 1; },
         setSelectionRange() {},
         remove() { calls.removed += 1; },
       };
+      return area;
     },
     body: { appendChild() { calls.appended += 1; } },
+    contains() { return живВDOM; },
     execCommand(cmd) { calls.exec.push(cmd); return execOk; },
   };
+  return doc;
+}
+
+// Тот, у кого копирование забирает фокус: считает, сколько раз его вернули.
+function фокусируемый(doc) {
+  const el = {
+    focus() {
+      doc.calls.restored += 1;
+      doc.activeElement = el;
+    },
+  };
+  return el;
 }
 
 test('когда Clipboard API есть — пользуемся им', async () => {
@@ -107,4 +128,51 @@ test('временное поле убирается, даже если execComm
   const ok = await copyText('привет', { clipboard: undefined, doc });
   assert.strictEqual(ok, false);
   assert.strictEqual(doc.calls.removed, 1, 'иначе поле останется висеть в DOM');
+});
+
+// === возврат фокуса (ревью 09.08, B2) ======================================
+//
+// Запасной путь фокусирует временное поле — иначе execCommand нечего
+// копировать. Если фокус не вернуть, он падает на body: клавиатура перестаёт
+// попадать в терминал, пока человек не кликнет мышью. Бьёт это по основному
+// сетевому сценарию (по http Clipboard API нет, а «копировать выделением»
+// включено по умолчанию), то есть ввод терялся после каждого выделения мышью.
+
+test('фокус возвращается тому, у кого его забрали', async () => {
+  const { copyText } = await import(url);
+  const doc = fakeDoc();
+  const владелец = фокусируемый(doc);
+  doc.activeElement = владелец;
+
+  const ok = await copyText('привет', { clipboard: undefined, doc });
+
+  assert.strictEqual(ok, true);
+  assert.strictEqual(doc.calls.restored, 1, 'фокус не вернулся — ввод уйдёт в body');
+  assert.strictEqual(doc.activeElement, владелец, 'фокус остался на удалённом временном поле');
+});
+
+test('фокус возвращается и когда копирование не удалось', async () => {
+  const { copyText } = await import(url);
+  const doc = fakeDoc({ execOk: false });
+  const владелец = фокусируемый(doc);
+  doc.activeElement = владелец;
+
+  const ok = await copyText('привет', { clipboard: undefined, doc });
+
+  assert.strictEqual(ok, false);
+  assert.strictEqual(doc.calls.restored, 1, 'при неудаче фокус тоже обязан вернуться');
+});
+
+test('исчезнувшему из DOM владельцу фокус не навязываем', async () => {
+  // Прежний владелец мог быть удалён, пока шло копирование (закрыли оверлей,
+  // перерисовали сайдбар). Тогда возвращать фокус некому — и focus() на
+  // оторванном узле только увёл бы его в никуда.
+  const { copyText } = await import(url);
+  const doc = fakeDoc({ живВDOM: false });
+  const владелец = фокусируемый(doc);
+  doc.activeElement = владелец;
+
+  await copyText('привет', { clipboard: undefined, doc });
+
+  assert.strictEqual(doc.calls.restored, 0, 'фокус вернули элементу, которого уже нет в документе');
 });
