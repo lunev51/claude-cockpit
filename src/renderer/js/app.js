@@ -1351,6 +1351,26 @@ function bindVoiceHotkey() {
   const holdKey = config.stt?.holdKey || 'ShiftRight';
   const minHoldMs = Number.isFinite(config.stt?.minHoldMs) ? config.stt.minHoldMs : 300;
 
+  // Голос работает только в окне на ПК (ревью 09.08, B11 — принято владельцем
+  // как ограничение 10.08). По сети запись не доезжает вовсе: recorder отдаёт
+  // ArrayBuffer, а транспорт сериализует кадр через JSON.stringify — у
+  // ArrayBuffer нет перечислимых свойств, и на провод уходит пустой объект.
+  // Main видит не WAV и отвечает «неверный формат», то есть человек получал
+  // сообщение про формат там, где на самом деле не отправился ни один байт.
+  //
+  // Чинить транспорт (base64 или отдельный бинарный кадр) не стали: владелец
+  // голосом с макбука не пользуется. Но молча делать вид, что кнопка есть,
+  // нельзя — говорим прямо, при первом же удержании клавиши.
+  if (window.__cockpitNetClient) {
+    let сказали = false;
+    window.addEventListener('keydown', (ev) => {
+      if (ev.code !== holdKey || ev.repeat || сказали) return;
+      сказали = true;
+      showToast('Голосовой ввод работает только в окне кокпита на ПК', 'warn');
+    });
+    return;
+  }
+
   voiceMachine = createVoiceMachine({
     recorder: voiceRecorder,
     transcribe: (wav) => window.api.stt.transcribe(wav),
