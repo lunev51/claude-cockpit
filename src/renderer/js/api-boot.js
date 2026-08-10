@@ -7,6 +7,10 @@
 // готовности window.api (ревью задачи 6, Critical 1).
 import { createNetApi } from './net-api.js';
 import { API_SHAPE } from './api-shape.js';
+// Копирование с отступлением на execCommand — тот же путь, что у терминала.
+// В незащищённом контексте (кокпит по сети отдаётся по http) navigator.clipboard
+// недоступен, и без этого отступления обещание «ссылка в буфере» было ложью.
+import { copyText } from './clipboard.js';
 
 // Недоступный сервер не должен вешать страницу навсегда (ревью задачи 6,
 // Important 2) — таймаут ловит тихо непослушный порт (пакеты роняются без
@@ -149,12 +153,20 @@ if (!window.api) {
     if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return;
     const activation = navigator.userActivation;
     if (activation && activation.isActive === false) {
+      // Сначала пробуем положить ссылку в буфер, и только потом говорим, что
+      // с ней стало. Раньше тост уходил ДО попытки и обещал буфер безусловно,
+      // а запись шла через navigator.clipboard — недоступный по http, то есть
+      // ровно в том контексте, ради которого эта ветка и написана. Человек
+      // жал Cmd+V и получал не то (ревью 09.08, B3).
+      //
+      // copyText — тот же путь, что у копирования из терминала: он сам
+      // отступает на execCommand, когда Clipboard API нет.
+      const copied = await copyText(url);
       window.dispatchEvent(new CustomEvent('cockpit:toast', {
-        detail: { text: 'браузер не дал открыть ссылку — она в буфере обмена', level: 'warn' },
+        detail: copied
+          ? { text: 'браузер не дал открыть ссылку — она в буфере обмена', level: 'warn' }
+          : { text: `браузер не дал открыть ссылку, и в буфер её положить не вышло: ${url}`, level: 'warn' },
       }));
-      try {
-        await navigator.clipboard.writeText(url);
-      } catch { /* буфер тоже могут не дать — тогда остаётся только текст тоста */ }
       return;
     }
     window.open(url, '_blank', 'noopener');

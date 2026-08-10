@@ -43,6 +43,13 @@ export async function copyText(text, {
   area.style.top = '-1000px';
   area.style.opacity = '0';
   area.setAttribute('readonly', '');
+  // Кого фокус покидает — тому и вернём. Без этого после КАЖДОГО копирования
+  // фокус оставался на удалённом поле и падал на body: клавиатура переставала
+  // попадать в терминал, пока человек не кликнет мышью (ревью 09.08, B2).
+  // Бьёт это по основному сетевому сценарию: в браузере по http Clipboard API
+  // недоступен, работает именно этот путь, а «копировать выделением» включено
+  // по умолчанию — то есть ввод терялся на каждом выделении текста мышью.
+  const previous = doc.activeElement;
   doc.body.appendChild(area);
   try {
     area.focus();
@@ -54,5 +61,10 @@ export async function copyText(text, {
   } finally {
     // Поле обязано уйти при любом исходе, иначе останется висеть в DOM.
     area.remove();
+    // Возвращаем фокус только живому элементу, который его умеет принимать:
+    // прежний владелец мог исчезнуть из DOM, пока шло копирование.
+    if (previous && typeof previous.focus === 'function' && doc.contains(previous)) {
+      try { previous.focus(); } catch { /* элемент мог стать нефокусируемым */ }
+    }
   }
 }

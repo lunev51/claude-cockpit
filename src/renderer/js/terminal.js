@@ -58,6 +58,9 @@ function stripAnsi(text) {
 // известный sessionId. Подключение не имеет права вести себя хуже рестарта.
 export function initTerminal(container, config, {
   tabId, onPtyStatus, onFontSize = () => {}, preludeText = null, autoStart = true,
+  // Перезапуск по Ctrl+Shift+R отдаём наружу: проверка управления и объяснение
+  // отказа живут в app.js, а импортировать его отсюда нельзя — цикл.
+  onRestartRequest = null,
 }) {
   const cfg = config.terminal;
   const term = new window.Terminal({
@@ -250,11 +253,20 @@ export function initTerminal(container, config, {
   term.attachCustomKeyEventHandler((ev) => {
     if (ev.type !== 'keydown') return true;
 
-    // Ctrl+Shift+R — перезапуск завершённого процесса.
+    // Ctrl+Shift+R — перезапуск завершённого процесса. Идёт через колбэк, а не
+    // напрямую в window.api: это ТРЕТЬЯ дверь к одному действию (кнопка ⟳ и
+    // палитра — первые две), и она обязана проверять управление и объяснять
+    // отказ теми же словами. Раньше слала term:restart сама и у клиента без
+    // управления молча не срабатывала — ровно находка B1, только замеченная
+    // уже на ревью её фикса.
+    //
+    // Колбэк, а не импорт: app.js импортирует этот модуль, обратный импорт дал
+    // бы цикл. Тот же приём, что у autoStart/onPtyStatus выше.
     if (ev.ctrlKey && ev.shiftKey && !ev.altKey && !ev.metaKey
         && (ev.key === 'R' || ev.key === 'r' || ev.code === 'KeyR')) {
       ev.preventDefault();
-      window.api.term.restart(tabId);
+      if (typeof onRestartRequest === 'function') onRestartRequest(tabId);
+      else window.api.term.restart(tabId); // модуль подняли без колбэка — прежнее поведение
       return false;
     }
 
