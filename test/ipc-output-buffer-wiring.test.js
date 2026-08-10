@@ -96,3 +96,54 @@ test('проводка: dropTabOutputBuffer зовётся из tabs:close РО�
   const count = countOccurrences(ipcSrc, signature);
   assert.ok(count >= 2, `в ipc.js только ${count} вхождение(й) "${signature}" — вызов из tabs:close пропал или подменён (диверсия д ре-ревью)`);
 });
+
+// Ревью 09.08 (TDZ). outputBuffer объявлялся на ~200 строк НИЖЕ замыкания
+// onEvent, которое его зовёт. Сегодня это работает только потому, что ни одно
+// событие не приходит синхронно в этом промежутке, то есть корректность держится
+// на тайминге, а не на коде: правка, эмитящая term:data синхронно при создании
+// менеджера сессий, дала бы ReferenceError на старте ВСЕГО приложения — и
+// только в проде, потому что registerIpc под node --test не запускается.
+// Ровно от этого класса broadcast в своё время подняли в начало registerIpc
+// (см. комментарий у его объявления), для outputBuffer приём не применили.
+//
+// Проверяем текстом: объявление обязано идти РАНЬШЕ первого использования.
+test('outputBuffer и broadcast объявлены раньше, чем ими пользуются замыкания', () => {
+  const start = ipcSrc.indexOf('function registerIpc(');
+  assert.notStrictEqual(start, -1, 'не найдена registerIpc — страж разъехался с исходником');
+
+  // Обе позиции — НОМЕРА СТРОК и обе с одинаковой зачисткой комментариев.
+  // Замечание ревью фикса: сначала объявление искалось сырым indexOf, а
+  // употребление — с пропуском комментариев. В этом файле комментарии
+  // регулярно цитируют код дословно, так что комментарий с текстом
+  // объявления выше первого употребления делал стража слепым ровно к той
+  // мине, ради которой он написан.
+  const lines = ipcSrc.slice(start).split(/\r?\n/);
+  const codeOf = (line) => line.replace(/^\s*\/\/.*/, '').replace(/\/\/.*$/, '');
+
+  for (const [name, declaration] of [
+    ['outputBuffer', 'const outputBuffer = createOutputBuffer('],
+    ['broadcast', 'const broadcast = createBroadcast('],
+  ]) {
+    let declaredLine = -1;
+    let firstUseLine = -1;
+    for (let i = 0; i < lines.length; i += 1) {
+      const code = codeOf(lines[i]);
+      if (declaredLine === -1 && code.includes(declaration)) { declaredLine = i; continue; }
+      // Имя как часть другого идентификатора (outputBufferSize) тоже считаем
+      // употреблением: ложная тревога здесь громкая и дешёвая, а пропуск
+      // настоящей мины стоит падения приложения на старте.
+      if (firstUseLine === -1 && code.includes(name)) firstUseLine = i;
+      if (declaredLine !== -1 && firstUseLine !== -1) break;
+    }
+
+    assert.notStrictEqual(declaredLine, -1, `в registerIpc не найдено объявление ${name}`);
+    if (firstUseLine === -1) continue; // имя больше нигде не используется
+
+    assert.ok(
+      declaredLine < firstUseLine,
+      `${name} используется раньше своего объявления (TDZ-мина): объявление на строке ${declaredLine} `
+      + `тела registerIpc, первое употребление — на ${firstUseLine}. Синхронный вызов такого замыкания `
+      + 'уронил бы старт всего приложения, и только в проде — registerIpc под node --test не запускается.',
+    );
+  }
+});
