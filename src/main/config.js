@@ -6,6 +6,10 @@ const fs = require('fs');
 const path = require('path');
 const { app } = require('electron');
 const { appRoot } = require('./paths');
+// Чтение/запись пользовательского оверлея вынесены в отдельный модуль без
+// electron — иначе эта логика (сохранность настроек) осталась бы непокрытой:
+// config.js под node --test не грузится вовсе.
+const { readOverlay, writeOverlay } = require('./config-overlay');
 
 const DEFAULTS = {
   terminal: {
@@ -132,7 +136,7 @@ function getConfig() {
   if (cached) return cached;
   // Трёхслойная загрузка: DEFAULTS ← config.json (корень) ← оверлей userData.
   const projectFile = readJson(path.join(appRoot(), 'config.json'), true);
-  const overlay = readJson(overlayPath());
+  const overlay = readOverlay(overlayPath());
   cached = deepMerge(deepMerge(DEFAULTS, projectFile), overlay);
   if (!cached.terminal.cwd) cached.terminal.cwd = app.getPath('home');
   // Minor-4/5 (ревью Task 2 фазы 9): вычисляемые/восстановительные патчи
@@ -153,9 +157,9 @@ function getConfig() {
 
 // Deep-merge partial в текущий оверлей, записать оверлей-файл, сбросить кэш.
 function setConfig(partial) {
-  const overlay = readJson(overlayPath());
+  const overlay = readOverlay(overlayPath());
   const merged = deepMerge(overlay, partial || {});
-  fs.writeFileSync(overlayPath(), JSON.stringify(merged, null, 2), 'utf8');
+  writeOverlay(overlayPath(), merged);
   cached = null;
   return getConfig();
 }
