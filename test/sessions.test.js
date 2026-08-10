@@ -2466,3 +2466,103 @@ test('sessionLabel Minor 2: запоздавший ответ старой се�
   await flushAsync();
   assert.strictEqual(mgr.list().find((t) => t.tabId === a.tabId).sessionLabel, 'RZ paper');
 });
+
+// === B6: провал резюма из start() детектится так же, как из restart() ======
+//
+// Ревью 09.08. start() при живом sessionId достраивает `--resume <id>` (см.
+// Important 2 в самом ядре), но, в отличие от restart(), не сбрасывал
+// sessionBound. А onExit считает провал как `usedOverride && !sessionBound` —
+// то есть у вкладки, которая УЖЕ жила и была привязана, флаг оставался true с
+// прошлой жизни, и провал резюма не детектился вовсе: не обнулялся протухший
+// sessionId, не срабатывало авто-восстановление, мёртвый id уезжал в манифест,
+// и следующий запуск кокпита снова резюмил мертвеца.
+
+test('start: провал резюма протухшей сессии подхватывается авто-восстановлением', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+
+  mgr.start(a.tabId, 80, 24); // спавн #1
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'sess-1' }); // привязались
+  factory.spawned[0].opts.onExit(0); // процесс завершился, вкладка мертва
+
+  mgr.start(a.tabId, 80, 24); // спавн #2: ядро само достраивает --resume sess-1
+  assert.deepStrictEqual(factory.spawned[1].opts.args, ['--resume', 'sess-1']);
+
+  // Резюм провалился: процесс умер, SessionStart за его жизнь не пришёл.
+  factory.spawned[1].opts.onExit(1);
+
+  assert.strictEqual(
+    factory.spawned.length, 3,
+    'провал резюма из start() не детектится — авто-восстановление не сработало',
+  );
+  assert.deepStrictEqual(
+    factory.spawned[2].opts.args, [],
+    'авто-восстановление обязано поднять ЧИСТУЮ сессию, без протухшего id',
+  );
+  const tab = mgr.list().find((t) => t.tabId === a.tabId);
+  assert.strictEqual(tab.sessionId, null, 'протухший sessionId уедет в манифест и переживёт перезапуск кокпита');
+});
+
+test('авто-восстановление доступно снова после того, как вкладка ожила', () => {
+  // Гард одноразовости (autoRecovered) не переживает целую жизнь вкладки:
+  // его гасит bindSession — «резюм действительно удался». Сценарий: вкладку
+  // уже спасали авто-восстановлением, она привязалась к новой сессии,
+  // поработала и умерла; следующий резюм тоже провалился — спасать обязаны
+  // снова, иначе вкладка останется мёртвой с протухшим id.
+  //
+  // Тест написан, когда я добавил в start() симметричный сброс этого флага:
+  // мутация показала, что удаление той строки не ловится ничем, потому что
+  // флаг к тому моменту уже false. Строку убрал, а проверку инварианта
+  // оставил — она стережёт настоящее место сброса.
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+
+  // Жизнь первая: провал резюма → авто-восстановление (спавн #3).
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'sess-1' });
+  factory.spawned[0].opts.onExit(0);
+  mgr.start(a.tabId, 80, 24);
+  factory.spawned[1].opts.onExit(1);
+  assert.strictEqual(factory.spawned.length, 3, 'первое авто-восстановление не сработало');
+
+  // Вкладка ожила и привязалась к новой сессии, поработала, завершилась.
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'sess-2' });
+  factory.spawned[2].opts.onExit(0);
+
+  // Жизнь вторая: снова резюмим и снова проваливаемся.
+  mgr.start(a.tabId, 80, 24);
+  assert.deepStrictEqual(factory.spawned[3].opts.args, ['--resume', 'sess-2']);
+  factory.spawned[3].opts.onExit(1);
+
+  assert.strictEqual(
+    factory.spawned.length, 5,
+    'второй провал резюма никто не подхватил — гард одноразовости пережил жизнь вкладки',
+  );
+  assert.deepStrictEqual(factory.spawned[4].opts.args, [], 'спасать надо чистой сессией, без протухшего id');
+});
+
+// === B9: очередь промптов видна тому, кто подключился к живым вкладкам =====
+
+test('list отдаёт очередь промптов — иначе подключившийся клиент её не увидит', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+
+  mgr.enqueue(a.tabId, 'сначала это');
+  mgr.enqueue(a.tabId, 'потом это');
+
+  const tab = mgr.list().find((t) => t.tabId === a.tabId);
+  assert.deepStrictEqual(
+    tab.queue.map((s) => s.trim()),
+    ['сначала это', 'потом это'],
+    'очередь не попала в list — клиент после перезагрузки страницы покажет пустую строку чипов',
+  );
+
+  // Копия, а не сам массив: снаружи его нельзя менять мимо ядра.
+  tab.queue.push('чужой элемент');
+  const снова = mgr.list().find((t) => t.tabId === a.tabId);
+  assert.strictEqual(снова.queue.length, 2, 'list отдал внутренний массив наружу — очередь можно испортить извне');
+});
