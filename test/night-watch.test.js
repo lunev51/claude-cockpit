@@ -45,8 +45,24 @@ function fakeTimers() {
     liveCount() {
       return live.size;
     },
+    // Живые таймеры в порядке планирования — тестам сна нужно стрелять
+    // конкретным (будильник против сторожа), а не «последним запланированным».
+    liveIds() {
+      return [...live.keys()];
+    },
+    msOf(id) {
+      const entry = live.get(id);
+      return entry ? entry.ms : null;
+    },
   };
 }
+
+// Ожидание сброса стоит на ДВУХ таймерах: длинный будильник на сам срок и
+// короткий сторож, который переживёт сон машины (см. блок тестов про сон).
+// Опознаём их по заказанной задержке, а не по порядку планирования.
+const WATCHDOG_MS = 60000;
+const watchdogId = (timers) => timers.liveIds().find((id) => timers.msOf(id) === WATCHDOG_MS);
+const alarmId = (timers) => timers.liveIds().find((id) => timers.msOf(id) !== WATCHDOG_MS);
 
 function fakeJournal() {
   let entries = [];
@@ -160,7 +176,11 @@ test('детект: working + Stop + fiveHour>=95% → pending, планируе
   assert.strictEqual(last.type, 'limit-stop');
   assert.strictEqual(last.tabId, 'tab1');
   assert.strictEqual(last.detail, String(resetsAt));
-  assert.strictEqual(ctx.timers.liveCount(), 1);
+  // Таймеров ДВА: длинный будильник на сам срок и короткий сторож, который
+  // подстрахует, если машина уснёт и длинный таймер не переживёт resume
+  // (см. блок тестов про сон).
+  assert.strictEqual(ctx.timers.liveCount(), 2);
+  assert.ok(watchdogId(ctx.timers), 'сторож обязан стоять рядом с будильником');
 });
 
 test('prevStatus !== working (например done) → тишина, refreshUsage не вызывается', async () => {
@@ -906,7 +926,7 @@ test('forget: закрытие ЕДИНСТВЕННОЙ pending-вкладки �
   ctx.nw.arm();
   await ctx.nw.onTabStop('tab1', 'working');
   assert.strictEqual(ctx.blocker.startCount, 1);
-  assert.strictEqual(ctx.timers.liveCount(), 1, 'таймер ожидания сброса запланирован');
+  assert.strictEqual(ctx.timers.liveCount(), 2, 'ожидание держится на будильнике и стороже');
 
   ctx.nw.forget('tab1');
 
@@ -1054,7 +1074,7 @@ test('dispose(): гасит armed/pending синхронно — ядро не �
   ctx.nw.arm();
   await ctx.nw.onTabStop('tab1', 'working');
   assert.strictEqual(ctx.nw.isArmed(), true);
-  assert.strictEqual(ctx.timers.liveCount(), 1);
+  assert.strictEqual(ctx.timers.liveCount(), 2, 'будильник и сторож');
   assert.strictEqual(ctx.blocker.startCount, 1);
 
   ctx.nw.dispose();
@@ -1334,4 +1354,185 @@ test('N1: forget последней pending-вкладки во время await
   assert.ok(!types.includes('retry'), 'ретраев при пустом pending нет');
   assert.ok(!types.includes('wake-complete'), 'фантомного пробуждения нет');
   assert.strictEqual(ctx.blocker.startCount, ctx.blocker.stopCount, 'блокер снят');
+});
+
+// === сон машины: будильник обязан пережить его (ревью 09.08, находка A7) ===
+//
+// Вся фича держалась на ОДНОМ длинном setTimeout до момента сброса лимита.
+// powerSaveBlocker удерживает систему от АВТОсна, но не от ручного «Сон»,
+// закрытой крышки, гибернации по разряду и отказа самого блокера. Поведение
+// длинных таймеров Node/Electron после resume на Windows недетерминировано:
+// таймер может «доспать» остаток уже после пробуждения машины (то есть
+// выстрелить на часы позже срока) или не выстрелить до утра.
+//
+// Отказ при этом тихий: в журнале останется armed + limit-stop и больше
+// ничего, а фича именно ради этого момента и существует. Поэтому в ядре есть
+// сторож: короткий повторяющийся таймер, который сам замечает, что срок
+// вышел, и будит. Короткие таймеры переживают resume несравнимо надёжнее.
+
+test('сон: длинный таймер не выстрелил, сторож будит сам', async () => {
+  const resetsAt = 100000;
+  const usage = makeUsageToggle({ resetsAt });
+  const ctx = setup({ refreshUsage: usage, statuses: new Map([['tab1', 'done']]) });
+  ctx.nw.arm();
+  await ctx.nw.onTabStop('tab1', 'working');
+
+  const wakeAt = ctx.nw.snapshot().wakeAt;
+  const guard = watchdogId(ctx.timers);
+  assert.ok(guard, 'сторож не запланирован — будильник остался без страховки на случай сна');
+
+  // Машина спала: время ушло далеко за срок, а основной таймер не выстрелил.
+  usage.markReset();
+  ctx.clock.set(wakeAt + 3600000);
+
+  await ctx.timers.fire(guard);
+  await Promise.resolve();
+
+  const types = ctx.journal.entries.map((e) => e.type);
+  assert.ok(types.includes('wake-complete'), `пробуждения не случилось: ${types.join(', ')}`);
+  assert.strictEqual(ctx.write.calls.length, 1, 'вкладке не отправили «продолжай»');
+  // Живых таймеров не остаётся — в том числе того самого длинного будильника,
+  // который в этот момент ещё не выстрелил. Ревью фикса показало цену
+  // осиротевшего хендла: он доспит своё часы спустя, посреди СЛЕДУЮЩЕГО цикла
+  // ожидания, собьёт его wakeAt, снимет его сторожа и уведёт ночь в ретраи до
+  // gave-up — то есть тихий отказ, против которого весь фикс и писался.
+  assert.strictEqual(ctx.timers.liveCount(), 0, 'после пробуждения через сторожа остался живой таймер');
+});
+
+test('сторож не будит раньше срока, а ждёт дальше', async () => {
+  const resetsAt = 100000;
+  const ctx = setup({
+    refreshUsage: makeUsageToggle({ resetsAt }),
+    statuses: new Map([['tab1', 'done']]),
+  });
+  ctx.nw.arm();
+  await ctx.nw.onTabStop('tab1', 'working');
+
+  const guard = watchdogId(ctx.timers);
+  ctx.clock.set(50000); // до срока ещё далеко
+
+  await ctx.timers.fire(guard);
+  await Promise.resolve();
+
+  const types = ctx.journal.entries.map((e) => e.type);
+  assert.ok(!types.includes('wake-complete'), 'сторож разбудил раньше времени');
+  assert.ok(watchdogId(ctx.timers), 'сторож обязан перепланировать себя, а не умолкнуть до утра');
+  assert.strictEqual(ctx.nw.snapshot().wakeAt, resetsAt + 60000, 'срок будильника не должен меняться');
+});
+
+test('первый вошедший в пробуждение снимает таймер конкурента', async () => {
+  // Оба пути ведут в одну функцию, и после сна машины могут сработать почти
+  // одновременно. Раньше вход в пробуждение просто обнулял хендл будильника,
+  // не снимая его, — конкурент оставался жив. Теперь первый вошедший снимает
+  // его явно, и второго входа не существует в принципе.
+  //
+  // Ревью фикса показало, почему это важнее «двойного продолжай»: в
+  // ретрай-ветке (окно ещё не сброшено) pending НЕ очищается, и два прохода
+  // нарастили бы retries вдвое, спалив окно ожидания в два раза быстрее.
+  const resetsAt = 100000;
+  const usage = makeUsageToggle({ resetsAt });
+  const ctx = setup({ refreshUsage: usage, statuses: new Map([['tab1', 'done']]) });
+  ctx.nw.arm();
+  await ctx.nw.onTabStop('tab1', 'working');
+
+  const guard = watchdogId(ctx.timers);
+  const alarm = alarmId(ctx.timers);
+  usage.markReset();
+  ctx.clock.set(resetsAt + 60000);
+
+  await ctx.timers.fire(guard); // будит сторож — будильник ещё жив
+  await Promise.resolve();
+
+  assert.throws(
+    () => ctx.timers.fire(alarm),
+    /не запланирован|уже снят/,
+    'будильник пережил пробуждение через сторожа и выстрелит сиротой посреди следующего цикла',
+  );
+
+  const completes = ctx.journal.entries.filter((e) => e.type === 'wake-complete');
+  assert.strictEqual(completes.length, 1, 'пробуждение обязано случиться ровно один раз');
+  assert.strictEqual(ctx.write.calls.length, 1, '«продолжай» отправлено дважды');
+});
+
+test('ретрай-ветка: сторожевое пробуждение не сжигает окно вдвое', async () => {
+  // Самый дорогой случай двойного прохода: окно ещё не сброшено, pending не
+  // очищается, и второй проход нарастил бы retries второй раз.
+  const resetsAt = 100000;
+  const ctx = setup({
+    refreshUsage: async () => usageOk({ fiveHourPercent: 99, resetsAt }),
+    statuses: new Map([['tab1', 'done']]),
+  });
+  ctx.nw.arm();
+  await ctx.nw.onTabStop('tab1', 'working');
+
+  ctx.clock.set(resetsAt + 60000);
+  await ctx.timers.fire(watchdogId(ctx.timers));
+  await Promise.resolve();
+  await Promise.resolve();
+
+  const retriesLogged = ctx.journal.entries.filter((e) => e.type === 'retry');
+  assert.strictEqual(retriesLogged.length, 1, `окно сгорело за один заход: ${retriesLogged.length} ретраев`);
+  assert.strictEqual(retriesLogged[0].detail, '1 (tab1)', 'счётчик ретраев ушёл вперёд');
+});
+
+test('сторож снимается вместе со взводом', async () => {
+  const ctx = setup({
+    refreshUsage: makeUsageToggle({ resetsAt: 100000 }),
+    statuses: new Map([['tab1', 'done']]),
+  });
+  ctx.nw.arm();
+  await ctx.nw.onTabStop('tab1', 'working');
+  assert.ok(ctx.timers.liveCount() >= 2, 'ожидались будильник и сторож');
+
+  ctx.nw.disarm();
+  assert.strictEqual(ctx.timers.liveCount(), 0, 'после disarm не должно остаться живых таймеров');
+});
+
+// === окно ретраев: ночной отвал сети не должен съедать всю ночь ===
+
+test('ретраи расходятся по времени, а не долбят с одним интервалом', async () => {
+  // Было: 3 попытки по 5 минут — всего ~16 минут. Любой ночной транзиент
+  // длиннее (Wi-Fi на USB-адаптере, 401 до обновления токена с его
+  // 15-минутным бэкоффом, 429 с десятиминутным) съедал всю ночь: после
+  // gave-up pending чистится, блокер снимается, и машина засыпает.
+  const resetsAt = 100000;
+  const ctx = setup({
+    // Окно так и не сбросилось: каждый опрос возвращает «лимит всё ещё выбран».
+    refreshUsage: async () => usageOk({ fiveHourPercent: 99, resetsAt }),
+    statuses: new Map([['tab1', 'done']]),
+  });
+  ctx.nw.arm();
+  await ctx.nw.onTabStop('tab1', 'working');
+
+  // Гоняем цикл «дождались срока → опросили → снова не сброшено» и смотрим,
+  // какую задержку ядро закладывает в следующий будильник. Задержку берём у
+  // самого таймера (он планируется последним, см. scheduleWaitAt), а не
+  // вычисляем из снапшота — так тест не зависит от того, как двигается клок.
+  const delays = [];
+  for (let i = 0; i < 4; i += 1) {
+    const alarm = alarmId(ctx.timers);
+    if (!alarm) break;
+    const due = ctx.nw.snapshot().wakeAt;
+    if (due === null) break;
+    // Считаем ретраи ДО и ПОСЛЕ: иначе «пробуждение молча не случилось»
+    // (например, залип внутренний флаг) выглядело бы как успешный ретрай с
+    // прежней задержкой — на этом тест уже один раз меня обманул.
+    const before = ctx.journal.entries.filter((e) => e.type === 'retry').length;
+    ctx.clock.set(due);
+    await ctx.timers.fire(alarm);
+    await Promise.resolve();
+    await Promise.resolve();
+    const after = ctx.journal.entries.filter((e) => e.type === 'retry').length;
+    if (after !== before + 1) break; // нового ретрая не случилось — дальше смотреть нечего
+    delays.push(ctx.timers.lastMs());
+  }
+
+  // Точные значения, а не только «растёт»: удвоение и потолок — это и есть
+  // обещанное окно ожидания, и молчаливая замена формулы (скажем, +1 минута
+  // за шаг) прошла бы проверку на монотонность незамеченной.
+  assert.deepStrictEqual(
+    delays.slice(0, 4),
+    [300000, 600000, 1200000, 1800000],
+    `ожидались 5, 10, 20 и 30 минут (последняя — по потолку), получили ${delays.join(', ')}`,
+  );
 });

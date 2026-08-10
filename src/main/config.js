@@ -64,13 +64,21 @@ const DEFAULTS = {
   // docs/superpowers/specs/2026-07-29-night-watch-design.md) — мержатся
   // с пользовательским оверлеем тем же deepMerge, что и остальные секции
   // ниже; ipc.js передаёт getConfig().nightWatch в createNightWatch({config}).
+  // ВНИМАНИЕ: эти значения ЗАТИРАЮТ дефолты ядра (night-watch.js мержит
+  // {...DEFAULT_CONFIG, ...config}), поэтому любой ключ, присутствующий здесь,
+  // обязан совпадать с ядром — иначе правка ядра просто не доедет до боя.
+  // Ровно это и случилось при фиксе A7: maxRetries подняли в ядре до 5, а
+  // здешняя тройка молча оставляла в проде прежнее окно ретраев. Сверку
+  // стережёт test/night-watch-config.test.js.
   nightWatch: {
     fiveHourThreshold: 95,
     wakeMarginMs: 60000,
     staggerMs: 10000,
     maxResets: 4,
     retryMs: 300000,
-    maxRetries: 3,
+    maxRetries: 5,
+    retryMaxMs: 1800000,
+    watchdogMs: 60000,
   },
   // Task 2 фазы 9 (голосовой ввод): дефолты для createStt (stt.js, Task 1,
   // спека docs/superpowers/specs/2026-07-29-voice-input-design.md). БЕЗ
