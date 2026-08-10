@@ -568,6 +568,87 @@ test('search(): лимит результатов по умолчанию — ma
   assert.strictEqual(res.length, 2);
 });
 
+// === B10: поиск не читает всё хранилище и уступает более свежему запросу ===
+//
+// Кэш хранит только firstUserText, поэтому КАЖДЫЙ поиск заново стримит
+// транскрипты с диска. Остановов было ровно два: набралось maxResults
+// попаданий или кончились файлы. Запрос без совпадений («опечатка», редкое
+// слово) читал всё хранилище целиком — на машине владельца это ~1.7 ГБ и
+// десятки секунд диска, конкурируя с выводом живых вкладок. Плюс отмены не
+// было: человек уточняет запрос, а прошлый проход дочитывает диск впустую.
+
+test('search(): потолок просмотренных сессий — не читаем всё хранилище ради промаха', async (t) => {
+  const tmp = makeTmpDir();
+  t.after(() => rmDir(tmp));
+  const dir = path.join(tmp, 'proj');
+  for (let i = 0; i < 6; i++) {
+    writeSession(dir, `sess-${i}`, [userLine({ sessionId: `sess-${i}`, cwd: 'C:\\proj', text: `запись номер ${i}` })]);
+  }
+
+  // Считаем, сколько файлов реально открыл поиск.
+  const deps = realDeps(tmp);
+  let opened = 0;
+  const idx = createHistoryIndex({
+    ...deps,
+    scanCap: 3,
+    readFileLines: (file) => { opened += 1; return deps.readFileLines(file); },
+  });
+  await idx.refresh({ force: true });
+
+  opened = 0;
+  const res = await idx.search('такогословатутнет');
+
+  assert.deepStrictEqual(res, [], 'совпадений и не должно быть');
+  assert.strictEqual(opened, 3, `прочитано ${opened} сессий вместо потолка в 3 — промах снова читает всё хранилище`);
+  assert.deepStrictEqual(
+    res.scannedOf, { scanned: 3, total: 6 },
+    'усечение не сообщено наружу — интерфейс не сможет честно сказать «просмотрено N из M»',
+  );
+});
+
+test('search(): полный обход не помечается усечённым', async (t) => {
+  const tmp = makeTmpDir();
+  t.after(() => rmDir(tmp));
+  const dir = path.join(tmp, 'proj');
+  writeSession(dir, 'sess-1', [userLine({ sessionId: 'sess-1', cwd: 'C:\\proj', text: 'первая' })]);
+  writeSession(dir, 'sess-2', [userLine({ sessionId: 'sess-2', cwd: 'C:\\proj', text: 'вторая' })]);
+
+  const idx = createHistoryIndex({ ...realDeps(tmp), scanCap: 10 });
+  await idx.refresh({ force: true });
+
+  const res = await idx.search('нетничего');
+  assert.strictEqual(res.scannedOf, undefined, 'обошли всё, но пометили усечением — интерфейс соврёт про пропущенное');
+});
+
+test('search(): более свежий запрос обесценивает предыдущий', async (t) => {
+  const tmp = makeTmpDir();
+  t.after(() => rmDir(tmp));
+  const dir = path.join(tmp, 'proj');
+  for (let i = 0; i < 5; i++) {
+    writeSession(dir, `sess-${i}`, [userLine({ sessionId: `sess-${i}`, cwd: 'C:\\proj', text: `общее маркер ${i}` })]);
+  }
+
+  // Замедляем чтение, чтобы первый проход гарантированно был в работе, когда
+  // стартует второй.
+  const deps = realDeps(tmp);
+  const idx = createHistoryIndex({
+    ...deps,
+    readFileLines: (file) => (async function* () {
+      await new Promise((r) => { setTimeout(r, 15); });
+      yield* deps.readFileLines(file);
+    }()),
+  });
+  await idx.refresh({ force: true });
+
+  const первый = idx.search('маркер');
+  await new Promise((r) => { setTimeout(r, 20); }); // первый уже читает
+  const второй = idx.search('маркер');
+
+  const [резПервый, резВторой] = await Promise.all([первый, второй]);
+  assert.deepStrictEqual(резПервый, [], 'устаревший запрос обязан бросить работу, а не дочитывать диск впустую');
+  assert.ok(резВторой.length > 0, 'свежий запрос должен вернуть настоящие результаты');
+});
+
 test('search(): битая строка JSONL пропускается при поиске, остальное находится', async (t) => {
   const tmp = makeTmpDir();
   t.after(() => rmDir(tmp));

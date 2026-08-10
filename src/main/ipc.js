@@ -693,7 +693,13 @@ async function historySearchHandler({
   }
   const o = opts && typeof opts === 'object' ? opts : {};
   const results = await historyIndex.search(query, o);
-  return { results, indexSize: state.size };
+  // scannedOf перекладываем в САМ конверт: у массива оно висит неперечислимым
+  // свойством и наружу не выходит ни одним транспортом — структурное
+  // клонирование Electron переносит у массива только элементы и enumerable
+  // свойства, а JSON у массива не сериализует нечисловые ключи вовсе. То есть
+  // без этой строки «просмотрено N из M» жило бы ровно до границы main —
+  // находка ревью фикса B10.
+  return { results, indexSize: state.size, scannedOf: results.scannedOf || null };
 }
 
 // Явный пересбор индекса ({force:true} игнорирует mtime/size-эвристику
@@ -1889,6 +1895,30 @@ function registerIpc(win, opts = {}) {
   registry.handle('owner:get', () => (
     { owner: ownership.owner(), self: 'local', online: ownership.ownerOnline() }
   ));
+
+  // Видимость окна ПК (ревью 09.08, B7). Renderer по ней решает, гонять ли
+  // фоновые перерисовки и веер gh: в спрятанном в трей окне их никто не видит.
+  // Спрашивать document.hidden там нельзя — окно создано с
+  // backgroundThrottling:false, и по документации Electron его состояние
+  // остаётся visible даже когда окно скрыто; а автозапуск с --hidden
+  // (show:false) даёт visible у окна, которого человек ни разу не видел.
+  //
+  // Событие уходит обычным broadcast: сетевые клиенты его получат, но им оно
+  // не про них — у браузера есть собственный document.hidden (см. app.js).
+  registry.handle('window:visible', () => (win ? win.isVisible() : true));
+  if (win) {
+    const пошлём = () => {
+      try {
+        broadcast.emit('window:visibility', { visible: win.isVisible() });
+      } catch (err) {
+        console.warn(`[окно] не удалось разослать видимость: ${err && err.message}`);
+      }
+    };
+    win.on('show', пошлём);
+    win.on('hide', пошлём);
+    win.on('minimize', пошлём);
+    win.on('restore', пошлём);
+  }
 
   // Регистрация вкладки. cwd обязателен — renderer берёт его из диалога
   // или из конфига; smoke-режим подменяет команду в sessions.js.

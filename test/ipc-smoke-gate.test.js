@@ -165,10 +165,23 @@ test('historySearchHandler: индекс ещё ни разу не строил�
   const res = await historySearchHandler({
     smoke: false, query: 'x', opts: {}, state, historyIndex, now: () => 1000,
   });
-  assert.deepStrictEqual(res, { results: [{ hit: true }], indexSize: 2 });
+  // scannedOf: null — «поиск обошёл всё, усечения не было». Поле кладётся в
+  // САМ конверт, потому что на массиве results оно неперечислимое и не
+  // переживает ни структурное клонирование Electron, ни JSON сетевого
+  // транспорта (ревью фикса B10).
+  assert.deepStrictEqual(res, { results: [{ hit: true }], indexSize: 2, scannedOf: null });
   assert.strictEqual(historyIndex.calls.refresh, 1);
   assert.strictEqual(historyIndex.calls.search, 1);
   assert.strictEqual(state.builtAt, 1000);
+  // И обратный случай: усечение из ядра обязано доехать до конверта, иначе
+  // интерфейс не сможет честно сказать «просмотрено N из M».
+  const усечённые = [{ hit: true }];
+  Object.defineProperty(усечённые, 'scannedOf', { value: { scanned: 400, total: 900 }, enumerable: false });
+  const усечHistory = fakeHistoryIndex({ entries: [{ a: 1 }], results: усечённые });
+  const усечRes = await historySearchHandler({
+    smoke: false, query: 'x', opts: {}, state: createHistoryIndexState(), historyIndex: усечHistory, now: () => 1000,
+  });
+  assert.deepStrictEqual(усечRes.scannedOf, { scanned: 400, total: 900 }, 'усечение потерялось на границе main');
 });
 
 test('historySearchHandler: индекс свежий (builtAt внутри TTL) → refresh() НЕ зовётся повторно, только search()', async () => {

@@ -176,11 +176,31 @@ function buildSnippet(text, words) {
   return { text: snippetText, ranges: shifted };
 }
 
-function createHistoryIndex({ listProjects, readFileLines, stat, cache, now = Date.now, maxResults = 50 }) {
+function createHistoryIndex({
+  listProjects, readFileLines, stat, cache, now = Date.now, maxResults = 50,
+  // Потолок просмотренных сессий за ОДИН поиск (ревью 09.08, B10). Кэш хранит
+  // только firstUserText, поэтому каждый запрос заново стримит транскрипты с
+  // диска, а останов был единственный — набралось maxResults попаданий. Запрос
+  // без совпадений («опечатка», редкое слово) читал весь индекс целиком.
+  //
+  // Про объём — точность важна, потому что она определяет цену: индекс
+  // намеренно НЕ рекурсивный (listProjects берёт только верхний уровень), так
+  // что суб-агентские транскрипты — а их на порядок больше — сюда не входят
+  // никогда. На машине владельца это сегодня 49 файлов, и потолок в 400 не
+  // срабатывает вовсе: он задел на будущее, а реальную экономию даёт отмена
+  // устаревшего прохода выше.
+  //
+  // Записи отсортированы по свежести, так что режется самый старый хвост, и об
+  // этом честно сообщается наружу (см. scannedOf в search и конверт в ipc.js).
+  scanCap = 400,
+}) {
   // Map<filePath, {filePath, sessionId, projectDir, cwd, mtime, size, firstUserText}>
   let entriesMap = new Map();
   let sortedEntries = []; // те же значения entriesMap, отсортированные по mtime убыв. — порядок выдачи refresh()/search()
   let loadedFromDisk = false;
+  // Номер последнего начатого поиска: проход сверяется с ним между файлами и
+  // бросает работу, если его обогнал более свежий запрос.
+  let searchGen = 0;
 
   // Ленивая загрузка диск-кэша (один раз за жизнь инстанса) — тот же приём,
   // что в usage-ccusage.js/usage-oauth.js: позволяет search() отработать
@@ -286,6 +306,18 @@ function createHistoryIndex({ listProjects, readFileLines, stat, cache, now = Da
   }
 
   async function search(query, opts = {}) {
+    // Поколение запроса (ревью 09.08, B10). Кэш хранит только firstUserText,
+    // поэтому КАЖДЫЙ поиск заново стримит транскрипты с диска. Отмены не было:
+    // человек уточняет запрос в открытом оверлее — дебаунс в renderer гасит
+    // только ещё не отправленный таймер, а уже улетевший проход дочитывает
+    // хранилище до конца впустую. Два-три уточнения подряд = два-три
+    // ПАРАЛЛЕЛЬНЫХ полных обхода диска и пула libuv (собственный замер
+    // проекта: history:search 17.8 с при занятом пуле).
+    //
+    // Новый запрос обесценивает старый: тот бросает работу на ближайшей
+    // границе файла.
+    const gen = searchGen + 1;
+    searchGen = gen;
     try {
       ensureLoaded();
 
@@ -297,8 +329,17 @@ function createHistoryIndex({ listProjects, readFileLines, stat, cache, now = Da
       const limit = opts && Number.isInteger(opts.limit) && opts.limit > 0 ? opts.limit : maxResults;
 
       const results = [];
+      let scanned = 0;
       for (const entry of sortedEntries) {
         if (results.length >= limit) break;
+        // Нас обогнал более свежий запрос — его ответ и нужен человеку.
+        if (gen !== searchGen) return [];
+        // Потолок просмотренных сессий: запрос БЕЗ совпадений иначе читает всё
+        // хранилище целиком (на этой машине ~1.7 ГБ транскриптов). Записи
+        // отсортированы по свежести, так что потолок режет самый старый хвост
+        // — и об этом честно сообщается наружу (см. truncated ниже).
+        if (scanned >= scanCap) break;
+        scanned += 1;
 
         let hit = null;
         try {
@@ -331,6 +372,17 @@ function createHistoryIndex({ listProjects, readFileLines, stat, cache, now = Da
             line: hit.line,
           });
         }
+      }
+      // Сколько сессий осталось непросмотренными — знает только этот цикл.
+      // Прячем результат в свойство массива, а не меняем его на объект:
+      // контракт «search возвращает список найденного» держат и вызывающий, и
+      // десяток тестов, и ломать его ради одного числа неразумно. Свойство
+      // необязательное: кто про него не знает, работает как раньше.
+      if (scanned >= scanCap && sortedEntries.length > scanned) {
+        Object.defineProperty(results, 'scannedOf', {
+          value: { scanned, total: sortedEntries.length },
+          enumerable: false,
+        });
       }
       return results;
     } catch {
