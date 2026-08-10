@@ -10,7 +10,9 @@
 // пор запинена — см. CCUSAGE_PACKAGE в ipc.js, — набор аргументов не менялся):
 //   npx --yes ccusage@X.Y.Z claude daily --json    → byDay + byModel + totals
 //   npx --yes ccusage@X.Y.Z claude session --json  → byProject + totals.sessions
-// Оба вызова идут параллельно через Promise.all — каждый npx стоит секунды.
+// Вызовы идут ПО ОЧЕРЕДИ, а не параллельно: каждый npx стоит секунд и сотен
+// мегабайт, и на машине с 8ГБ пик важнее задержки (подробности и замеры — у
+// fetchFresh ниже). Раньше здесь был Promise.all.
 //
 // Правило деградации: run бросил / code!=0 / вывод не парсится →
 // ok:false, error:'unavailable'|'parse'; если есть кэш — отдаём его со
@@ -182,14 +184,24 @@ function createCcusage({ run, cache, now = Date.now, ttlMs = 600000 }) {
     let dailyRes;
     let sessionRes;
     try {
-      [dailyRes, sessionRes] = await Promise.all([
-        run(['claude', 'daily', '--json', '--offline', '--single-thread']),
-        run(['claude', 'session', '--json', '--offline', '--single-thread']),
-      ]);
+      // ПОСЛЕДОВАТЕЛЬНО, а не Promise.all. Флаги выше срезали память каждого
+      // прогона (1.1ГБ → 485МБ на пару), но саму параллельность оставили: два
+      // npx по ~240МБ всё ещё жили одновременно. Последовательный запуск
+      // делит пик пополам ценой +7-9с к обновлению дашборда — а дашборд и так
+      // не про мгновенность (окно cacheOnly на старте 90с, отложенный
+      // пересчёт расходов, stale-данные показываются сразу). На машине с 8ГБ
+      // разовый пик 485МБ — это толчок в своп, особенно если совпал с
+      // активными вкладками. Таймаут у runCcusage свой на КАЖДЫЙ вызов (60с),
+      // так что удвоение общего времени в него не упирается.
+      dailyRes = await run(['claude', 'daily', '--json', '--offline', '--single-thread']);
+      // Провал первого — незачем платить вторым тяжёлым прогоном ради того же
+      // ответа 'unavailable' (ccusage снесён, битая версия, нет сети).
+      if (!dailyRes || dailyRes.code !== 0) return { kind: 'unavailable' };
+      sessionRes = await run(['claude', 'session', '--json', '--offline', '--single-thread']);
     } catch (err) {
       return { kind: 'unavailable' };
     }
-    if (!dailyRes || dailyRes.code !== 0 || !sessionRes || sessionRes.code !== 0) {
+    if (!sessionRes || sessionRes.code !== 0) {
       return { kind: 'unavailable' };
     }
 

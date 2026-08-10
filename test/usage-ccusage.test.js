@@ -100,6 +100,66 @@ function runFixture({ dailyBody = DAILY_SAMPLE, sessionBody = SESSION_SAMPLE, ca
   };
 }
 
+test('два npx идут ПОСЛЕДОВАТЕЛЬНО, а не одновременно', async () => {
+  // Инцидент 01.08 «зависает вместе с компом» лечили флагами --offline и
+  // --single-thread, но саму параллельность оставили. По замерам в комментарии
+  // usage-ccusage.js пик двух одновременных прогонов ~485 МБ против ~240 МБ у
+  // одного — на машине с 8 ГБ (свободно обычно ~2 ГБ) это разница между
+  // «подтормаживает» и «уходит в своп».
+  //
+  // Меряем не время, а НАЛОЖЕНИЕ: сколько вызовов run() жило одновременно.
+  let active = 0;
+  let maxActive = 0;
+  const run = async (args) => {
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    await new Promise((r) => setTimeout(r, 5));
+    active -= 1;
+    if (args[1] === 'daily') return ok(DAILY_SAMPLE);
+    return ok(SESSION_SAMPLE);
+  };
+
+  const ccusage = createCcusage({ run, cache: noopCache(), now: () => 1000 });
+  const snap = await ccusage.get();
+
+  assert.strictEqual(snap.ok, true, 'данные всё равно должны собраться');
+  assert.strictEqual(maxActive, 1, `одновременно работало ${maxActive} прогонов ccusage — пик памяти удваивается`);
+});
+
+test('провал первого прогона не запускает второй', async () => {
+  // Следствие последовательности, ради которого её и делали: если ccusage
+  // сломан (нет сети, снесён npx, битая версия), незачем платить вторым
+  // тяжёлым прогоном ради того же ответа 'unavailable'.
+  const calls = [];
+  const run = async (args) => {
+    calls.push(args[1]);
+    if (args[1] === 'daily') return { code: 1, stdout: '', stderr: 'ccusage упал' };
+    return ok(SESSION_SAMPLE);
+  };
+
+  const ccusage = createCcusage({ run, cache: noopCache(), now: () => 1000 });
+  const snap = await ccusage.get();
+
+  assert.strictEqual(snap.ok, false);
+  assert.deepStrictEqual(calls, ['daily'], 'после провала первого прогона второй запускаться не должен');
+});
+
+test('провал ВТОРОГО прогона тоже даёт unavailable, а не мусор', async () => {
+  // Ревью фикса: после развода вызовов проверка второго ответа стала
+  // отдельной веткой, и её удаление выживало — session с code!=0 и пустым
+  // stdout утекал бы в JSON.parse и давал 'parse' вместо 'unavailable'.
+  const run = async (args) => {
+    if (args[1] === 'daily') return ok(DAILY_SAMPLE);
+    return { code: 1, stdout: '', stderr: 'session упал' };
+  };
+
+  const ccusage = createCcusage({ run, cache: noopCache(), now: () => 1000 });
+  const snap = await ccusage.get();
+
+  assert.strictEqual(snap.ok, false);
+  assert.strictEqual(snap.error, 'unavailable', 'провал прогона — это unavailable, а не ошибка разбора');
+});
+
 test('успешный разбор реального образца: totals из body.totals, byModel/byProject/byDay агрегированы и отсортированы', async () => {
   const calls = [];
   const ccusage = createCcusage({ run: runFixture({ calls }), cache: noopCache(), now: () => 1000 });
@@ -153,27 +213,12 @@ test('успешный разбор реального образца: totals и
   );
 });
 
-test('get() запускает daily и session ПАРАЛЛЕЛЬНО (Promise.all), а не по очереди', async () => {
-  let sessionStarted = false;
-  let dailyObservedSessionStarted = false;
-  const run = async (args) => {
-    if (args[1] === 'daily') {
-      await new Promise((r) => setTimeout(r, 20));
-      dailyObservedSessionStarted = sessionStarted; // к моменту завершения daily session уже должен был стартовать
-      return ok(DAILY_SAMPLE);
-    }
-    if (args[1] === 'session') {
-      sessionStarted = true;
-      return ok(SESSION_SAMPLE);
-    }
-    throw new Error('unreachable');
-  };
-  const ccusage = createCcusage({ run, cache: noopCache(), now: () => 1 });
-
-  await ccusage.get();
-
-  assert.strictEqual(dailyObservedSessionStarted, true, 'session должен был стартовать до завершения daily — вызовы не последовательны');
-});
+// Здесь стоял тест, ТРЕБОВАВШИЙ параллельного запуска (Promise.all). Он писался
+// раньше инцидента 01.08 («зависает вместе с компом», своп до 14.6ГБ) и своего
+// обоснования не имел — только «а не по очереди». После инцидента приоритет
+// обратный: пик памяти важнее 7-9 секунд обновления дашборда, который и так
+// показывает stale-данные мгновенно. Решение перевёрнуто сознательно, поэтому
+// тест не обойдён, а заменён — см. «два npx идут ПОСЛЕДОВАТЕЛЬНО» выше.
 
 test('byDay: даты приходят не по порядку → сортируем по возрастанию сами, не полагаемся на порядок ccusage', async () => {
   const shuffledDaily = {
