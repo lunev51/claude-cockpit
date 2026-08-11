@@ -243,3 +243,54 @@ test('после закрытия оверлеев фокус уводится �
   const curtain = topLevelBody(APP_JS, 'function renderCurtain(');
   assert.match(curtain, /parkFocusOnCurtain\(\)/, 'появление заглушки больше не паркует фокус');
 });
+
+// --- 11.08: копирование из терминала не молчит при отказе -------------------
+
+// Комментарии выкидываем целиком: разборы багов написаны прямо над кодом и
+// цитируют его дословно — страж по сырому тексту остался бы зелёным после
+// удаления самой строки (так уже трижды выходили холостые стражи).
+const codeOnly = (source) => source
+  .split(/\r?\n/)
+  .filter((line) => !/^\s*\/\//.test(line))
+  .join('\n');
+
+test('все пути копирования из терминала проходят через жалующийся репортёр', () => {
+  // copyText возвращает false, но в terminal.js его результат не смотрел никто:
+  // выделение, Cmd+C и правый клик молча не срабатывали. Путей три, и обойти
+  // репортёр не должен ни один — иначе вернётся ровно та же немота.
+  const code = codeOnly(read('terminal.js'));
+
+  const direct = code.split(/\r?\n/).filter((line) => /(?<!createCopy)\bcopyText\s*\(/.test(line));
+  assert.deepStrictEqual(
+    direct, [],
+    `copyText зовётся напрямую (${direct.join(' | ')}) — этот путь снова молчит при отказе`,
+  );
+
+  assert.match(code, /createCopyReporter\(/, 'репортёр больше не создаётся — жаловаться некому');
+  const calls = (code.match(/copyOrComplain\s*\(/g) || []).length;
+  assert.ok(
+    calls >= 3,
+    `путей копирования три (выделение, Cmd+C, правый клик), а вызовов репортёра ${calls} — какой-то путь снова молчит`,
+  );
+  assert.match(
+    code,
+    /copyOrComplain\(sel,\s*\{\s*throttle:\s*true\s*\}\)/,
+    'копирование выделением без глушилки завалит экран тостами: xterm зовёт onSelectionChange десятки раз за протяжку',
+  );
+});
+
+test('правый клик не читает буфер обмена, не проверив, что он вообще есть', () => {
+  // По http navigator.clipboard НЕ СУЩЕСТВУЕТ: обращение к свойству undefined
+  // даёт синхронный TypeError мимо .catch. Для записи это чинили в #30, для
+  // чтения баг оставался — правый клик без выделения тихо падал.
+  const code = codeOnly(read('terminal.js'));
+  const start = code.indexOf("addEventListener('contextmenu'");
+  assert.notStrictEqual(start, -1, 'не найден обработчик правого клика — страж разъехался с исходником');
+  const block = code.slice(start, start + 1600);
+
+  const guard = block.search(/if\s*\(!navigator\.clipboard\s*\|\|\s*!navigator\.clipboard\.readText\)/);
+  const call = block.search(/navigator\.clipboard\.readText\(\)/);
+  assert.notStrictEqual(guard, -1, 'из правого клика пропала проверка наличия Clipboard API');
+  assert.notStrictEqual(call, -1, 'не найдено само чтение буфера — страж разъехался с исходником');
+  assert.ok(guard < call, 'проверка стоит ПОСЛЕ чтения буфера — TypeError всё равно случится');
+});

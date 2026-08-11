@@ -4,7 +4,16 @@
 // copyText — своё копирование с запасным путём: на странице по http (браузер на
 // макбуке) Clipboard API не существует, и прямой вызов writeText там падал
 // синхронно, мимо .catch (см. clipboard.js).
-import { copyText } from './clipboard.js';
+// createCopyReporter — то же копирование, но с жалобой при отказе: copyText
+// возвращал false, и этот false никто не смотрел (см. clipboard.js).
+import { createCopyReporter } from './clipboard.js';
+
+// Тост из модуля, который про DOM интерфейса ничего не знает: app.js слушает
+// это событие и показывает (тот же приём, что у api-boot.js — импортировать
+// app.js отсюда нельзя, будет цикл).
+function toast(text, level = 'warn') {
+  window.dispatchEvent(new CustomEvent('cockpit:toast', { detail: { text, level } }));
+}
 
 // Тема терминала v2: нейтральный чёрный + ANSI-палитра Warp default_dark (MIT).
 const THEME = {
@@ -229,10 +238,16 @@ export function initTerminal(container, config, {
   // макбука нельзя скопировать текст). На странице по http Clipboard API не
   // существует вовсе, и прежний вызов обращался к свойству undefined —
   // исключение синхронное, .catch() его не ловил, копирование падало молча.
+  // Одна жалоба на все пути копирования этой вкладки: у репортёра есть память
+  // о последнем тосте, и «копировать выделением» не спамит (см. clipboard.js).
+  const copyOrComplain = createCopyReporter({ notify: (text) => toast(text) });
+
   if (cfg.copyOnSelect) {
     term.onSelectionChange(() => {
       const sel = term.getSelection();
-      if (sel) copyText(sel);
+      // throttle: xterm зовёт это на каждое изменение выделения — за одну
+      // протяжку мышью десятки раз.
+      if (sel) copyOrComplain(sel, { throttle: true });
     });
   }
 
@@ -240,12 +255,22 @@ export function initTerminal(container, config, {
   container.addEventListener('contextmenu', (ev) => {
     ev.preventDefault();
     if (term.hasSelection()) {
-      copyText(term.getSelection());
+      copyOrComplain(term.getSelection());
       term.clearSelection();
     } else if (cfg.rightClickPaste) {
+      // По сети страница отдаётся по http, а Clipboard API живёт только в
+      // защищённом контексте: navigator.clipboard там НЕ СУЩЕСТВУЕТ, и это
+      // обращение к свойству undefined — синхронный TypeError мимо .catch.
+      // Тот же баг, что чинили для записи (#30), для чтения оставался: правый
+      // клик без выделения тихо падал с исключением. Гард такой же, как в
+      // ветке Ctrl+V ниже, но здесь ещё и объясняем, чем вставлять.
+      if (!navigator.clipboard || !navigator.clipboard.readText) {
+        toast('вставка правым кликом работает только в окне на ПК — по сети жми Cmd+V (Ctrl+V)');
+        return;
+      }
       navigator.clipboard.readText()
         .then((text) => { if (text) term.paste(text); })
-        .catch(() => {});
+        .catch((err) => console.warn('[вставка] буфер обмена недоступен:', err && err.message));
     }
   });
 
@@ -294,7 +319,9 @@ export function initTerminal(container, config, {
         && (ev.key === 'C' || ev.key === 'c' || ev.code === 'KeyC')) {
       const sel = term.getSelection();
       if (sel) {
-        copyText(sel);
+        // Без throttle: человек нажал клавишу и ждёт результата — молчать
+        // здесь нельзя даже один раз.
+        copyOrComplain(sel);
         ev.preventDefault();
         return false;
       }
