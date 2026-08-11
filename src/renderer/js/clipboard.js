@@ -16,6 +16,43 @@
 // устаревшим, но работает в незащищённом контексте, и другого способа для
 // http-страницы нет. Правильное лекарство — HTTPS через Tailscale Serve
 // (план 4 фазы), но пока его нет, копирование должно работать.
+// Копирование, которое не молчит при отказе.
+//
+// copyText честно возвращает false, когда положить текст не вышло, — но в
+// terminal.js результат не смотрел никто: человек выделял текст, ничего не
+// происходило, и в интерфейсе не было ни строчки об этом. Ровно тот класс, что
+// чинили в api-boot.js (B3, тост про буфер): действие молча не срабатывает.
+//
+// throttle — для «копировать выделением»: xterm зовёт onSelectionChange на
+// КАЖДОЕ изменение выделения, то есть за одну протяжку мышью десятки раз. Без
+// глушилки сломанный буфер обмена засыпал бы экран тостами. Явные действия
+// (Cmd+C, правый клик) сообщают всегда: человек нажал и ждёт результата.
+//
+// Зависимости снаружи (copy/notify/now) — чтобы поведение проверялось тестом, а
+// не стражем по исходнику: стражи здесь уже трижды оказывались холостыми.
+export function createCopyReporter({
+  copy = copyText,
+  notify,
+  now = () => Date.now(),
+  quietMs = 10000,
+  message = 'скопировать не вышло: браузер не дал доступ к буферу обмена',
+} = {}) {
+  let lastComplaintAt = null;
+  return async function copyOrComplain(text, { throttle = false } = {}) {
+    // await обязателен: без него ok — это Promise, всегда истинный, и жалоба
+    // не прозвучит никогда (та же мина, что ловил страж B3).
+    const ok = await copy(text);
+    if (ok) return true;
+    const stamp = now();
+    const recently = throttle && lastComplaintAt !== null && (stamp - lastComplaintAt) < quietMs;
+    if (!recently) {
+      lastComplaintAt = stamp;
+      if (typeof notify === 'function') notify(message);
+    }
+    return false;
+  };
+}
+
 export async function copyText(text, {
   clipboard = (typeof navigator !== 'undefined' ? navigator.clipboard : undefined),
   doc = (typeof document !== 'undefined' ? document : undefined),

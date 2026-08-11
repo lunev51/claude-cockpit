@@ -138,6 +138,77 @@ test('временное поле убирается, даже если execComm
 // сетевому сценарию (по http Clipboard API нет, а «копировать выделением»
 // включено по умолчанию), то есть ввод терялся после каждого выделения мышью.
 
+// === жалоба при отказе (11.08) =============================================
+//
+// copyText честно возвращает false, но в terminal.js этот false не смотрел
+// никто: человек выделял текст, ничего не происходило, и нигде — ни тоста, ни
+// строчки. Тот же класс, что B3 в api-boot.js. Репортёр добавляет жалобу и
+// глушилку для «копировать выделением»: xterm зовёт onSelectionChange на каждое
+// изменение выделения, за одну протяжку — десятки раз.
+
+test('удачное копирование молчит', async () => {
+  const { createCopyReporter } = await import(url);
+  const сказано = [];
+  const copyOrComplain = createCopyReporter({
+    copy: async () => true,
+    notify: (t) => сказано.push(t),
+  });
+  assert.strictEqual(await copyOrComplain('привет'), true);
+  assert.deepStrictEqual(сказано, [], 'успех не повод беспокоить человека');
+});
+
+test('провал копирования виден человеку', async () => {
+  // copy асинхронный НАРОЧНО: без await результат — Promise, всегда истинный,
+  // и жалоба не прозвучит никогда (мина, на которой уже ловили B3).
+  const { createCopyReporter } = await import(url);
+  const сказано = [];
+  const copyOrComplain = createCopyReporter({
+    copy: async () => false,
+    notify: (t) => сказано.push(t),
+  });
+  assert.strictEqual(await copyOrComplain('привет'), false);
+  assert.strictEqual(сказано.length, 1, 'отказ копирования обязан быть слышен');
+  assert.match(сказано[0], /скопировать/i);
+});
+
+test('копирование выделением не спамит жалобами, но и не глохнет навсегда', async () => {
+  const { createCopyReporter } = await import(url);
+  const сказано = [];
+  let время = 1000;
+  const copyOrComplain = createCopyReporter({
+    copy: async () => false,
+    notify: (t) => сказано.push(t),
+    now: () => время,
+    quietMs: 10000,
+  });
+
+  await copyOrComplain('раз', { throttle: true });
+  await copyOrComplain('два', { throttle: true });
+  время += 5000;
+  await copyOrComplain('три', { throttle: true });
+  assert.strictEqual(сказано.length, 1, 'одна протяжка мышью — одна жалоба, а не десятки');
+
+  время += 6000; // окно тишины вышло
+  await copyOrComplain('четыре', { throttle: true });
+  assert.strictEqual(сказано.length, 2, 'через окно тишины отказ снова обязан быть слышен');
+});
+
+test('явное действие жалуется каждый раз', async () => {
+  // Cmd+C и правый клик — человек нажал и ждёт результата: молчать нельзя даже
+  // один раз, глушилка тут не к месту.
+  const { createCopyReporter } = await import(url);
+  const сказано = [];
+  const время = 1000;
+  const copyOrComplain = createCopyReporter({
+    copy: async () => false,
+    notify: (t) => сказано.push(t),
+    now: () => время,
+  });
+  await copyOrComplain('раз');
+  await copyOrComplain('два');
+  assert.strictEqual(сказано.length, 2, 'каждое нажатие обязано получить ответ');
+});
+
 test('фокус возвращается тому, у кого его забрали', async () => {
   const { copyText } = await import(url);
   const doc = fakeDoc();
