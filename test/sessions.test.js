@@ -1,6 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert');
+const fs = require('fs');
 const { createSessionManager } = require('../src/main/sessions');
 
 // Фейковая фабрика pty: записывает вызовы, отдаёт управляемый инстанс.
@@ -1958,12 +1959,107 @@ test('spawn: env несёт COCKPIT_TAB_GEN как строку текущего
   assert.ok(Number.isInteger(gen2) && gen2 > gen1, 'поколение второго спавна должно быть строго больше первого');
 });
 
+// C30 (ревью 09.08): одинарный бэкслэш после буквы диска в строковом литерале
+// съедается как escape-последовательность — фикстура молча становится путём
+// без разделителей («C:projalpha»). Сегодня безвредно (имя вкладки берётся из
+// последнего сегмента, а он один), но опасно при копипасте в тест, где путь
+// важен. В этом файле сотни фикстур путей — страж на весь файл.
+//
+// Проверяются именно строковые литералы ('…', "…", `…`): сканер пропускает
+// комментарии и регэксп-литералы, иначе кавычка внутри них открыла бы
+// «строку». Внутри литерала плохо: одинарный бэкслэш перед буквой, кроме
+// настоящих escape JS (\n \r \t \b \f \v \x \u), и любой одинарный бэкслэш
+// сразу после «X:» — 'cd C:\new' тоже путь, просто съеденный иначе.
+function stringLiterals(src) {
+  const lineStarts = [0];
+  for (let k = 0; k < src.length; k += 1) if (src[k] === '\n') lineStarts.push(k + 1);
+  const lineOf = (pos) => {
+    let lo = 0;
+    let hi = lineStarts.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (lineStarts[mid] <= pos) lo = mid; else hi = mid - 1;
+    }
+    return lo + 1;
+  };
+  const out = [];
+  let prev = ''; // последний значимый символ: «/» после него — деление или регэксп
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    if (c === '/' && src[i + 1] === '/') {
+      const eol = src.indexOf('\n', i);
+      i = eol < 0 ? src.length : eol;
+    } else if (c === '/' && src[i + 1] === '*') {
+      i = src.indexOf('*/', i + 2) + 2;
+    } else if (c === '\'' || c === '"' || c === '`') {
+      const start = i;
+      i += 1;
+      while (i < src.length && src[i] !== c) {
+        if (src[i] === '\\') {
+          i += 2;
+        } else if (c === '`' && src[i] === '$' && src[i + 1] === '{') {
+          let depth = 1;
+          i += 2;
+          while (i < src.length && depth) {
+            if (src[i] === '{') depth += 1;
+            else if (src[i] === '}') depth -= 1;
+            i += 1;
+          }
+        } else {
+          i += 1;
+        }
+      }
+      out.push({ body: src.slice(start + 1, i), line: lineOf(start) });
+      i += 1;
+      prev = c;
+    } else if (c === '/' && (prev === '' || '(,=:[!&|?{};'.includes(prev))) {
+      let inClass = false;
+      i += 1;
+      while (i < src.length && src[i] !== '\n') {
+        if (src[i] === '\\') { i += 2; continue; }
+        if (src[i] === '[') inClass = true;
+        else if (src[i] === ']') inClass = false;
+        else if (src[i] === '/' && !inClass) break;
+        i += 1;
+      }
+      i += 1;
+      prev = '/';
+    } else {
+      if (!/\s/.test(c)) prev = c;
+      i += 1;
+    }
+  }
+  return out;
+}
+
+function brokenPathEscape(body) {
+  for (let j = 0; j < body.length; j += 1) {
+    if (body[j] !== '\\') continue;
+    const next = body[j + 1];
+    if (next === '\\') { j += 1; continue; }
+    if (/(^|[^A-Za-z0-9_])[A-Za-z]:$/.test(body.slice(0, j))) return true;
+    if (/[A-Za-zА-Яа-яЁё]/.test(next) && !'nrtbfvxu'.includes(next)) return true;
+  }
+  return false;
+}
+
+test('фикстуры путей в этом файле экранированы: в строках нет одинарного бэкслэша перед буквой', () => {
+  const literals = stringLiterals(fs.readFileSync(__filename, 'utf8'));
+  // Якоря: сканер видит литералы, и экранированная фикстура для него — норма.
+  assert.ok(literals.length > 1000, `сканер нашёл только ${literals.length} строковых литералов`);
+  assert.ok(literals.some((l) => l.body === 'C:\\\\proj\\\\alpha'), 'сканер не видит обычную фикстуру пути');
+  assert.ok(literals.some((l) => l.body === 'первый\\r'), 'сканер не видит литерал с escape');
+  const bad = literals.filter((l) => brokenPathEscape(l.body)).map((l) => `${l.line}: ${l.body}`);
+  assert.deepStrictEqual(bad, [], 'одинарный бэкслэш перед буквой — в рантайме это другая строка');
+});
+
 // ---------- N2 (ре-ревью финальной волны): notification_type первым сигналом + липкий permission ----------
 
 test('N2: notification_type "idle_prompt" даёт idle даже при НЕЗНАКОМОМ тексте (локализация не ломает C1)', () => {
   const factory = makeFakePtyFactory();
   const { mgr } = makeManager(factory);
-  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
   mgr.applyHookEvent(a.tabId, 'Notification', {
     message: 'Клод ждёт вашего ввода', notification_type: 'idle_prompt',
@@ -1975,7 +2071,7 @@ test('N2: notification_type "idle_prompt" даёт idle даже при НЕЗН
 test('N2: notification_type "permission_prompt" побеждает idle-похожий текст', () => {
   const factory = makeFakePtyFactory();
   const { mgr } = makeManager(factory);
-  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
   mgr.applyHookEvent(a.tabId, 'Notification', {
     message: 'waiting for your input to approve Bash', notification_type: 'permission_prompt',
@@ -1987,7 +2083,7 @@ test('N2: notification_type "permission_prompt" побеждает idle-похо
 test('N2: липкий permission — idle-пинг ПОВЕРХ открытого диалога не понижает waitingKind', () => {
   const factory = makeFakePtyFactory();
   const { mgr } = makeManager(factory);
-  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
   mgr.applyHookEvent(a.tabId, 'Notification', { message: 'Claude needs your permission to use Bash' });
   // Диалог всё ещё открыт (статус waiting), прилетает idle-пинг:
@@ -2001,7 +2097,7 @@ test('N2: липкий permission — idle-пинг ПОВЕРХ открыто�
 test('N2: после ВЫХОДА из waiting понижение разрешено — новый idle после working даёт idle', () => {
   const factory = makeFakePtyFactory();
   const { mgr } = makeManager(factory);
-  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
   mgr.applyHookEvent(a.tabId, 'Notification', { message: 'Claude needs your permission to use Bash' });
   mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', {}); // пользователь ответил, вкладка снова работает
@@ -2565,6 +2661,44 @@ test('list отдаёт очередь промптов — иначе подк�
   tab.queue.push('чужой элемент');
   const снова = mgr.list().find((t) => t.tabId === a.tabId);
   assert.strictEqual(снова.queue.length, 2, 'list отдал внутренний массив наружу — очередь можно испортить извне');
+});
+
+// === C24 (ревью 09.08): get(tabId) — одна вкладка без копии всех ==========
+// Обвязка ipc.js искала вкладку как list().find(...) — семь раз, дважды на одно
+// событие tab:status, а list() на каждый вызов копирует ВСЕ вкладки с очередями.
+
+test('get(tabId) отдаёт ту же форму, что элемент list(), а для чужого tabId — null', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha', sessionLabel: 'разбор логов' });
+  const b = mgr.open({ cwd: 'C:\\proj\\beta' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.enqueue(a.tabId, 'следующий промпт');
+  mgr.applyHookEvent(a.tabId, 'Notification', {
+    message: 'Claude is waiting for your input', notification_type: 'idle_prompt',
+  });
+
+  for (const id of [a.tabId, b.tabId]) {
+    assert.deepStrictEqual(mgr.get(id), mgr.list().find((t) => t.tabId === id));
+  }
+  assert.strictEqual(mgr.get(a.tabId).waitingKind, 'idle', 'фикстура не довела вкладку до ожидания');
+  assert.strictEqual(mgr.get('нет-такой-вкладки'), null);
+});
+
+test('get(tabId) — копия: правка снаружи не задевает ядро', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.enqueue(a.tabId, 'свой промпт');
+
+  const tab = mgr.get(a.tabId);
+  tab.queue.push('чужой элемент');
+  tab.status = 'dead';
+
+  const снова = mgr.get(a.tabId);
+  assert.strictEqual(снова.queue.length, 1, 'get отдал внутренний массив очереди');
+  assert.notStrictEqual(снова.status, 'dead', 'get отдал внутренний объект вкладки');
 });
 
 // === Статус «фон» (план 2026-11-05): ход окончен, фоновая работа жива =====

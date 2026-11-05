@@ -81,6 +81,31 @@ function isGoodCacheShape(c) {
     && c.sevenDay && typeof c.sevenDay.percent === 'number';
 }
 
+// Кэш на диске нужен только как запасные цифры после перезапуска при упавшей
+// сети — писать его на каждый удачный опрос (~480 раз в сутки) незачем, если
+// цифры не менялись (ревью 09.08, C20). «Не менялись» — по данным, без
+// fetchedAt. Сроки окон сервер отдаёт с плавающими долями секунды: на живом
+// кэше 05.11 два опроса подряд дали 16:09:59.855 и 16:10:00.086 — это один
+// срок, а настоящая смена окна сдвигает его на часы. Отсюда допуск.
+const RESETS_AT_JITTER_MS = 5000;
+// fetchedAt в кэше — то, что дашборд после перезапуска без сети покажет как
+// «обновлено в HH:MM». Без дозаписи при тех же цифрах он отставал бы на часы
+// (ре-ревью: 181 мин на экране при реальной давности в 1 мин). Раз в 30 минут
+// — не больше 48 записей в сутки вместо ~480.
+const CACHE_MAX_AGE_MS = 30 * 60 * 1000;
+
+// null при вычитании даёт 0: null с null совпадает, null со сроком — нет.
+function samePart(a, b) {
+  return a.percent === b.percent && Math.abs(a.resetsAt - b.resetsAt) < RESETS_AT_JITTER_MS;
+}
+
+function sameUsageData(next, saved) {
+  if (!saved) return false; // в эту сессию кэш ещё не писали
+  if (!samePart(next.fiveHour, saved.fiveHour) || !samePart(next.sevenDay, saved.sevenDay)) return false;
+  if (next.scoped.length !== saved.scoped.length) return false;
+  return next.scoped.every((s, i) => s.label === saved.scoped[i].label && samePart(s, saved.scoped[i]));
+}
+
 function createUsagePoller({
   readToken,
   httpGet,
@@ -93,6 +118,8 @@ function createUsagePoller({
   let state = zeroSnapshot();
   let haveGood = false; // получали ли реальные данные — живьём в эту сессию или из кэша
   let lastGood = null; // { fiveHour, sevenDay, scoped, fetchedAt }
+  let persisted = null; // данные последней удачной записи кэша — см. sameUsageData
+  let persistedAt = 0; // fetchedAt последней удачной записи — см. CACHE_MAX_AGE_MS
   let currentIntervalMs = intervalMs; // рабочий интервал автопоследовательности (растёт при 401/429)
   let nextAllowedAt = 0; // now() раньше которого refresh() не бьёт по сети (жёсткий гейт 429)
   let started = false;
@@ -115,8 +142,17 @@ function createUsagePoller({
       fiveHour: parsed.fiveHour, sevenDay: parsed.sevenDay, scoped: parsed.scoped,
       error: null,
     };
+    // Снапшот в памяти (и его fetchedAt, по которому ночная смена судит о
+    // свежести) обновлён выше всегда; пропускается только запись на диск.
+    if (sameUsageData(parsed, persisted) && fetchedAt - persistedAt < CACHE_MAX_AGE_MS) return;
     try {
-      cache.write(lastGood);
+      // Отметку ставим только по true: настоящий кэш (ipc.js/createJsonFileCache)
+      // ошибку диска глотает сам, и проваленная запись иначе считалась бы
+      // сделанной — кэш на диске остался бы старым до смены цифр.
+      if (cache.write(lastGood) === true) {
+        persisted = parsed;
+        persistedAt = fetchedAt;
+      }
     } catch (err) {
       safeLog(`[usage-oauth] cache.write упал: ${err.message}`);
     }
@@ -146,7 +182,21 @@ function createUsagePoller({
     }
   }
 
-  async function refresh() {
+  // Единственный рубеж против параллельных запросов (ревью 09.08, C22). К
+  // refresh() ведут три пути — свой таймер, ночная смена (ipc.js/refreshUsage)
+  // и ручное обновление (usage:refresh), — и прежние single-flight у двух из
+  // них друг друга не видели: тик таймера и клик по кольцам уходили в сеть
+  // параллельно. 429 гасит поллер на 10 минут, а ночная смена без свежих цифр
+  // не продолжит вкладку. Одновременный вызов получает ТОТ ЖЕ промис: ответ
+  // общего запроса свежий для каждого из вызывающих.
+  let inFlight = null;
+
+  function refresh() {
+    if (!inFlight) inFlight = fetchOnce().finally(() => { inFlight = null; });
+    return inFlight;
+  }
+
+  async function fetchOnce() {
     // 429-бэкофф — жёсткий гейт: не долбим сервер раньше времени, ни таймером, ни руками.
     if (now() < nextAllowedAt) return state;
 

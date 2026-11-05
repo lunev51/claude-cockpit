@@ -328,6 +328,25 @@ function shouldDetectLimitStop(prev, payload) {
   return prev === 'working' || prev === 'stuck';
 }
 
+// Детект лимит-стопа из события 'tab:status' (зовётся из onEvent в
+// registerIpc). Вынесен ради теста на настоящих ядрах (C23, ревью 09.08) —
+// см. test/ipc-smoke-gate.test.js.
+function routeLimitStop({ prev, payload, nightWatch, manager }) {
+  if (!nightWatch || !shouldDetectLimitStop(prev, payload)) return;
+  // M2 (ревью финальной волны): текущее поколение pty вкладки НА МОМЕНТ
+  // детекта — ядро сравнит его с актуальным на пробуждении (getTabGen), чтобы
+  // не резюмить в pty, который успел смениться (авто-респавн/ручной рестарт в
+  // пикер сессий) между детектом и пробуждением.
+  const tab = manager.get(payload.tabId);
+  // Литерал 'working', а не prev, — НАМЕРЕННО. «Это остановка хода» уже
+  // решено строкой выше (shouldDetectLimitStop: 'stuck' там наравне с
+  // 'working', Minor 1), а гард ядра (night-watch.js/onTabStop) пропускает
+  // только 'working'. Передать «настоящий» prev — и вкладка, которую
+  // checkStuck() пометил 'stuck' перед самым Stop (типичная картина на
+  // исчерпанном лимите), молча выпадет из детекта.
+  nightWatch.onTabStop(payload.tabId, 'working', tab ? tab.gen : undefined);
+}
+
 // C1 (Critical, ревью финальной волны фазы 8): getTabStatus-адаптер для
 // createNightWatch({getTabStatus}) — маппинг «сырого» пятистатусного статуса
 // sessions.js в то, что ядро понимает как «резюмируемо». Claude Code шлёт хук
@@ -434,6 +453,10 @@ function withNightToasts(journal, wakeMarginMs) {
 // JSON-файл кэша: read/write в try/catch (битый/отсутствующий файл → null,
 // ошибка записи — не критична, просто предупреждение). Оба слоя используют
 // эту же фабрику, каждый со своим путём.
+// write() отвечает true, только если запись легла на диск (ре-ревью C20/C21):
+// кэши лимитов и истории не переписывают файл без изменений и по этому
+// ответу понимают, что проваленную запись (EBUSY/EPERM от антивируса) надо
+// повторить, а не считать сделанной.
 function createJsonFileCache(file) {
   return {
     read() {
@@ -447,8 +470,10 @@ function createJsonFileCache(file) {
       try {
         fs.mkdirSync(path.dirname(file), { recursive: true });
         fs.writeFileSync(file, JSON.stringify(obj), 'utf8');
+        return true;
       } catch (err) {
         console.warn(`[usage] не удалось записать кэш ${path.basename(file)}: ${err.message}`);
+        return false;
       }
     },
   };
@@ -712,6 +737,9 @@ async function historySearchHandler({
 // UI (search.js) им не пользуется напрямую (полагается на встроенный
 // ленивый пересбор внутри historySearchHandler выше), задел на будущую
 // кнопку «Обновить индекс». Вынесена по той же причине, что historySearchHandler.
+// Отдаёт только счётчик (ревью 09.08, C27): раньше уходил весь индекс —
+// первое сообщение и cwd каждой сессии, — в том числе браузеру по сети, хотя
+// кнопке нужен только итог. Поле то же, что в конверте history:search.
 async function historyRefreshHandler({
   smoke, opts, state, historyIndex, now = Date.now,
 }) {
@@ -720,7 +748,7 @@ async function historyRefreshHandler({
   const entries = await historyIndex.refresh({ force });
   state.builtAt = now();
   state.size = entries.length;
-  return entries;
+  return { indexSize: state.size };
 }
 
 // Дыра тестов №1 (ревью финальной волны фазы 7): recipes:* добавлены в ЭТОЙ
@@ -940,6 +968,16 @@ function sttHttpPost(port, urlPath, headers, bodyBuffer, timeoutMs) {
 // покрыта тестами на настоящем временном файле.
 const sessionTitleReader = createSessionTitleReader({ readParts: createFsReadParts(fs) });
 
+// setTimer для инжектируемых ядер (night-watch.js, stt.js): обычный
+// setTimeout, но с unref — их таймеры (ожидание сброса окна, стаггер резюма,
+// ready-поллинг whisper-server) не должны сами по себе держать процесс
+// живым. Была дословно продублирована в двух местах (ревью 09.08, C26).
+function unrefSetTimer(fn, ms) {
+  const id = setTimeout(fn, ms);
+  if (id.unref) id.unref();
+  return id;
+}
+
 // Геттер инстанса createStt — создаёт JS-объект при ПЕРВОМ реальном
 // обращении к stt:transcribe/status (через sttTranscribeHandler/
 // sttStatusHandler ниже), НЕ при registerIpc. M2 (ревью финальной волны):
@@ -961,13 +999,9 @@ function getOrCreateStt() {
     httpPost: sttHttpPost,
     fs,
     now: Date.now,
-    // unref — тот же приём, что у nightWatch/usageMonitorTimer выше: таймеры
+    // unref — тот же приём, что у nightWatch/usageMonitorTimer: таймеры
     // ready-поллинга не должны сами по себе держать процесс живым.
-    setTimer: (fn, ms) => {
-      const id = setTimeout(fn, ms);
-      if (id.unref) id.unref();
-      return id;
-    },
+    setTimer: unrefSetTimer,
     clearTimer: (id) => clearTimeout(id),
     // Реестр процессов runners.js (Task 5 carryover фазы 6) — тот же, что для
     // npx/git/gh: trackChild() вешает СВОЙ once('exit') для уборки
@@ -1562,21 +1596,14 @@ function registerIpc(win, opts = {}) {
         lastStatusByTab.set(payload.tabId, payload.status);
         // M4 финального ревью: логика вынесена в shouldDetectLimitStop()
         // (чистая функция выше по файлу) — см. её комментарий за подробным
-        // обоснованием Minor 1 (stuck) и Important 1 (genProven).
-        if (nightWatch && shouldDetectLimitStop(prev, payload)) {
-          // M2 (ревью финальной волны): текущее поколение pty вкладки НА
-          // МОМЕНТ детекта — ядро сравнит его с актуальным на пробуждении
-          // (getTabGen ниже), чтобы не резюмить в pty, который успел
-          // смениться (авто-респавн/ручной рестарт в пикер сессий) между
-          // детектом и пробуждением.
-          const tab = manager.list().find((t) => t.tabId === payload.tabId);
-          nightWatch.onTabStop(payload.tabId, 'working', tab ? tab.gen : undefined);
-        }
+        // обоснованием Minor 1 (stuck) и Important 1 (genProven); проводка
+        // до ядра — в routeLimitStop() рядом с ней.
+        routeLimitStop({ prev, payload, nightWatch, manager });
       }
       // Task 2 фазы 4: тот же поток, что шлёт tab:status в renderer, — тостер
       // (toasts.js, чистый модуль) сам решает, показывать ли уведомление
       // Windows, по правилу «не уведомлять о том, на что смотришь». Имя
-      // вкладки берём из manager.list() — payload статуса его не несёт.
+      // вкладки берём из manager.get() — payload статуса его не несёт.
       // smoke: headless-прогон никогда не должен показывать тосты.
       // I2 (ре-ревью 01.08): labelOnly — событие, у которого изменилась ТОЛЬКО
       // метка сессии (заголовок дочитался из транскрипта), статус тот же.
@@ -1590,7 +1617,7 @@ function registerIpc(win, opts = {}) {
       // TypeError на старте всего приложения; сегодня спасает лишь то, что
       // фабрика sessions.js до return ничего не эмитит.
       if (!smoke && channel === 'tab:status' && toaster && manager && !payload.labelOnly) {
-        const tab = manager.list().find((t) => t.tabId === payload.tabId);
+        const tab = manager.get(payload.tabId);
         toaster.onStatus({
           tabId: payload.tabId,
           tabName: tab ? tab.name : payload.tabId,
@@ -1636,24 +1663,19 @@ function registerIpc(win, opts = {}) {
   // барьера теперь: (I2) если snapshot() уже свежий (ok, не stale, младше
   // USAGE_SNAPSHOT_FRESH_MS) — отдаём его синхронно, БЕЗ похода в сеть вовсе;
   // (Minor 5) иначе — single-flight, конкурентные детекты делят ОДИН запрос.
-  let usageRefreshInFlight = null;
+  // Сам single-flight живёт внутри usagePoller.refresh() (C22, ревью 09.08):
+  // свой здесь не видел ни таймера поллера, ни ручного usage:refresh.
   const refreshUsage = () => {
     const snap = usagePoller.snapshot();
     if (isSnapshotFreshEnough(snap, Date.now())) return Promise.resolve(snap);
-    return usageRefreshInFlight
-      || (usageRefreshInFlight = Promise.resolve(usagePoller.refresh())
-        .finally(() => { usageRefreshInFlight = null; }));
+    return Promise.resolve(usagePoller.refresh());
   };
   nightWatch = createNightWatch({
     now: Date.now,
     // unref — так же, как stuckTimer/usageMonitorTimer ниже: таймеры ночной
     // смены (ожидание сброса окна, стаггер резюма, ретраи) не должны сами по
     // себе держать процесс живым.
-    setTimer: (fn, ms) => {
-      const id = setTimeout(fn, ms);
-      if (id.unref) id.unref();
-      return id;
-    },
+    setTimer: unrefSetTimer,
     clearTimer: (id) => clearTimeout(id),
     refreshUsage,
     // C1 (Critical, ревью финальной волны): resumableTabStatus() (см. выше по
@@ -1662,7 +1684,7 @@ function registerIpc(win, opts = {}) {
     // не в фокусе), никогда не продолжилась бы: ЛЮБОЙ 'waiting' считался бы
     // непродолжаемым диалогом (NO_RESUME_STATUSES ядра).
     getTabStatus: (tabId) => {
-      const tab = manager.list().find((t) => t.tabId === tabId);
+      const tab = manager.get(tabId);
       return tab ? resumableTabStatus(tab.status, tab.waitingKind) : null;
     },
     // M2 (ревью финальной волны): текущее поколение pty вкладки — ядро
@@ -1670,7 +1692,7 @@ function registerIpc(win, opts = {}) {
     // onTabStop(tabId, prevStatus, gen) в onEvent выше), чтобы не резюмить в
     // pty, который успел смениться между детектом и пробуждением.
     getTabGen: (tabId) => {
-      const tab = manager.list().find((t) => t.tabId === tabId);
+      const tab = manager.get(tabId);
       return tab ? tab.gen : undefined;
     },
     // Гард непустого текста + '\r' (бриф) — тот же приём, что normalizeForPty/
@@ -2035,10 +2057,10 @@ function registerIpc(win, opts = {}) {
   registry.handle('tabs:close', (tabId) => {
     if (typeof tabId !== 'string') return;
     // Резолвим ghostId ДО manager.close (Task 5) — close() удаляет вкладку
-    // из менеджера, и list() её больше не найдёт; отдельного ghost:delete
+    // из менеджера, и get() её больше не найдёт; отдельного ghost:delete
     // IPC не заводим — подчистка ghost-файла естественно живёт здесь же,
     // рядом с самим закрытием вкладки.
-    const tab = manager.list().find((t) => t.tabId === tabId);
+    const tab = manager.get(tabId);
     manager.close(tabId);
     // Task 5 carryover фазы 4/5 (утечка карт в toasts.js): manager.close()
     // инкрементит generation ДО kill() pty — закрытая (а не естественно
@@ -2079,7 +2101,7 @@ function registerIpc(win, opts = {}) {
     if (!payload || typeof payload !== 'object') return;
     const { tabId, text } = payload;
     if (typeof tabId !== 'string' || typeof text !== 'string') return;
-    const tab = manager.list().find((t) => t.tabId === tabId);
+    const tab = manager.get(tabId);
     if (!tab || !tab.ghostId) return;
     try {
       fs.mkdirSync(ghostDir(), { recursive: true });
@@ -2182,7 +2204,7 @@ function registerIpc(win, opts = {}) {
     scriptPath: path.join(appRoot(), 'scripts', 'cockpit-hook.js'),
     portFile: path.join(app.getPath('userData'), 'bridge-port'),
   });
-  const tabCwd = (tabId) => manager.list().find((t) => t.tabId === tabId)?.cwd || null;
+  const tabCwd = (tabId) => manager.get(tabId)?.cwd || null;
 
   // Находка 4б (ревью фазы 6): раньше клик по ⚡ гасил кнопку сразу же после
   // успешного connectProject() — но ТЕКУЩАЯ сессия CLI внутри уже запущенного
@@ -2521,7 +2543,10 @@ module.exports = {
   // M4 финального ревью (обязательно) + C1 (Critical) + I2 — чистые функции
   // без Electron, экспортированы ради собственных юнит-тестов (см. комментарии
   // у их определения выше).
-  shouldDetectLimitStop, resumableTabStatus, isSnapshotFreshEnough, USAGE_SNAPSHOT_FRESH_MS,
+  shouldDetectLimitStop, routeLimitStop, resumableTabStatus, isSnapshotFreshEnough, USAGE_SNAPSHOT_FRESH_MS,
+  // C26 (ревью 09.08): общая обёртка таймера, ответ write() кэша (ре-ревью
+  // C20/C21) — ради test/ipc-hygiene-guard.test.js.
+  unrefSetTimer, createJsonFileCache,
   // I1 финального ревью ветки: карта корней статики — чистая функция от корня
   // приложения, экспортирована ради test/renderer-boot-guard.test.js (он
   // поднимает НАСТОЯЩИЙ сервер ровно на ней и проверяет каждую ссылку
