@@ -302,8 +302,11 @@ function createHistoryIndex({
       const entriesJson = JSON.stringify(sortedEntries);
       if (entriesJson !== persistedEntriesJson) {
         try {
-          cache.write({ schemaVersion: SCHEMA_VERSION, builtAt: now(), entries: sortedEntries });
-          persistedEntriesJson = entriesJson;
+          // Отметку — только по true: настоящий кэш (ipc.js/createJsonFileCache)
+          // ошибку диска глотает сам и сообщает о ней лишь ответом write().
+          if (cache.write({ schemaVersion: SCHEMA_VERSION, builtAt: now(), entries: sortedEntries }) === true) {
+            persistedEntriesJson = entriesJson;
+          }
         } catch {
           // запись кэша упала — не критично, отдаём свежепостроенный индекс всё
           // равно; отметку не ставим, следующий refresh попробует снова

@@ -17,6 +17,26 @@ const codeOnly = (source) => source
   .map((line) => line.replace(/\/\*.*?\*\//g, '').replace(/\s\/\/\s.*$/, ''))
   .join('\n');
 
+// C20/C21 (ре-ревью): кэши лимитов и истории не переписывают файл, если
+// данные не менялись, — и для этого им надо знать, легла ли прошлая запись.
+// Настоящий кэш ошибку диска (EBUSY/EPERM от антивируса) глотает сам, так что
+// без ответа write() проваленная запись считалась бы сделанной.
+test('C20/C21: createJsonFileCache.write отвечает, легла ли запись на диск', (t) => {
+  const { createJsonFileCache } = require('../src/main/ipc');
+  const os = require('node:os');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'json-cache-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const good = createJsonFileCache(path.join(dir, 'sub', 'c.json'));
+  assert.strictEqual(good.write({ a: 1 }), true);
+  assert.deepStrictEqual(good.read(), { a: 1 });
+
+  // Файл на месте каталога — запись лечь не может.
+  fs.writeFileSync(path.join(dir, 'blocker'), 'x');
+  const bad = createJsonFileCache(path.join(dir, 'blocker', 'c.json'));
+  assert.strictEqual(bad.write({ a: 1 }), false);
+});
+
 // C26: обёртка «setTimeout + unref» для инжектируемых таймеров была
 // продублирована дословно (ночная смена и голосовой ввод) — одна копия.
 test('C26: unrefSetTimer — таймер срабатывает и не держит процесс живым', async () => {

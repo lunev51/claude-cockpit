@@ -140,8 +140,12 @@ function createUsagePoller({
     // свежести) обновлён выше всегда; пропускается только запись на диск.
     if (sameUsageData(parsed, persisted)) return;
     try {
-      cache.write(lastGood);
-      persisted = parsed;
+      // Отметку ставим только по true: настоящий кэш (ipc.js/createJsonFileCache)
+      // ошибку диска глотает сам, и проваленная запись иначе считалась бы
+      // сделанной — кэш на диске остался бы старым до смены цифр.
+      if (cache.write(lastGood) === true) {
+        persisted = parsed;
+      }
     } catch (err) {
       safeLog(`[usage-oauth] cache.write упал: ${err.message}`);
     }

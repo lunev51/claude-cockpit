@@ -381,9 +381,11 @@ function liveBody({
   };
 }
 
+// write() отдаёт true — так настоящий кэш (ipc.js/createJsonFileCache)
+// сообщает, что запись легла на диск.
 function recordingCache() {
   const writes = [];
-  return { read: () => null, write: (v) => { writes.push(v); }, writes };
+  return { read: () => null, write: (v) => { writes.push(v); return true; }, writes };
 }
 
 // Поллер, которому тест подсовывает ответ и время на каждый опрос.
@@ -427,6 +429,29 @@ test('C20: дрожь долей секунды в resets_at между опро
   await poller.refresh();
 
   assert.strictEqual(cache.writes.length, 1);
+});
+
+test('C20: проваленная запись (диск занят, ошибка проглочена кэшем) повторяется на следующем опросе', async () => {
+  const attempts = [];
+  let failNext = true;
+  const cache = {
+    read: () => null,
+    write: (v) => {
+      attempts.push(v);
+      if (failNext) { failNext = false; return false; }
+      return true;
+    },
+  };
+  const { poller, ctl } = scriptedPoller(cache);
+
+  await poller.refresh(); // запись не легла
+  ctl.time += 180000;
+  await poller.refresh(); // цифры те же, но на диске их нет
+  assert.strictEqual(attempts.length, 2, 'после проваленной записи кэш на диске остался бы старым');
+
+  ctl.time += 180000;
+  await poller.refresh();
+  assert.strictEqual(attempts.length, 2, 'после удачной записи — снова без записи');
 });
 
 test('C20: каждая настоящая смена данных записывается', async () => {

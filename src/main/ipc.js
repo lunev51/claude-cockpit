@@ -453,6 +453,10 @@ function withNightToasts(journal, wakeMarginMs) {
 // JSON-файл кэша: read/write в try/catch (битый/отсутствующий файл → null,
 // ошибка записи — не критична, просто предупреждение). Оба слоя используют
 // эту же фабрику, каждый со своим путём.
+// write() отвечает true, только если запись легла на диск (ре-ревью C20/C21):
+// кэши лимитов и истории не переписывают файл без изменений и по этому
+// ответу понимают, что проваленную запись (EBUSY/EPERM от антивируса) надо
+// повторить, а не считать сделанной.
 function createJsonFileCache(file) {
   return {
     read() {
@@ -466,8 +470,10 @@ function createJsonFileCache(file) {
       try {
         fs.mkdirSync(path.dirname(file), { recursive: true });
         fs.writeFileSync(file, JSON.stringify(obj), 'utf8');
+        return true;
       } catch (err) {
         console.warn(`[usage] не удалось записать кэш ${path.basename(file)}: ${err.message}`);
+        return false;
       }
     },
   };
@@ -2538,8 +2544,9 @@ module.exports = {
   // без Electron, экспортированы ради собственных юнит-тестов (см. комментарии
   // у их определения выше).
   shouldDetectLimitStop, routeLimitStop, resumableTabStatus, isSnapshotFreshEnough, USAGE_SNAPSHOT_FRESH_MS,
-  // C26 (ревью 09.08): общая обёртка таймера — ради test/ipc-hygiene-guard.test.js.
-  unrefSetTimer,
+  // C26 (ревью 09.08): общая обёртка таймера, ответ write() кэша (ре-ревью
+  // C20/C21) — ради test/ipc-hygiene-guard.test.js.
+  unrefSetTimer, createJsonFileCache,
   // I1 финального ревью ветки: карта корней статики — чистая функция от корня
   // приложения, экспортирована ради test/renderer-boot-guard.test.js (он
   // поднимает НАСТОЯЩИЙ сервер ровно на ней и проверяет каждую ссылку

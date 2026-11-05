@@ -149,9 +149,12 @@ function memoryCache(initial = null) {
   const writes = [];
   return {
     read: () => stored,
+    // true — так настоящий кэш (ipc.js/createJsonFileCache) сообщает, что
+    // запись легла на диск.
     write: (v) => {
       stored = v;
       writes.push(v);
+      return true;
     },
     writes,
     peek: () => stored,
@@ -492,6 +495,34 @@ test('Кэш: новый инстанс поверх валидного диск
   // Перезапуск кокпита: тот же файл кэша, тот же диск.
   await createHistoryIndex(realDeps(tmp, { cache })).refresh({});
   assert.strictEqual(cache.writes.length, 1, 'перезапуск без изменений не должен переписывать кэш');
+});
+
+test('Кэш: проваленная запись (диск занят, ошибка проглочена кэшем) повторяется на следующем refresh', async (t) => {
+  const tmp = makeTmpDir();
+  t.after(() => rmDir(tmp));
+  const dirA = path.join(tmp, 'proj');
+  writeSession(dirA, 'sess-A', [userLine({ sessionId: 'sess-A', cwd: 'C:\\proj', text: 'A' })]);
+
+  let stored = null;
+  let attempts = 0;
+  const cache = {
+    read: () => stored,
+    write: (v) => {
+      attempts += 1;
+      if (attempts === 1) return false; // как createJsonFileCache при EBUSY от антивируса
+      stored = v;
+      return true;
+    },
+  };
+  const idx = createHistoryIndex(realDeps(tmp, { cache }));
+
+  await idx.refresh({});
+  await idx.refresh({});
+  assert.strictEqual(attempts, 2, 'после проваленной записи кэш на диске остался бы пустым');
+  assert.ok(stored && stored.entries.length === 1);
+
+  await idx.refresh({});
+  assert.strictEqual(attempts, 2, 'после удачной записи — снова без записи');
 });
 
 test('Кэш: изменённый, новый и удалённый файл — каждый раз кэш переписывается', async (t) => {
