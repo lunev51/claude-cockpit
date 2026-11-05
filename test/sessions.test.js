@@ -1964,13 +1964,94 @@ test('spawn: env несёт COCKPIT_TAB_GEN как строку текущего
 // без разделителей («C:projalpha»). Сегодня безвредно (имя вкладки берётся из
 // последнего сегмента, а он один), но опасно при копипасте в тест, где путь
 // важен. В этом файле сотни фикстур путей — страж на весь файл.
-test('фикстуры путей в этом файле экранированы: после «X:» идёт двойной бэкслэш', () => {
-  const lines = fs.readFileSync(__filename, 'utf8').split(/\r?\n/);
-  const bad = lines
-    .map((line, i) => ({ line, n: i + 1 }))
-    .filter(({ line }) => /['"`][A-Za-z]:\\(?!\\)/.test(line))
-    .map(({ line, n }) => `${n}: ${line.trim()}`);
-  assert.deepStrictEqual(bad, [], 'путь с одинарным бэкслэшем — в рантайме это другая строка');
+//
+// Проверяются именно строковые литералы ('…', "…", `…`): сканер пропускает
+// комментарии и регэксп-литералы, иначе кавычка внутри них открыла бы
+// «строку». Внутри литерала плохо: одинарный бэкслэш перед буквой, кроме
+// настоящих escape JS (\n \r \t \b \f \v \x \u), и любой одинарный бэкслэш
+// сразу после «X:» — 'cd C:\new' тоже путь, просто съеденный иначе.
+function stringLiterals(src) {
+  const lineStarts = [0];
+  for (let k = 0; k < src.length; k += 1) if (src[k] === '\n') lineStarts.push(k + 1);
+  const lineOf = (pos) => {
+    let lo = 0;
+    let hi = lineStarts.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (lineStarts[mid] <= pos) lo = mid; else hi = mid - 1;
+    }
+    return lo + 1;
+  };
+  const out = [];
+  let prev = ''; // последний значимый символ: «/» после него — деление или регэксп
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    if (c === '/' && src[i + 1] === '/') {
+      const eol = src.indexOf('\n', i);
+      i = eol < 0 ? src.length : eol;
+    } else if (c === '/' && src[i + 1] === '*') {
+      i = src.indexOf('*/', i + 2) + 2;
+    } else if (c === '\'' || c === '"' || c === '`') {
+      const start = i;
+      i += 1;
+      while (i < src.length && src[i] !== c) {
+        if (src[i] === '\\') {
+          i += 2;
+        } else if (c === '`' && src[i] === '$' && src[i + 1] === '{') {
+          let depth = 1;
+          i += 2;
+          while (i < src.length && depth) {
+            if (src[i] === '{') depth += 1;
+            else if (src[i] === '}') depth -= 1;
+            i += 1;
+          }
+        } else {
+          i += 1;
+        }
+      }
+      out.push({ body: src.slice(start + 1, i), line: lineOf(start) });
+      i += 1;
+      prev = c;
+    } else if (c === '/' && (prev === '' || '(,=:[!&|?{};'.includes(prev))) {
+      let inClass = false;
+      i += 1;
+      while (i < src.length && src[i] !== '\n') {
+        if (src[i] === '\\') { i += 2; continue; }
+        if (src[i] === '[') inClass = true;
+        else if (src[i] === ']') inClass = false;
+        else if (src[i] === '/' && !inClass) break;
+        i += 1;
+      }
+      i += 1;
+      prev = '/';
+    } else {
+      if (!/\s/.test(c)) prev = c;
+      i += 1;
+    }
+  }
+  return out;
+}
+
+function brokenPathEscape(body) {
+  for (let j = 0; j < body.length; j += 1) {
+    if (body[j] !== '\\') continue;
+    const next = body[j + 1];
+    if (next === '\\') { j += 1; continue; }
+    if (/(^|[^A-Za-z0-9_])[A-Za-z]:$/.test(body.slice(0, j))) return true;
+    if (/[A-Za-zА-Яа-яЁё]/.test(next) && !'nrtbfvxu'.includes(next)) return true;
+  }
+  return false;
+}
+
+test('фикстуры путей в этом файле экранированы: в строках нет одинарного бэкслэша перед буквой', () => {
+  const literals = stringLiterals(fs.readFileSync(__filename, 'utf8'));
+  // Якоря: сканер видит литералы, и экранированная фикстура для него — норма.
+  assert.ok(literals.length > 1000, `сканер нашёл только ${literals.length} строковых литералов`);
+  assert.ok(literals.some((l) => l.body === 'C:\\\\proj\\\\alpha'), 'сканер не видит обычную фикстуру пути');
+  assert.ok(literals.some((l) => l.body === 'первый\\r'), 'сканер не видит литерал с escape');
+  const bad = literals.filter((l) => brokenPathEscape(l.body)).map((l) => `${l.line}: ${l.body}`);
+  assert.deepStrictEqual(bad, [], 'одинарный бэкслэш перед буквой — в рантайме это другая строка');
 });
 
 // ---------- N2 (ре-ревью финальной волны): notification_type первым сигналом + липкий permission ----------
