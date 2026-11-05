@@ -136,7 +136,7 @@ const TAB_CWD = { t1: 'C:\\proj\\a', t1b: 'C:\\proj\\a', t2: 'C:\\proj\\b' };
 
 function repoState(dir) {
   return {
-    dir, files: 12, edited: null, branch: 'feat/visible-c-render', ahead: 1, behind: 0, untracked: [],
+    dir, files: 12, edited: null, branch: 'feat/visible-c-render', ahead: 1, behind: 0, untracked: [], fail: null,
   };
 }
 
@@ -185,6 +185,10 @@ function makeRepo() {
   const run = async (args, cwd) => {
     const st = repos[cwd];
     if (!st) throw new Error(`неизвестный cwd: ${cwd}`);
+    // fail: 'failed' — git ответил ошибкой; 'missing' — git не запустился
+    // (spawn ENOENT, как его видит git-info.js/isGitMissingError).
+    if (st.fail === 'missing') throw Object.assign(new Error('spawn git ENOENT'), { code: 'ENOENT' });
+    if (st.fail === 'failed') return { code: 128, stdout: '', stderr: 'fatal: unable to read index file' };
     if (args.includes('--no-index')) {
       // Неотслеживаемые файлы в фикстуре — бинарники: numstat "-\t-\t…" (код 1
       // у --no-index — «есть отличия», штатный путь), сам дифф не тянется.
@@ -386,4 +390,77 @@ test('повторная активация той же вкладки — пр�
   await flush();
 
   assert.deepStrictEqual([body.scrollTop, body.scrollLeft, files.scrollTop], [900, 120, 20], 'щелчок по уже открытой вкладке выкинул дифф к началу');
+});
+
+// Ревью ветки, M5: сверка обязана видеть всё, что панель рисует, а не только
+// текст диффа. Каждый шаг меняет ровно одно поле снимка при том же тексте.
+
+test('push, fetch, смена ветки при том же диффе — шапка обновляется', async (t) => {
+  const { root, state, text, gitChanged } = await setup(t);
+  const summary = findOne(root, 'diff-panel-summary');
+  assert.strictEqual(summary.textContent, 'feat/visible-c-render · +36 −12 · 12 файлов · ↑1');
+
+  state.ahead = 0; // git push
+  await gitChanged();
+  assert.strictEqual(summary.textContent, 'feat/visible-c-render · +36 −12 · 12 файлов', 'после push в шапке висит ↑1');
+
+  state.behind = 2; // git fetch: на сервере два новых коммита
+  await gitChanged();
+  assert.strictEqual(summary.textContent, 'feat/visible-c-render · +36 −12 · 12 файлов · ↓2', 'после fetch в шапке нет ↓2');
+
+  state.branch = 'fix/другая'; // git switch -c с теми же правками
+  await gitChanged();
+  assert.strictEqual(summary.textContent, 'fix/другая · +36 −12 · 12 файлов · ↓2', 'после смены ветки в шапке старая ветка');
+  assert.strictEqual(text.children.length, 120, 'текст диффа не тот — шаги меняют не одно поле');
+});
+
+test('новый бинарный файл вне git — появляется в списке, хотя текст диффа тот же', async (t) => {
+  // Содержимое бинарника в дифф не входит (git-info.js: newFileDiffMissing),
+  // меняется только files[].
+  const { root, state, text, files, gitChanged } = await setup(t);
+  const diffBefore = text.textContent;
+
+  state.untracked = ['assets/logo.png'];
+  await gitChanged();
+
+  assert.strictEqual(text.textContent, diffBefore, 'текст диффа изменился — проверка не про files[]');
+  assert.strictEqual(files.children.length, 13, 'новый файл не появился в списке');
+  const row = files.children[12];
+  assert.strictEqual(findOne(row, 'diff-file-path').textContent, 'assets/logo.png');
+  assert.strictEqual(findOne(row, 'diff-file-counts').textContent, 'новый');
+  assert.strictEqual(findOne(root, 'diff-panel-summary').textContent, 'feat/visible-c-render · +36 −12 · 13 файлов · 1 новый · ↑1');
+});
+
+const texts = (nodes) => nodes.map((n) => n.textContent);
+
+test('git сломался, потом пропал — причина в панели сменилась', async (t) => {
+  // Оба снимка пустые и ok:false — отличаются только error.
+  const { root, state, gitChanged } = await setup(t);
+  const empty = findOne(root, 'diff-panel-empty');
+
+  state.fail = 'failed';
+  await gitChanged();
+  assert.strictEqual(empty.textContent, 'не удалось получить статус git');
+
+  state.fail = 'missing';
+  await gitChanged();
+  assert.strictEqual(empty.textContent, 'git не найден в PATH', 'git пропал из PATH, а панель всё ещё про сбой запроса');
+});
+
+test('за отрезом прибавились файлы и строки — «показано N из M» обновилось', async (t) => {
+  // Панель показывает первые 200 файлов и 2000 строк (git-info.js). Правки за
+  // отрезом не меняют видимую часть — меняется только truncated.
+  const { root, state, gitChanged } = await setup(t);
+  const notes = () => texts(findAll(root, 'diff-panel-truncated'));
+
+  state.files = 210;
+  await gitChanged();
+  assert.deepStrictEqual(notes(), ['показано 200 из 210 файлов', 'показано 2000 из 2100 строк диффа']);
+
+  state.files = 220;
+  await gitChanged();
+  assert.deepStrictEqual(
+    notes(), ['показано 200 из 220 файлов', 'показано 2000 из 2200 строк диффа'],
+    'за отрезом прибавилось, а панель показывает прежний итог',
+  );
 });
