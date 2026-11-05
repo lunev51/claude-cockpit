@@ -656,8 +656,13 @@ export function createDashboard({
       empty.className = 'dashboard-spend-empty';
       // Инцидент 8ГБ: первые ~90с после старта подсчёт расходов отложен
       // (cacheOnly, kind 'deferred') — честно говорим «позже», а не «сломано».
+      // Без кэша 'deferred' держится и ПОСЛЕ окна, пока идёт первый подсчёт
+      // (U1: usage:get отвечает сразу, не дожидаясь npx; на живой машине
+      // подсчёт идёт за 90 с), — прежнее «начнётся через минуту после
+      // запуска» там врало. Текст верен для обоих случаев: результат придёт
+      // сам через usage:update (deferredSpendTimer / фоновый пересчёт).
       empty.textContent = (spend && spend.error === 'deferred')
-        ? 'подсчёт расходов начнётся через минуту после запуска…'
+        ? 'расходы ещё не посчитаны — появятся сами…'
         : SPEND_UNAVAILABLE_TEXT;
       bodyEl.appendChild(empty);
     } else {
