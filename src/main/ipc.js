@@ -37,6 +37,7 @@ const { createCcusage } = require('./usage-ccusage');
 const { createGitInfo } = require('./git-info');
 const { createGhInfo } = require('./gh-info');
 const { createRunners } = require('./runners');
+const { runSteps } = require('./run-steps');
 const { createHistoryIndex } = require('./history-index');
 const {
   createRecipeStore, extractPlaceholders, fillPrompt, normalizeForPty,
@@ -2344,10 +2345,18 @@ function registerIpc(win, opts = {}) {
 // markQuitting() отрезает любые дальнейшие sync() — так закрытие вкладок
 // внутри disposeSessions(), которое происходит СРАЗУ вслед за этим вызовом,
 // уже не может затереть pending пустым списком к моменту второго flush().
+//
+// finally — не перестраховка (ревью 09.08, C25): каскад выхода теперь идёт
+// дальше упавшего шага (runSteps). Упади flush() без finally, markQuitting()
+// не выполнился бы, а disposeSessions следующим шагом закрыл бы вкладки — и
+// второй flush на before-quit записал бы на диск пустой воркспейс.
 function flushWorkspace() {
   if (!wsync) return;
-  wsync.flush();
-  wsync.markQuitting();
+  try {
+    wsync.flush();
+  } finally {
+    wsync.markQuitting();
+  }
 }
 
 // Идемпотентно гасит мост хуков (безопасно звать повторно — например,
@@ -2377,28 +2386,40 @@ function disposeSessions() {
     clearTimeout(deferredSpendTimer);
     deferredSpendTimer = null;
   }
-  if (usagePoller) usagePoller.stop();
-  // Task 2 фазы 8 («Ночная смена»): dispose() снимает ВСЕ таймеры ядра
-  // (ожидание/ретрай + хвост стаггера) и гасит powerSaveBlocker, если он был
-  // включён, — без этого приложение могло бы выйти с реально удерживаемым
-  // системным блокером энергосбережения (см. night-watch.js/dispose()).
-  // Идемпотентно (как и остальные вызовы этой функции) — disposeSessions()
-  // зовётся несколько раз за один выход (window-all-closed, потом before-quit).
-  if (nightWatch) nightWatch.dispose();
-  // Task 2 фазы 9 (голосовой ввод): dispose() убивает живой whisper-server
-  // (если был запущен) и снимает таймеры ready-поллинга — рядом с
-  // nightWatch.dispose() выше. Гард «если создавался» (см. getOrCreateStt()):
-  // если голосом за сессию ни разу не воспользовались, stt остаётся null, и
-  // дизпоузить нечего.
-  if (stt) stt.dispose();
-  stopBridge();
-  if (manager) manager.disposeAll();
-  // Задача 5 фазы 6 (carryover): если приложение закрывается, пока
-  // runCcusage/gitRun/ghRun ещё выполняются (npx/git/gh), реестр процессов
-  // runners.js всё ещё держит их — killAllTracked() добивает ДЕРЕВО
-  // принудительно (/T /F — headless-помощники без состояния, не сам кокпит;
-  // подробное обоснование /F и снимка ключей в массив ДО цикла — в runners.js).
-  if (runners) runners.killAllTracked();
+  // Ревью 09.08 (C25): дальше — шаги, каждый из которых может бросить, и
+  // каждый в своём try/catch (run-steps.js). Голой цепочкой исключение,
+  // скажем, в nightWatch.dispose() оставляло живыми claude.exe всех вкладок и
+  // whisper-server — до них очередь просто не доходила.
+  runSteps([
+    ['usage-poller', () => { if (usagePoller) usagePoller.stop(); }],
+    // Task 2 фазы 8 («Ночная смена»): dispose() снимает ВСЕ таймеры ядра
+    // (ожидание/ретрай + хвост стаггера) и гасит powerSaveBlocker, если он был
+    // включён, — без этого приложение могло бы выйти с реально удерживаемым
+    // системным блокером энергосбережения (см. night-watch.js/dispose()).
+    // Идемпотентно (как и остальные вызовы этой функции) — disposeSessions()
+    // зовётся несколько раз за один выход (window-all-closed, потом before-quit).
+    ['night-watch', () => { if (nightWatch) nightWatch.dispose(); }],
+    // Task 2 фазы 9 (голосовой ввод): dispose() убивает живой whisper-server
+    // (если был запущен) и снимает таймеры ready-поллинга — рядом с
+    // ночной сменой выше. Гард «если создавался» (см. getOrCreateStt()):
+    // если голосом за сессию ни разу не воспользовались, stt остаётся null, и
+    // дизпоузить нечего.
+    ['stt', () => { if (stt) stt.dispose(); }],
+    ['hook-bridge', stopBridge],
+    ['sessions', () => { if (manager) manager.disposeAll(); }],
+    // Задача 5 фазы 6 (carryover): если приложение закрывается, пока
+    // runCcusage/gitRun/ghRun ещё выполняются (npx/git/gh), реестр процессов
+    // runners.js всё ещё держит их — killAllTracked() добивает ДЕРЕВО
+    // принудительно (/T /F — headless-помощники без состояния, не сам кокпит;
+    // подробное обоснование /F и снимка ключей в массив ДО цикла — в runners.js).
+    ['runners', () => { if (runners) runners.killAllTracked(); }],
+  ], logDisposeFailure);
+}
+
+// Тот же формат, что у сбоев трея в main.js: метка шага — чтобы по логу было
+// видно, ЧТО именно не убралось на выходе.
+function logDisposeFailure(label, err) {
+  console.error(`[dispose] сбой (${label}): ${(err && err.stack) || err}`);
 }
 
 module.exports = {
