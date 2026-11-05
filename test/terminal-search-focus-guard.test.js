@@ -46,14 +46,47 @@ function mkBtnBody() {
   return assert.fail('не найден конец mkBtn');
 }
 
+// Текст вызова от открывающей скобки до парной (строки в кавычках пропускаем).
+function callText(text, from) {
+  const open = text.indexOf('(', from);
+  let depth = 0;
+  for (let i = open; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch === '\'' || ch === '"' || ch === '`') i = text.indexOf(ch, i + 1);
+    else if (ch === '(') depth += 1;
+    else if (ch === ')') {
+      depth -= 1;
+      if (depth === 0) return text.slice(open, i + 1);
+    }
+  }
+  return assert.fail('не найден конец вызова');
+}
+
 test('кнопки поиска не забирают фокус у поля ввода на mousedown', () => {
   const body = mkBtnBody();
   assert.match(body, /return b;/, 'тело mkBtn вырезано не целиком');
-  assert.match(
-    body,
-    /\.addEventListener\(\s*'mousedown'\s*,\s*\(?\s*(\w+)\s*\)?\s*=>\s*\{?\s*\1\.preventDefault\(\)/,
-    'у кнопок поиска нет mousedown → preventDefault: клик мышью уводит фокус с поля, '
+  const at = body.search(/\.addEventListener\(\s*'mousedown'/);
+  assert.notStrictEqual(
+    at, -1,
+    'у кнопок поиска нет обработчика mousedown: клик мышью уводит фокус с поля, '
     + 'и Esc/Enter панели после этого мертвы',
+  );
+  const handler = callText(body, at);
+  const param = (handler.match(/'mousedown'\s*,\s*\(?\s*(\w+)\s*\)?\s*=>/) || [])[1];
+  assert.ok(param, 'обработчик mousedown не стрелочная функция с параметром события — страж его не разберёт');
+  assert.match(
+    handler,
+    new RegExp(`\\b${param}\\.preventDefault\\(\\)`),
+    'mousedown кнопок поиска без preventDefault: клик уводит фокус на кнопку',
+  );
+  // Ревью ветки: одного preventDefault мало — фокус остаётся, где был. Если
+  // человек успел кликнуть в терминал, а потом нажал ▼ и Esc, Esc уходит в
+  // claude как \x1b и прерывает генерацию. Клик по кнопке панели — работа с
+  // панелью, фокус должен быть в её поле.
+  assert.match(
+    handler,
+    /\bsearchInput\.focus\(\)/,
+    'mousedown кнопок поиска не возвращает фокус в поле: после клика из терминала Esc уйдёт в claude',
   );
 });
 
