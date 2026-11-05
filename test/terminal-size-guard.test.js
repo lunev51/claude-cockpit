@@ -179,10 +179,11 @@ test('term.start не берёт term.cols/term.rows напрямую', () => {
 
 // --- app.js: сетка видимой вкладки — скрытым (A6) ---------------------------
 // main раздаёт размер видимой вкладки ВСЕМ pty, а скрытые xterm подогнаться
-// не могут. app.js держит последнюю подогнанную сетку (sharedGrid) и отдаёт её
-// скрытым вкладкам: при каждой отправке размера (onGrid → shareGrid) и при
-// создании вкладки (adoptGrid сразу после initTerminal, ДО истории вывода —
-// иначе история ляжет в сетку 80×24).
+// не могут. Значения раздачи (кому, с какими cols/rows, копия, поздняя
+// вкладка) проверяет test/grid-share.test.js на самом модуле; здесь —
+// только что app.js его подключает: при каждой отправке размера (onGrid →
+// gridShare.share) и при создании вкладки (gridShare.adopt сразу после
+// initTerminal, ДО истории вывода — иначе история ляжет в сетку 80×24).
 const APP = stripComments(fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'js', 'app.js'), 'utf8'));
 
 function appFunction(signature) {
@@ -197,12 +198,10 @@ function appFunction(signature) {
   return rest.slice(0, end);
 }
 
-test('shareGrid раздаёт сетку всем вкладкам, кроме той, что её прислала', () => {
-  const body = appFunction('function shareGrid(');
-  assert.match(body, /sharedGrid\s*=/, 'shareGrid не запоминает сетку — вкладка, открытая позже, её не получит');
-  assert.match(body, /for\s*\(\s*const\s*\[\s*(\w+)\s*,\s*(\w+)\s*\]\s*of\s*views\s*\)/, 'shareGrid не обходит views');
-  assert.match(body, /\.adoptGrid\(/, 'shareGrid не отдаёт сетку вкладкам (adoptGrid)');
-  assert.match(body, /!==\s*fromTabId|fromTabId\s*!==/, 'shareGrid не пропускает вкладку-источник');
+test('app.js держит одну общую сетку из grid-share.js', () => {
+  assert.match(APP, /import\s*\{\s*createGridShare\s*\}\s*from\s*'\.\/grid-share\.js'/, 'grid-share.js не подключён');
+  const made = [...APP.matchAll(/const\s+gridShare\s*=\s*createGridShare\(\)/g)].length;
+  assert.strictEqual(made, 1, `createGridShare() в app.js вызван ${made} раз(а) — сетка должна быть одна на окно`);
 });
 
 for (const [fn, idExpr] of [['async function openTab(', 'tab.tabId'], ['async function attachTab(', 't.tabId']]) {
@@ -211,12 +210,12 @@ for (const [fn, idExpr] of [['async function openTab(', 'tab.tabId'], ['async fu
     const idRe = idExpr.replace('.', '\\.');
     assert.match(
       body,
-      new RegExp(`onGrid:\\s*\\((\\w+)\\)\\s*=>\\s*shareGrid\\(\\s*${idRe}\\s*,\\s*\\1\\s*\\)`),
-      `initTerminal в ${fn} не получает onGrid → shareGrid: сетка этой вкладки не дойдёт до скрытых`,
+      new RegExp(`onGrid:\\s*\\((\\w+)\\)\\s*=>\\s*gridShare\\.share\\(\\s*views\\s*,\\s*${idRe}\\s*,\\s*\\1\\s*\\)`),
+      `initTerminal в ${fn} не получает onGrid → gridShare.share: сетка этой вкладки не дойдёт до скрытых`,
     );
-    const adopt = body.search(/if\s*\(\s*sharedGrid\s*\)\s*view\.adoptGrid\(\s*sharedGrid\s*\)/);
+    const adopt = body.search(/gridShare\.adopt\(\s*view\s*\)/);
     assert.notStrictEqual(adopt, -1, `${fn}: новая вкладка не принимает общую сетку — останется в 80×24 при pty в размере окна`);
-    assert.ok(adopt > body.indexOf('initTerminal('), `${fn}: adoptGrid раньше initTerminal`);
+    assert.ok(adopt > body.indexOf('initTerminal('), `${fn}: gridShare.adopt раньше initTerminal`);
   });
 }
 
@@ -226,7 +225,7 @@ test('attachTab: сетка известна ДО истории вывода', 
   const body = appFunction('async function attachTab(');
   const history = body.indexOf('await replayHistory(');
   assert.notStrictEqual(history, -1, 'в attachTab нет replayHistory — страж разъехался с исходником');
-  const adopt = body.search(/view\.adoptGrid\(\s*sharedGrid\s*\)/);
+  const adopt = body.search(/gridShare\.adopt\(\s*view\s*\)/);
   assert.ok(adopt !== -1 && adopt < history, 'общая сетка принимается ПОСЛЕ истории — история ляжет в 80×24');
   const refit = body.search(/\.refit\(\)/);
   const activate = body.search(/activateTab\(\s*t\.tabId\s*\)/);

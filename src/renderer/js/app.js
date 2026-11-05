@@ -26,6 +26,8 @@ import { linkState, onLinkChange, RELOAD_MARK_KEY } from './api-boot.js';
 import { initTerminal } from './terminal.js';
 // Шрифт терминала ждём до первого терминала — см. boot().
 import { waitForFont } from './term-size.js';
+// Сетка видимой вкладки — скрытым (см. gridShare ниже).
+import { createGridShare } from './grid-share.js';
 import {
   curtainState, selfId, controlBlock, shouldClaimOnLoad,
 } from './handoff-view.js';
@@ -712,11 +714,11 @@ async function openTab(cwd, {
       entry.fontSize = px;
     },
     onRestartRequest: (id) => restartSession(id),
-    onGrid: (size) => shareGrid(tab.tabId, size),
+    onGrid: (size) => gridShare.share(views, tab.tabId, size),
   });
   entry.view = view;
-  // Вкладка создана скрытой — встаёт в общую сетку сразу (см. shareGrid).
-  if (sharedGrid) view.adoptGrid(sharedGrid);
+  // Вкладка создана скрытой — встаёт в общую сетку сразу (см. grid-share.js).
+  gridShare.adopt(view);
 
   tabStore.add(tab);
   refreshConnectBadge(tab.tabId);
@@ -724,29 +726,11 @@ async function openTab(cwd, {
   return tab;
 }
 
-// --- общая сетка терминалов (план «размер терминала») ---
-//
-// main применяет размер видимой вкладки ко ВСЕМ pty (termResizeHandler в
-// ipc.js): область окна у вкладок одна, а скрытые свой размер не сообщают.
-// Но скрытый xterm сам подогнаться не может (контейнер display:none), и без
-// этой раздачи стоял бы в своей старой сетке — у ни разу не показанной
-// вкладки это умолчание 80×24. Вывод фоновой сессии ложился бы в чужую
-// сетку, а при показе ресайз pty выходил бы пустым (размер уже тот), и Claude
-// Code не перерисовался бы поверх испорченного экрана. До плана это
-// маскировал сам баг: скрытая вкладка слала pty 80×24, и показ давал
-// настоящий ресайз с перерисовкой.
-//
-// sharedGrid — последняя подогнанная сетка этого клиента; её получает и
-// вкладка, открытая позже (сразу после initTerminal). В pty adoptGrid не
-// шлёт ничего, подогнанную вкладку не трогает. Вкладка с другим размером
-// шрифта при показе подгонится сама и сообщит свою сетку — принятая цена.
-let sharedGrid = null;
-function shareGrid(fromTabId, size) {
-  sharedGrid = { cols: size.cols, rows: size.rows };
-  for (const [id, entry] of views) {
-    if (id !== fromTabId) entry.view?.adoptGrid(sharedGrid);
-  }
-}
+// Общая сетка терминалов: подогнанная сетка видимой вкладки — скрытым, иначе
+// вывод фоновой сессии ложится в чужую сетку (почему — в grid-share.js). До
+// плана «размер терминала» это маскировал сам баг: скрытая вкладка слала pty
+// 80×24, и показ давал настоящий ресайз с перерисовкой.
+const gridShare = createGridShare();
 
 // --- подключение к УЖЕ живым вкладкам (C1/C2 финального ревью ветки) ---
 //
@@ -804,12 +788,12 @@ async function attachTab(t, { activate = false } = {}) {
     // Ctrl+Shift+R внутри терминала — третья дверь к перезапуску; ведём её в
     // ту же функцию, что кнопку ⟳ и палитру.
     onRestartRequest: (id) => restartSession(id),
-    onGrid: (size) => shareGrid(t.tabId, size),
+    onGrid: (size) => gridShare.share(views, t.tabId, size),
   });
   entry.view = view;
   // Общая сетка — ДО истории вывода ниже: история печатается как есть, и в
-  // сетке 80×24 она разъехалась бы без перерисовки (см. shareGrid).
-  if (sharedGrid) view.adoptGrid(sharedGrid);
+  // сетке 80×24 она разъехалась бы без перерисовки (см. grid-share.js).
+  gridShare.adopt(view);
 
   tabStore.add(t);
   // Очередь промптов из менеджера (ревью 09.08, B9). Клиент собирает её из
