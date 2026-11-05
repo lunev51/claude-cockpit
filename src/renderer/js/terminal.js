@@ -7,6 +7,9 @@
 // createCopyReporter — то же копирование, но с жалобой при отказе: copyText
 // возвращал false, и этот false никто не смотрел (см. clipboard.js).
 import { createCopyReporter } from './clipboard.js';
+// fittedSize — «подогнан ли терминал»: в pty уходит только такой размер (см.
+// measure() ниже и term-size.js).
+import { fittedSize } from './term-size.js';
 
 // Тост из модуля, который про DOM интерфейса ничего не знает: app.js слушает
 // это событие и показывает (тот же приём, что у api-boot.js — импортировать
@@ -142,7 +145,21 @@ export function initTerminal(container, config, {
     }
   }
 
-  fit.fit();
+  // Подогнать терминал под контейнер и сказать, удалось ли. null — НЕ подогнан
+  // (контейнер скрыт или нулевой), и тогда сообщать pty нечего: term.cols в
+  // этот момент — умолчание xterm 80×24, а не размер окна. Запись кадров на
+  // стенде 05.11: именно такие 80×24 уходили из term:start скрытой вкладки и
+  // из её ResizeObserver, и main раздавал их сессиям.
+  //
+  // fit() — только ПОСЛЕ проверки: на контейнере 0×0 (свёрнутое окно) FitAddon
+  // предлагает 2×1 и честно ужал бы сам xterm, переложив буфер в две колонки.
+  const measure = () => {
+    const size = fittedSize(fit.proposeDimensions(), { width: container.clientWidth, height: container.clientHeight });
+    if (size) fit.fit();
+    return size;
+  };
+
+  measure();
 
   // --- состояние PTY: alive=true между onStarted и onExit ---
   let alive = false;
@@ -280,8 +297,8 @@ export function initTerminal(container, config, {
   const setFontSize = (size) => {
     fontSize = Math.min(32, Math.max(8, Math.round(size)));
     term.options.fontSize = fontSize;
-    fit.fit();
-    window.api.term.resize(tabId, term.cols, term.rows);
+    const s = measure();
+    if (s) window.api.term.resize(tabId, s.cols, s.rows);
     onFontSize(fontSize);
     // Персист размера шрифта в конфиг с дебаунсом.
     clearTimeout(persistTimer);
@@ -427,9 +444,15 @@ export function initTerminal(container, config, {
   // Единственное место, откуда renderer вообще просит поднять процесс, —
   // поэтому гард стоит здесь, а не у вызывающего: любой будущий путь создания
   // терминала проходит через эту строку.
+  //
+  // Размер — только подогнанный, иначе null: вкладка создаётся в СКРЫТОМ
+  // контейнере (app.js: 'term-view hidden'), и term.cols здесь почти всегда
+  // умолчание 80×24. Без размера main поднимет процесс в размере владельца
+  // (resolveStartSize в ipc.js), а первый видимый fit его уточнит.
   if (autoStart) {
     onPtyStatus('запускается…');
-    window.api.term.start(tabId, term.cols, term.rows);
+    const started = measure();
+    window.api.term.start(tabId, started ? started.cols : null, started ? started.rows : null);
   } else {
     // Процесса нет и поднимать его мы не просим. alive остаётся false — ввод
     // заблокирован (см. term.onData ниже), человек сам решит, перезапускать
@@ -446,15 +469,52 @@ export function initTerminal(container, config, {
   term.onData((data) => { if (alive) window.api.term.write(tabId, data); });
 
   // Подгонка размеров при изменении контейнера (с дебаунсом ~100 мс).
+  //
+  // Наблюдатель срабатывает и у СКРЫТОЙ вкладки — переход в display:none тоже
+  // смена размера (в 0×0). Раньше размер уходил безусловно: fit() там no-op, и
+  // pty получал умолчание xterm 80×24, а main запоминал его как размер
+  // владельца. Теперь скрытая вкладка молчит, а при показе наблюдатель
+  // сработает снова — уже на настоящем контейнере.
   let resizeTimer = null;
   const observer = new ResizeObserver(() => {
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
-      fit.fit();
-      window.api.term.resize(tabId, term.cols, term.rows);
+      const s = measure();
+      if (s) window.api.term.resize(tabId, s.cols, s.rows);
     }, 100);
   });
   observer.observe(container);
+
+  // Шрифт догрузился ПОСЛЕ замера ячейки. xterm 6 перемеряет ячейку только в
+  // _afterResize, при смене опций шрифта и смене DPR — догрузку вшитого
+  // JetBrains Mono он не замечает. Ячейка остаётся посчитанной по запасному
+  // шрифту (Menlo на маке ниже на ~12% по высоте строки), fit считает строки
+  // по ней, и нижние строки — статус-бар Claude Code — уезжают за край.
+  // app.js ждёт шрифт до первого терминала (waitForFont), но ожидание
+  // ограничено 3 с: медленная сеть до макбука догрузит его позже — это ловим
+  // здесь.
+  //
+  // Публичного перемера в xterm 6 нет. _core._charSizeService.measure() —
+  // ровно то, что xterm зовёт сам (open, _afterResize, смена DPR); синхронно
+  // обновляет размеры рендера через onCharSizeChange, после чего
+  // proposeDimensions уже видит новую ячейку. В _core ходит и сам FitAddon
+  // (_renderService.dimensions), так что зависимость не новая; optional
+  // chaining — чтобы другая версия xterm без этого поля не роняла терминал.
+  //
+  // Событие приходит на ЛЮБОЙ догруженный шрифт (Inter интерфейса, жирное
+  // начертание при первом жирном тексте) — шлём размер, только если ячейка
+  // правда изменилась: иначе каждый такой шрифт гонял бы ресайз всех pty.
+  const onFontsLoaded = () => {
+    const charSize = term._core?._charSizeService;
+    if (!charSize || typeof charSize.measure !== 'function') return;
+    const was = { width: charSize.width, height: charSize.height };
+    charSize.measure();
+    if (charSize.width === was.width && charSize.height === was.height) return;
+    const s = measure();
+    if (s) window.api.term.resize(tabId, s.cols, s.rows);
+    term.refresh(0, term.rows - 1);
+  };
+  document.fonts?.addEventListener?.('loadingdone', onFontsLoaded);
 
   // Приём маршрутизированных событий (диспатч по tabId делает app.js).
   const handlers = {
@@ -483,11 +543,14 @@ export function initTerminal(container, config, {
     // же. При этом pty всё это время стоял в размере макбука, и весь вывод
     // Claude Code форматировался под него — в окне ПК картинка разъезжалась,
     // и лечилось это лишь ручным ресайзом окна (живая жалоба 05.08).
-    // Возвращает применённый размер, чтобы вызывающий мог его залогировать.
+    // Возвращает применённый размер {cols, rows} — или null, если терминал не
+    // подогнан (контейнер скрыт/нулевой): тогда в pty не ушло ничего, и
+    // вызывающий (app.js: termSize для захвата управления) обязан считать, что
+    // размера у него нет, а не подставлять умолчание xterm.
     refit: () => {
-      fit.fit();
-      window.api.term.resize(tabId, term.cols, term.rows);
-      return { cols: term.cols, rows: term.rows };
+      const s = measure();
+      if (s) window.api.term.resize(tabId, s.cols, s.rows);
+      return s;
     },
     // Ghost-снимок буфера (Task 5): scrollback:2000 — достаточно контекста для
     // «о чём мы говорили», не раздувая ghost-файл на диске.
@@ -497,6 +560,9 @@ export function initTerminal(container, config, {
     // жить, утечка на каждое закрытие/переоткрытие вкладки).
     dispose: () => {
       observer.disconnect();
+      // Подписка на document.fonts живёт дольше вкладки: без снятия закрытая
+      // вкладка держала бы свой xterm в памяти, а догрузка шрифта будила бы её.
+      document.fonts?.removeEventListener?.('loadingdone', onFontsLoaded);
       term.dispose();
     },
   };
