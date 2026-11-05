@@ -125,4 +125,6 @@ function createOwnership({ onChange, onPresence } = {}) {
   };
 }
 
-module.exports = { createOwnership, MIN_SHARED_GRID, isShareableSize };
+// isValidSize наружу — ради screen-mirror.js: зеркало экрана обязано совпадать
+// с pty по размеру, и своё правило «валидного» там разошлось бы с этим.
+module.exports = { createOwnership, MIN_SHARED_GRID, isShareableSize, isValidSize };
