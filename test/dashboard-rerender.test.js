@@ -157,23 +157,32 @@ function makeState(T0) {
     notificationsAtLimit: false,
     fetchedAt: T0 - MIN,
   };
-  // night-watch.js/snapshot().
+  // night-watch.js/snapshot(): прошлой ночью одна вкладка была продолжена
+  // (запись журнала — night-watch.js/appendJournal, tabId — UUID вкладки).
   const night = {
-    armed: false, pendingCount: 0, wakeAt: null, resetsHandled: 0, journal: [],
+    armed: false,
+    pendingCount: 0,
+    wakeAt: null,
+    resetsHandled: 1,
+    journal: [{ ts: T0 - 9 * HOUR, type: 'resumed', tabId: 'b6a1f0c2-4d3e-4f5a-9b8c-7d6e5f4a3b2c' }],
   };
   return { usage: { limits, spend }, gh, night };
 }
 
-async function setup() {
+// before(state) — правка снимка до open(): например, gh ещё не пришёл.
+async function setup({ before } = {}) {
   const dom = makeDom();
   globalThis.document = dom.doc;
   const { createDashboard } = await import(modUrl('dashboard.js'));
   const T0 = Date.now();
   const state = makeState(T0);
+  if (before) before(state);
   const root = dom.el('div');
   dom.doc.body.appendChild(root);
   // app.js/dashboardSnapshot(): { ...lastUsage, gh: lastGh, night: nightState }.
   const getData = () => ({ ...state.usage, gh: state.gh, night: state.night });
+  // app.js: resolveTabName = (tabId) => tabStore.peekInfo(tabId)?.name.
+  const tabNames = new Map([['b6a1f0c2-4d3e-4f5a-9b8c-7d6e5f4a3b2c', 'cockpit']]);
   const dash = createDashboard({
     root,
     getData,
@@ -181,13 +190,13 @@ async function setup() {
     onOpen() {},
     fallbackFocus: () => null,
     api: { shell: { openExternal() {} } },
-    resolveTabName: () => '',
+    resolveTabName: (tabId) => tabNames.get(tabId),
   });
   dash.open();
   // Тик app.js: redrawUsageViews(now) → dashboard.render(dashboardSnapshot(), now).
   const tick = (now) => dash.render(getData(), now);
   return {
-    dom, root, dash, state, T0, tick,
+    dom, root, dash, state, T0, tick, tabNames,
   };
 }
 
@@ -282,4 +291,17 @@ test('закрыть и открыть снова — дашборд нарис�
   dash.close();
   dash.open();
   assert.strictEqual(sections(root).length, count, 'повторно открытый дашборд пуст — сверка осталась от прошлого открытия');
+});
+
+test('вкладку переименовали — журнал ночной смены показывает новое имя после тика', async () => {
+  // Ревью ветки, M3. Имя в строке журнала берётся не из снимка, а из
+  // resolveTabName: данные те же, а строка другая.
+  const { root, T0, tick, tabNames } = await setup();
+  const row = () => findOne(root, 'dashboard-night-journal-row').textContent;
+  assert.ok(row().endsWith(' — cockpit продолжена'), `строка журнала не та — сценарий не воспроизведён: ${row()}`);
+
+  tabNames.set('b6a1f0c2-4d3e-4f5a-9b8c-7d6e5f4a3b2c', 'cockpit: ревью');
+  tick(T0 + 30000);
+
+  assert.ok(row().endsWith(' — cockpit: ревью продолжена'), `тик оставил в журнале старое имя вкладки: ${row()}`);
 });

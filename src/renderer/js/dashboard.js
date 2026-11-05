@@ -647,11 +647,15 @@ export function createDashboard({
   // подсказку столбика под курсором, выделение и фокус. Данные те же — только
   // пересчитываем отсчёты на месте; пересборка — только на новые данные.
   // Сверка по содержимому: app.js собирает снимок новым объектом на каждый
-  // вызов.
+  // вызов. Ревью ветки (M3): имена вкладок в журнале ночной смены приходят не
+  // из снимка, а из resolveTabName — переименовали вкладку, данные те же, а
+  // строка журнала другая. Поэтому в ключ идут и готовые строки журнала.
   function render(data, now = Date.now()) {
     if (!bodyEl) return;
     lastData = data;
-    const key = JSON.stringify(data);
+    const night = data && data.night;
+    const journalLines = night ? recentJournalEntries(night.journal).map((e) => formatJournalLine(e, resolveTabName)) : null;
+    const key = JSON.stringify([data, journalLines]);
     if (key === renderedKey) {
       for (const c of countdowns) c.el.textContent = countdownText(c.resetsAt, now);
       return;
