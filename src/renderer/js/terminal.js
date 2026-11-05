@@ -602,10 +602,15 @@ export function initTerminal(container, config, {
       alive = true;
       onPtyStatus(`работает · pid ${pid}`);
     },
-    onExit: ({ exitCode }) => {
+    // print:false — состояние сразу, строку о выходе печатает вызывающий
+    // позже: app.js ставит её в очередь после истории, пока та едет
+    // (deliverTermExit в attach-guards.js, ревью ветки screen-mirror, m4).
+    onExit: ({ exitCode }, { print = true } = {}) => {
       alive = false;
       onPtyStatus(`процесс завершён (код ${exitCode})`);
-      term.write(`\r\n\x1b[31m[процесс завершён (код ${exitCode}) — Ctrl+Shift+R для перезапуска]\x1b[0m\r\n`);
+      const banner = `\r\n\x1b[31m[процесс завершён (код ${exitCode}) — Ctrl+Shift+R для перезапуска]\x1b[0m\r\n`;
+      if (print) term.write(banner);
+      return banner;
     },
   };
   term.focus();

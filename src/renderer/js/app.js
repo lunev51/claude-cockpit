@@ -51,7 +51,7 @@ import { singleFlight } from './single-flight.js';
 import { createRestoreKeyHandler } from './restore-keys.js';
 // Important (ре-ревью фикс-волны): подключение к вкладке без живого процесса
 // не должно его поднимать — обоснование в самом модуле.
-import { shouldStartPty } from './attach-guards.js';
+import { shouldStartPty, deliverTermExit } from './attach-guards.js';
 // Task 3 фазы 9 (голосовой ввод, push-to-talk по правому Shift): recorder —
 // портирован из Companion как есть (src/renderer/js/voice/recorder.js, см.
 // комментарий там же — ни одного изменённого пути импорта не понадобилось,
@@ -767,8 +767,9 @@ async function attachTab(t, { activate = false } = {}) {
     container,
     // Живой вывод, пришедший ПОКА едет история (см. replayHistory ниже и
     // диспатч term:data в boot()): пишем его в терминал только ПОСЛЕ истории,
-    // иначе хвост буфера лёг бы поверх более свежих строк и экран показал бы
-    // прошлое как настоящее. null = истории больше не ждём, пишем сразу.
+    // иначе снимок экрана из net:buffer лёг бы поверх более свежих правок и
+    // экран показал бы прошлое как настоящее. Сюда же встаёт строка о выходе
+    // процесса (deliverTermExit). null = истории больше не ждём, пишем сразу.
     pendingOutput: [],
   };
   views.set(t.tabId, entry);
@@ -3116,7 +3117,7 @@ async function boot() {
   // pendingOutput (C2 финального ревью) — вкладка, к которой мы ТОЛЬКО ЧТО
   // подключились, ещё ждёт свою историю из net:buffer. Живой вывод, пришедший
   // в это окно, копим и печатаем ПОСЛЕ истории (см. replayHistory), иначе
-  // хвост буфера лёг бы поверх более свежих строк.
+  // снимок экрана лёг бы поверх более свежих правок.
   window.api.term.onData(({ tabId, data }) => {
     const entry = views.get(tabId);
     if (!entry) return;
@@ -3126,9 +3127,10 @@ async function boot() {
   window.api.term.onStarted((p) => {
     views.get(p.tabId)?.view.handlers.onStarted(p);
   });
-  window.api.term.onExit((p) => {
-    views.get(p.tabId)?.view.handlers.onExit(p);
-  });
+  // Выход — тоже с оглядкой на pendingOutput: строка «[процесс завершён…]»
+  // встаёт в очередь после истории, состояние применяется сразу (см.
+  // deliverTermExit в attach-guards.js).
+  window.api.term.onExit((p) => deliverTermExit(views.get(p.tabId), p));
   // Task 2 фазы 6 (панель диффа): PostToolUse (main/sessions.js) → git:changed.
   // diffPanel сама решает, актуально ли событие (открыта ли панель, та ли это
   // вкладка) и держит дебаунс 1500мс — здесь только проводка канала.
