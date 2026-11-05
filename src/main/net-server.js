@@ -598,7 +598,8 @@ function createNetServer({
         const hint = (allowedHosts || []).map((h) => String(h).trim()).find(Boolean);
         name = hint || '127.0.0.1';
       }
-      return `http://${name.includes(':') && !name.startsWith('[') ? `[${name}]` : name}:${boundPort}`;
+      // Скобки вокруг IPv6 — те же, что в белом списке Host (withPort).
+      return `http://${withPort(name, boundPort)}`;
     },
   };
 }
