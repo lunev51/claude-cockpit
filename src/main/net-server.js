@@ -415,7 +415,13 @@ function createNetServer({
     // единственный формат. Без отдельного try здесь клиент не получил бы
     // вообще ничего и завис бы на промисе навсегда, хотя протокол обещает
     // ok:false на любую свою ошибку.
+    //
+    // Без id отвечать некому — молчим (C7 ревью). Раньше это проверяли только
+    // ветки ошибок протокола, а успех и ошибка обработчика уходили кадром без
+    // id и без event, который браузерному мосту некуда деть. Проверка одна,
+    // здесь, — чтобы новая ветка не забыла её снова.
     const reply = (body) => {
+      if (!hasId) return;
       let payload;
       try {
         payload = JSON.stringify({ id: msg.id, ...body });
@@ -427,13 +433,13 @@ function createNetServer({
 
     // Протокол обещает {id, ok:false, error} на любую свою ошибку, а не
     // тишину: браузерный мост держит промис по id, и без ответа он повис бы
-    // навсегда. Молчим только когда id вообще нет — отвечать некому.
+    // навсегда. Кадр без id reply сам оставит без ответа (см. выше).
     if (typeof msg.channel !== 'string') {
-      if (hasId) reply({ ok: false, error: 'протокол: нет канала' });
+      reply({ ok: false, error: 'протокол: нет канала' });
       return;
     }
     if (msg.args !== undefined && !Array.isArray(msg.args)) {
-      if (hasId) reply({ ok: false, error: 'протокол: args должен быть массивом' });
+      reply({ ok: false, error: 'протокол: args должен быть массивом' });
       return;
     }
     const args = Array.isArray(msg.args) ? msg.args : [];

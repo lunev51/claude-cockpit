@@ -775,6 +775,27 @@ test('args не массивом — явная ошибка протокола,
   ws.close();
 });
 
+test('кадр без id ответа не получает — ни на успех, ни на ошибку (C7 ревью)', async () => {
+  // Ветки ошибок протокола молчали без id, а основной путь и ошибка
+  // обработчика отвечали всё равно — кадром без id и без event, который
+  // браузерному мосту некуда деть. Порядок ws сохраняет, и все кадры без id
+  // обработаны раньше последнего: их ответ, если он есть, пришёл бы первым.
+  const { server } = makeServer();
+  const { port } = await server.start();
+  const ws = await openBuffered(`ws://127.0.0.1:${port}/ws`);
+  ws.send(JSON.stringify({ channel: 'эхо', args: ['без id'] })); // успех
+  ws.send(JSON.stringify({ channel: 'рвётся', args: [] })); // обработчик бросил
+  ws.send(JSON.stringify({ channel: 'нет:такой', args: [] })); // неизвестная команда
+  ws.send(JSON.stringify({ channel: 'эхо', args: 'не массив' })); // ошибка протокола
+  ws.send(JSON.stringify({ args: [] })); // нет канала
+  ws.send(JSON.stringify({ id: 9, channel: 'эхо', args: ['с id'] }));
+  assert.deepStrictEqual(
+    await takeFrame(ws), { id: 9, ok: true, result: { эхо: 'с id' } },
+    'первым пришёл ответ на кадр без id',
+  );
+  ws.close();
+});
+
 test('несериализуемый результат канала получает ok:false, а не тишину', async () => {
   // BigInt/циклическая ссылка проходят по локальному IPC (structured clone),
   // но не через JSON.stringify — по сети JSON единственный формат. Без
