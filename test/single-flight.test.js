@@ -78,6 +78,65 @@ test('синхронный throw в fn — отказ промисом, без �
   assert.strictEqual(await once(), 'ok', 'после синхронного throw вызов залип');
 });
 
+// --- удержание после завершения (ревью ветки: реальный двойной клик) --------
+//
+// night:toggle в main синхронный: ответ IPC приходит за миллисекунды, а
+// между кликами двойного клика 100–300 мс. То есть второй клик приходит,
+// когда первый вызов УЖЕ завершился, — «в полёте» его не поймать. Часы
+// поддельные: тест не ждёт реальных 600 мс и не зависит от загрузки машины.
+
+test('второй клик ПОСЛЕ ответа на первый, но в окне удержания — fn не зовётся', async () => {
+  const { singleFlight } = await import(url);
+  let clock = 1000;
+  let calls = 0;
+  const once = singleFlight(async () => { calls += 1; return calls; }, { holdMs: 600, now: () => clock });
+
+  const first = await once(); // ответ пришёл — вызов завершён
+  clock += 150; // пауза между кликами двойного клика
+  const second = await once();
+
+  assert.strictEqual(calls, 1, 'второй клик двойного клика снова позвал fn — ночная смена переключилась дважды');
+  assert.strictEqual(second, first, 'в окне удержания вызов должен получить прежний результат');
+});
+
+test('после окна удержания fn зовётся снова', async () => {
+  const { singleFlight } = await import(url);
+  let clock = 1000;
+  let calls = 0;
+  const once = singleFlight(async () => { calls += 1; return calls; }, { holdMs: 600, now: () => clock });
+
+  await once();
+  clock += 601;
+  assert.strictEqual(await once(), 2, 'после окна удержания тумблер не срабатывает — он залип');
+});
+
+test('окно удержания отсчитывается от ответа, а не от клика', async () => {
+  // Медленный ответ (сеть с макбука) не должен съедать окно: второй клик
+  // через 100 мс после ответа — всё ещё тот же жест.
+  const { singleFlight } = await import(url);
+  let clock = 1000;
+  let calls = 0;
+  const d = deferred();
+  const once = singleFlight(() => { calls += 1; return d.promise; }, { holdMs: 600, now: () => clock });
+
+  const first = once();
+  clock += 700; // ответ шёл дольше окна
+  d.resolve('armed');
+  await first;
+  clock += 100;
+  await once();
+  assert.strictEqual(calls, 1, 'окно удержания посчитано от клика: после долгого ответа двойной клик снова переключает');
+});
+
+test('без holdMs поведение прежнее — удержания нет', async () => {
+  const { singleFlight } = await import(url);
+  let calls = 0;
+  const once = singleFlight(async () => { calls += 1; });
+  await once();
+  await once();
+  assert.strictEqual(calls, 2);
+});
+
 test('аргументы доходят до fn', async () => {
   const { singleFlight } = await import(url);
   const once = singleFlight(async (x, y) => x + y);
@@ -129,6 +188,20 @@ test('toggleNight зовёт night:toggle только через singleFlight',
     calls[0] > open && calls[0] < end,
     'night.toggle() зовётся мимо singleFlight — двойной клик переключит дважды',
   );
+
+  // Без окна удержания singleFlight двойной клик не ловит: ответ приходит
+  // раньше второго клика. Окно — не меньше системного интервала двойного
+  // клика Windows по умолчанию (500 мс).
+  const callText = code.slice(open, end + 1);
+  const hold = callText.match(/holdMs:\s*([A-Z_]+|\d+)/);
+  assert.ok(hold, 'у тумблера ночной смены нет holdMs — второй клик двойного клика придёт после ответа и переключит');
+  let holdMs = Number(hold[1]);
+  if (Number.isNaN(holdMs)) {
+    const decl = code.match(new RegExp(`const ${hold[1]} = (\\d+);`));
+    assert.ok(decl, `не найдено значение ${hold[1]}`);
+    holdMs = Number(decl[1]);
+  }
+  assert.ok(holdMs >= 500, `окно удержания ${holdMs} мс короче двойного клика Windows (500 мс)`);
 
   const body = code.slice(code.indexOf('function toggleNight('));
   assert.match(

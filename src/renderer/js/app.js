@@ -667,12 +667,17 @@ function applyNightState(snapshot) {
 //
 // Ревью 09.08 (C16): через singleFlight. Двойной клик по 🌙 слал toggle
 // дважды — вооружал и тут же разоружал, а человек видел мелькнувшую кнопку и
-// считал, что включил. Второй вызов, пока первый в полёте, не делает ничего.
+// считал, что включил. Второй вызов — пока первый в полёте И ещё
+// NIGHT_TOGGLE_HOLD_MS после ответа — не делает ничего: ответ main приходит за
+// миллисекунды, раньше второго клика. 600 мс — с запасом над интервалом
+// двойного клика Windows по умолчанию (500 мс). Окно в обёртке, а не
+// ev.detail у кнопки: так оно держит и действие палитры.
+const NIGHT_TOGGLE_HOLD_MS = 600;
 const toggleNightOnce = singleFlight(() => window.api.night.toggle()
   .then(applyNightState)
   .catch((err) => {
     console.warn('[night] night:toggle не удался:', err);
-  }));
+  }), { holdMs: NIGHT_TOGGLE_HOLD_MS });
 
 function toggleNight() {
   toggleNightOnce();
