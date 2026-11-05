@@ -81,6 +81,26 @@ function isGoodCacheShape(c) {
     && c.sevenDay && typeof c.sevenDay.percent === 'number';
 }
 
+// Кэш на диске нужен только как запасные цифры после перезапуска при упавшей
+// сети — писать его на каждый удачный опрос (~480 раз в сутки) незачем, если
+// цифры не менялись (ревью 09.08, C20). «Не менялись» — по данным, без
+// fetchedAt. Сроки окон сервер отдаёт с плавающими долями секунды: на живом
+// кэше 05.11 два опроса подряд дали 16:09:59.855 и 16:10:00.086 — это один
+// срок, а настоящая смена окна сдвигает его на часы. Отсюда допуск.
+const RESETS_AT_JITTER_MS = 5000;
+
+// null при вычитании даёт 0: null с null совпадает, null со сроком — нет.
+function samePart(a, b) {
+  return a.percent === b.percent && Math.abs(a.resetsAt - b.resetsAt) < RESETS_AT_JITTER_MS;
+}
+
+function sameUsageData(next, saved) {
+  if (!saved) return false; // в эту сессию кэш ещё не писали
+  if (!samePart(next.fiveHour, saved.fiveHour) || !samePart(next.sevenDay, saved.sevenDay)) return false;
+  if (next.scoped.length !== saved.scoped.length) return false;
+  return next.scoped.every((s, i) => s.label === saved.scoped[i].label && samePart(s, saved.scoped[i]));
+}
+
 function createUsagePoller({
   readToken,
   httpGet,
@@ -93,6 +113,7 @@ function createUsagePoller({
   let state = zeroSnapshot();
   let haveGood = false; // получали ли реальные данные — живьём в эту сессию или из кэша
   let lastGood = null; // { fiveHour, sevenDay, scoped, fetchedAt }
+  let persisted = null; // данные последней удачной записи кэша — см. sameUsageData
   let currentIntervalMs = intervalMs; // рабочий интервал автопоследовательности (растёт при 401/429)
   let nextAllowedAt = 0; // now() раньше которого refresh() не бьёт по сети (жёсткий гейт 429)
   let started = false;
@@ -115,8 +136,12 @@ function createUsagePoller({
       fiveHour: parsed.fiveHour, sevenDay: parsed.sevenDay, scoped: parsed.scoped,
       error: null,
     };
+    // Снапшот в памяти (и его fetchedAt, по которому ночная смена судит о
+    // свежести) обновлён выше всегда; пропускается только запись на диск.
+    if (sameUsageData(parsed, persisted)) return;
     try {
       cache.write(lastGood);
+      persisted = parsed;
     } catch (err) {
       safeLog(`[usage-oauth] cache.write упал: ${err.message}`);
     }
