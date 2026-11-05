@@ -1,6 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert');
+const fs = require('fs');
 const { createSessionManager } = require('../src/main/sessions');
 
 // Фейковая фабрика pty: записывает вызовы, отдаёт управляемый инстанс.
@@ -1958,12 +1959,26 @@ test('spawn: env несёт COCKPIT_TAB_GEN как строку текущего
   assert.ok(Number.isInteger(gen2) && gen2 > gen1, 'поколение второго спавна должно быть строго больше первого');
 });
 
+// C30 (ревью 09.08): одинарный бэкслэш после буквы диска в строковом литерале
+// съедается как escape-последовательность — фикстура молча становится путём
+// без разделителей («C:projalpha»). Сегодня безвредно (имя вкладки берётся из
+// последнего сегмента, а он один), но опасно при копипасте в тест, где путь
+// важен. В этом файле сотни фикстур путей — страж на весь файл.
+test('фикстуры путей в этом файле экранированы: после «X:» идёт двойной бэкслэш', () => {
+  const lines = fs.readFileSync(__filename, 'utf8').split(/\r?\n/);
+  const bad = lines
+    .map((line, i) => ({ line, n: i + 1 }))
+    .filter(({ line }) => /['"`][A-Za-z]:\\(?!\\)/.test(line))
+    .map(({ line, n }) => `${n}: ${line.trim()}`);
+  assert.deepStrictEqual(bad, [], 'путь с одинарным бэкслэшем — в рантайме это другая строка');
+});
+
 // ---------- N2 (ре-ревью финальной волны): notification_type первым сигналом + липкий permission ----------
 
 test('N2: notification_type "idle_prompt" даёт idle даже при НЕЗНАКОМОМ тексте (локализация не ломает C1)', () => {
   const factory = makeFakePtyFactory();
   const { mgr } = makeManager(factory);
-  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
   mgr.applyHookEvent(a.tabId, 'Notification', {
     message: 'Клод ждёт вашего ввода', notification_type: 'idle_prompt',
@@ -1975,7 +1990,7 @@ test('N2: notification_type "idle_prompt" даёт idle даже при НЕЗН
 test('N2: notification_type "permission_prompt" побеждает idle-похожий текст', () => {
   const factory = makeFakePtyFactory();
   const { mgr } = makeManager(factory);
-  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
   mgr.applyHookEvent(a.tabId, 'Notification', {
     message: 'waiting for your input to approve Bash', notification_type: 'permission_prompt',
@@ -1987,7 +2002,7 @@ test('N2: notification_type "permission_prompt" побеждает idle-похо
 test('N2: липкий permission — idle-пинг ПОВЕРХ открытого диалога не понижает waitingKind', () => {
   const factory = makeFakePtyFactory();
   const { mgr } = makeManager(factory);
-  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
   mgr.applyHookEvent(a.tabId, 'Notification', { message: 'Claude needs your permission to use Bash' });
   // Диалог всё ещё открыт (статус waiting), прилетает idle-пинг:
@@ -2001,7 +2016,7 @@ test('N2: липкий permission — idle-пинг ПОВЕРХ открыто�
 test('N2: после ВЫХОДА из waiting понижение разрешено — новый idle после working даёт idle', () => {
   const factory = makeFakePtyFactory();
   const { mgr } = makeManager(factory);
-  const a = mgr.open({ cwd: 'C:\proj\alpha' });
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
   mgr.start(a.tabId, 80, 24);
   mgr.applyHookEvent(a.tabId, 'Notification', { message: 'Claude needs your permission to use Bash' });
   mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', {}); // пользователь ответил, вкладка снова работает
