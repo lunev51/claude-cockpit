@@ -713,21 +713,16 @@ async function openTab(cwd, {
   container.className = 'term-view hidden';
   $('terminal-host').appendChild(container);
 
-  const entry = { view: null, container, lastPtyStatus: '', fontSize: config.terminal.fontSize };
+  // Ни строки состояния pty, ни размера шрифта в записи нет: отладочную
+  // статус-строку убрали ещё в фазе панели действий, а поля под неё
+  // писались и не читались никем (ревью 09.08, C19). onPtyStatus/onFontSize
+  // у initTerminal необязательные.
+  const entry = { view: null, container };
   views.set(tab.tabId, entry);
 
   const view = initTerminal(container, config, {
     tabId: tab.tabId,
     preludeText,
-    // Отладочная статус-строка убрана (панель действий заняла её место), но
-    // initTerminal всё равно безусловно зовёт эти колбэки — оставляем их
-    // валидными функциями, поля entry просто больше никуда не выводятся.
-    onPtyStatus: (s) => {
-      entry.lastPtyStatus = s;
-    },
-    onFontSize: (px) => {
-      entry.fontSize = px;
-    },
     onRestartRequest: (id) => restartSession(id),
     onGrid: (size) => gridShare.share(views, tab.tabId, size),
   });
@@ -768,8 +763,6 @@ async function attachTab(t, { activate = false } = {}) {
   const entry = {
     view: null,
     container,
-    lastPtyStatus: '',
-    fontSize: config.terminal.fontSize,
     // Живой вывод, пришедший ПОКА едет история (см. replayHistory ниже и
     // диспатч term:data в boot()): пишем его в терминал только ПОСЛЕ истории,
     // иначе хвост буфера лёг бы поверх более свежих строк и экран показал бы
@@ -794,12 +787,6 @@ async function attachTab(t, { activate = false } = {}) {
     tabId: t.tabId,
     preludeText: null,
     autoStart: shouldStartPty(t),
-    onPtyStatus: (s) => {
-      entry.lastPtyStatus = s;
-    },
-    onFontSize: (px) => {
-      entry.fontSize = px;
-    },
     // Ctrl+Shift+R внутри терминала — третья дверь к перезапуску; ведём её в
     // ту же функцию, что кнопку ⟳ и палитру.
     onRestartRequest: (id) => restartSession(id),
@@ -850,12 +837,11 @@ async function attachTab(t, { activate = false } = {}) {
   await replayHistory(t.tabId);
   // Мёртвой вкладке говорим об этом ПРЯМО В ТЕРМИНАЛЕ, и только здесь —
   // после истории (иначе подпись легла бы выше неё и уехала бы вверх) и
-  // единственным видимым способом: onPtyStatus в terminal.js кладёт строку в
-  // entry.lastPtyStatus, а это поле во всём проекте больше нигде не читается
-  // (отладочная статус-строка убрана ещё в фазе панели действий). Строка
-  // сайдбара показывает «процесс завершён (код N)», но человек, открывший
-  // вкладку, смотрит в терминал — и без этой строки видит просто застывший
-  // экран, на который не реагирует клавиатура.
+  // единственным видимым способом: строку состояния pty из terminal.js
+  // (onPtyStatus) никто не показывает — отладочная статус-строка убрана ещё в
+  // фазе панели действий. Строка сайдбара показывает «процесс завершён (код
+  // N)», но человек, открывший вкладку, смотрит в терминал — и без этой строки
+  // видит просто застывший экран, на который не реагирует клавиатура.
   if (!shouldStartPty(t)) {
     views.get(t.tabId)?.view.term.write(
       '\r\n\x1b[2m— процесс не запущен · Ctrl+Shift+R продолжит сессию —\x1b[0m\r\n',

@@ -422,6 +422,22 @@ test('dispose пишет отложенный размер шрифта сраз
   assert.strictEqual(sent('config.set').length, 1, 'таймер сохранения шрифта пережил вкладку и записал конфиг повторно');
 });
 
+// --- Колбэки состояния необязательны (ревью 09.08, C19) ------------------------
+// app.js передавал onPtyStatus/onFontSize только затем, чтобы писать строки в
+// поля записи вкладки, которых никто не читал. Убрать их можно, лишь если
+// терминал сам живёт без колбэков: onPtyStatus звался безусловно и без
+// умолчания — первое же создание вкладки падало бы с TypeError.
+for (const autoStart of [true, false]) {
+  test(`без onPtyStatus/onFontSize терминал проходит весь цикл (autoStart: ${autoStart})`, async (t) => {
+    const view = await open(t, { onPtyStatus: undefined, onFontSize: undefined, autoStart });
+    view.handlers.onStarted({ pid: 42 });
+    view.handlers.onExit({ exitCode: 0 });
+    view.setFontSize(15);
+    view.dispose();
+    assert.deepStrictEqual(sent('start'), autoStart ? [['start', 'T1', null, null]] : []);
+  });
+}
+
 test('dispose без отложенной смены шрифта конфиг не трогает', async (t) => {
   const view = await open(t);
   view.setFontSize(16);

@@ -68,8 +68,11 @@ function stripAnsi(text) {
 // продолжения работы поднялась бы чистая новая сессия, а старая потерялась
 // бы. Штатный Ctrl+Shift+R (term.restart) сессию бережёт: он резюмит
 // известный sessionId. Подключение не имеет права вести себя хуже рестарта.
+//
+// onPtyStatus/onFontSize — необязательные: строку состояния и размер шрифта
+// сейчас никто не показывает (app.js их не передаёт, ревью 09.08, C19).
 export function initTerminal(container, config, {
-  tabId, onPtyStatus, onFontSize = () => {}, preludeText = null, autoStart = true,
+  tabId, onPtyStatus = () => {}, onFontSize = () => {}, preludeText = null, autoStart = true,
   // Перезапуск по Ctrl+Shift+R отдаём наружу: проверка управления и объяснение
   // отказа живут в app.js, а импортировать его отсюда нельзя — цикл.
   onRestartRequest = null,
@@ -530,10 +533,9 @@ export function initTerminal(container, config, {
     // заблокирован (см. term.onData ниже), человек сам решит, перезапускать
     // ли вкладку: Ctrl+Shift+R резюмит её сессию, а не заводит новую.
     //
-    // Это ТОЛЬКО состояние для вызывающего: onPtyStatus кладёт строку в
-    // entry.lastPtyStatus (app.js), а его сейчас никто не отображает. Видимую
-    // подпись пишет в сам терминал attachTab — после истории, чтобы она не
-    // уехала вверх (см. app.js).
+    // Это ТОЛЬКО состояние для вызывающего, и сейчас его никто не
+    // отображает. Видимую подпись пишет в сам терминал attachTab — после
+    // истории, чтобы она не уехала вверх (см. app.js).
     onPtyStatus('процесс не запущен — Ctrl+Shift+R для перезапуска');
   }
 
