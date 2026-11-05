@@ -42,6 +42,7 @@ import { createHotkeysOverlay } from './hotkeys.js';
 import { pluralTabs } from './format.js';
 import { shouldMarkSeen } from './seen.js';
 import { singleFlight } from './single-flight.js';
+import { createRestoreKeyHandler } from './restore-keys.js';
 // Important (ре-ревью фикс-волны): подключение к вкладке без живого процесса
 // не должно его поднимать — обоснование в самом модуле.
 import { shouldStartPty } from './attach-guards.js';
@@ -2331,16 +2332,15 @@ function showRestoreOverlay(manifest) {
   // startEmpty() срабатывал бы за спиной пользователя. Теперь оба места
   // читают ОДИН и тот же реестр — пропустить будущий новый оверлей в одном
   // из них, забыв про другое, структурно невозможно.
-  function onKey(ev) {
-    if (otherOverlayOpen('restore')) return;
-    if (ev.key === 'Enter') {
-      ev.preventDefault();
-      startRestore();
-    } else if (ev.key === 'Escape') {
-      ev.preventDefault();
-      startEmpty();
-    }
-  }
+  //
+  // Само решение — в restore-keys.js (под node --test). Там же — почему
+  // «зарегистрирован РАНЬШЕ» выше верно не всегда и что restore делает,
+  // когда сосед подписался первым (ревью ветки).
+  const onKey = createRestoreKeyHandler({
+    isCovered: () => otherOverlayOpen('restore'),
+    onRestore: startRestore,
+    onEmpty: startEmpty,
+  });
 
   // Горячие клавиши активны, только пока оверлей на экране.
   document.addEventListener('keydown', onKey, true);

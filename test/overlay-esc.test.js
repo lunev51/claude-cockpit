@@ -7,7 +7,8 @@
 // поля больше не доходила: оверлей висел, пока не кликнешь мимо него.
 // Дашборд, peek и шпаргалка этим не страдают: они слушают Esc на document,
 // пока открыты. Тест гоняет настоящие palette.js и search.js на минимальном
-// поддельном DOM — ровно на том, чем они пользуются.
+// поддельном DOM — ровно на том, чем они пользуются. Второй раздел — Esc
+// оверлеев против обработчика restore под ними (ревью ветки).
 const { test } = require('node:test');
 const assert = require('node:assert');
 const path = require('node:path');
@@ -55,6 +56,13 @@ function makeDom() {
       get textContent() { return this._text; },
       set textContent(v) { this.children = []; this._text = v; },
       appendChild(child) { child.parent = this; this.children.push(child); return child; },
+      append(...nodes) { nodes.forEach((n) => this.appendChild(n)); },
+      setAttribute() {},
+      removeAttribute() {},
+      dataset: {},
+      getBoundingClientRect: () => ({
+        left: 0, top: 0, right: 100, bottom: 40, width: 100, height: 40,
+      }),
       remove() {
         if (!this.parent) return;
         this.parent.children = this.parent.children.filter((c) => c !== this);
@@ -199,11 +207,12 @@ for (const overlay of OVERLAYS) {
 
   test(`${overlay.name}: закрытие снимает слушатель с document`, async () => {
     const { doc, ui, press } = await setup(overlay);
-    const before = doc.listeners.length;
+    const keydown = () => doc.listeners.filter((l) => l.type === 'keydown').length;
+    const before = keydown();
     ui.open();
     ui.close();
     assert.strictEqual(
-      doc.listeners.length, before,
+      keydown(), before,
       'после закрытия на document остался слушатель — копятся с каждым открытием',
     );
     // И повторное открытие после закрытия снова слушает Esc.
@@ -213,26 +222,6 @@ for (const overlay of OVERLAYS) {
     assert.strictEqual(ui.isOpen(), false, 'после повторного открытия Esc вне поля не закрывает');
   });
 
-  test(`${overlay.name}: Esc не достаётся restore, подписанному позже оверлея`, async () => {
-    // Обработчик restore (app.js/showRestoreOverlay) тоже на document в
-    // capture и уступает, только пока открыт другой оверлей. Подписан он не
-    // всегда раньше: bootWorkspace ждёт IPC до показа restore, а для зрителя
-    // проходит заново после захвата управления. Если оверлей, закрывшись,
-    // пропустит Esc дальше, restore решит «начать пусто» за спиной человека.
-    const { doc, ui, press } = await setup(overlay);
-    ui.open();
-    let startEmpty = 0;
-    doc.addEventListener('keydown', (ev) => {
-      if (ui.isOpen()) return; // otherOverlayOpen('restore')
-      if (ev.key === 'Escape') startEmpty += 1;
-    }, true);
-
-    press('Escape');
-
-    assert.strictEqual(ui.isOpen(), false);
-    assert.strictEqual(startEmpty, 0, 'тот же Esc после закрытия оверлея долетел до restore — «начать пусто» без спроса');
-  });
-
   test(`${overlay.name}: другие клавиши вне поля оверлей не закрывают`, async () => {
     const { doc, ui, press } = await setup(overlay);
     ui.open();
@@ -240,5 +229,105 @@ for (const overlay of OVERLAYS) {
     press('a');
     press('Enter');
     assert.strictEqual(ui.isOpen(), true, 'оверлей закрылся не по Esc');
+  });
+}
+
+// --- restore под другим оверлеем (ревью ветки) -----------------------------
+//
+// Обработчик restore (restore-keys.js, подписывает app.js/showRestoreOverlay)
+// висит на том же document в той же capture-фазе и уступает, только пока
+// видит открытый оверлей. Подписан он не всегда раньше: bootWorkspace ждёт
+// IPC до показа restore, а у зрителя проходит заново после захвата управления.
+// Тогда оверлей, подписанный раньше, получает Esc первым, закрывается — и
+// restore следом не видел бы ничего сверху: «начать пусто», вчерашний список
+// проектов потерян. Так было и до ветки — у дашборда и шпаргалки.
+//
+// Гоняем настоящий обработчик restore против настоящих оверлеев.
+
+const NEIGHBOURS = [
+  OVERLAYS[0],
+  OVERLAYS[1],
+  {
+    name: 'шпаргалка клавиш',
+    async create(root) {
+      const { createHotkeysOverlay } = await import(modUrl('hotkeys.js'));
+      return createHotkeysOverlay({ host: root });
+    },
+  },
+  {
+    name: 'peek',
+    async create(root, el) {
+      globalThis.window = { innerWidth: 1280, innerHeight: 800 };
+      const { createPeek } = await import(modUrl('peek.js'));
+      const peek = createPeek({
+        root, onSend() {}, onOpenTab() {}, onHide() {},
+      });
+      const anchorEl = el('div');
+      return {
+        open: () => peek.show({
+          tabId: 't1', name: 'проект', text: 'Продолжить?', anchorEl,
+        }),
+        isOpen: () => peek.isOpen(),
+      };
+    },
+  },
+  {
+    name: 'дашборд',
+    async create(root) {
+      const { createDashboard } = await import(modUrl('dashboard.js'));
+      return createDashboard({
+        root,
+        getData: () => null,
+        onRefresh: async () => null,
+        onOpen() {},
+        fallbackFocus: () => null,
+        api: {},
+        resolveTabName: () => '',
+      });
+    },
+  },
+];
+
+async function restoreUnder(overlay) {
+  const dom = makeDom();
+  globalThis.document = dom.doc;
+  const root = dom.el('div');
+  dom.doc.body.appendChild(root);
+  const ui = await overlay.create(root, dom.el);
+  const { createRestoreKeyHandler } = await import(modUrl('restore-keys.js'));
+  const calls = { empty: 0, restore: 0 };
+  const onKey = createRestoreKeyHandler({
+    isCovered: () => ui.isOpen(), // app.js: otherOverlayOpen('restore')
+    onRestore: () => { calls.restore += 1; },
+    onEmpty: () => { calls.empty += 1; },
+  });
+  return { ...dom, ui, onKey, calls };
+}
+
+for (const overlay of NEIGHBOURS) {
+  test(`restore под оверлеем «${overlay.name}», подписан ПОЗЖЕ: Esc закрывает оверлей, а не воркспейс`, async () => {
+    const { doc, ui, onKey, calls, press } = await restoreUnder(overlay);
+    ui.open();
+    doc.addEventListener('keydown', onKey, true); // restore подписался позже
+
+    press('Escape');
+
+    assert.strictEqual(ui.isOpen(), false, 'Esc не закрыл оверлей');
+    assert.strictEqual(calls.empty, 0, 'тот же Esc после закрытия оверлея долетел до restore — «начать пусто» без спроса');
+
+    // Сверху ничего не осталось — следующий Esc уже решение restore.
+    press('Escape');
+    assert.strictEqual(calls.empty, 1, 'restore без оверлея сверху перестал понимать Esc');
+  });
+
+  test(`restore под оверлеем «${overlay.name}», подписан РАНЬШЕ: штатный порядок не сломан`, async () => {
+    const { doc, ui, onKey, calls, press } = await restoreUnder(overlay);
+    doc.addEventListener('keydown', onKey, true);
+    ui.open();
+
+    press('Escape');
+
+    assert.strictEqual(ui.isOpen(), false, 'Esc не закрыл оверлей');
+    assert.strictEqual(calls.empty, 0, 'restore принял Esc, предназначенный оверлею сверху');
   });
 }

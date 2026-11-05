@@ -244,15 +244,11 @@ export function createSearch({ root, api, onOpenResult }) {
 
   // Esc — на document в capture-фазе, пока поиск открыт, как в palette.js и
   // dashboard.js (ревью 09.08, C11): слушатель на поле ввода умирал, стоило
-  // кликнуть по паддингу панели — фокус уходил на <body>.
-  // stopImmediatePropagation — чтобы restore под оверлеем не принял тот же Esc
-  // за «начать пусто», если подписался позже нас (разбор — в palette.js). Для
-  // поиска это не теория: он открыт и зрителю, а bootWorkspace проходит
-  // заново, когда зритель забирает управление, — restore подписывается позже.
+  // кликнуть по паддингу панели — фокус уходил на <body>. Почему capture и
+  // почему preventDefault несущий — см. palette.js/onDocKeydown.
   function onDocKeydown(ev) {
     if (ev.key !== 'Escape') return;
     ev.preventDefault();
-    ev.stopImmediatePropagation();
     close();
   }
 

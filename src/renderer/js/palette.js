@@ -96,17 +96,13 @@ export function createPalette({ root, getActions }) {
   // уводит фокус на <body>, и клавиша до поля больше не доходила — палитра
   // висела, пока не кликнешь мимо.
   //
-  // stopImmediatePropagation — сверх соседей, и не зря. Обработчик restore
-  // (app.js/showRestoreOverlay) тоже висит на document в capture и уступает,
-  // только пока видит открытый оверлей. Обычно он подписан раньше и уступает
-  // штатно. Но Ctrl+P работает уже до bootWorkspace — палитра, открытая в
-  // этот момент, подпишется ПЕРВОЙ, закроется, и restore следом решил бы
-  // «начать пусто» за спиной человека. Поле ввода этой зависимости от
-  // порядка не знало — значит, не должен знать и document.
+  // Capture — потому что элемент в фокусе может погасить Esc сам (xterm на
+  // своём textarea), и во всплытии клавиши уже не было бы. preventDefault —
+  // несущий: по нему restore под палитрой понимает, что Esc уже обработан,
+  // даже если подписался позже нас (restore-keys.js).
   function onDocKeydown(ev) {
     if (ev.key !== 'Escape') return;
     ev.preventDefault();
-    ev.stopImmediatePropagation();
     close();
   }
 
