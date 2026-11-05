@@ -125,9 +125,24 @@ const codeOnly = (source) => source
   .map((line) => line.replace(/\s\/\/\s.*$/, ''))
   .join('\n');
 
+// Имена, которые app.js берёт из модуля, — в любой форме импорта: отдельной
+// строкой, общим списком, многострочным (M4 ревью ветки: страж, требовавший
+// ровно `import { deadTabHint }`, краснел на безобидном объединении импортов).
+function importedFrom(code, file) {
+  const names = new Set();
+  const re = new RegExp(`import\\s*\\{([^}]*)\\}\\s*from\\s*['"]\\./${file.replace('.', '\\.')}['"]`, 'g');
+  for (const m of code.matchAll(re)) {
+    for (const spec of m[1].split(',')) {
+      const name = spec.trim().split(/\s+as\s+/)[0];
+      if (name) names.add(name);
+    }
+  }
+  return names;
+}
+
 test('attachTab пишет мёртвой вкладке deadTabHint(t), а не зашитый текст', () => {
   const app = codeOnly(fs.readFileSync(path.join(RENDERER, 'app.js'), 'utf8'));
-  assert.match(app, /import\s+\{\s*deadTabHint\s*\}\s+from\s+'\.\/attach-guards\.js'/, 'deadTabHint не импортируется в app.js');
+  assert.ok(importedFrom(app, 'attach-guards.js').has('deadTabHint'), 'deadTabHint не импортируется в app.js из attach-guards.js');
   assert.match(
     app,
     /if \(!shouldStartPty\(t\)\) \{\s*\n\s*views\.get\(t\.tabId\)\?\.view\.term\.write\(`\\r\\n\\x1b\[2m— \$\{deadTabHint\(t\)\} —\\x1b\[0m\\r\\n`\);/,

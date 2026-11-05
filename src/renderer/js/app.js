@@ -51,10 +51,9 @@ import { shouldMarkSeen } from './seen.js';
 import { singleFlight } from './single-flight.js';
 import { createRestoreKeyHandler } from './restore-keys.js';
 // Important (ре-ревью фикс-волны): подключение к вкладке без живого процесса
-// не должно его поднимать — обоснование в самом модуле.
-import { shouldStartPty } from './attach-guards.js';
-// Подпись мёртвой вкладки — по тому, что на деле сделает Ctrl+Shift+R (T1).
-import { deadTabHint } from './attach-guards.js';
+// не должно его поднимать — обоснование в самом модуле. deadTabHint —
+// подпись мёртвой вкладки по тому, что на деле сделает Ctrl+Shift+R (T1).
+import { shouldStartPty, deadTabHint } from './attach-guards.js';
 // Task 3 фазы 9 (голосовой ввод, push-to-talk по правому Shift): recorder —
 // портирован из Companion как есть (src/renderer/js/voice/recorder.js, см.
 // комментарий там же — ни одного изменённого пути импорта не понадобилось,
