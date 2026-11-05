@@ -128,30 +128,43 @@ function findOne(root, className) {
 
 // --- git: настоящий git-info.js на подставленном run() ----------------------
 //
-// 12 изменённых файлов по 10 строк диффа — 120 строк текста и 12 строк
-// списка файлов: обе области прокручиваются.
+// По репозиторию на cwd: t1 и t1b — две вкладки одного проекта (дифф один),
+// t2 — другой проект. В каждом 12 изменённых файлов по 10 строк диффа —
+// 120 строк текста и 12 строк списка файлов: обе области прокручиваются.
+
+const TAB_CWD = { t1: 'C:\\proj\\a', t1b: 'C:\\proj\\a', t2: 'C:\\proj\\b' };
+
+function repoState(dir) {
+  return {
+    dir, files: 12, edited: null, branch: 'feat/visible-c-render', ahead: 1, behind: 0, untracked: [],
+  };
+}
 
 function makeRepo() {
-  const state = { files: 12, edited: null };
+  const repos = { 'C:\\proj\\a': repoState('модуль'), 'C:\\proj\\b': repoState('другой') };
+  const state = repos['C:\\proj\\a'];
 
-  function fileName(i) { return `src/renderer/js/модуль-${String(i).padStart(2, '0')}.js`; }
+  function fileName(st, i) { return `src/renderer/js/${st.dir}-${String(i).padStart(2, '0')}.js`; }
 
-  function statusOut() {
-    const lines = ['## feat/visible-c-render...origin/feat/visible-c-render [ahead 1]'];
-    for (let i = 0; i < state.files; i += 1) lines.push(` M ${fileName(i)}`);
+  // Формат — как у настоящего `git status --porcelain=v1 -b` (см. git-info.test.js).
+  function statusOut(st) {
+    const track = [st.ahead && `ahead ${st.ahead}`, st.behind && `behind ${st.behind}`].filter(Boolean).join(', ');
+    const lines = [`## ${st.branch}...origin/${st.branch}${track ? ` [${track}]` : ''}`];
+    for (let i = 0; i < st.files; i += 1) lines.push(` M ${fileName(st, i)}`);
+    for (const p of st.untracked) lines.push(`?? ${p}`);
     return `${lines.join('\n')}\n`;
   }
 
-  function numstatOut() {
+  function numstatOut(st) {
     const lines = [];
-    for (let i = 0; i < state.files; i += 1) lines.push(`3\t1\t${fileName(i)}`);
+    for (let i = 0; i < st.files; i += 1) lines.push(`3\t1\t${fileName(st, i)}`);
     return `${lines.join('\n')}\n`;
   }
 
-  function diffOut() {
+  function diffOut(st) {
     const out = [];
-    for (let i = 0; i < state.files; i += 1) {
-      const f = fileName(i);
+    for (let i = 0; i < st.files; i += 1) {
+      const f = fileName(st, i);
       out.push(
         `diff --git a/${f} b/${f}`,
         'index 8343da4..e84a0b4 100644',
@@ -161,7 +174,7 @@ function makeRepo() {
         '   const host = document.getElementById(\'diff-panel\'); // длинная строка контекста, шире окна панели',
         '-  return host;',
         `+  return host ?? null; // правка ${i}`,
-        state.edited === i ? '+  // вторая правка, уже после первого чтения' : '+  // правка',
+        st.edited === i ? '+  // вторая правка, уже после первого чтения' : '+  // правка',
         '+  // ещё строка',
       );
     }
@@ -169,10 +182,18 @@ function makeRepo() {
   }
 
   const ok = (stdout) => ({ code: 0, stdout, stderr: '' });
-  const run = async (args) => {
-    if (args.includes('--numstat')) return ok(numstatOut());
-    if (args.includes('status')) return ok(statusOut());
-    if (args.includes('diff')) return ok(diffOut());
+  const run = async (args, cwd) => {
+    const st = repos[cwd];
+    if (!st) throw new Error(`неизвестный cwd: ${cwd}`);
+    if (args.includes('--no-index')) {
+      // Неотслеживаемые файлы в фикстуре — бинарники: numstat "-\t-\t…" (код 1
+      // у --no-index — «есть отличия», штатный путь), сам дифф не тянется.
+      if (args.includes('--numstat')) return { code: 1, stdout: `-\t-\t${args[args.length - 1]}\n`, stderr: '' };
+      throw new Error('дифф бинарника git-info запрашивать не должен');
+    }
+    if (args.includes('--numstat')) return ok(numstatOut(st));
+    if (args.includes('status')) return ok(statusOut(st));
+    if (args.includes('diff')) return ok(diffOut(st));
     throw new Error(`неожиданные args: ${JSON.stringify(args)}`);
   };
 
@@ -181,12 +202,14 @@ function makeRepo() {
   let clock = Date.UTC(2026, 10, 5, 12, 0, 0);
   const info = createGitInfo({ run, now: () => (clock += 5000), cache: new Map() });
   const fetched = [];
-  const repo = { state, fetched, hold: null };
+  const repo = {
+    state, repos, fetched, hold: null,
+  };
   repo.api = {
     git: {
       async get(tabId, opts) {
         // IPC отдаёт копию: ссылка на прошлый ответ никогда не совпадает.
-        const snap = structuredClone(await info.get(`C:\\proj\\${tabId}`, opts));
+        const snap = structuredClone(await info.get(TAB_CWD[tabId], opts));
         // hold — ответ «ещё в пути»: тест сам решает, когда он долетит.
         if (repo.hold) await repo.hold;
         fetched.push(snap.fetchedAt);
@@ -324,4 +347,43 @@ test('закрыли панель, пока летел git:get, дифф изм�
     text.children.some((n) => n.textContent === '+  // вторая правка, уже после первого чтения'),
     'открыли панель после изменения диффа — а на экране прежний',
   );
+});
+
+// Ревью ветки, M2: прокрутка — про тот дифф, который читаешь. Другая
+// вкладка — другой дифф (или тот же проект, но другой разговор): его
+// читают с начала, а не с места, где остановились в прошлой.
+
+test('переход на вкладку другого проекта — дифф с начала', async (t) => {
+  const { panel, text, files, body } = await setup(t);
+
+  panel.setActiveTab('t2');
+  await flush();
+
+  assert.ok(text.children.some((n) => n.textContent.startsWith('diff --git a/src/renderer/js/другой-')), 'дифф второй вкладки не нарисован');
+  assert.deepStrictEqual(
+    [body.scrollTop, body.scrollLeft, files.scrollTop], [0, 0, 0],
+    'прокрутка первой вкладки перенеслась на чужой дифф',
+  );
+});
+
+test('переход на вторую вкладку того же проекта — тоже с начала', async (t) => {
+  // Дифф тот же — DOM не перестраивается, но вкладка другая.
+  const { panel, text, files, body } = await setup(t);
+  const lines = [...text.children];
+
+  panel.setActiveTab('t1b');
+  await flush();
+
+  assert.ok(text.children.every((n, i) => n === lines[i]), 'тот же дифф перестроен при смене вкладки');
+  assert.deepStrictEqual([body.scrollTop, body.scrollLeft, files.scrollTop], [0, 0, 0], 'прокрутка перенеслась на другую вкладку');
+});
+
+test('повторная активация той же вкладки — прокрутка на месте', async (t) => {
+  // app.js/activateTab зовёт setActiveTab и для уже активной вкладки.
+  const { panel, files, body } = await setup(t);
+
+  panel.setActiveTab('t1');
+  await flush();
+
+  assert.deepStrictEqual([body.scrollTop, body.scrollLeft, files.scrollTop], [900, 120, 20], 'щелчок по уже открытой вкладке выкинул дифф к началу');
 });

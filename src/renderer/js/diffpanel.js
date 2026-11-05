@@ -166,6 +166,7 @@ export function createDiffPanel({ root, api }) {
   let debounceTimer = null;
   let fileAnchors = new Map(); // path → DOM-элемент строки "diff --git" в тексте диффа (для скролла по клику)
   let renderedKey = null; // snapshotKey() того, что сейчас нарисовано; null — нарисовано мимо снимков
+  let tabChanged = false; // вкладка сменилась, а её дифф ещё не показан — показать с начала (см. show)
 
   // --- DOM: строится один раз, дальше только точечно обновляется ---
 
@@ -361,15 +362,22 @@ export function createDiffPanel({ root, api }) {
   // сохранение ниже — страховка: если в render() появится чтение размеров
   // посреди сборки, браузер поджал бы прокрутку к пустой панели. Если дифф
   // стал короче, браузер сам поджимает её к концу.
+  //
+  // Ревью ветки (M2): первый показ после смены вкладки — с начала, даже если
+  // дифф тот же (вторая вкладка того же проекта): место, где человек
+  // остановился в прошлой вкладке, к этой не относится.
   function show(snap) {
     if (!isOpenFlag) return;
+    const fromTop = tabChanged;
+    tabChanged = false;
+    const filesTop = fromTop ? 0 : filesEl.scrollTop;
+    const bodyTop = fromTop ? 0 : bodyEl.scrollTop;
+    const bodyLeft = fromTop ? 0 : bodyEl.scrollLeft;
     const key = snapshotKey(snap);
-    if (key === renderedKey) return;
-    renderedKey = key;
-    const filesTop = filesEl.scrollTop;
-    const bodyTop = bodyEl.scrollTop;
-    const bodyLeft = bodyEl.scrollLeft;
-    render(snap);
+    if (key !== renderedKey) {
+      renderedKey = key;
+      render(snap);
+    }
     filesEl.scrollTop = filesTop;
     bodyEl.scrollTop = bodyTop;
     bodyEl.scrollLeft = bodyLeft;
@@ -436,6 +444,7 @@ export function createDiffPanel({ root, api }) {
   // последней вкладки) — обновляет содержимое, только если панель открыта;
   // если закрыта, просто запоминает activeTabId на будущее открытие.
   function setActiveTab(tabId) {
+    if (tabId !== activeTabId) tabChanged = true;
     activeTabId = tabId;
     if (isOpenFlag) refresh({ force: false });
   }
