@@ -264,17 +264,75 @@ test('forget(tabId) сбрасывает и lastStatus — working после fo
 // Статус «фон» (план 2026-11-05): ход окончен, фоновая задача жива — вкладка
 // в «Работают». «Готово» звать рано: результата, ради которого всё затевалось
 // (записанная флешка), ещё нет.
-test('фон: background — тишина, тоста «готово» нет', () => {
+// Решение владельца 05.11: вкладка с вечным dev-сервером каждый ход кончает в
+// «фоне», и без этого тоста о том, что Claude ответил, человек не узнал бы
+// никогда. Тост — не «готово» (работа ещё идёт), а «ответил · фон ещё работает».
+test('фон: конец хода дольше 30с с живым фоном → тост «ответил · фон ещё работает» с подписью', () => {
   const h = makeToaster();
+  h.setFocused(false);
   h.setClock(0);
-  h.toaster.onStatus({
-    tabId: 't1', tabName: 'proj', status: 'working', waitingText: '',
-  });
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
   h.setClock(60000);
   h.toaster.onStatus({
-    tabId: 't1', tabName: 'proj', status: 'background', waitingText: '',
+    tabId: 't1', tabName: 'proj', status: 'background', waitingText: '', subtitle: 'фон · 1 команда',
   });
+  assert.strictEqual(h.notifications.length, 1);
+  assert.strictEqual(h.notifications[0].title, 'proj: ответил · фон ещё работает');
+  assert.strictEqual(h.notifications[0].body, 'фон · 1 команда');
+  h.notifications[0].onClick();
+  assert.deepStrictEqual(h.focusCalls, ['t1']);
+});
+
+test('фон: конец хода из «завис» с живым фоном — тоже ответ, тост есть', () => {
+  const h = makeToaster();
+  h.setFocused(false);
+  h.setClock(0);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
+  h.setClock(400000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'stuck', waitingText: '' });
+  h.setClock(420000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '', subtitle: 'фон · 1 агент' });
+  assert.strictEqual(h.notifications.length, 1);
+  assert.strictEqual(h.notifications[0].title, 'proj: ответил · фон ещё работает');
+});
+
+test('фон: короткий ход (до 30с) с живым фоном — тишина, тот же порог, что у «готово»', () => {
+  const h = makeToaster();
+  h.setFocused(false);
+  h.setClock(0);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
+  h.setClock(20000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '', subtitle: 'фон · 1 команда' });
   assert.strictEqual(h.notifications.length, 0);
+});
+
+test('фон: человек смотрит на эту вкладку — тишина', () => {
+  const h = makeToaster();
+  h.setFocused(true);
+  h.setActive('t1');
+  h.setClock(0);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
+  h.setClock(60000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '', subtitle: 'фон · 1 команда' });
+  assert.strictEqual(h.notifications.length, 0);
+});
+
+test('фон: возврат в «фон» не из работы (хук фонового агента, смена подписи) — хода не было, тишина', () => {
+  // sessions.js возвращает вкладку в «фон» хуком фонового агента из «Ждут
+  // тебя»/«Готово»/«Наготове» и шлёт новый «фон» при смене подписи. Ни то, ни
+  // другое — не ответ Claude; тост здесь был бы ложным.
+  for (const from of ['waiting', 'done', 'ready', 'background']) {
+    const h = makeToaster();
+    h.setFocused(false);
+    h.setClock(0);
+    h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
+    h.setClock(60000);
+    h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: from, waitingText: 'вопрос' });
+    const before = h.notifications.length;
+    h.setClock(120000);
+    h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '', subtitle: 'фон · 2 агента' });
+    assert.strictEqual(h.notifications.length, before, `из «${from}» в «фон» тоста быть не должно`);
+  }
 });
 
 test('фон: короткий ход после уведомления о конце фона даёт «готово» — время считается с начала всей работы', () => {

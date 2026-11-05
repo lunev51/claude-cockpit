@@ -57,8 +57,9 @@ function createToaster({
 
   // taskNotification — ход начал сам CLI с уведомлением о конце фоновой
   // задачи (sessions.js, UserPromptSubmit), а не человек новым промптом.
+  // subtitle — подпись статуса («фон · 1 команда»), идёт в тело тоста «фона».
   function onStatus({
-    tabId, tabName, status, waitingText, taskNotification,
+    tabId, tabName, status, waitingText, taskNotification, subtitle,
   }) {
     const prevStatus = lastStatus.get(tabId);
 
@@ -78,8 +79,23 @@ function createToaster({
 
     lastStatus.set(tabId, status);
 
+    // «Фон»: Claude ответил, но оставил живую фоновую задачу. Решение владельца
+    // 05.11 — сказать об этом: вкладка с вечным dev-сервером каждый ход кончает
+    // здесь, и тоста «готово» по ней не было бы никогда. Тост только на КОНЦЕ
+    // ХОДА (из работы): в «фон» вкладку возвращает и хук фонового агента из
+    // «Ждут тебя»/«Готово», и смена подписи — это не ответ Claude. Порог тот же,
+    // что у «готово», по той же причине (шум на каждую мелочь).
+    if (status === 'background') {
+      if (prevStatus !== 'working' && prevStatus !== 'stuck') return;
+      if (isSuppressed(tabId)) return;
+      const startedAt = workingSince.get(tabId);
+      const elapsed = startedAt == null ? Infinity : now() - startedAt;
+      if (elapsed <= DONE_THRESHOLD_MS) return;
+      show(tabId, `${tabName}: ответил · фон ещё работает`, truncate(String(subtitle || '')));
+      return;
+    }
+
     // stuck и любые прочие статусы — тишина по контракту (working обработан выше).
-    // «Фон» тоже: результата ещё нет, вкладка в «Работают».
     if (status !== 'waiting' && status !== 'done' && status !== 'dead') return;
 
     if (status === 'dead') {
