@@ -23,6 +23,24 @@ function isValidSize(s) {
   return !!s && typeof s === 'object' && dim(s.cols) && dim(s.rows);
 }
 
+// Порог РАЗДАЧИ размера всем вкладкам: 40×10 — в такой сетке ещё можно
+// читать и работать, а всё уже — временное сужение (диф-панель в узком
+// браузере, перетаскивание края окна), ради которого нельзя перерисовывать
+// все сессии и срезать прокрутку скрытых (ре-ревью: 14×27 при ~720px с
+// диф-панелью). Копия — в src/renderer/js/term-size.js: по ней renderer
+// решает, раздавать ли сетку скрытым xterm; равенство копий держит
+// test/grid-share.test.js (ESM и CJS не импортируют один файл).
+const MIN_SHARED_GRID = Object.freeze({ cols: 40, rows: 10 });
+
+// Запомненный размер владельца нужен ТОЛЬКО для раздачи всем вкладкам:
+// пересадка (applyHandoffSize в ipc.js) и старт скрытой вкладки
+// (resolveStartSize). Поэтому запоминаем только раздаваемый: узкий размер
+// видимой вкладки разошёлся бы всем при следующей пересадке. Остаётся
+// последний раздаваемый — в нём main и держит остальные pty.
+function isShareableSize(s) {
+  return isValidSize(s) && s.cols >= MIN_SHARED_GRID.cols && s.rows >= MIN_SHARED_GRID.rows;
+}
+
 function createOwnership({ onChange, onPresence } = {}) {
   let owner = 'local';
   let online = true;
@@ -34,7 +52,7 @@ function createOwnership({ onChange, onPresence } = {}) {
   const sizes = new Map();
 
   function claim(who, nextSize) {
-    if (isValidSize(nextSize)) sizes.set(who, { cols: nextSize.cols, rows: nextSize.rows });
+    if (isShareableSize(nextSize)) sizes.set(who, { cols: nextSize.cols, rows: nextSize.rows });
     if (who === owner) {
       // Тот же хозяин вернулся после обрыва — смены владельца нет, но факт
       // «снова на связи» касается всех: у остальных клиентов на заглушке и в
@@ -63,11 +81,11 @@ function createOwnership({ onChange, onPresence } = {}) {
   // только ручной ресайз окна: он будил наблюдателя, тот слал настоящий размер.
   //
   // Владельца и событий не трогаем — это не захват, а уточнение факта.
-  // Кривой размер игнорируем (та же isValidSize, что у claim): скрытое окно
-  // даёт контейнер нулевого размера, и запомнить 0×0 значило бы вернуться к
-  // нему при следующем захвате.
+  // Кривой и узкий размер игнорируем (та же isShareableSize, что у claim):
+  // скрытое окно даёт контейнер нулевого размера, узкое — 14×27, и запомнить
+  // такое значило бы раздать его всем при следующем захвате.
   function noteSize(nextSize) {
-    if (!isValidSize(nextSize)) return;
+    if (!isShareableSize(nextSize)) return;
     sizes.set(owner, { cols: nextSize.cols, rows: nextSize.rows });
   }
 
@@ -92,4 +110,4 @@ function createOwnership({ onChange, onPresence } = {}) {
   };
 }
 
-module.exports = { createOwnership };
+module.exports = { createOwnership, MIN_SHARED_GRID, isShareableSize };

@@ -71,6 +71,72 @@ test('хранится копия: чужой объект размера не �
   assert.deepStrictEqual(grid.current(), { cols: 100, rows: 30 });
 });
 
+// --- Порог раздачи (ре-ревью) -------------------------------------------------
+// Ре-ревью в headless Chrome: браузер ~720px с диф-панелью → видимая вкладка
+// 14×27. Скрытая B (2000 строк по 101 символу) приняла 14×27, её буфер упёрся
+// в лимит прокрутки, и при возврате к 1440px от 2000 строк осталось ~190. На
+// main скрытые так не страдали. Видимая вкладка свой узкий размер получает,
+// остальным он не раздаётся.
+
+test('узкая сетка (уже порога) скрытым не раздаётся и общей не становится', async () => {
+  const { createGridShare } = await import(url);
+  const grid = createGridShare();
+  const { views, got } = fakeViews(['A', 'B', 'C']);
+  grid.share(views, 'A', { cols: 200, rows: 50 });
+  got.length = 0;
+
+  grid.share(views, 'A', { cols: 14, rows: 27 });
+  assert.deepStrictEqual(got, [], 'узкая сетка видимой вкладки срезала прокрутку скрытых');
+  assert.deepStrictEqual(grid.current(), { cols: 200, rows: 50 }, 'узкая сетка стала общей — её примет и вкладка, открытая позже');
+
+  const late = [];
+  grid.adopt({ adoptGrid: (size) => late.push({ ...size }) });
+  assert.deepStrictEqual(late, [{ cols: 200, rows: 50 }], 'новая вкладка встала не в последнюю раздаваемую сетку');
+
+  // Ширину вернули — раздаётся снова.
+  grid.share(views, 'A', { cols: 180, rows: 50 });
+  assert.deepStrictEqual(got, [['B', { cols: 180, rows: 50 }], ['C', { cols: 180, rows: 50 }]]);
+});
+
+test('узкая сетка до первой нормальной — общей сетки нет вовсе', async () => {
+  const { createGridShare } = await import(url);
+  const grid = createGridShare();
+  const { views, got } = fakeViews(['A', 'B']);
+  grid.share(views, 'A', { cols: 14, rows: 27 });
+  assert.deepStrictEqual(got, []);
+  assert.strictEqual(grid.current(), null);
+});
+
+test('порог раздачи: ровно на пороге раздаётся, на единицу меньше по любой оси — нет', async () => {
+  const { createGridShare } = await import(url);
+  const { MIN_SHARED_GRID } = await import(pathToFileURL(path.join(__dirname, '..', 'src', 'renderer', 'js', 'term-size.js')).href);
+  const { cols: c, rows: r } = MIN_SHARED_GRID;
+  for (const [size, shared] of [
+    [{ cols: c, rows: r }, true],
+    [{ cols: c - 1, rows: r }, false],
+    [{ cols: c, rows: r - 1 }, false],
+    [{ cols: c + 100, rows: r + 100 }, true],
+  ]) {
+    const grid = createGridShare();
+    const { views, got } = fakeViews(['A', 'B']);
+    grid.share(views, 'A', size);
+    assert.strictEqual(got.length > 0, shared, `${size.cols}×${size.rows}: раздача ${shared ? 'не случилась' : 'случилась'}`);
+  }
+});
+
+test('порог раздачи один и тот же в renderer (term-size.js) и main (ownership.js)', async () => {
+  // Скрытые xterm (renderer) и их pty (main) обязаны оставаться в одной сетке:
+  // раздай одна сторона узкую сетку, а другая нет — вывод фоновой сессии
+  // снова ляжет в чужую. ESM renderer и CJS main не могут импортировать один
+  // файл, поэтому копии две, а держит их вместе этот тест.
+  const { MIN_SHARED_GRID: renderer } = await import(pathToFileURL(path.join(__dirname, '..', 'src', 'renderer', 'js', 'term-size.js')).href);
+  const { MIN_SHARED_GRID: main } = require('../src/main/ownership');
+  for (const [side, v] of [['renderer', renderer], ['main', main]]) {
+    assert.ok(v && Number.isInteger(v.cols) && Number.isInteger(v.rows) && v.cols > 2 && v.rows > 2, `порог в ${side} не задан`);
+  }
+  assert.deepStrictEqual({ cols: renderer.cols, rows: renderer.rows }, { cols: main.cols, rows: main.rows }, 'пороги раздачи renderer и main разъехались');
+});
+
 test('запись без view (initTerminal ещё не вернулся) пропускается без исключения', async () => {
   const { createGridShare } = await import(url);
   const grid = createGridShare();

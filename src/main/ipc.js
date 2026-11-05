@@ -16,7 +16,7 @@ const { createCommandRegistry } = require('./command-registry');
 const { createBroadcast } = require('./broadcast');
 const { createOutputBuffer } = require('./output-buffer');
 const { createNetServer } = require('./net-server');
-const { createOwnership } = require('./ownership');
+const { createOwnership, isShareableSize } = require('./ownership');
 const { listDir, listDrives } = require('./fs-browse');
 const { isWriteChannel } = require('./write-channels');
 const { getConfig, setConfig } = require('./config');
@@ -1074,8 +1074,14 @@ function dropTabOutputBuffer({ tabId, outputBuffer }) {
 // Живой замер (09.08): фоновая вкладка после возврата руля оставалась в
 // размере ушедшего клиента (140 колонок при окне на 105), чинилась только
 // переключением на неё — ResizeObserver в terminal.js слал term:resize сам.
+//
+// Раздаётся только размер не уже порога (isShareableSize, MIN_SHARED_GRID в
+// ownership.js): узкий размер видимой вкладки перерисовал бы все сессии в
+// 14 колонок (ре-ревью). Узкое сюда приходить и не должно (ownership его не
+// запоминает, termResizeHandler шлёт его только своей вкладке), но раздача
+// всем — одна точка, и правило держится здесь, а не у каждого вызывающего.
 function applyHandoffSize({ manager, size }) {
-  if (!size || !(size.cols > 0) || !(size.rows > 0)) return;
+  if (!isShareableSize(size)) return;
   for (const tab of manager.list()) manager.resize(tab.tabId, size.cols, size.rows);
 }
 
@@ -1124,11 +1130,21 @@ function termStartHandler({ manager, ownership, payload }) {
 // Затем размер запоминается за владельцем. Живая жалоба 05.08: «при возврате
 // на ПК размер ломается, приходится дёргать окно» — владение знало размер
 // лишь с момента захвата, и возврат ставил pty в размер загрузки страницы.
+//
+// Узкий размер (уже MIN_SHARED_GRID: ре-ревью поймало 14×27 в браузере ~720px
+// с диф-панелью) — только своей вкладке и без запоминания: раздача всем
+// перерисовала бы все сессии в 14 колонок, а renderer тем же порогом не
+// раздаёт такую сетку скрытым xterm (grid-share.js) — их pty и xterm остаются
+// в последней общей сетке.
 function termResizeHandler({ manager, ownership, payload }) {
   if (!payload || typeof payload !== 'object') return;
   const { tabId, cols, rows } = payload;
   if (typeof tabId !== 'string') return;
   if (!validDim(cols) || !validDim(rows)) return;
+  if (!isShareableSize({ cols, rows })) {
+    manager.resize(tabId, cols, rows);
+    return;
+  }
   applyHandoffSize({ manager, size: { cols, rows } });
   ownership.noteSize({ cols, rows });
 }

@@ -15,6 +15,13 @@
 // вкладки в pty не шлёт ничего и подогнанную вкладку не трогает
 // (terminal.js). Вкладка с другим размером шрифта при показе подгонится сама
 // и сообщит свою сетку — принятая цена.
+//
+// Узкая сетка (уже MIN_SHARED_GRID, см. term-size.js) не раздаётся и общей не
+// становится: скрытые вкладки остаются в последней раздаваемой — ровно в той,
+// в которой main оставил их pty (termResizeHandler шлёт узкий размер только
+// своей вкладке). Иначе сужение видимой срезало бы прокрутку всех скрытых.
+import { isShareableGrid } from './term-size.js';
+
 export function createGridShare() {
   let grid = null;
   return {
@@ -22,6 +29,7 @@ export function createGridShare() {
     // views — Map tabId → запись app.js ({view, ...}); view бывает ещё null,
     // пока initTerminal не вернулся.
     share(views, fromTabId, size) {
+      if (!isShareableGrid(size)) return grid;
       grid = { cols: size.cols, rows: size.rows };
       for (const [id, entry] of views) {
         if (id !== fromTabId) entry.view?.adoptGrid(grid);

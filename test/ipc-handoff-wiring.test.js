@@ -385,6 +385,55 @@ test('term:resize: форма вкладок — та, что отдаёт manag
   ]);
 });
 
+// Ре-ревью: браузер ~720px с диф-панелью → видимая вкладка 14×27. Раздача
+// всем перерисовывала ВСЕ сессии Claude Code в 14 колонок и срезала прокрутку
+// скрытых. Видимая вкладка свой узкий размер получает, остальные — нет.
+test('узкий ресайз (уже порога раздачи) меняет только свою вкладку и не запоминается', () => {
+  const { mgr, spawned } = realManager();
+  const ids = ['A', 'B', 'C'].map((name) => mgr.open({ cwd: `C:\\${name}` }).tabId);
+  for (const tabId of ids) mgr.start(tabId, 120, 40);
+  const ownership = createOwnership();
+  termResizeHandler({ manager: mgr, ownership, payload: { tabId: ids[0], cols: 120, rows: 40 } });
+  const sizes = () => spawned.map((p) => ({ cols: p.cols, rows: p.rows }));
+  assert.deepStrictEqual(sizes(), [{ cols: 120, rows: 40 }, { cols: 120, rows: 40 }, { cols: 120, rows: 40 }]);
+
+  termResizeHandler({ manager: mgr, ownership, payload: { tabId: ids[0], cols: 14, rows: 27 } });
+  assert.deepStrictEqual(
+    sizes(),
+    [{ cols: 14, rows: 27 }, { cols: 120, rows: 40 }, { cols: 120, rows: 40 }],
+    'узкий размер видимой вкладки разослан всем — все сессии перерисуются в 14 колонок',
+  );
+  assert.deepStrictEqual(
+    ownership.size(), { cols: 120, rows: 40 },
+    'узкий размер запомнен за владельцем — следующая пересадка раздаст его всем',
+  );
+
+  termResizeHandler({ manager: mgr, ownership, payload: { tabId: ids[0], cols: 200, rows: 50 } });
+  assert.deepStrictEqual(sizes(), [{ cols: 200, rows: 50 }, { cols: 200, rows: 50 }, { cols: 200, rows: 50 }], 'ширину вернули, а раздача не возобновилась');
+  assert.deepStrictEqual(ownership.size(), { cols: 200, rows: 50 });
+});
+
+test('порог раздачи в main: ровно на пороге — всем, на единицу меньше — только своей', () => {
+  const { MIN_SHARED_GRID: { cols: c, rows: r } } = require('../src/main/ownership');
+  for (const [cols, rows, all] of [[c, r, true], [c - 1, r, false], [c, r - 1, false]]) {
+    const manager = fakeManager([{ tabId: 'T1' }, { tabId: 'T2' }]);
+    termResizeHandler({ manager, ownership: createOwnership(), payload: { tabId: 'T2', cols, rows } });
+    assert.deepStrictEqual(
+      manager.calls,
+      all ? [{ tabId: 'T1', cols, rows }, { tabId: 'T2', cols, rows }] : [{ tabId: 'T2', cols, rows }],
+      `${cols}×${rows}`,
+    );
+  }
+});
+
+test('applyHandoffSize: размер уже порога раздачи не раздаётся никому', () => {
+  // Пересадка без размера раздаёт запомненный — а запомненным узкий быть не
+  // должен; страховка на случай, если он придёт другим путём.
+  const manager = fakeManager([{ tabId: 'T1' }, { tabId: 'T2' }]);
+  applyHandoffSize({ manager, size: { cols: 14, rows: 27 } });
+  assert.deepStrictEqual(manager.calls, []);
+});
+
 test('term:resize с кривым размером не трогает pty и не запоминается', () => {
   const manager = fakeManager([{ tabId: 'T1' }]);
   const ownership = createOwnership();

@@ -143,6 +143,24 @@ test('захват с кривым размером не запоминаетс�
   assert.strictEqual(changes[0].size, null, 'onChange получил кривой размер вместо null');
 });
 
+test('узкий размер (уже порога раздачи) не запоминается ни захватом, ни noteSize', () => {
+  // Запомненный размер владельца нужен только для раздачи ВСЕМ вкладкам
+  // (пересадка — applyHandoffSize, старт скрытой вкладки — resolveStartSize).
+  // Узкий размер видимой вкладки (ре-ревью: 14×27 при ~720px с диф-панелью)
+  // раздавать нельзя — значит и запоминать нельзя: иначе следующая пересадка
+  // разошлёт его всем сессиям.
+  const { own, changes } = make();
+  own.claim('c1', { cols: 200, rows: 50 });
+  own.noteSize({ cols: 14, rows: 27 });
+  assert.deepStrictEqual(own.size(), { cols: 200, rows: 50 }, 'noteSize запомнил узкий размер');
+  own.claim('c1', { cols: 14, rows: 27 });
+  assert.deepStrictEqual(own.size(), { cols: 200, rows: 50 }, 'захват запомнил узкий размер');
+
+  own.claim('c9', { cols: 14, rows: 27 });
+  assert.strictEqual(own.size(), null);
+  assert.strictEqual(changes[changes.length - 1].size, null, 'пересадка получила узкий размер для раздачи всем');
+});
+
 test('noteSize: размер за пределами 2..500 не запоминается', () => {
   const { own } = make();
   own.claim('local', { cols: 100, rows: 30 });
