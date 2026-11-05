@@ -90,11 +90,28 @@ export function createPalette({ root, getActions }) {
     render();
   }
 
+  // Esc — на document в capture-фазе, пока палитра открыта: тот же приём, что
+  // у дашборда, peek и шпаргалки (dashboard.js/onDocKeydown). Раньше Esc
+  // слушало только поле ввода (ревью 09.08, C11): клик по паддингу панели
+  // уводит фокус на <body>, и клавиша до поля больше не доходила — палитра
+  // висела, пока не кликнешь мимо.
+  //
+  // stopImmediatePropagation — сверх соседей, и не зря. Обработчик restore
+  // (app.js/showRestoreOverlay) тоже висит на document в capture и уступает,
+  // только пока видит открытый оверлей. Обычно он подписан раньше и уступает
+  // штатно. Но Ctrl+P работает уже до bootWorkspace — палитра, открытая в
+  // этот момент, подпишется ПЕРВОЙ, закроется, и restore следом решил бы
+  // «начать пусто» за спиной человека. Поле ввода этой зависимости от
+  // порядка не знало — значит, не должен знать и document.
+  function onDocKeydown(ev) {
+    if (ev.key !== 'Escape') return;
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    close();
+  }
+
   function onInputKeydown(ev) {
-    if (ev.key === 'Escape') {
-      ev.preventDefault();
-      close();
-    } else if (ev.key === 'ArrowDown') {
+    if (ev.key === 'ArrowDown') {
       ev.preventDefault();
       moveSelection(1);
     } else if (ev.key === 'ArrowUp') {
@@ -165,6 +182,7 @@ export function createPalette({ root, getActions }) {
 
     overlayEl = build();
     root.appendChild(overlayEl);
+    document.addEventListener('keydown', onDocKeydown, true);
     render();
     inputEl.focus();
   }
@@ -172,6 +190,7 @@ export function createPalette({ root, getActions }) {
   function close() {
     if (!isOpenFlag) return;
     isOpenFlag = false;
+    document.removeEventListener('keydown', onDocKeydown, true);
     overlayEl?.remove();
     overlayEl = null;
     inputEl = null;
