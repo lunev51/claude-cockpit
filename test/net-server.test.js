@@ -967,3 +967,100 @@ test('уход клиента не отдаёт управление обрат�
   assert.strictEqual(ownership.owner(), hello.payload.clientId, 'обрыв ≠ потеря управления');
   assert.strictEqual(ownership.ownerOnline(), false);
 });
+
+// --- Кэширование статики (план «размер терминала», задача A5) --------------
+// Шрифт терминала JetBrainsMono NF — 1 МБ, и отдавался он БЕЗ единого
+// заголовка кэширования: браузер на макбуке качал его заново на каждой
+// загрузке страницы, и xterm успевал измерить ячейку по запасному шрифту.
+// Шрифты и картинки кэшируем на неделю; скрипты и разметку — всегда с
+// перепроверкой (no-cache + ETag): старый app.js не должен залипать в
+// браузере после обновления кокпита, а 304 делает перепроверку дешёвой.
+
+function makeStaticServer() {
+  return makeServer({
+    staticRoots: {
+      '/assets': path.join(__dirname, '..', 'assets'),
+      '/': path.join(__dirname, '..', 'src', 'renderer'),
+    },
+  });
+}
+
+test('шрифт кэшируется на неделю и несёт валидаторы', async () => {
+  const { server } = makeStaticServer();
+  const { port } = await server.start();
+  const res = await fetch(`http://127.0.0.1:${port}/assets/fonts/JetBrainsMonoNF-Regular.woff2`);
+  await res.arrayBuffer();
+  assert.strictEqual(res.status, 200);
+  assert.strictEqual(res.headers.get('cache-control'), 'max-age=604800', 'шрифт без кэширования — 1 МБ на каждую загрузку страницы');
+  assert.ok(res.headers.get('etag'), 'нет ETag');
+  assert.ok(res.headers.get('last-modified'), 'нет Last-Modified');
+  assert.match(res.headers.get('content-type'), /^font\/woff2/);
+});
+
+test('скрипт всегда перепроверяется (no-cache) и несёт валидаторы', async () => {
+  const { server } = makeStaticServer();
+  const { port } = await server.start();
+  for (const url of ['/js/app.js', '/index.html', '/css/app.css']) {
+    const res = await fetch(`http://127.0.0.1:${port}${url}`);
+    await res.text();
+    assert.strictEqual(res.status, 200, url);
+    assert.strictEqual(res.headers.get('cache-control'), 'no-cache', `${url}: старый файл залипнет в браузере после обновления`);
+    assert.ok(res.headers.get('etag'), `${url}: нет ETag — перепроверка будет качать файл целиком`);
+    assert.ok(res.headers.get('last-modified'), `${url}: нет Last-Modified`);
+  }
+});
+
+test('повтор с совпавшим If-None-Match — 304 без тела', async () => {
+  const { server } = makeStaticServer();
+  const { port } = await server.start();
+  for (const url of ['/js/app.js', '/assets/fonts/JetBrainsMonoNF-Regular.woff2']) {
+    const first = await fetch(`http://127.0.0.1:${port}${url}`);
+    await first.arrayBuffer();
+    const etag = first.headers.get('etag');
+    assert.ok(etag, `${url}: нет ETag`);
+    // Сырой запрос: fetch сам прячет 304 за своим кэшем (в Node его нет, но
+    // проверяем ровно то, что уходит по проводу, — тело тоже).
+    const raw = await rawRequest(port, `GET ${url} HTTP/1.1`, `If-None-Match: ${etag}\r\n`);
+    assert.strictEqual(statusOf(raw), 304, `${url}: совпавший ETag не дал 304`);
+    const body = raw.split('\r\n\r\n').slice(1).join('\r\n\r\n');
+    assert.strictEqual(body, '', `${url}: 304 пришёл с телом`);
+    assert.match(raw, /\r\netag: /i, `${url}: 304 без ETag`);
+    // Слабое сравнение и список: браузер вправе прислать несколько меток.
+    const list = await rawRequest(port, `GET ${url} HTTP/1.1`, `If-None-Match: "other-tag", ${etag}\r\n`);
+    assert.strictEqual(statusOf(list), 304, `${url}: метка в списке не распознана`);
+  }
+});
+
+test('несовпавший If-None-Match — обычный 200 с телом', async () => {
+  const { server } = makeStaticServer();
+  const { port } = await server.start();
+  const raw = await rawRequest(port, 'GET /js/app.js HTTP/1.1', 'If-None-Match: W/"0-0"\r\n');
+  assert.strictEqual(statusOf(raw), 200);
+  assert.ok(raw.includes('import'), 'тело скрипта не пришло');
+});
+
+test('изменённый файл — новый ETag, старый больше не даёт 304', async () => {
+  // ETag из размера и времени изменения: обновление кокпита меняет файл, и
+  // браузер с меткой старой версии обязан получить новую.
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'net-server-etag-'));
+  const file = path.join(tmp, 'app.js');
+  fs.writeFileSync(file, 'export const v = 1;\n', 'utf8');
+  try {
+    const { server } = makeServer({ staticRoots: { '/': tmp } });
+    const { port } = await server.start();
+    const first = await fetch(`http://127.0.0.1:${port}/app.js`);
+    await first.text();
+    const oldTag = first.headers.get('etag');
+    fs.writeFileSync(file, 'export const v = 22;\n', 'utf8');
+    const later = new Date(Date.now() + 5000);
+    fs.utimesSync(file, later, later);
+    const raw = await rawRequest(port, 'GET /app.js HTTP/1.1', `If-None-Match: ${oldTag}\r\n`);
+    assert.strictEqual(statusOf(raw), 200, 'старая метка дала 304 на изменённый файл — браузер остался бы со старым скриптом');
+    assert.ok(raw.includes('v = 22'), 'пришло не новое содержимое');
+    const fresh = await fetch(`http://127.0.0.1:${port}/app.js`);
+    await fresh.text();
+    assert.notStrictEqual(fresh.headers.get('etag'), oldTag);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
