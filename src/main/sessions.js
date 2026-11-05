@@ -14,7 +14,9 @@ const crypto = require('crypto');
 // безопасно и не ломает "чистоту" sessions.js. Два пути записи текста в pty
 // (рецепт и очередь) должны быть захардены ОДИНАКОВО — см. enqueue() ниже.
 const { normalizeForPty } = require('./recipes');
-const { launchedTaskId, liveBackground, backgroundSubtitle } = require('./background-tasks');
+const {
+  launchedTaskId, liveBackground, backgroundSubtitle, isTaskNotification,
+} = require('./background-tasks');
 
 // 'ready' («Наготове», живая приёмка 01.08) — сессия поднята и стоит у
 // промпта: никто ничего не поручал, ждать нечего, смотреть не на что. До этого
@@ -295,6 +297,11 @@ function createSessionManager({
       // или рестарте не нужна: чужой или протухший id не переживает первого
       // же Stop.
       bg: new Map(),
+      // Идёт ход основного потока: от промпта (или первого его инструмента)
+      // до Stop. Нужен, чтобы отличить хук сабагента, которого ход ждёт,
+      // от хука фонового агента после хода. awaitingReply для этого не
+      // годится: Notification снимает его посреди хода (ревью 05.11, S1).
+      inTurn: false,
     });
     onEvent('tabs:changed', {}); // состав вкладок изменился — main пересоберёт манифест
     // sessionLabel в ответе (I3, ревью 01.08) — renderer рисует метку сразу
@@ -357,6 +364,9 @@ function createSessionManager({
     // --resume), и тогда SessionStart не придёт, а флаг остался бы взведённым
     // от прошлой жизни вкладки — и она уехала бы в «Проблемы» ни за что.
     tab.awaitingReply = false;
+    // Тот же довод для хода: оборванный рестартом ход (Stop не пришёл) —
+    // факт о прошлом процессе, новый начинает вне хода.
+    tab.inTurn = false;
     // Прошлая смерть вкладки перестаёт быть фактом о ней ЗДЕСЬ, до вызова
     // фабрики. Гард ниже (`tab.status !== 'dead'`) задумывался против
     // СИНХРОННОГО exit из самой фабрики — «процесс умер, не успев родиться,
@@ -880,6 +890,26 @@ function createSessionManager({
   }
 
 
+  // Хук сабагента ВНЕ хода основного потока (Stop уже был) — это работа
+  // фонового агента, а не поручение: ожидания ответа не взводим (Stop за ней
+  // не последует, и детект зависания увёл бы вкладку в «Проблемы»), а сам хук
+  // считаем доказательством, что агент жив, — даже если его запуска мы не
+  // видели (возобновился сам, хук запуска потерялся). Вкладку — в «фон»:
+  // из 'waiting' тоже (ревью 05.11, S1: человек ответил на вопрос агента, и
+  // агент пошёл дальше). Цена: при двух фоновых агентах инструмент второго
+  // уводит из «Ждут тебя» вопрос первого — так же, как это уже было в ходе
+  // с обычными агентами; тост о вопросе к этому моменту уже показан.
+  // Следующий Stop сверит список, как и для остального фона.
+  function noteBackgroundAgent(tab, agentId) {
+    if (!tab.proc) return; // поздний хук умершего процесса вкладку не воскрешает
+    tab.bg.set(agentId, 'agent');
+    const subtitle = backgroundSubtitle(tab.bg);
+    // Без изменений — без события: renderer на каждый 'background' пишет
+    // ghost-буфер, а инструменты агента идут десятками.
+    if (tab.status === 'background' && tab.subtitle === subtitle) return;
+    setStatus(tab, 'background', subtitle);
+  }
+
   // Переходы машины статусов по событиям хуков (спека §5.2). gen — поколение
   // pty, которое ПОРОДИЛО это событие (см. COCKPIT_TAB_GEN в spawn() выше и
   // маршрутизацию в hook-bridge.js/cockpit-hook.js) — необязательный
@@ -982,14 +1012,21 @@ function createSessionManager({
         // промпте, пока не получим настоящий (гард внутри — см. функцию).
         requestSessionTitle(tab, data.transcript_path);
         tab.awaitingReply = true; // вот теперь ответа реально ждут
-        setStatus(tab, 'working', 'думает…');
+        tab.inTurn = true;
+        // Ход начал сам CLI — с уведомлением о конце фоновой задачи. Тостеру
+        // это продолжение прежней работы, а не новый промпт человека: время
+        // до «готово» он меряет с её начала (toasts.js). Ключ только на таком
+        // ходе — обычный payload не меняется ни на байт.
+        setStatus(tab, 'working', 'думает…', isTaskNotification(data.prompt) ? { taskNotification: true } : undefined);
         break;
       case 'PreToolUse':
-        // Статус «фон»: инструмент ФОНОВОГО агента — это работа фона, а не
-        // новый ход. Без гарды вкладка уходила бы в 'working' с ожиданием
-        // ответа, Stop основного потока за этим не следует, и через пять
-        // минут без вывода детект зависания увёл бы её в «Проблемы».
-        if (tab.status === 'background' && fromSubagent(data)) break;
+        // Статус «фон»: инструмент фонового агента после хода — см.
+        // noteBackgroundAgent. В ходе хук сабагента ведёт себя как раньше.
+        if (fromSubagent(data) && !tab.inTurn) {
+          noteBackgroundAgent(tab, data.agent_id);
+          break;
+        }
+        tab.inTurn = true;
         // Работа инструментом — тоже доказательство, что ответ в процессе.
         // Взводим и здесь: промпт мог уйти мимо кокпита (сторонний процесс той
         // же сессии, маршрутизация по session_id), а зависнуть на инструменте
@@ -1053,6 +1090,7 @@ function createSessionManager({
         // обвязка ipc.js могла потребовать ДОКАЗАННОЕ поколение и для детекта
         // ночной смены, тем же приёмом, что уже защищает вброс очереди.
         tab.awaitingReply = false; // ответ пришёл — ждать больше нечего
+        tab.inTurn = false;
         // Статус «фон»: что из запущенного ещё живо, говорит сам CLI полем
         // background_tasks — уведомление о конце задачи часто приходит
         // посреди хода мимо хуков (см. шапку background-tasks.js). Журнал
@@ -1092,7 +1130,11 @@ function createSessionManager({
         // в журнал (сверится на Stop). Фон сабагента — не наш: его
         // уведомление уходит самому сабагенту, а в списке Stop он может
         // остаться и после того, как ход вкладки к нему отношения не имеет.
-        if (!fromSubagent(data)) {
+        // Сам хук сабагента после хода — признак живого фонового агента
+        // (после ответа на его вопрос первым приходит именно PostToolUse).
+        if (fromSubagent(data)) {
+          if (!tab.inTurn) noteBackgroundAgent(tab, data.agent_id);
+        } else {
           const launched = launchedTaskId(data.tool_name, data.tool_response);
           if (launched) tab.bg.set(launched.id, launched.kind);
         }
@@ -1138,7 +1180,7 @@ function createSessionManager({
       // «Фон» молчит по природе (запись флешки, dev-сервер), и проверку на
       // зависание к нему владелец применять запретил (05.11). Он защищён
       // дважды: Stop снимает ожидание ответа, инструменты фонового агента его
-      // не взводят (гарда в PreToolUse), а сюда проходит только 'working'.
+      // не взводят (noteBackgroundAgent), а сюда проходит только 'working'.
       if (tab.status === 'working' && tab.proc && ts - tab.lastOutputAt > stuckAfterMs) {
         const min = Math.max(1, Math.round((ts - tab.lastOutputAt) / 60000));
         // Запоминаем, ЧЕМ вкладка была занята («думает…», «Bash…»): когда

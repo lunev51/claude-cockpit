@@ -1596,6 +1596,9 @@ function registerIpc(win, opts = {}) {
           tabName: tab ? tab.name : payload.tabId,
           status: payload.status,
           waitingText: payload.waitingText,
+          // Статус «фон»: ход начат уведомлением о конце фоновой задачи —
+          // тостер меряет «готово» от начала всей работы (toasts.js).
+          taskNotification: payload.taskNotification,
         });
       }
       broadcast.emit(channel, payload);

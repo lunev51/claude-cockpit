@@ -2835,3 +2835,178 @@ test('фон: PreToolUse основного потока (без agent_id) — �
   assert.strictEqual(statusOf(events, a.tabId).status, 'working');
   assert.strictEqual(statusOf(events, a.tabId).subtitle, 'Read…');
 });
+
+// --- Хуки сабагента: в ходе основного потока и вне его (ревью 05.11) ---
+
+const subagentPre = (tool = 'Bash') => ({
+  ...hookBase('PreToolUse'),
+  tool_name: tool,
+  tool_input: { command: 'npm test' },
+  tool_use_id: 'toolu_01Sub',
+  agent_id: BG_AGENT,
+  agent_type: 'general-purpose',
+});
+const permission = () => ({
+  ...hookBase('Notification'), message: 'Claude needs your permission to use Bash', notification_type: 'permission_prompt',
+});
+
+function tabWithBackgroundAgent() {
+  const factory = makeFakePtyFactory();
+  const env = makeManager(factory);
+  const a = env.mgr.open({ cwd: 'C:\\proj\\alpha' });
+  env.mgr.start(a.tabId, 80, 24);
+  const gen = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  env.mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { ...hookBase('UserPromptSubmit'), prompt: 'отревьюй ветку в фоне' }, gen);
+  env.mgr.applyHookEvent(a.tabId, 'PostToolUse', agentAsync(), gen);
+  env.mgr.applyHookEvent(a.tabId, 'Stop', stop([LIVE_AGENT]), gen);
+  return {
+    ...env, factory, a, gen,
+  };
+}
+
+test('фон S1: фоновый агент спросил разрешение, человек разрешил — вкладка снова «фон», а не «зависла»', () => {
+  // Сценарий S1 ревьюера: после ответа на диалог первым приходит хук самого
+  // агента — при статусе 'waiting'. Раньше он делал вкладку 'working' с
+  // ожиданием ответа, Stop основного потока не следовал, и через пять минут
+  // тишины вкладка уезжала в «Проблемы».
+  const { mgr, events, a, gen, tick } = tabWithBackgroundAgent();
+  mgr.applyHookEvent(a.tabId, 'Notification', permission(), gen);
+  assert.strictEqual(statusOf(events, a.tabId).status, 'waiting');
+  mgr.applyHookEvent(a.tabId, 'PreToolUse', subagentPre(), gen);
+  assert.strictEqual(statusOf(events, a.tabId).status, 'background');
+  assert.strictEqual(statusOf(events, a.tabId).subtitle, 'фон · 1 агент');
+  tick(10 * 60 * 1000);
+  mgr.checkStuck();
+  assert.strictEqual(statusOf(events, a.tabId).status, 'background');
+});
+
+test('фон: после разрешения первым может прийти и PostToolUse разрешённого инструмента — тоже назад в «фон»', () => {
+  const { mgr, events, a, gen } = tabWithBackgroundAgent();
+  mgr.applyHookEvent(a.tabId, 'Notification', permission(), gen);
+  mgr.applyHookEvent(a.tabId, 'PostToolUse', {
+    ...subagentPre(), hook_event_name: 'PostToolUse', tool_response: { stdout: 'ok', stderr: '', interrupted: false },
+  }, gen);
+  assert.strictEqual(statusOf(events, a.tabId).status, 'background');
+});
+
+test('фон: хук сабагента в ХОДЕ основного потока — «работает» с подписью инструмента, как раньше', () => {
+  // Обычный (не фоновый) агент: ход ждёт его, Stop основного потока придёт.
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { ...hookBase('UserPromptSubmit'), prompt: 'прогони тесты агентом' });
+  mgr.applyHookEvent(a.tabId, 'PreToolUse', { ...hookBase('PreToolUse'), tool_name: 'Agent', tool_input: {}, tool_use_id: 'toolu_01Main' });
+  mgr.applyHookEvent(a.tabId, 'PreToolUse', subagentPre('Grep'));
+  assert.strictEqual(statusOf(events, a.tabId).status, 'working');
+  assert.strictEqual(statusOf(events, a.tabId).subtitle, 'Grep…');
+});
+
+test('фон: ход без UserPromptSubmit (промпт >256 КБ мост не принял) — первый инструмент открывает ход', () => {
+  // hook-bridge.js рвёт тело больше 256 КБ — огромная вставка в промпт
+  // приходит без UserPromptSubmit. Ход тогда виден с первого PreToolUse
+  // основного потока, и агент этого хода — не фоновый.
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'PreToolUse', { ...hookBase('PreToolUse'), tool_name: 'Agent', tool_input: {}, tool_use_id: 'toolu_01Main' });
+  mgr.applyHookEvent(a.tabId, 'PreToolUse', subagentPre('Grep'));
+  assert.strictEqual(statusOf(events, a.tabId).status, 'working');
+  assert.strictEqual(statusOf(events, a.tabId).subtitle, 'Grep…');
+});
+
+test('фон: разрешение агенту в ХОДЕ — после ответа «работает», не «фон»', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { ...hookBase('UserPromptSubmit'), prompt: 'прогони тесты агентом' });
+  mgr.applyHookEvent(a.tabId, 'Notification', permission());
+  mgr.applyHookEvent(a.tabId, 'PreToolUse', subagentPre());
+  assert.strictEqual(statusOf(events, a.tabId).status, 'working');
+  assert.strictEqual(statusOf(events, a.tabId).subtitle, 'Bash…');
+});
+
+test('фон: хук агента, чей запуск мы не видели, после хода — «фон · 1 агент», и следующий Stop сверяет', () => {
+  // Агент возобновился сам (повторное уведомление под тем же id) или хук его
+  // запуска потерялся. Хук сабагента вне хода — доказательство, что он жив.
+  const factory = makeFakePtyFactory();
+  const { mgr, events, tick } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { ...hookBase('UserPromptSubmit'), prompt: 'что там' });
+  mgr.applyHookEvent(a.tabId, 'Stop', stop([]));
+  assert.strictEqual(statusOf(events, a.tabId).status, 'done');
+  mgr.applyHookEvent(a.tabId, 'PreToolUse', subagentPre());
+  assert.strictEqual(statusOf(events, a.tabId).status, 'background');
+  assert.strictEqual(statusOf(events, a.tabId).subtitle, 'фон · 1 агент');
+  tick(10 * 60 * 1000);
+  mgr.checkStuck();
+  assert.strictEqual(statusOf(events, a.tabId).status, 'background');
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', taskNotification(BG_AGENT));
+  mgr.applyHookEvent(a.tabId, 'Stop', stop([]));
+  assert.strictEqual(statusOf(events, a.tabId).status, 'done');
+});
+
+test('фон: каждый инструмент фонового агента не плодит tab:status (renderer пишет ghost на каждый)', () => {
+  const { mgr, events, a, gen } = tabWithBackgroundAgent();
+  const before = events.filter((e) => e.channel === 'tab:status').length;
+  mgr.applyHookEvent(a.tabId, 'PreToolUse', subagentPre('Read'), gen);
+  mgr.applyHookEvent(a.tabId, 'PostToolUse', { ...subagentPre('Read'), hook_event_name: 'PostToolUse', tool_response: {} }, gen);
+  mgr.applyHookEvent(a.tabId, 'PreToolUse', subagentPre('Grep'), gen);
+  assert.strictEqual(events.filter((e) => e.channel === 'tab:status').length, before);
+});
+
+test('фон: поздний хук сабагента мёртвую вкладку не воскрешает', () => {
+  const { mgr, events, a, gen, factory } = tabWithBackgroundAgent();
+  factory.spawned[0].opts.onExit(0);
+  mgr.applyHookEvent(a.tabId, 'PreToolUse', subagentPre(), gen);
+  assert.strictEqual(statusOf(events, a.tabId).status, 'dead');
+});
+
+test('фон: новый процесс начинает вне хода — хук сабагента до первого промпта не взводит ожидание ответа', () => {
+  // Ход оборвался рестартом (Stop не пришёл). Флаг «идёт ход» — про процесс,
+  // который его вёл, и в новый переезжать не должен.
+  const factory = makeFakePtyFactory();
+  const { mgr, events, tick } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { ...hookBase('UserPromptSubmit'), prompt: 'долгая задача' });
+  mgr.restart(a.tabId);
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { ...hookBase('SessionStart'), source: 'resume' });
+  mgr.applyHookEvent(a.tabId, 'PreToolUse', subagentPre());
+  tick(10 * 60 * 1000);
+  mgr.checkStuck();
+  assert.strictEqual(statusOf(events, a.tabId).status, 'background');
+});
+
+test('фон: Workflow в фоне — «фон · 1 workflow»', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'PostToolUse', {
+    ...hookBase('PostToolUse'),
+    tool_name: 'Workflow',
+    tool_input: { name: 'spec' },
+    tool_response: {
+      status: 'async_launched', taskId: 'wq8n3m2kd', taskType: 'local_workflow', workflowName: 'spec', runId: 'wf_1a2b3c4d5e6f', summary: 'Разбор',
+    },
+    tool_use_id: 'toolu_01Wf',
+  });
+  mgr.applyHookEvent(a.tabId, 'Stop', stop([{
+    id: 'wq8n3m2kd', type: 'workflow', status: 'running', description: 'Разбор', name: 'spec',
+  }]));
+  assert.strictEqual(statusOf(events, a.tabId).status, 'background');
+  assert.strictEqual(statusOf(events, a.tabId).subtitle, 'фон · 1 workflow');
+});
+
+test('фон: ход, начатый уведомлением о конце задачи, помечен в tab:status (тостеру: это не новый промпт)', () => {
+  const { mgr, events, a, gen } = tabInBackground();
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', taskNotification(BG_SHELL), gen);
+  assert.strictEqual(statusOf(events, a.tabId).taskNotification, true);
+  mgr.applyHookEvent(a.tabId, 'Stop', stop([]), gen);
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { ...hookBase('UserPromptSubmit'), prompt: 'теперь проверь флешку' }, gen);
+  assert.strictEqual(statusOf(events, a.tabId).taskNotification, undefined);
+});

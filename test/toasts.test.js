@@ -287,11 +287,28 @@ test('фон: короткий ход после уведомления о ко�
   h.setClock(20000);
   h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '' });
   h.setClock(620000);
-  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
+  h.toaster.onStatus({
+    tabId: 't1', tabName: 'proj', status: 'working', waitingText: '', taskNotification: true,
+  });
   h.setClock(635000);
   h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'done', waitingText: '' });
   assert.strictEqual(h.notifications.length, 1);
   assert.strictEqual(h.notifications[0].title, 'proj: готово');
+});
+
+test('фон: НОВЫЙ промпт человека из «фона» — новый ход, порог 30с меряется от него (сценарий S2 ревью)', () => {
+  // Три часа живого dev-сервера, потом короткий вопрос с ответом за 2с —
+  // тост «готово» с длительностью «3 часа» был бы враньём.
+  const h = makeToaster();
+  h.setClock(0);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
+  h.setClock(20000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '' });
+  h.setClock(3 * 3600 * 1000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
+  h.setClock(3 * 3600 * 1000 + 2000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'done', waitingText: '' });
+  assert.strictEqual(h.notifications.length, 0);
 });
 
 test('неизвестный статус не показывает тост и не падает', () => {

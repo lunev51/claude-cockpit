@@ -3,9 +3,9 @@
 // без состояния; состояние (tab.bg) держит sessions.js.
 //
 // «Фон» — то, что Claude оставил жить после своего хода: команда в фоне
-// (Bash/PowerShell с backgroundTaskId) или фоновый агент (Agent с isAsync,
-// либо возобновлённый через SendMessage). Monitor и прочие наблюдатели — не
-// работа, их не считаем.
+// (Bash/PowerShell с backgroundTaskId), фоновый агент (Agent с isAsync,
+// либо возобновлённый через SendMessage) или Workflow. Monitor и прочие
+// наблюдатели — не работа, их не считаем.
 //
 // Откуда берётся «жива ли ещё» — с хука Stop, а не из уведомлений. Stop у
 // CLI (схема хука, проверено по бинарю 2.1.316 и 2.1.318) несёт поле
@@ -47,7 +47,25 @@ function launchedTaskId(toolName, toolResponse) {
     // Возобновлённый агент снова работает в фоне под тем же id.
     return isId(toolResponse.resumedAgentId) ? { id: toolResponse.resumedAgentId, kind: 'agent' } : null;
   }
+  if (toolName === 'Workflow') {
+    // Workflow всегда фоновый. taskId — ключ задачи в реестре CLI (бинарь
+    // 2.1.318: тот же id уходит в запуск задачи, и по нему же CLI сам ведёт
+    // живой воркфлоу при восстановлении). Ответ с error — сценарий не
+    // скомпилировался, задачи нет; taskType 'remote_agent' — запуск в
+    // облаке, не здесь. Операция над уже идущим прогоном отвечает с пустым
+    // taskId — её отсекает проверка id ниже.
+    if (toolResponse.taskType !== 'local_workflow') return null;
+    if (typeof toolResponse.error === 'string') return null;
+    return isId(toolResponse.taskId) ? { id: toolResponse.taskId, kind: 'workflow' } : null;
+  }
   return null;
+}
+
+// Ход, который CLI начал сам — с уведомлением о конце фоновой задачи, — а не
+// новый промпт человека. Такой prompt начинается с тега (журналы 05.11:
+// 388 из 388); тег посреди текста — это человек, который о нём спрашивает.
+function isTaskNotification(prompt) {
+  return typeof prompt === 'string' && /^\s*<task-notification>/.test(prompt);
 }
 
 // Сверка журнала запусков со списком Stop: Map<id, kind> только живых.
@@ -78,17 +96,23 @@ function plural(n, one, few, many) {
 }
 
 // Подпись строки сайдбара: 'фон · 1 команда', 'фон · 2 команды, 1 агент'.
+// «workflow» не склоняем: владелец зовёт инструмент по имени.
 function backgroundSubtitle(bg) {
   let shells = 0;
   let agents = 0;
+  let workflows = 0;
   for (const kind of bg.values()) {
     if (kind === 'agent') agents += 1;
+    else if (kind === 'workflow') workflows += 1;
     else shells += 1;
   }
   const parts = [];
   if (shells) parts.push(`${shells} ${plural(shells, 'команда', 'команды', 'команд')}`);
   if (agents) parts.push(`${agents} ${plural(agents, 'агент', 'агента', 'агентов')}`);
+  if (workflows) parts.push(`${workflows} workflow`);
   return parts.length ? `фон · ${parts.join(', ')}` : '';
 }
 
-module.exports = { launchedTaskId, liveBackground, backgroundSubtitle };
+module.exports = {
+  launchedTaskId, liveBackground, backgroundSubtitle, isTaskNotification,
+};

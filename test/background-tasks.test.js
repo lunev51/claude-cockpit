@@ -10,7 +10,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const {
-  launchedTaskId, liveBackground, backgroundSubtitle,
+  launchedTaskId, liveBackground, backgroundSubtitle, isTaskNotification,
 } = require('../src/main/background-tasks');
 
 // --- реальные payload'ы PostToolUse ---
@@ -99,7 +99,40 @@ test('launchedTaskId: SendMessage возобновил агента → снов
   assert.strictEqual(launchedTaskId('SendMessage', { success: false, message: 'not reachable' }), null);
 });
 
+// Форма ответа Workflow — из бинаря 2.1.318: {status:'async_launched', taskId,
+// taskType:'local_workflow', workflowName, runId, summary, transcriptDir,
+// scriptPath}; при ошибке компиляции сценария — то же плюс error.
+const WORKFLOW_ASYNC = {
+  status: 'async_launched',
+  taskId: 'wq8n3m2kd',
+  taskType: 'local_workflow',
+  workflowName: 'spec',
+  runId: 'wf_1a2b3c4d5e6f',
+  summary: 'Разбор документов волнами',
+  transcriptDir: 'C:\\Users\\x\\.claude\\projects\\p\\S1\\workflows\\wf_1a2b3c4d5e6f',
+  scriptPath: 'C:\\Users\\x\\.claude\\projects\\p\\S1\\workflows\\spec.js',
+};
+
+test('launchedTaskId: фоновый Workflow → id из taskId, вид workflow', () => {
+  assert.deepStrictEqual(launchedTaskId('Workflow', WORKFLOW_ASYNC), { id: 'wq8n3m2kd', kind: 'workflow' });
+});
+
+test('launchedTaskId: Workflow со сломанным сценарием или удалённый — не фон', () => {
+  // error — сценарий не скомпилировался, задача не живёт; remote_launched —
+  // запуск в облаке, вне этой машины.
+  assert.strictEqual(launchedTaskId('Workflow', { ...WORKFLOW_ASYNC, error: 'SyntaxError: Unexpected token' }), null);
+  assert.strictEqual(launchedTaskId('Workflow', { ...WORKFLOW_ASYNC, status: 'remote_launched', taskType: 'remote_agent' }), null);
+  // Схема допускает и такое сочетание; локальным воркфлоу CLI его не считает.
+  assert.strictEqual(launchedTaskId('Workflow', { ...WORKFLOW_ASYNC, taskType: 'remote_agent' }), null);
+  // Операция над уже идущим прогоном (runId в запросе): бинарь отвечает
+  // {status: RUN_OP_STATUS, taskId: '', runId, runOp} — это не новый фон.
+  assert.strictEqual(launchedTaskId('Workflow', { status: 'run_op', taskId: '', runId: 'wf_1a2b3c4d5e6f', runOp: 'stop' }), null);
+  assert.strictEqual(launchedTaskId('Workflow', { ...WORKFLOW_ASYNC, taskId: '' }), null);
+});
+
 test('launchedTaskId: Monitor и прочие инструменты не считаются, даже с похожими полями', () => {
+  // Настоящий ответ Monitor — {taskId, timeoutMs}.
+  assert.strictEqual(launchedTaskId('Monitor', { taskId: 'bmon12345', timeoutMs: 600000 }), null);
   assert.strictEqual(launchedTaskId('Monitor', { taskId: 'bmon12345', backgroundTaskId: 'bmon12345' }), null);
   assert.strictEqual(launchedTaskId('TaskStop', { task_id: 'btlnghtdk' }), null);
   assert.strictEqual(launchedTaskId('Read', { file: { content: '' } }), null);
@@ -192,6 +225,30 @@ test('backgroundSubtitle: команды и агенты вместе — сна
   assert.strictEqual(backgroundSubtitle(more), 'фон · 2 команды, 5 агентов');
 });
 
+test('backgroundSubtitle: workflow — после команд и агентов, слово не склоняется', () => {
+  assert.strictEqual(backgroundSubtitle(new Map([['w1', 'workflow']])), 'фон · 1 workflow');
+  const all = new Map([['w1', 'workflow'], ['a1', 'agent'], ['w2', 'workflow'], ['b1', 'shell']]);
+  assert.strictEqual(backgroundSubtitle(all), 'фон · 1 команда, 1 агент, 2 workflow');
+});
+
 test('backgroundSubtitle: пустой фон — пустая подпись', () => {
   assert.strictEqual(backgroundSubtitle(new Map()), '');
+});
+
+// --- isTaskNotification ---
+
+test('isTaskNotification: ход, начатый уведомлением о конце задачи, — да', () => {
+  const prompt = '<task-notification>\n<task-id>a12f8ef3df5eb51b4</task-id>\n<tool-use-id>toolu_01AgentLaunch</tool-use-id>\n'
+    + '<output-file>C:\\Users\\x\\AppData\\Local\\Temp\\claude\\p\\S1\\tasks\\a12f8ef3df5eb51b4.output</output-file>\n'
+    + '<status>completed</status>\n<summary>Agent "Ревью ветки" completed</summary>\n</task-notification>';
+  assert.strictEqual(isTaskNotification(prompt), true);
+  assert.strictEqual(isTaskNotification(`\n  ${prompt}`), true);
+});
+
+test('isTaskNotification: обычный промпт человека — нет, даже если упоминает тег', () => {
+  assert.strictEqual(isTaskNotification('почему <task-notification> не пришёл?'), false);
+  assert.strictEqual(isTaskNotification('запиши образ на флешку'), false);
+  assert.strictEqual(isTaskNotification(''), false);
+  assert.strictEqual(isTaskNotification(undefined), false);
+  assert.strictEqual(isTaskNotification(42), false);
 });
