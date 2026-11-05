@@ -295,7 +295,8 @@ test('отключившийся НЕ владелец забывается: 100
     own.claim('local'); // окно ПК вернуло его себе
     own.drop(`c${i}`); // браузер закрыли — он уже не владелец
   }
-  assert.ok(own.sizeCount() <= 1, `в карте ${own.sizeCount()} размеров после 100 ушедших клиентов`);
+  // Ровно один — окна ПК: «не больше» пропустило бы и сломанный счётчик.
+  assert.strictEqual(own.sizeCount(), 1, `в карте ${own.sizeCount()} размеров после 100 ушедших клиентов`);
   assert.deepStrictEqual(own.size(), { cols: 200, rows: 50 }, 'размер окна ПК потерялся');
 });
 
@@ -310,7 +311,8 @@ test('перезагрузки страницы владельцем карту 
     own.claim(`c${i}`, { cols: 80 + (i % 5), rows: 24 });
     own.drop(`c${i}`);
   }
-  assert.ok(own.sizeCount() <= 2, `в карте ${own.sizeCount()} размеров после 100 перезагрузок`);
+  // Ровно два: окно ПК и текущий (офлайн) владелец.
+  assert.strictEqual(own.sizeCount(), 2, `в карте ${own.sizeCount()} размеров после 100 перезагрузок`);
   assert.deepStrictEqual(own.size(), { cols: 80, rows: 24 }, 'размер текущего (офлайн) владельца потерян');
   own.claim('local');
   assert.deepStrictEqual(own.size(), { cols: 200, rows: 50 }, 'размер окна ПК потерялся');
