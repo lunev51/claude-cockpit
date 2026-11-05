@@ -328,6 +328,25 @@ function shouldDetectLimitStop(prev, payload) {
   return prev === 'working' || prev === 'stuck';
 }
 
+// Детект лимит-стопа из события 'tab:status' (зовётся из onEvent в
+// registerIpc). Вынесен ради теста на настоящих ядрах (C23, ревью 09.08) —
+// см. test/ipc-smoke-gate.test.js.
+function routeLimitStop({ prev, payload, nightWatch, manager }) {
+  if (!nightWatch || !shouldDetectLimitStop(prev, payload)) return;
+  // M2 (ревью финальной волны): текущее поколение pty вкладки НА МОМЕНТ
+  // детекта — ядро сравнит его с актуальным на пробуждении (getTabGen), чтобы
+  // не резюмить в pty, который успел смениться (авто-респавн/ручной рестарт в
+  // пикер сессий) между детектом и пробуждением.
+  const tab = manager.get(payload.tabId);
+  // Литерал 'working', а не prev, — НАМЕРЕННО. «Это остановка хода» уже
+  // решено строкой выше (shouldDetectLimitStop: 'stuck' там наравне с
+  // 'working', Minor 1), а гард ядра (night-watch.js/onTabStop) пропускает
+  // только 'working'. Передать «настоящий» prev — и вкладка, которую
+  // checkStuck() пометил 'stuck' перед самым Stop (типичная картина на
+  // исчерпанном лимите), молча выпадет из детекта.
+  nightWatch.onTabStop(payload.tabId, 'working', tab ? tab.gen : undefined);
+}
+
 // C1 (Critical, ревью финальной волны фазы 8): getTabStatus-адаптер для
 // createNightWatch({getTabStatus}) — маппинг «сырого» пятистатусного статуса
 // sessions.js в то, что ядро понимает как «резюмируемо». Claude Code шлёт хук
@@ -1562,16 +1581,9 @@ function registerIpc(win, opts = {}) {
         lastStatusByTab.set(payload.tabId, payload.status);
         // M4 финального ревью: логика вынесена в shouldDetectLimitStop()
         // (чистая функция выше по файлу) — см. её комментарий за подробным
-        // обоснованием Minor 1 (stuck) и Important 1 (genProven).
-        if (nightWatch && shouldDetectLimitStop(prev, payload)) {
-          // M2 (ревью финальной волны): текущее поколение pty вкладки НА
-          // МОМЕНТ детекта — ядро сравнит его с актуальным на пробуждении
-          // (getTabGen ниже), чтобы не резюмить в pty, который успел
-          // смениться (авто-респавн/ручной рестарт в пикер сессий) между
-          // детектом и пробуждением.
-          const tab = manager.get(payload.tabId);
-          nightWatch.onTabStop(payload.tabId, 'working', tab ? tab.gen : undefined);
-        }
+        // обоснованием Minor 1 (stuck) и Important 1 (genProven); проводка
+        // до ядра — в routeLimitStop() рядом с ней.
+        routeLimitStop({ prev, payload, nightWatch, manager });
       }
       // Task 2 фазы 4: тот же поток, что шлёт tab:status в renderer, — тостер
       // (toasts.js, чистый модуль) сам решает, показывать ли уведомление
@@ -2520,7 +2532,7 @@ module.exports = {
   // M4 финального ревью (обязательно) + C1 (Critical) + I2 — чистые функции
   // без Electron, экспортированы ради собственных юнит-тестов (см. комментарии
   // у их определения выше).
-  shouldDetectLimitStop, resumableTabStatus, isSnapshotFreshEnough, USAGE_SNAPSHOT_FRESH_MS,
+  shouldDetectLimitStop, routeLimitStop, resumableTabStatus, isSnapshotFreshEnough, USAGE_SNAPSHOT_FRESH_MS,
   // I1 финального ревью ветки: карта корней статики — чистая функция от корня
   // приложения, экспортирована ради test/renderer-boot-guard.test.js (он
   // поднимает НАСТОЯЩИЙ сервер ровно на ней и проверяет каждую ссылку

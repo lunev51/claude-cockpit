@@ -20,8 +20,10 @@ const {
   recipesListWorkspacesHandler, recipesSaveWorkspaceHandler, recipesDeleteWorkspaceHandler,
   nightToggleHandler, nightGetHandler, hasRealUserInput,
   shouldDetectLimitStop, resumableTabStatus, isSnapshotFreshEnough, USAGE_SNAPSHOT_FRESH_MS,
-  sttTranscribeHandler, sttStatusHandler,
+  sttTranscribeHandler, sttStatusHandler, routeLimitStop,
 } = require('../src/main/ipc');
+const { createSessionManager } = require('../src/main/sessions');
+const { createNightWatch } = require('../src/main/night-watch');
 
 // gitInfo/ghInfo-заглушки, которые ПАДАЮТ, если их дёрнули: смоук-гейт по
 // контракту (бриф фазы, глобальное ограничение «в smoke не спавнить процессы»)
@@ -516,6 +518,91 @@ test('shouldDetectLimitStop: background без доказанного покол
   assert.strictEqual(shouldDetectLimitStop('working', { status: 'background' }), false);
   assert.strictEqual(shouldDetectLimitStop('background', { status: 'background', genProven: true }), false);
   assert.strictEqual(shouldDetectLimitStop('background', { status: 'done', genProven: true }), false);
+});
+
+// ------------------------------------------------------------- routeLimitStop --
+// C23 (ревью 09.08): в nightWatch.onTabStop обвязка передаёт литерал 'working',
+// а не настоящий prev. Это обязательно, но нигде не было объяснено и ничем не
+// закреплено: добросовестный рефакторинг «передавать prev как есть» молча убил
+// бы детект лимит-стопа для вкладки, которую checkStuck() успел пометить
+// 'stuck' перед самым Stop. Поэтому проверка — на НАСТОЯЩИХ ядрах: payload
+// даёт sessions.js, гард prevStatus — night-watch.js.
+
+// Вкладка, которую checkStuck() пометил 'stuck' (поручение есть, вывода нет —
+// типичная картина на исчерпанном лимите), а потом пришёл её собственный Stop.
+// Отдаёт prev и payload ровно так, как их видит onEvent в registerIpc.
+function stuckThenStop() {
+  const events = [];
+  let nowMs = 0;
+  const factory = () => ({ write() {}, resize() {}, kill() {}, pid: 4242 });
+  const manager = createSessionManager({
+    ptyFactory: factory,
+    getTermConfig: () => ({ command: 'claude', args: [], useConpty: true, useConptyDll: true }),
+    onEvent: (channel, payload) => events.push({ channel, payload }),
+    now: () => nowMs,
+    stuckAfterMs: 1000,
+  });
+  const a = manager.open({ cwd: 'C:\\proj\\alpha' });
+  manager.start(a.tabId, 80, 24);
+  const { gen } = manager.get(a.tabId);
+  manager.applyHookEvent(a.tabId, 'SessionStart', { session_id: 'S1' }, gen);
+  manager.applyHookEvent(a.tabId, 'UserPromptSubmit', { prompt: 'большая задача' }, gen);
+  nowMs += 1500;
+  manager.checkStuck();
+  manager.applyHookEvent(a.tabId, 'Stop', {}, gen);
+
+  const statuses = events.filter((e) => e.channel === 'tab:status').map((e) => e.payload);
+  const payload = statuses[statuses.length - 1];
+  const prev = statuses[statuses.length - 2].status;
+  return { manager, tabId: a.tabId, gen, prev, payload };
+}
+
+test('routeLimitStop: вкладка в stuck перед Stop всё равно доходит до детекта ночной смены', async () => {
+  const { manager, prev, payload } = stuckThenStop();
+  assert.strictEqual(prev, 'stuck', 'фикстура не довела вкладку до stuck');
+  assert.strictEqual(payload.status, 'done');
+  assert.strictEqual(payload.genProven, true);
+
+  let usageCalls = 0;
+  const nightWatch = createNightWatch({
+    now: () => 0,
+    setTimer: () => 1,
+    clearTimer: () => {},
+    refreshUsage: async () => {
+      usageCalls += 1;
+      return { ok: true, fiveHour: { percent: 100, resetsAt: 3600000 }, sevenDay: { percent: 10 } };
+    },
+    getTabStatus: () => 'done',
+    writeToTab: () => {},
+    emit: () => {},
+    powerBlocker: { start() {}, stop() {} },
+    journal: { append() {}, readAll: () => [], reset() {} },
+    config: {},
+  });
+  nightWatch.arm();
+
+  routeLimitStop({ prev, payload, nightWatch, manager });
+  // onEvent промис ядра не ждёт — даём ему доработать.
+  await new Promise((resolve) => { setImmediate(resolve); });
+
+  assert.strictEqual(usageCalls, 1, 'ядро отбило вызов на гарде prevStatus — лимит-стоп из stuck не замечен');
+  assert.strictEqual(nightWatch.snapshot().pendingCount, 1);
+});
+
+test('routeLimitStop: в ядро уходят tabId, \'working\' и поколение pty вкладки; не остановка хода — ничего', () => {
+  const { manager, tabId, gen, prev, payload } = stuckThenStop();
+  const calls = [];
+  const spy = { onTabStop: (...args) => { calls.push(args); } };
+
+  routeLimitStop({ prev, payload, nightWatch: spy, manager });
+  assert.deepStrictEqual(calls, [[tabId, 'working', gen]]);
+
+  routeLimitStop({ prev: 'done', payload, nightWatch: spy, manager });
+  routeLimitStop({ prev, payload: { ...payload, genProven: false }, nightWatch: spy, manager });
+  assert.strictEqual(calls.length, 1, 'детект сработал там, где shouldDetectLimitStop говорит «нет»');
+
+  // Ночная смена ещё не создана — тихо, без обращения к менеджеру.
+  assert.doesNotThrow(() => routeLimitStop({ prev, payload, nightWatch: null, manager: null }));
 });
 
 // ------------------------------------------------------------- resumableTabStatus --

@@ -17,6 +17,23 @@ const codeOnly = (source) => source
   .map((line) => line.replace(/\/\*.*?\*\//g, '').replace(/\s\/\/\s.*$/, ''))
   .join('\n');
 
+// C23: сама логика детекта под тестом на настоящих ядрах (routeLimitStop в
+// test/ipc-smoke-gate.test.js), но звать её обязан onEvent — сразу после того,
+// как prev прочитан из карты статусов и карта обновлена.
+test('C23: onEvent отдаёт событие tab:status в routeLimitStop с prev из карты статусов', () => {
+  const code = codeOnly(IPC_JS);
+  const anchor = 'const prev = lastStatusByTab.get(payload.tabId);';
+  assert.strictEqual(code.split(anchor).length - 1, 1, 'якорь чтения prev не найден или не один');
+  const after = code.slice(code.indexOf(anchor), code.indexOf(anchor) + 300);
+  assert.match(
+    after,
+    /^const prev = lastStatusByTab\.get\(payload\.tabId\);\s*lastStatusByTab\.set\(payload\.tabId, payload\.status\);\s*routeLimitStop\(\{ prev, payload, nightWatch, manager \}\);/,
+    'детект лимит-стопа больше не вызывается из onEvent — ночная смена не заметит остановку по лимиту',
+  );
+  const calls = code.match(/(?<!function )routeLimitStop\(\{/g) || [];
+  assert.strictEqual(calls.length, 1, `ожидался ровно один вызов routeLimitStop, найдено ${calls.length}`);
+});
+
 // C24: list() копирует ВСЕ вкладки с очередями, а искали в нём одну по tabId —
 // семь раз, дважды на одно событие tab:status. Для одной вкладки есть get().
 test('C24: одну вкладку по tabId обвязка берёт через manager.get(), а не list().find()', () => {
