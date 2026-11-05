@@ -17,6 +17,27 @@ const codeOnly = (source) => source
   .map((line) => line.replace(/\/\*.*?\*\//g, '').replace(/\s\/\/\s.*$/, ''))
   .join('\n');
 
+// C26: обёртка «setTimeout + unref» для инжектируемых таймеров была
+// продублирована дословно (ночная смена и голосовой ввод) — одна копия.
+test('C26: unrefSetTimer — таймер срабатывает и не держит процесс живым', async () => {
+  const { unrefSetTimer } = require('../src/main/ipc');
+  let fired = false;
+  const id = unrefSetTimer(() => { fired = true; }, 5);
+  assert.strictEqual(id.hasRef(), false, 'таймер держит event loop — процесс не выйдет, пока он не сработает');
+  // Свой ref'нутый таймер ждёт срабатывания: unref'нутый сам не удержал бы тест.
+  await new Promise((resolve) => { setTimeout(resolve, 30); });
+  assert.strictEqual(fired, true);
+  clearTimeout(id);
+});
+
+test('C26: инжектируемый setTimer в ipc.js — одна общая обёртка, а не копии', () => {
+  const code = codeOnly(IPC_JS);
+  const inline = code.match(/setTimer:\s*\(/g) || [];
+  assert.strictEqual(inline.length, 0, `инлайн-обёрток setTimer в ipc.js: ${inline.length}`);
+  const shared = code.match(/setTimer:\s*unrefSetTimer\b/g) || [];
+  assert.strictEqual(shared.length, 2, `ожидалось 2 места с setTimer: unrefSetTimer (ночная смена, голос), найдено ${shared.length}`);
+});
+
 // C23: сама логика детекта под тестом на настоящих ядрах (routeLimitStop в
 // test/ipc-smoke-gate.test.js), но звать её обязан onEvent — сразу после того,
 // как prev прочитан из карты статусов и карта обновлена.

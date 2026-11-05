@@ -959,6 +959,16 @@ function sttHttpPost(port, urlPath, headers, bodyBuffer, timeoutMs) {
 // покрыта тестами на настоящем временном файле.
 const sessionTitleReader = createSessionTitleReader({ readParts: createFsReadParts(fs) });
 
+// setTimer для инжектируемых ядер (night-watch.js, stt.js): обычный
+// setTimeout, но с unref — их таймеры (ожидание сброса окна, стаггер резюма,
+// ready-поллинг whisper-server) не должны сами по себе держать процесс
+// живым. Была дословно продублирована в двух местах (ревью 09.08, C26).
+function unrefSetTimer(fn, ms) {
+  const id = setTimeout(fn, ms);
+  if (id.unref) id.unref();
+  return id;
+}
+
 // Геттер инстанса createStt — создаёт JS-объект при ПЕРВОМ реальном
 // обращении к stt:transcribe/status (через sttTranscribeHandler/
 // sttStatusHandler ниже), НЕ при registerIpc. M2 (ревью финальной волны):
@@ -980,13 +990,9 @@ function getOrCreateStt() {
     httpPost: sttHttpPost,
     fs,
     now: Date.now,
-    // unref — тот же приём, что у nightWatch/usageMonitorTimer выше: таймеры
+    // unref — тот же приём, что у nightWatch/usageMonitorTimer: таймеры
     // ready-поллинга не должны сами по себе держать процесс живым.
-    setTimer: (fn, ms) => {
-      const id = setTimeout(fn, ms);
-      if (id.unref) id.unref();
-      return id;
-    },
+    setTimer: unrefSetTimer,
     clearTimer: (id) => clearTimeout(id),
     // Реестр процессов runners.js (Task 5 carryover фазы 6) — тот же, что для
     // npx/git/gh: trackChild() вешает СВОЙ once('exit') для уборки
@@ -1660,11 +1666,7 @@ function registerIpc(win, opts = {}) {
     // unref — так же, как stuckTimer/usageMonitorTimer ниже: таймеры ночной
     // смены (ожидание сброса окна, стаггер резюма, ретраи) не должны сами по
     // себе держать процесс живым.
-    setTimer: (fn, ms) => {
-      const id = setTimeout(fn, ms);
-      if (id.unref) id.unref();
-      return id;
-    },
+    setTimer: unrefSetTimer,
     clearTimer: (id) => clearTimeout(id),
     refreshUsage,
     // C1 (Critical, ревью финальной волны): resumableTabStatus() (см. выше по
@@ -2533,6 +2535,8 @@ module.exports = {
   // без Electron, экспортированы ради собственных юнит-тестов (см. комментарии
   // у их определения выше).
   shouldDetectLimitStop, routeLimitStop, resumableTabStatus, isSnapshotFreshEnough, USAGE_SNAPSHOT_FRESH_MS,
+  // C26 (ревью 09.08): общая обёртка таймера — ради test/ipc-hygiene-guard.test.js.
+  unrefSetTimer,
   // I1 финального ревью ветки: карта корней статики — чистая функция от корня
   // приложения, экспортирована ради test/renderer-boot-guard.test.js (он
   // поднимает НАСТОЯЩИЙ сервер ровно на ней и проверяет каждую ссылку
