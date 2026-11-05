@@ -123,6 +123,66 @@ test('attachTab передаёт решение shouldStartPty в initTerminal (
   assert.ok(fromGuards.includes('shouldStartPty'), 'предикат больше не импортируется — значение autoStart взялось откуда-то ещё');
 });
 
+// Ревью ветки screen-mirror (m4): выход процесса не копился, в отличие от
+// живого вывода. Процесс умер, пока ехал снимок экрана, — строка «[процесс
+// завершён…]» ложилась в свежий терминал ДО снимка, а снимок пишется строками
+// через \r\n от текущего курсора: весь экран съезжал. Строка — в ту же
+// очередь pendingOutput, после истории. Состояние (alive, статус) — сразу:
+// отложенный целиком выход, за которым пришёл term:started рестарта, лёг бы
+// поверх старта, и ввод встал бы — класс C1 финального ревью.
+//
+// Подделка повторяет контракт handlers.onExit из terminal.js: (payload,
+// { print }) и строка о выходе в ответ.
+function fakeExitView() {
+  const calls = [];
+  return {
+    calls,
+    handlers: {
+      onExit: (payload, opts) => {
+        calls.push({ payload, opts });
+        return `[процесс завершён (код ${payload.exitCode})]`;
+      },
+    },
+  };
+}
+
+test('deliverTermExit: пока едет история — состояние сразу, строка о выходе в очередь после живого вывода', async () => {
+  const { deliverTermExit } = await import('../src/renderer/js/attach-guards.js');
+  const view = fakeExitView();
+  const entry = { view, pendingOutput: ['живой кусок'] };
+  deliverTermExit(entry, { tabId: 'T1', exitCode: 1 });
+  assert.deepStrictEqual(view.calls, [{ payload: { tabId: 'T1', exitCode: 1 }, opts: { print: false } }], 'состояние выхода не применено сразу или строка напечатана до истории');
+  assert.deepStrictEqual(entry.pendingOutput, ['живой кусок', '[процесс завершён (код 1)]'], 'строка о выходе не встала в очередь после живого вывода');
+});
+
+test('deliverTermExit: история уже приехала — обычный выход, строку печатает терминал', async () => {
+  const { deliverTermExit } = await import('../src/renderer/js/attach-guards.js');
+  const view = fakeExitView();
+  const entry = { view, pendingOutput: null };
+  deliverTermExit(entry, { tabId: 'T1', exitCode: 0 });
+  assert.deepStrictEqual(view.calls, [{ payload: { tabId: 'T1', exitCode: 0 }, opts: undefined }]);
+  assert.strictEqual(entry.pendingOutput, null);
+});
+
+test('deliverTermExit: вкладки уже нет — ничего', async () => {
+  const { deliverTermExit } = await import('../src/renderer/js/attach-guards.js');
+  assert.doesNotThrow(() => deliverTermExit(undefined, { tabId: 'T1', exitCode: 0 }));
+});
+
+test('выход вкладки идёт через deliverTermExit, а terminal.js при print:false строку не печатает', () => {
+  assert.match(
+    APP_JS,
+    /window\.api\.term\.onExit\(\(p\) => deliverTermExit\(views\.get\(p\.tabId\), p\)\);/,
+    'событие выхода снова применяется мимо очереди истории — строка ляжет до снимка экрана',
+  );
+  assert.match(APP_JS, /import\s+\{[^}]*\bdeliverTermExit\b[^}]*\}\s+from\s+'\.\/attach-guards\.js'/, 'deliverTermExit не импортирован в app.js');
+  const block = TERMINAL_JS.match(/onExit: \(\{ exitCode \}, \{ print = true \} = \{\}\) => \{([\s\S]*?)\n {4}\},/);
+  assert.ok(block, 'в terminal.js не найден onExit с параметром print — контракт с deliverTermExit разъехался');
+  assert.match(block[1], /if \(print\) term\.write\(banner\);/, 'onExit печатает строку о выходе не по print');
+  assert.match(block[1], /return banner;/, 'onExit не отдаёт строку о выходе — в очередь встанет undefined');
+  assert.strictEqual((block[1].match(/term\.write\(/g) || []).length, 1, 'onExit пишет в терминал ещё где-то мимо print');
+});
+
 test('terminal.js просит поднять pty только под гардом autoStart', () => {
   const starts = [...TERMINAL_JS.matchAll(/window\.api\.term\.start\s*\(/g)];
   assert.strictEqual(starts.length, 1, `window.api.term.start встречается ${starts.length} раз(а) — гард стоит перед ОДНИМ вызовом, второй пройдёт мимо него`);

@@ -817,6 +817,17 @@ function createSessionManager({
     return tabs.has(tabId);
   }
 
+  // Размер pty вкладки — для зеркала экрана в main (screen-mirror.js, жалоба
+  // 05.11): снимок для подключившегося клиента верен, только если зеркало в
+  // той же сетке, что pty. tab.cols/rows ставят ровно start() (до спавна) и
+  // resize() (вместе с proc.resize), так что это и есть сетка pty. null —
+  // вкладки нет: хвост убитого pty, долетевший после close, не должен
+  // заводить зеркало заново.
+  function size(tabId) {
+    const tab = tabs.get(tabId);
+    return tab ? { cols: tab.cols, rows: tab.rows } : null;
+  }
+
   function findBySessionId(sessionId) {
     for (const tab of tabs.values()) {
       if (tab.sessionId === sessionId) return tab.tabId;
@@ -1286,7 +1297,7 @@ function createSessionManager({
 
   return {
     open, start, write, resize, restart, close, list, get, disposeAll,
-    bindSession, has, findBySessionId, findUnboundByCwd, applyHookEvent, checkStuck, markSeen,
+    bindSession, has, size, findBySessionId, findUnboundByCwd, applyHookEvent, checkStuck, markSeen,
     enqueue, removeFromQueue, clearQueue, dequeueAll,
   };
 }
