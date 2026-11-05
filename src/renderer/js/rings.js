@@ -5,13 +5,8 @@
 // полная перерисовка hostEl из снапшота слоя A (usage-oauth.js через IPC).
 
 import { formatCountdown } from './countdown.js';
-
-// Пороги окраски строго по брифу: <60% --ok, 60–85% --warn, >85% --err.
-function colorFor(percent) {
-  if (percent > 85) return 'var(--err)';
-  if (percent >= 60) return 'var(--warn)';
-  return 'var(--ok)';
-}
+// Пороги окраски — общие с полосами дашборда (format.js, ревью 09.08, C14).
+import { limitColor } from './format.js';
 
 function buildRing(label, part, ok, now) {
   const wrap = document.createElement('div');
@@ -25,7 +20,7 @@ function buildRing(label, part, ok, now) {
   const rawPercent = part && typeof part.percent === 'number' ? part.percent : 0;
   const percent = ok ? Math.max(0, Math.min(100, Math.round(rawPercent))) : 0;
   visual.style.setProperty('--ring-pct', String(percent));
-  visual.style.setProperty('--ring-color', ok ? colorFor(percent) : 'var(--text-dim)');
+  visual.style.setProperty('--ring-color', ok ? limitColor(percent) : 'var(--text-dim)');
 
   const percentText = document.createElement('span');
   percentText.className = 'ring-percent';

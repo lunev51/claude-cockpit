@@ -179,7 +179,7 @@ beforeEach(() => {
         restart() {},
       },
       shell: { openExternal() {} },
-      config: { set() {} },
+      config: { set: (...a) => calls.push(['config.set', ...a]) },
     },
   };
   env = {
@@ -394,4 +394,56 @@ test('dispose снимает подписку на шрифты', async (t) => {
   assert.ok(env.fontListeners.has('loadingdone'));
   view.dispose();
   assert.strictEqual(env.fontListeners.has('loadingdone'), false, 'закрытая вкладка осталась подписана на document.fonts');
+});
+
+// --- Таймеры, пережившие вкладку (ревью 09.08, C12) ---------------------------
+// dispose отключал наблюдатель, но не гасил уже взведённые таймеры: дебаунс
+// ресайза (100 мс) после закрытия звал fit() на мёртвом xterm и слал
+// term:resize вкладке, которой в main уже нет.
+
+test('dispose гасит отложенный ресайз: закрытая вкладка не шлёт term:resize', async (t) => {
+  const view = await open(t);
+  showWindow();
+  env.fireResize(); // наблюдатель взвёл дебаунс — и тут вкладку закрыли
+  view.dispose();
+  t.mock.timers.tick(100);
+  assert.deepStrictEqual(sent('resize'), [], 'дебаунс ресайза пережил вкладку и отправил размер в несуществующий pty');
+});
+
+test('dispose пишет отложенный размер шрифта сразу и не оставляет таймер после себя', async (t) => {
+  // Сохранение шрифта — то, что человек нажал (Ctrl+«+») за мгновение до
+  // закрытия вкладки. Просто погасить таймер значило бы молча потерять его.
+  const view = await open(t);
+  view.setFontSize(16);
+  assert.deepStrictEqual(sent('config.set'), [], 'до дебаунса 400 мс в конфиг ничего не уходит — сценарий не воспроизведён');
+  view.dispose();
+  assert.deepStrictEqual(sent('config.set'), [['config.set', { terminal: { fontSize: 16 } }]], 'отложенный размер шрифта потерян при закрытии вкладки');
+  t.mock.timers.tick(1000);
+  assert.strictEqual(sent('config.set').length, 1, 'таймер сохранения шрифта пережил вкладку и записал конфиг повторно');
+});
+
+// --- Колбэки состояния необязательны (ревью 09.08, C19) ------------------------
+// app.js передавал onPtyStatus/onFontSize только затем, чтобы писать строки в
+// поля записи вкладки, которых никто не читал. Убрать их можно, лишь если
+// терминал сам живёт без колбэков: onPtyStatus звался безусловно и без
+// умолчания — первое же создание вкладки падало бы с TypeError.
+for (const autoStart of [true, false]) {
+  test(`без onPtyStatus/onFontSize терминал проходит весь цикл (autoStart: ${autoStart})`, async (t) => {
+    const view = await open(t, { onPtyStatus: undefined, onFontSize: undefined, autoStart });
+    view.handlers.onStarted({ pid: 42 });
+    view.handlers.onExit({ exitCode: 0 });
+    view.setFontSize(15);
+    view.dispose();
+    assert.deepStrictEqual(sent('start'), autoStart ? [['start', 'T1', null, null]] : []);
+  });
+}
+
+test('dispose без отложенной смены шрифта конфиг не трогает', async (t) => {
+  const view = await open(t);
+  view.setFontSize(16);
+  t.mock.timers.tick(400); // дебаунс отработал штатно
+  env.calls.length = 0;
+  view.dispose();
+  t.mock.timers.tick(1000);
+  assert.deepStrictEqual(sent('config.set'), [], 'закрытие вкладки пишет конфиг, хотя писать нечего');
 });

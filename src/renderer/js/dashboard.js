@@ -23,8 +23,10 @@
 // createDashboard ниже.
 
 import { formatCountdown } from './countdown.js';
+// limitColor и formatClock — общие с кольцами сайдбара и ночной секцией: свои
+// копии здесь были дословными и разъехались бы молча (ревью 09.08, C14).
 import {
-  formatTokens, formatUsd, formatShortDate,
+  formatTokens, formatUsd, formatShortDate, formatClock, limitColor,
 } from './format.js';
 // Task 3 фазы 8 («Ночная смена»): секция дашборда — чистый маппинг журнала/
 // строки состояния вынесен в night-format.js (см. там же, покрыт тестом через
@@ -35,13 +37,6 @@ import {
 
 const CHART_PRESETS = [7, 30];
 const DEFAULT_CHART_PRESET = 7;
-
-// Пороги окраски — те же, что в rings.js (бриф: <60 → ok, 60..85 → warn, >85 → err).
-function colorFor(percent) {
-  if (percent > 85) return 'var(--err)';
-  if (percent >= 60) return 'var(--warn)';
-  return 'var(--ok)';
-}
 
 // Коды ошибок слоя A (usage-oauth.js: 'auth'|'network'|'rate'|'failed') →
 // человеко-читаемая причина. Находка 10 (ревью фазы 6, минор): без ключа
@@ -59,18 +54,6 @@ function limitsErrorText(error) {
 }
 
 const SPEND_UNAVAILABLE_TEXT = 'расходы недоступны: ccusage не запустился — попробуйте «Обновить»';
-
-// FIX 2 (ревью): «обновлено в HH:MM» рядом с маркерами «оценка»/лимитов —
-// fetchedAt уже приходит в обоих снапшотах (limits/spend), лишнего IPC не
-// требует. ms<=0 — «данных ещё не было» (buildResult/zeroSnapshot кладут туда
-// 0), отдаём null, а не «01.01.1970».
-function formatTime(ms) {
-  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return null;
-  const d = new Date(ms);
-  if (Number.isNaN(d.getTime())) return null;
-  const pad = (n) => String(n).padStart(2, '0');
-  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-}
 
 // Коды ошибок ghInfo.getRepo/getGlobal ('no-gh'|'auth'|'failed') → человеко-
 // читаемая причина для пустых состояний раздела GitHub (бриф §Task 4 фазы 6).
@@ -128,7 +111,7 @@ export function createDashboard({
     const hasPercent = ok && !!part && typeof part.percent === 'number';
     const pct = hasPercent ? Math.max(0, Math.min(100, Math.round(part.percent))) : 0;
     fill.style.width = `${pct}%`;
-    fill.style.background = hasPercent ? colorFor(pct) : 'var(--text-dim)';
+    fill.style.background = hasPercent ? limitColor(pct) : 'var(--text-dim)';
     track.appendChild(fill);
     row.appendChild(track);
 
@@ -188,7 +171,7 @@ export function createDashboard({
     // явный клик «Обновить»), а stale-бейдж молчал, если сам снапшот при этом
     // формально ok:true. Единственный честный сигнал «насколько это свежо» —
     // время получения, показываем его безусловно, если оно вообще есть.
-    const limitsTime = formatTime(limits && limits.fetchedAt);
+    const limitsTime = formatClock(limits && limits.fetchedAt);
     if (limitsTime) {
       const updatedEl = document.createElement('div');
       updatedEl.className = 'dashboard-updated-at dashboard-limits-updated';
@@ -239,7 +222,7 @@ export function createDashboard({
     badge.textContent = 'оценка';
     meta.appendChild(badge);
 
-    const time = formatTime(spend && spend.fetchedAt);
+    const time = formatClock(spend && spend.fetchedAt);
     if (time) {
       const updated = document.createElement('span');
       updated.className = 'dashboard-updated-at';

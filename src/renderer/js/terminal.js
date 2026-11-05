@@ -63,13 +63,13 @@ function stripAnsi(text) {
 // pty этой вкладке. true (умолчание) — прежнее поведение: вкладку только что
 // создал tabs:open, процесс ей и правда нужен. false — ПОДКЛЮЧЕНИЕ к вкладке,
 // у которой процесса уже нет (см. attachTab в app.js): её нельзя стартовать
-// молча. sessions.js/start() на вкладке без proc делает spawn БЕЗ --resume —
-// флаг resumeOnFirstSpawn одноразовый и давно израсходован, — то есть вместо
-// продолжения работы поднялась бы чистая новая сессия, а старая потерялась
-// бы. Штатный Ctrl+Shift+R (term.restart) сессию бережёт: он резюмит
-// известный sessionId. Подключение не имеет права вести себя хуже рестарта.
+// молча. Перезапуск мёртвой вкладки — решение человека (Ctrl+Shift+R), а не
+// побочный эффект подключения; почему — в shouldStartPty (attach-guards.js).
+//
+// onPtyStatus/onFontSize — необязательные: строку состояния и размер шрифта
+// сейчас никто не показывает (app.js их не передаёт, ревью 09.08, C19).
 export function initTerminal(container, config, {
-  tabId, onPtyStatus, onFontSize = () => {}, preludeText = null, autoStart = true,
+  tabId, onPtyStatus = () => {}, onFontSize = () => {}, preludeText = null, autoStart = true,
   // Перезапуск по Ctrl+Shift+R отдаём наружу: проверка управления и объяснение
   // отказа живут в app.js, а импортировать его отсюда нельзя — цикл.
   onRestartRequest = null,
@@ -356,6 +356,10 @@ export function initTerminal(container, config, {
   // --- размер шрифта: Ctrl+«+»/«−»/«0» и Ctrl+колесо ---
   let fontSize = cfg.fontSize;
   let persistTimer = null;
+  const persistFontSize = () => {
+    persistTimer = null;
+    window.api.config.set({ terminal: { fontSize } });
+  };
   const setFontSize = (size) => {
     fontSize = Math.min(32, Math.max(8, Math.round(size)));
     term.options.fontSize = fontSize;
@@ -364,9 +368,7 @@ export function initTerminal(container, config, {
     onFontSize(fontSize);
     // Персист размера шрифта в конфиг с дебаунсом.
     clearTimeout(persistTimer);
-    persistTimer = setTimeout(() => {
-      window.api.config.set({ terminal: { fontSize } });
-    }, 400);
+    persistTimer = setTimeout(persistFontSize, 400);
   };
 
   term.attachCustomKeyEventHandler((ev) => {
@@ -526,12 +528,12 @@ export function initTerminal(container, config, {
   } else {
     // Процесса нет и поднимать его мы не просим. alive остаётся false — ввод
     // заблокирован (см. term.onData ниже), человек сам решит, перезапускать
-    // ли вкладку: Ctrl+Shift+R резюмит её сессию, а не заводит новую.
+    // ли вкладку: Ctrl+Shift+R резюмит известную сессию, а без неё откроет
+    // пикер --resume (sessions.js/restart) — чистой новой молча не заведёт.
     //
-    // Это ТОЛЬКО состояние для вызывающего: onPtyStatus кладёт строку в
-    // entry.lastPtyStatus (app.js), а его сейчас никто не отображает. Видимую
-    // подпись пишет в сам терминал attachTab — после истории, чтобы она не
-    // уехала вверх (см. app.js).
+    // Это ТОЛЬКО состояние для вызывающего, и сейчас его никто не
+    // отображает. Видимую подпись пишет в сам терминал attachTab — после
+    // истории, чтобы она не уехала вверх (см. app.js).
     onPtyStatus('процесс не запущен — Ctrl+Shift+R для перезапуска');
   }
 
@@ -649,6 +651,15 @@ export function initTerminal(container, config, {
     // жить, утечка на каждое закрытие/переоткрытие вкладки).
     dispose: () => {
       observer.disconnect();
+      // Взведённые таймеры живут дольше вкладки (ревью 09.08, C12): дебаунс
+      // ресайза звал бы fit() на мёртвом xterm и слал term:resize вкладке,
+      // которой в main уже нет. Отложенное сохранение шрифта не гасим, а
+      // пишем сразу: человек нажал Ctrl+«+» и закрыл вкладку — размер его.
+      clearTimeout(resizeTimer);
+      if (persistTimer) {
+        clearTimeout(persistTimer);
+        persistFontSize();
+      }
       // Подписка на document.fonts живёт дольше вкладки: без снятия закрытая
       // вкладка держала бы свой xterm в памяти, а догрузка шрифта будила бы её.
       document.fonts?.removeEventListener?.('loadingdone', onFontsLoaded);
