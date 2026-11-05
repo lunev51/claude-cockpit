@@ -1599,8 +1599,10 @@ function registerIpc(win, opts = {}) {
           // Статус «фон»: ход начат уведомлением о конце фоновой задачи —
           // тостер меряет «готово» от начала всей работы (toasts.js).
           taskNotification: payload.taskNotification,
-          // Подпись «фон · 1 команда» — тело тоста «ответил · фон ещё работает».
+          // Подпись «фон · 1 команда» — тело тоста «ответил · фон ещё работает»;
+          // turnEnd — что это конец хода Claude (Stop), а не хук фонового агента.
           subtitle: payload.subtitle,
+          turnEnd: payload.turnEnd,
         });
       }
       broadcast.emit(channel, payload);

@@ -45,6 +45,11 @@ function createToaster({
   // вместо «время с начала хода» — тост подавлялся бы тем чаще, чем содержательнее
   // работа (ревью, finding 1 — прямо обратное задуманному).
   const lastStatus = new Map();
+  // tabId → начало ТЕКУЩЕГО хода. Отличается от workingSince тем, что
+  // сбрасывается и на ходе, начатом уведомлением о фоновой задаче: тост «фона»
+  // меряет порог по ходу, иначе каждое трёхсекундное событие Monitor при живом
+  // dev-сервере давало бы «ответил · фон ещё работает» (ревью PR #51).
+  const turnSince = new Map();
 
   // Пользователь смотрит именно на эту вкладку прямо сейчас — уведомлять не о чем.
   function isSuppressed(tabId) {
@@ -58,8 +63,9 @@ function createToaster({
   // taskNotification — ход начал сам CLI с уведомлением о конце фоновой
   // задачи (sessions.js, UserPromptSubmit), а не человек новым промптом.
   // subtitle — подпись статуса («фон · 1 команда»), идёт в тело тоста «фона».
+  // turnEnd — статус выставлен Stop'ом, то есть Claude закончил ход.
   function onStatus({
-    tabId, tabName, status, waitingText, taskNotification, subtitle,
+    tabId, tabName, status, waitingText, taskNotification, subtitle, turnEnd,
   }) {
     const prevStatus = lastStatus.get(tabId);
 
@@ -73,6 +79,8 @@ function createToaster({
       // дал бы тост «готово» (ревью 05.11, S2).
       const continuesBackground = prevStatus === 'background' && taskNotification === true;
       if (prevStatus !== 'working' && !continuesBackground) workingSince.set(tabId, now());
+      // «Завис» → «работает» — тот же ход ожил, не новый.
+      if (prevStatus !== 'working' && prevStatus !== 'stuck') turnSince.set(tabId, now());
       lastStatus.set(tabId, status);
       return;
     }
@@ -82,13 +90,13 @@ function createToaster({
     // «Фон»: Claude ответил, но оставил живую фоновую задачу. Решение владельца
     // 05.11 — сказать об этом: вкладка с вечным dev-сервером каждый ход кончает
     // здесь, и тоста «готово» по ней не было бы никогда. Тост только на КОНЦЕ
-    // ХОДА (из работы): в «фон» вкладку возвращает и хук фонового агента из
-    // «Ждут тебя»/«Готово», и смена подписи — это не ответ Claude. Порог тот же,
-    // что у «готово», по той же причине (шум на каждую мелочь).
+    // ХОДА (turnEnd от Stop): в «фон» вкладку возвращает и хук фонового агента
+    // из «Ждут тебя»/«Готово», и смена подписи — это не ответ Claude. Порог тот
+    // же, что у «готово», но от начала ТЕКУЩЕГО хода (см. turnSince).
     if (status === 'background') {
-      if (prevStatus !== 'working' && prevStatus !== 'stuck') return;
+      if (turnEnd !== true) return;
       if (isSuppressed(tabId)) return;
-      const startedAt = workingSince.get(tabId);
+      const startedAt = turnSince.get(tabId);
       const elapsed = startedAt == null ? Infinity : now() - startedAt;
       if (elapsed <= DONE_THRESHOLD_MS) return;
       show(tabId, `${tabName}: ответил · фон ещё работает`, truncate(String(subtitle || '')));
@@ -136,6 +144,7 @@ function createToaster({
   // естественно). ipc.js зовёт forget() из обработчика tabs:close.
   function forget(tabId) {
     workingSince.delete(tabId);
+    turnSince.delete(tabId);
     lastStatus.delete(tabId);
   }
 

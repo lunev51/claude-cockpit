@@ -2666,6 +2666,26 @@ test('фон: ход окончен, фоновая команда жива — 
   // Ночная смена ловит остановку по лимиту на этом же событии — признак
   // доказанного поколения обязан доехать и сюда, как у 'done'.
   assert.strictEqual(st.genProven, true);
+  // Тостеру: это конец хода (тост «ответил · фон ещё работает»), а не возврат
+  // в «фон» хуком фонового агента. По прежнему статусу это не угадать: ход,
+  // кончившийся на вопросе разрешения, приходит в Stop из 'waiting'.
+  assert.strictEqual(st.turnEnd, true);
+});
+
+test('фон: конец хода, начатый из «Ждут тебя» (последний инструмент спрашивал разрешение), тоже помечен turnEnd', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  const gen = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { ...hookBase('UserPromptSubmit'), prompt: 'подними сервер' }, gen);
+  mgr.applyHookEvent(a.tabId, 'PostToolUse', bashBackground(), gen);
+  mgr.applyHookEvent(a.tabId, 'Notification', { ...hookBase('Notification'), message: 'Claude needs your permission to use Bash', notification_type: 'permission_prompt' }, gen);
+  assert.strictEqual(statusOf(events, a.tabId).status, 'waiting');
+  mgr.applyHookEvent(a.tabId, 'Stop', stop([LIVE_SHELL]), gen);
+  const st = statusOf(events, a.tabId);
+  assert.strictEqual(st.status, 'background');
+  assert.strictEqual(st.turnEnd, true);
 });
 
 test('фон: команда и фоновый агент — подпись перечисляет оба вида', () => {
@@ -2968,6 +2988,8 @@ test('фон: хук агента, чей запуск мы не видели, �
   mgr.applyHookEvent(a.tabId, 'PreToolUse', subagentPre());
   assert.strictEqual(statusOf(events, a.tabId).status, 'background');
   assert.strictEqual(statusOf(events, a.tabId).subtitle, 'фон · 1 агент');
+  // Это не конец хода Claude — тостер не должен говорить «ответил».
+  assert.notStrictEqual(statusOf(events, a.tabId).turnEnd, true);
   tick(10 * 60 * 1000);
   mgr.checkStuck();
   assert.strictEqual(statusOf(events, a.tabId).status, 'background');

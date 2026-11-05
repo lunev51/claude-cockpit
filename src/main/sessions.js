@@ -1108,8 +1108,12 @@ function createSessionManager({
         // остановка для ночной смены.
         const live = liveBackground(tab.bg, data.background_tasks);
         tab.bg = live || new Map();
-        if (tab.bg.size) setStatus(tab, 'background', backgroundSubtitle(tab.bg), { genProven });
-        else setStatus(tab, 'done', '', { genProven });
+        // turnEnd — тостеру: это конец хода Claude («ответил · фон ещё
+        // работает»), а не возврат в «фон» хуком фонового агента
+        // (noteBackgroundAgent). По прежнему статусу это не угадать: ход,
+        // кончившийся на вопросе разрешения, приходит сюда из 'waiting'.
+        if (tab.bg.size) setStatus(tab, 'background', backgroundSubtitle(tab.bg), { genProven, turnEnd: true });
+        else setStatus(tab, 'done', '', { genProven, turnEnd: true });
         // Task 1 фазы 7 (очередь промптов): вбрасываем СТРОГО один элемент
         // очереди на этот Stop — не всю очередь разом. Гарды (pty жив,
         // очередь непуста) — внутри injectQueuedOnStop(). I4 (ревью финальной
