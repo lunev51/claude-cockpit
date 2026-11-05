@@ -356,6 +356,10 @@ export function initTerminal(container, config, {
   // --- размер шрифта: Ctrl+«+»/«−»/«0» и Ctrl+колесо ---
   let fontSize = cfg.fontSize;
   let persistTimer = null;
+  const persistFontSize = () => {
+    persistTimer = null;
+    window.api.config.set({ terminal: { fontSize } });
+  };
   const setFontSize = (size) => {
     fontSize = Math.min(32, Math.max(8, Math.round(size)));
     term.options.fontSize = fontSize;
@@ -364,9 +368,7 @@ export function initTerminal(container, config, {
     onFontSize(fontSize);
     // Персист размера шрифта в конфиг с дебаунсом.
     clearTimeout(persistTimer);
-    persistTimer = setTimeout(() => {
-      window.api.config.set({ terminal: { fontSize } });
-    }, 400);
+    persistTimer = setTimeout(persistFontSize, 400);
   };
 
   term.attachCustomKeyEventHandler((ev) => {
@@ -649,6 +651,15 @@ export function initTerminal(container, config, {
     // жить, утечка на каждое закрытие/переоткрытие вкладки).
     dispose: () => {
       observer.disconnect();
+      // Взведённые таймеры живут дольше вкладки (ревью 09.08, C12): дебаунс
+      // ресайза звал бы fit() на мёртвом xterm и слал term:resize вкладке,
+      // которой в main уже нет. Отложенное сохранение шрифта не гасим, а
+      // пишем сразу: человек нажал Ctrl+«+» и закрыл вкладку — размер его.
+      clearTimeout(resizeTimer);
+      if (persistTimer) {
+        clearTimeout(persistTimer);
+        persistFontSize();
+      }
       // Подписка на document.fonts живёт дольше вкладки: без снятия закрытая
       // вкладка держала бы свой xterm в памяти, а догрузка шрифта будила бы её.
       document.fonts?.removeEventListener?.('loadingdone', onFontsLoaded);
