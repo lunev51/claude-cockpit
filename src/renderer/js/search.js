@@ -242,11 +242,18 @@ export function createSearch({ root, api, onOpenResult }) {
     scheduleSearch(q);
   }
 
+  // Esc — на document в capture-фазе, пока поиск открыт, как в palette.js и
+  // dashboard.js (ревью 09.08, C11): слушатель на поле ввода умирал, стоило
+  // кликнуть по паддингу панели — фокус уходил на <body>. Почему capture и
+  // почему preventDefault несущий — см. palette.js/onDocKeydown.
+  function onDocKeydown(ev) {
+    if (ev.key !== 'Escape') return;
+    ev.preventDefault();
+    close();
+  }
+
   function onInputKeydown(ev) {
-    if (ev.key === 'Escape') {
-      ev.preventDefault();
-      close();
-    } else if (ev.key === 'ArrowDown') {
+    if (ev.key === 'ArrowDown') {
       ev.preventDefault();
       moveSelection(1);
     } else if (ev.key === 'ArrowUp') {
@@ -306,6 +313,7 @@ export function createSearch({ root, api, onOpenResult }) {
 
     overlayEl = build();
     root.appendChild(overlayEl);
+    document.addEventListener('keydown', onDocKeydown, true);
     render();
     inputEl.focus();
   }
@@ -313,6 +321,7 @@ export function createSearch({ root, api, onOpenResult }) {
   function close() {
     if (!isOpenFlag) return;
     isOpenFlag = false;
+    document.removeEventListener('keydown', onDocKeydown, true);
     clearDebounce();
     // Инвалидирует любой запрос в полёте — его ответ (если ещё придёт) не
     // должен трогать DOM оверлея, который сейчас уходит (listEl/inputEl → null).

@@ -17,6 +17,7 @@ const { buildLoginItem, isAutostartOn } = require('./autostart');
 const { decidePermission } = require('./permissions');
 const { createAttention } = require('./attention');
 const { createToaster } = require('./toasts');
+const { runSteps } = require('./run-steps');
 
 const SMOKE = process.argv.includes('--smoke');
 
@@ -653,16 +654,28 @@ function destroyTray() {
   tray = null;
 }
 
+// Одна уборка на все три двери выхода (ревью 09.08, C25). Раньше каждая
+// дверь несла свою копию цепочки без try/catch: исключение, скажем, в
+// flushWorkspace() отменяло disposeSessions(), и живые claude.exe и
+// whisper-server переживали кокпит. Теперь каждый шаг сам по себе
+// (run-steps.js), а порядок прежний: манифест пишется ДО закрытия вкладок
+// (см. flushWorkspace в ipc.js).
+function teardown() {
+  runSteps([
+    ['tray', destroyTray],
+    ['workspace', flushWorkspace],
+    ['sessions', disposeSessions],
+    // Задача 7: гасим сетевой сервер здесь же, рядом с disposeSessions() —
+    // без этого порт (48300 по умолчанию) остаётся занятым процессом Electron
+    // до его полного завершения, и повторный npm start до этого момента падал
+    // бы на EADDRINUSE. Гард на случай, если выход случился раньше, чем
+    // registerIpc() успел создать сервер.
+    ['net-server', () => { if (netServer) netServer.stop(); }],
+  ], (label, err) => console.error(`[quit] сбой (${label}): ${(err && err.stack) || err}`));
+}
+
 app.on('window-all-closed', () => {
-  destroyTray();
-  flushWorkspace();
-  disposeSessions();
-  // Задача 7: гасим сетевой сервер здесь же, рядом с disposeSessions() —
-  // без этого порт (48300 по умолчанию) остаётся занятым процессом Electron
-  // до его полного завершения, и повторный npm start до этого момента падал
-  // бы на EADDRINUSE. Гард на случай, если выход случился раньше, чем
-  // registerIpc() успел создать сервер.
-  if (netServer) netServer.stop();
+  teardown();
   app.quit();
 });
 
@@ -672,17 +685,11 @@ app.on('before-quit', () => {
   // иначе приложение просто не закроется и человек будет снимать его
   // диспетчером задач.
   quitting = true;
-  destroyTray();
-  flushWorkspace();
-  disposeSessions();
-  if (netServer) netServer.stop();
+  teardown();
 });
 
 process.on('uncaughtException', (e) => {
   console.error(e);
-  destroyTray();
-  flushWorkspace();
-  disposeSessions();
-  if (netServer) netServer.stop();
+  teardown();
   app.exit(1);
 });

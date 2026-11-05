@@ -45,6 +45,8 @@ import { createRecipeForm } from './recipe-form.js';
 import { createHotkeysOverlay } from './hotkeys.js';
 import { pluralTabs } from './format.js';
 import { shouldMarkSeen } from './seen.js';
+import { singleFlight } from './single-flight.js';
+import { createRestoreKeyHandler } from './restore-keys.js';
 // Important (ре-ревью фикс-волны): подключение к вкладке без живого процесса
 // не должно его поднимать — обоснование в самом модуле.
 import { shouldStartPty } from './attach-guards.js';
@@ -667,10 +669,23 @@ function applyNightState(snapshot) {
 // Тумблер armed — общий для кнопки 🌙 панели действий (renderActionBar) и
 // одноимённого действия палитры (buildPaletteActions) — обе точки входа
 // зовут ТОЛЬКО api.night.toggle(), никогда не решая за main состояние сами.
-function toggleNight() {
-  window.api.night.toggle().then(applyNightState).catch((err) => {
+//
+// Ревью 09.08 (C16): через singleFlight. Двойной клик по 🌙 слал toggle
+// дважды — вооружал и тут же разоружал, а человек видел мелькнувшую кнопку и
+// считал, что включил. Второй вызов — пока первый в полёте И ещё
+// NIGHT_TOGGLE_HOLD_MS после ответа — не делает ничего: ответ main приходит за
+// миллисекунды, раньше второго клика. 600 мс — с запасом над интервалом
+// двойного клика Windows по умолчанию (500 мс). Окно в обёртке, а не
+// ev.detail у кнопки: так оно держит и действие палитры.
+const NIGHT_TOGGLE_HOLD_MS = 600;
+const toggleNightOnce = singleFlight(() => window.api.night.toggle()
+  .then(applyNightState)
+  .catch((err) => {
     console.warn('[night] night:toggle не удался:', err);
-  });
+  }), { holdMs: NIGHT_TOGGLE_HOLD_MS });
+
+function toggleNight() {
+  toggleNightOnce();
 }
 
 // Создать вкладку: контейнер + xterm + запись в стор. activate — переключиться сразу.
@@ -1452,11 +1467,27 @@ function bindVoiceHotkey() {
     if (document.hidden) voiceMachine.cancel();
   });
 
-  // Живая приёмка 01.08: третий момент «прочитано» — окно вернуло фокус, а на
-  // экране всё это время висела вкладка, которая успела ответить. Первые два —
-  // переключение на вкладку (activateTab) и ответ, пришедший на активной
-  // вкладке (обработчик onStatus). Без этого результат, дождавшийся тебя из
-  // Alt+Tab, навсегда остался бы в «Готово».
+  // I1 (ревью финальной волны): мышь с зажатым Shift — штатное выделение
+  // текста в xterm (Shift+клик выделяет диапазон, Shift+колесо — горизонтальный
+  // скролл), НЕ диктовка. Без этого удержанный Shift во время обычной работы
+  // мышью тихо копил бы тишину/шум комнаты, и whisper (large-v3) на тишине
+  // регулярно галлюцинирует читаемый, но бессмысленный текст («Продолжение
+  // следует…», «Субтитры сделал…») — который улетел бы с Enter в терминал.
+  // passive:true на wheel — мы не зовём preventDefault, скролл не должен тормозить.
+  window.addEventListener('mousedown', () => voiceMachine.cancel(), { capture: true });
+  window.addEventListener('wheel', () => voiceMachine.cancel(), { capture: true, passive: true });
+}
+
+// Живая приёмка 01.08: третий момент «прочитано» — окно вернуло фокус, а на
+// экране всё это время висела вкладка, которая успела ответить. Первые два —
+// переключение на вкладку (activateTab) и ответ, пришедший на активной
+// вкладке (обработчик onStatus). Без этого результат, дождавшийся тебя из
+// Alt+Tab, навсегда остался бы в «Готово».
+//
+// Своя функция, а не кусок bindVoiceHotkey (ревью 09.08, C; регрессия #45):
+// там слушатель стоял ниже раннего return для сетевого клиента и в браузере
+// не вешался вовсе. Зовётся из boot безусловно — голос тут ни при чём.
+function bindSeenOnFocus() {
   window.addEventListener('focus', () => {
     // Отсрочка — не косметика. Окно могло подняться кликом по тосту ЧУЖОЙ
     // вкладки: main делает win.focus(), а 'tab:activate' шлёт следующей
@@ -1468,15 +1499,6 @@ function bindVoiceHotkey() {
       if (tabStore.activeId) markSeenIfWatching(tabStore.activeId);
     }, 400);
   });
-  // I1 (ревью финальной волны): мышь с зажатым Shift — штатное выделение
-  // текста в xterm (Shift+клик выделяет диапазон, Shift+колесо — горизонтальный
-  // скролл), НЕ диктовка. Без этого удержанный Shift во время обычной работы
-  // мышью тихо копил бы тишину/шум комнаты, и whisper (large-v3) на тишине
-  // регулярно галлюцинирует читаемый, но бессмысленный текст («Продолжение
-  // следует…», «Субтитры сделал…») — который улетел бы с Enter в терминал.
-  // passive:true на wheel — мы не зовём preventDefault, скролл не должен тормозить.
-  window.addEventListener('mousedown', () => voiceMachine.cancel(), { capture: true });
-  window.addEventListener('wheel', () => voiceMachine.cancel(), { capture: true, passive: true });
 }
 
 // Клик по ⚡: прописать хуки Cockpit в .claude/settings.json проекта вкладки.
@@ -2337,16 +2359,15 @@ function showRestoreOverlay(manifest) {
   // startEmpty() срабатывал бы за спиной пользователя. Теперь оба места
   // читают ОДИН и тот же реестр — пропустить будущий новый оверлей в одном
   // из них, забыв про другое, структурно невозможно.
-  function onKey(ev) {
-    if (otherOverlayOpen('restore')) return;
-    if (ev.key === 'Enter') {
-      ev.preventDefault();
-      startRestore();
-    } else if (ev.key === 'Escape') {
-      ev.preventDefault();
-      startEmpty();
-    }
-  }
+  //
+  // Само решение — в restore-keys.js (под node --test). Там же — почему
+  // «зарегистрирован РАНЬШЕ» выше верно не всегда и что restore делает,
+  // когда сосед подписался первым (ревью ветки).
+  const onKey = createRestoreKeyHandler({
+    isCovered: () => otherOverlayOpen('restore'),
+    onRestore: startRestore,
+    onEmpty: startEmpty,
+  });
 
   // Горячие клавиши активны, только пока оверлей на экране.
   document.addEventListener('keydown', onKey, true);
@@ -3212,6 +3233,7 @@ async function boot() {
 
   bindHotkeys();
   bindVoiceHotkey();
+  bindSeenOnFocus();
 
   // Ghost-буфер (Task 5): периодический снимок ТОЛЬКО активной вкладки —
   // сериализация всех открытых вкладок каждые 30с дорога при нескольких

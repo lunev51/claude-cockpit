@@ -90,11 +90,24 @@ export function createPalette({ root, getActions }) {
     render();
   }
 
+  // Esc — на document в capture-фазе, пока палитра открыта: тот же приём, что
+  // у дашборда, peek и шпаргалки (dashboard.js/onDocKeydown). Раньше Esc
+  // слушало только поле ввода (ревью 09.08, C11): клик по паддингу панели
+  // уводит фокус на <body>, и клавиша до поля больше не доходила — палитра
+  // висела, пока не кликнешь мимо.
+  //
+  // Capture — потому что элемент в фокусе может погасить Esc сам (xterm на
+  // своём textarea), и во всплытии клавиши уже не было бы. preventDefault —
+  // несущий: по нему restore под палитрой понимает, что Esc уже обработан,
+  // даже если подписался позже нас (restore-keys.js).
+  function onDocKeydown(ev) {
+    if (ev.key !== 'Escape') return;
+    ev.preventDefault();
+    close();
+  }
+
   function onInputKeydown(ev) {
-    if (ev.key === 'Escape') {
-      ev.preventDefault();
-      close();
-    } else if (ev.key === 'ArrowDown') {
+    if (ev.key === 'ArrowDown') {
       ev.preventDefault();
       moveSelection(1);
     } else if (ev.key === 'ArrowUp') {
@@ -165,6 +178,7 @@ export function createPalette({ root, getActions }) {
 
     overlayEl = build();
     root.appendChild(overlayEl);
+    document.addEventListener('keydown', onDocKeydown, true);
     render();
     inputEl.focus();
   }
@@ -172,6 +186,7 @@ export function createPalette({ root, getActions }) {
   function close() {
     if (!isOpenFlag) return;
     isOpenFlag = false;
+    document.removeEventListener('keydown', onDocKeydown, true);
     overlayEl?.remove();
     overlayEl = null;
     inputEl = null;

@@ -259,6 +259,17 @@ export function initTerminal(container, config, {
       'font-size:12px',
       'padding:2px 4px',
     ].join(';');
+    // Ревью 09.08 (C10): Enter/Esc панели слушает только поле ввода, а клик
+    // по кнопке на mousedown уводил фокус на неё — после ▼ мышью клавиши
+    // были мертвы. preventDefault — тот же приём, что строки палитры и
+    // кнопка дашборда; click доходит как обычно.
+    // focus() в поле — не лишний (ревью ветки): без него фокус остаётся, где
+    // был. Кликнул в терминал, потом ▼, потом Esc — и Esc уходит в claude как
+    // \x1b, прерывая генерацию. Клик по кнопке панели — работа с панелью.
+    b.addEventListener('mousedown', (ev) => {
+      ev.preventDefault();
+      searchInput.focus();
+    });
     return b;
   };
   const btnPrev = mkBtn('▲');
@@ -359,6 +370,14 @@ export function initTerminal(container, config, {
   };
 
   term.attachCustomKeyEventHandler((ev) => {
+    // Клавиша уже обработана выше по пути (ре-ревью ветки): оверлей поверх
+    // терминала закрылся по Esc и позвал preventDefault. xterm сам
+    // defaultPrevented не смотрит — _keyDown зовёт этот обработчик и дальше
+    // шлёт в pty. Без этой строки при фокусе в терминале тот же Esc уходил в
+    // claude как \x1b и прерывал генерацию. preventDefault без stopPropagation
+    // до терминала зовут только Esc оверлеев, Enter/Esc restore и Ctrl+Enter
+    // peek — все не для pty; хоткеи bindHotkeys сюда не доходят вовсе.
+    if (ev.defaultPrevented) return false;
     if (ev.type !== 'keydown') return true;
 
     // Ctrl+Shift+R — перезапуск завершённого процесса. Идёт через колбэк, а не
