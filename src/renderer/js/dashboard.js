@@ -82,13 +82,22 @@ export function createDashboard({
   let isOpenFlag = false;
   let overlayEl = null;
   let refreshBtn = null;
-  let bodyEl = null; // контент — перерисовывается целиком при каждом render()
+  let bodyEl = null; // контент — перерисовывается целиком, когда render() приносит новые данные
   let previousActive = null;
   let refreshing = false;
   let chartPreset = DEFAULT_CHART_PRESET;
   let lastData = null; // последний отрендеренный {limits, spend} — presets графика перерисовывают без нового getData()
+  // Ревью 09.08 (C9): что нарисовано — для сверки в render() (null — ничего,
+  // рисовать заново), и строки «сброс через …» этой сборки — их тик
+  // пересчитывает на месте.
+  let renderedKey = null;
+  let countdowns = []; // [{ el, resetsAt }]
 
   // --- Построение секций контента ---
+
+  function countdownText(resetsAt, now) {
+    return `сброс через ${formatCountdown(resetsAt, now)}`;
+  }
 
   function buildLimitBar(label, part, ok, now) {
     const row = document.createElement('div');
@@ -122,7 +131,8 @@ export function createDashboard({
 
     const resetEl = document.createElement('div');
     resetEl.className = 'limit-bar-reset';
-    resetEl.textContent = hasPercent ? `сброс через ${formatCountdown(part.resetsAt, now)}` : '—';
+    resetEl.textContent = hasPercent ? countdownText(part.resetsAt, now) : '—';
+    if (hasPercent) countdowns.push({ el: resetEl, resetsAt: part.resetsAt });
     row.appendChild(resetEl);
 
     return row;
@@ -131,7 +141,7 @@ export function createDashboard({
   // buildLimitsSection(limits, stale, now): stale — вычислен ОДИН РАЗ в
   // render() (см. комментарий там) и рисуется здесь БЕЗУСЛОВНО, независимо от
   // ok/scoped/ошибок — секция лимитов единственное место дашборда, которое
-  // гарантированно строится при каждом render(), поэтому пометка «устарело»
+  // гарантированно строится при каждой сборке, поэтому пометка «устарело»
   // живёт именно тут, а не в блоке расходов (см. buildSpendMeta).
   function buildLimitsSection(limits, stale, now) {
     const section = document.createElement('div');
@@ -437,6 +447,9 @@ export function createDashboard({
         chartPreset = days;
         // Пересобираем ВЕСЬ дашборд из уже известного lastData — presets не
         // требуют нового getData()/IPC, byDay уже есть целиком (до 30 дней).
+        // Данные те же — сверку в render() сбрасываем, иначе она решит, что
+        // перерисовывать нечего.
+        renderedKey = null;
         if (lastData) render(lastData, Date.now());
       });
       presets.appendChild(btn);
@@ -624,13 +637,31 @@ export function createDashboard({
   }
 
   // render(data, now): data — {limits, spend} (форма usage:get/usage:refresh/
-  // usage:update). Идемпотентная полная перерисовка bodyEl — вызывается и из
+  // usage:update) плюс .gh/.night (app.js/dashboardSnapshot). Вызывается и из
   // open(), и повторно извне (см. app.js) при каждом usage:update/локальном
   // тике отсчёта, пока дашборд открыт. Безвредна, если оверлей уже закрыт
   // (bodyEl тогда null) — вызывающему коду не нужно самому проверять isOpen().
+  //
+  // Ревью 09.08 (C9): тик 30 с приносит тот же снимок с новым now — ради
+  // строки «сброс через …», а полная пересборка на каждый тик сбрасывала
+  // подсказку столбика под курсором, выделение и фокус. Данные те же — только
+  // пересчитываем отсчёты на месте; пересборка — только на новые данные.
+  // Сверка по содержимому: app.js собирает снимок новым объектом на каждый
+  // вызов. Ревью ветки (M3): имена вкладок в журнале ночной смены приходят не
+  // из снимка, а из resolveTabName — переименовали вкладку, данные те же, а
+  // строка журнала другая. Поэтому в ключ идут и готовые строки журнала.
   function render(data, now = Date.now()) {
     if (!bodyEl) return;
     lastData = data;
+    const night = data && data.night;
+    const journalLines = night ? recentJournalEntries(night.journal).map((e) => formatJournalLine(e, resolveTabName)) : null;
+    const key = JSON.stringify([data, journalLines]);
+    if (key === renderedKey) {
+      for (const c of countdowns) c.el.textContent = countdownText(c.resetsAt, now);
+      return;
+    }
+    renderedKey = key;
+    countdowns = [];
     const limits = data && data.limits;
     const spend = data && data.spend;
     const gh = data && data.gh;
@@ -810,6 +841,8 @@ export function createDashboard({
     refreshBtn = null;
     bodyEl = null;
     lastData = null;
+    renderedKey = null; // следующий open() строит новый bodyEl — сверять не с чем
+    countdowns = []; // строки отсчёта держат через родителей весь отцепленный оверлей
     refreshing = false;
 
     const toFocus = previousActive;
