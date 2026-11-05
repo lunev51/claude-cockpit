@@ -198,6 +198,12 @@ function createHistoryIndex({
   let entriesMap = new Map();
   let sortedEntries = []; // те же значения entriesMap, отсортированные по mtime убыв. — порядок выдачи refresh()/search()
   let loadedFromDisk = false;
+  // Записи индекса в том виде, в каком они лежат в кэше на диске (JSON), —
+  // чтобы не переписывать файл целиком на каждый refresh, когда ни один
+  // транскрипт не менялся (ревью 09.08, C21). Сравниваем данные, а не
+  // builtAt: метка времени новая всегда. Ничья по mtime может переставить
+  // записи местами и дать одну лишнюю запись — это безвредно.
+  let persistedEntriesJson = null;
   // Номер последнего начатого поиска: проход сверяется с ним между файлами и
   // бросает работу, если его обогнал более свежий запрос.
   let searchGen = 0;
@@ -217,6 +223,7 @@ function createHistoryIndex({
     if (isGoodCacheShape(cached)) {
       for (const e of cached.entries) entriesMap.set(e.filePath, e);
       resort();
+      persistedEntriesJson = JSON.stringify(sortedEntries);
     }
   }
 
@@ -292,10 +299,15 @@ function createHistoryIndex({
       entriesMap = nextMap;
       resort();
 
-      try {
-        cache.write({ schemaVersion: SCHEMA_VERSION, builtAt: now(), entries: sortedEntries });
-      } catch {
-        // запись кэша упала — не критично, отдаём свежепостроенный индекс всё равно
+      const entriesJson = JSON.stringify(sortedEntries);
+      if (entriesJson !== persistedEntriesJson) {
+        try {
+          cache.write({ schemaVersion: SCHEMA_VERSION, builtAt: now(), entries: sortedEntries });
+          persistedEntriesJson = entriesJson;
+        } catch {
+          // запись кэша упала — не критично, отдаём свежепостроенный индекс всё
+          // равно; отметку не ставим, следующий refresh попробует снова
+        }
       }
 
       return sortedEntries.map(publicEntry);

@@ -457,6 +457,73 @@ test('now() пробрасывается в персистентный кэш (b
   assert.strictEqual(typeof cache.writes[0].schemaVersion, 'number');
 });
 
+// C21 (ревью 09.08, раздел C): кэш переписывался целиком на КАЖДЫЙ refresh,
+// даже если ни один транскрипт не менялся. «Изменился» — по данным записей
+// индекса, а не по builtAt: метка времени меняется всегда.
+test('Кэш: refresh без изменений на диске НЕ переписывает кэш повторно', async (t) => {
+  const tmp = makeTmpDir();
+  t.after(() => rmDir(tmp));
+  const dirA = path.join(tmp, 'proj');
+  writeSession(dirA, 'sess-A', [userLine({ sessionId: 'sess-A', cwd: 'C:\\proj', text: 'A' })]);
+  writeSession(dirA, 'sess-B', [userLine({ sessionId: 'sess-B', cwd: 'C:\\proj', text: 'B' })]);
+
+  const cache = memoryCache();
+  let clock = 1000;
+  const idx = createHistoryIndex(realDeps(tmp, { cache, now: () => clock }));
+  await idx.refresh({});
+  assert.strictEqual(cache.writes.length, 1, 'первая сборка обязана записаться');
+
+  clock = 2000; // builtAt был бы другим — но данные те же
+  await idx.refresh({});
+  await idx.refresh({ force: true }); // перечитали всё, а данные всё равно те же
+  assert.strictEqual(cache.writes.length, 1, 'данные не менялись — писать на диск нечего');
+});
+
+test('Кэш: новый инстанс поверх валидного диск-кэша и неизменных файлов НЕ переписывает его', async (t) => {
+  const tmp = makeTmpDir();
+  t.after(() => rmDir(tmp));
+  const dirA = path.join(tmp, 'proj');
+  writeSession(dirA, 'sess-A', [userLine({ sessionId: 'sess-A', cwd: 'C:\\proj', text: 'A' })]);
+
+  const cache = memoryCache();
+  await createHistoryIndex(realDeps(tmp, { cache })).refresh({});
+  assert.strictEqual(cache.writes.length, 1);
+
+  // Перезапуск кокпита: тот же файл кэша, тот же диск.
+  await createHistoryIndex(realDeps(tmp, { cache })).refresh({});
+  assert.strictEqual(cache.writes.length, 1, 'перезапуск без изменений не должен переписывать кэш');
+});
+
+test('Кэш: изменённый, новый и удалённый файл — каждый раз кэш переписывается', async (t) => {
+  const tmp = makeTmpDir();
+  t.after(() => rmDir(tmp));
+  const dirA = path.join(tmp, 'proj');
+  const fileA = writeSession(dirA, 'sess-A', [userLine({ sessionId: 'sess-A', cwd: 'C:\\proj', text: 'A' })]);
+  const fileB = writeSession(dirA, 'sess-B', [userLine({ sessionId: 'sess-B', cwd: 'C:\\proj', text: 'B' })]);
+
+  const cache = memoryCache();
+  const idx = createHistoryIndex(realDeps(tmp, { cache }));
+  await idx.refresh({});
+  assert.strictEqual(cache.writes.length, 1);
+
+  await new Promise((r) => setTimeout(r, 10));
+  fs.appendFileSync(fileA, JSON.stringify(userLine({ sessionId: 'sess-A', cwd: 'C:\\proj', text: 'ещё' })) + '\n', 'utf8');
+  await idx.refresh({});
+  assert.strictEqual(cache.writes.length, 2, 'изменённый файл');
+
+  fs.unlinkSync(fileB);
+  await idx.refresh({});
+  assert.strictEqual(cache.writes.length, 3, 'удалённый файл');
+  assert.deepStrictEqual(cache.peek().entries.map((e) => e.sessionId), ['sess-A']);
+
+  // Одна сессия ушла, другая пришла: число записей то же, набор — другой.
+  fs.unlinkSync(fileA);
+  writeSession(dirA, 'sess-C', [userLine({ sessionId: 'sess-C', cwd: 'C:\\proj', text: 'C' })]);
+  await idx.refresh({});
+  assert.strictEqual(cache.writes.length, 4, 'подмена файла при том же размере индекса');
+  assert.deepStrictEqual(cache.peek().entries.map((e) => e.sessionId), ['sess-C']);
+});
+
 // ---- search() -----------------------------------------------------------
 
 async function buildTwoSessionIndex(tmp) {
