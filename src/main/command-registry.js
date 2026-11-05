@@ -22,10 +22,19 @@ function createCommandRegistry({ ipcMain, guard } = {}) {
   // может стать хозяином.
   const allowed = (channel, who) => (typeof guard === 'function' ? guard({ channel, who }) : true);
 
+  // C4 ревью: повтор раньше молча подменял обработчик в карте. ipcMain.handle
+  // на повтор бросает, но уже после подмены, а ipcMain.on не бросает вовсе и
+  // вешает второго слушателя — локальное окно звало бы оба обработчика, сеть
+  // только последний. Отказываем ДО того, как тронута хоть одна сторона.
+  function assertFree(channel) {
+    if (handlers.has(channel)) throw new Error(`канал уже зарегистрирован: ${channel}`);
+  }
+
   // Обработчики в ipc.js написаны как (event, payload). Обёртка отбрасывает
   // event, чтобы сетевой вызов передавал РОВНО те же аргументы, что локальный:
   // иначе два транспорта незаметно разъедутся в сигнатурах.
   function handle(channel, fn) {
+    assertFree(channel);
     handlers.set(channel, { kind: 'invoke', fn });
     ipcMain.handle(channel, (_event, ...args) => {
       // Локальный отказ — молчаливый null. Бросать в окно нельзя: renderer
@@ -37,6 +46,7 @@ function createCommandRegistry({ ipcMain, guard } = {}) {
   }
 
   function on(channel, fn) {
+    assertFree(channel);
     handlers.set(channel, { kind: 'send', fn });
     ipcMain.on(channel, (_event, ...args) => {
       if (!allowed(channel, 'local')) return;
