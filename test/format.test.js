@@ -151,6 +151,17 @@ test('limitColor: пороги 60/85 — по брифу, обе границы 
   assert.strictEqual(limitColor(100), 'var(--err)');
 });
 
+test('limitColor: мусор — ok, а не тревога (как у обеих прежних копий)', async () => {
+  // Ревью ветки: перенос в format.js не должен молча менять поведение на
+  // краях. Обе colorFor до C14 отдавали на NaN/undefined/null 'var(--ok)' —
+  // проверено исполнением их кода из коммита до правки. Рефакторинг вида
+  // `!(percent <= 85)` красил бы битые данные красным.
+  const { limitColor } = await import('../src/renderer/js/format.js');
+  assert.strictEqual(limitColor(NaN), 'var(--ok)');
+  assert.strictEqual(limitColor(undefined), 'var(--ok)');
+  assert.strictEqual(limitColor(null), 'var(--ok)');
+});
+
 // Страж по исходнику: копия порогов в любом из двух потребителей — ровно тот
 // дубль, который разъезжается молча, и поведенческий тест его не увидит
 // (копия с теми же числами зелёная, пока числа не тронули).

@@ -62,8 +62,14 @@ function findAll(node, className, out = []) {
   return out;
 }
 
-// Граница каждого порога с обеих сторон: 59/60 и 85/86.
-const CASES = [[59, 'var(--ok)'], [60, 'var(--warn)'], [85, 'var(--warn)'], [86, 'var(--err)']];
+// Граница каждого порога с обеих сторон: 59/60 и 85/86. И дробные рядом с
+// границами (ревью ветки): оба потребителя красят ОКРУГЛЁННЫЙ процент — тот
+// же, что подписан цифрой. Сырое 85.4 у limitColor — err, а на экране «85%»;
+// кольцо, покрашенное по сырому, стало бы красным рядом с жёлтой полосой.
+const CASES = [
+  [59, 'var(--ok)'], [59.6, 'var(--warn)'], [60, 'var(--warn)'],
+  [85, 'var(--warn)'], [85.4, 'var(--warn)'], [86, 'var(--err)'],
+];
 const NOW = new Date(2026, 10, 5, 12, 0, 0).getTime();
 const FETCHED = new Date(2026, 10, 5, 9, 7, 0).getTime();
 
@@ -118,4 +124,37 @@ test('полосы дашборда красятся по тем же порог
     assert.strictEqual(updated[0].textContent, 'обновлено в 09:07');
     dash.close();
   }
+});
+
+test('подпись расходов «обновлено в» — от spend.fetchedAt, а не от лимитов', async () => {
+  // Ревью ветки: у расходов и лимитов разное время получения (ccusage и OAuth
+  // опрашиваются порознь). Подпись, отвязанная от spend.fetchedAt, врала бы
+  // про свежесть расходов — тест с одними лимитами этого не видел.
+  const dom = makeDom();
+  globalThis.document = dom.doc;
+  const { createDashboard } = await import(modUrl('dashboard.js'));
+  const root = dom.el('div');
+  const spendAt = new Date(2026, 10, 5, 10, 42, 0).getTime();
+  const dash = createDashboard({
+    root,
+    getData: () => ({
+      limits: snapshot(10, 10),
+      spend: {
+        ok: true, fetchedAt: spendAt, totals: { costUsd: 0, tokens: 0, sessions: 0 }, byDay: [], byProject: [],
+      },
+    }),
+    onRefresh: async () => null,
+    onOpen() {},
+    fallbackFocus: () => null,
+    api: {},
+    resolveTabName: () => '',
+  });
+  dash.open();
+  const meta = findAll(root, 'dashboard-spend-meta');
+  assert.strictEqual(meta.length, 1, 'блока «оценка · обновлено в» у расходов нет — сценарий не воспроизведён');
+  const stamp = findAll(meta[0], 'dashboard-updated-at');
+  assert.strictEqual(stamp.length, 1);
+  assert.strictEqual(stamp[0].textContent, 'обновлено в 10:42', 'время расходов взято не из spend.fetchedAt');
+  assert.strictEqual(findAll(root, 'dashboard-limits-updated')[0].textContent, 'обновлено в 09:07');
+  dash.close();
 });
