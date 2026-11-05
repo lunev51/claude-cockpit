@@ -154,6 +154,17 @@ test('waitForFont: шрифт не грузится никогда — timeout, 
   assert.ok(Date.now() - t0 < 1000, 'таймаут не сработал вовремя');
 });
 
+test('FONT_WAIT_MS: шрифт ждём не дольше 3 с', async () => {
+  // Пункт «на что смотреть ревью» плана: шрифт не грузится вовсе (заблокирован,
+  // нет сети) — ожидание обрывается по таймауту 3 с, терминал всё равно
+  // открывается. Ревью ветки: литерал 3000 в app.js не стерёг никто, мутация
+  // 300000 (пять минут пустого окна вместо терминала) выживала.
+  const { FONT_WAIT_MS } = await import(url);
+  assert.strictEqual(typeof FONT_WAIT_MS, 'number', 'FONT_WAIT_MS не экспортируется');
+  assert.ok(FONT_WAIT_MS > 0, 'нулевой таймаут — шрифт не ждём вовсе, ячейка снова по запасному');
+  assert.ok(FONT_WAIT_MS <= 3000, `ожидание шрифта ${FONT_WAIT_MS} мс — дольше 3 с терминал без шрифта не держим`);
+});
+
 test('waitForFont: нет FontFaceSet вовсе — failed, без исключения', async () => {
   const { waitForFont } = await import(url);
   assert.strictEqual(await waitForFont(undefined, '14px x', 30), 'failed');

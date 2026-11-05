@@ -25,7 +25,7 @@ import './api-boot.js';
 import { linkState, onLinkChange, RELOAD_MARK_KEY } from './api-boot.js';
 import { initTerminal } from './terminal.js';
 // Шрифт терминала ждём до первого терминала — см. boot().
-import { waitForFont } from './term-size.js';
+import { waitForFont, FONT_WAIT_MS } from './term-size.js';
 // Сетка видимой вкладки — скрытым (см. gridShare ниже).
 import { createGridShare } from './grid-share.js';
 import {
@@ -2868,12 +2868,12 @@ async function boot() {
   // шрифт, где бы в списке он ни стоял, — и не ждём ничего, если конфиг его
   // не упоминает (стенд с запасным Consolas).
   //
-  // Не дождались за 3 с (нет сети, шрифт заблокирован) — работаем дальше:
+  // Не дождались за FONT_WAIT_MS (3 с; нет сети, шрифт заблокирован) — дальше:
   // терминал откроется на запасном, а догрузку поймает terminal.js.
   const fontWait = await waitForFont(
     document.fonts,
     `${config.terminal.fontSize}px ${config.terminal.fontFamily}`,
-    3000,
+    FONT_WAIT_MS,
   );
   if (fontWait !== 'loaded') {
     console.warn(`[boot] шрифт терминала не дождались (${fontWait}) — открываю на запасном, перемерю при догрузке`);

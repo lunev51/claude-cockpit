@@ -54,6 +54,12 @@ export function fittedSize(proposed, area, cell) {
 // `14px "JetBrainsMono NF"`. Никогда не бросает: шрифт — улучшение, а не
 // условие запуска. Не загрузился (заблокирован, нет сети) — терминал всё
 // равно открывается, а догрузку позже ловит подписка в terminal.js.
+// Сколько ждать шрифт до первого терминала (app.js/boot). Дольше — пустое
+// окно вместо терминала при заблокированном шрифте или без сети; догрузку
+// позже всё равно поймает terminal.js (onFontsLoaded). Границы стережёт
+// test/term-size.test.js: литерал по месту не стерёг никто (ревью ветки).
+export const FONT_WAIT_MS = 3000;
+
 export async function waitForFont(fonts, spec, timeoutMs) {
   let timer = null;
   const timeout = new Promise((resolve) => {

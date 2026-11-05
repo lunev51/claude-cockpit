@@ -115,7 +115,12 @@ test('boot ждёт шрифт терминала до первого терми
     font < sync && font < workspace,
     'ожидание шрифта стоит ПОСЛЕ того, как могут появиться терминалы (сверка вкладок/подъём воркспейса)',
   );
-  assert.match(APP_JS, /import\s*\{\s*waitForFont\s*\}\s*from\s*'\.\/term-size\.js'/, 'waitForFont не импортируется из term-size.js');
+  assert.match(APP_JS, /import\s*\{\s*waitForFont\s*,\s*FONT_WAIT_MS\s*\}\s*from\s*'\.\/term-size\.js'/, 'waitForFont и FONT_WAIT_MS не импортируются из term-size.js');
+  // Таймаут — константа term-size.js (её границы стережёт term-size.test.js),
+  // а не литерал по месту: литерал 3000 не стерёг никто, мутация 300000 выживала.
+  const call = body.match(/await\s+waitForFont\(\s*document\.fonts\s*,[\s\S]*?\)\s*;/);
+  assert.ok(call, 'вызов waitForFont в boot не разобрался');
+  assert.match(call[0], /,\s*FONT_WAIT_MS\s*,?\s*\)\s*;$/, 'таймаут ожидания шрифта — не FONT_WAIT_MS');
 });
 
 test('повтор term:start после захвата не шлёт размер скрытых терминалов', () => {
