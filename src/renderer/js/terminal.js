@@ -302,6 +302,14 @@ export function initTerminal(container, config, {
   };
 
   term.attachCustomKeyEventHandler((ev) => {
+    // Клавиша уже обработана выше по пути (ре-ревью ветки): оверлей поверх
+    // терминала закрылся по Esc и позвал preventDefault. xterm сам
+    // defaultPrevented не смотрит — _keyDown зовёт этот обработчик и дальше
+    // шлёт в pty. Без этой строки при фокусе в терминале тот же Esc уходил в
+    // claude как \x1b и прерывал генерацию. preventDefault без stopPropagation
+    // до терминала зовут только Esc оверлеев, Enter/Esc restore и Ctrl+Enter
+    // peek — все не для pty; хоткеи bindHotkeys сюда не доходят вовсе.
+    if (ev.defaultPrevented) return false;
     if (ev.type !== 'keydown') return true;
 
     // Ctrl+Shift+R — перезапуск завершённого процесса. Идёт через колбэк, а не
