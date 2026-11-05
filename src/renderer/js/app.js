@@ -40,6 +40,7 @@ import { createPalette } from './palette.js';
 import { createBrowse } from './browse.js';
 import { diffTabs } from './tabs-sync.js';
 import { createDashboard } from './dashboard.js';
+import { fetchOnDashboardOpen } from './dashboard-fetch.js';
 import { renderRings } from './rings.js';
 import { createDiffPanel } from './diffpanel.js';
 import { createSearch } from './search.js';
@@ -50,8 +51,9 @@ import { shouldMarkSeen } from './seen.js';
 import { singleFlight } from './single-flight.js';
 import { createRestoreKeyHandler } from './restore-keys.js';
 // Important (ре-ревью фикс-волны): подключение к вкладке без живого процесса
-// не должно его поднимать — обоснование в самом модуле.
-import { shouldStartPty } from './attach-guards.js';
+// не должно его поднимать — обоснование в самом модуле. deadTabHint —
+// подпись мёртвой вкладки по тому, что на деле сделает Ctrl+Shift+R (T1).
+import { shouldStartPty, deadTabHint } from './attach-guards.js';
 // Task 3 фазы 9 (голосовой ввод, push-to-talk по правому Shift): recorder —
 // портирован из Companion как есть (src/renderer/js/voice/recorder.js, см.
 // комментарий там же — ни одного изменённого пути импорта не понадобилось,
@@ -532,61 +534,15 @@ async function refreshUsage() {
   return lastUsage;
 }
 
-// FIX 2 (ревью): дашборд открывался ИСКЛЮЧИТЕЛЬНО на lastUsage, снятом при
-// первом usage:get() в boot() — если кокпит простоял открытым несколько
-// часов, 10-минутный TTL внутри usage-ccusage.js в авто-режиме не мог
-// сработать НИКОГДА (только явный клик «Обновить» вообще бил по сети), и
-// пользователь в конце дня видел утренние цифры как актуальные, без единого
-// намёка на возраст. Вызывается из dashboard.js/open() при КАЖДОМ открытии —
-// window.api.usage.get() (НЕ usage:refresh!) сам уважает TTL: если кэш
-// свежий, реального npx не будет, это дешёвый no-op. redrawUsageViews() уже
-// умеет перерисовать дашборд, если он сейчас открыт, — а он открыт, раз это
-// вообще было вызвано.
-// Task 4 фазы 6: тем же обработчиком (тот же принцип «лениво, при каждом
-// открытии») тянем сводку GitHub (gh:global). ВАЖНО: usage.get() и gh.global()
-// запускаются НЕЗАВИСИМО (каждый — свой .then/.catch, тот же fire-and-forget
-// приём, что и первичный usage.get() в boot()), а НЕ через один общий await —
-// первый вызов usage.get() (ленивый ccusage.get() внутри может спавнить npx,
-// до 60с по таймауту) не должен задерживать отрисовку раздела GitHub, если тот
-// уже готов раньше. Каждый источник сам зовёт redrawUsageViews() по своему
-// разрешению — раздел «загружаю…» (dashboard.js/buildGithubSection) сменится
-// на реальные данные ровно тогда, когда придёт ИМЕННО его ответ, а не когда
-// придут оба разом.
-// FIX (ревью задачи 4 фазы 6, carryover в задачу 5): раньше оба .catch ниже
-// только логировали ошибку в консоль — ни lastUsage/lastGh, ни перерисовка
-// не трогались. window.api.usage.get()/gh.global() штатно НЕ бросают (main
-// сам ловит любой сбой и отдаёт {ok:false,...} через .then) — .catch здесь
-// это на случай РЕАЛЬНОГО отказа промиса (обрыв IPC-моста, исключение вне
-// try/catch и т.п.). Без присвоения+редро в этой ветке плашка «загружаю…» у
-// раздела GitHub (dashboard.js/buildGithubSection: gh===null → «загружаю…»)
-// виснет навсегда до полного закрытия и повторного открытия дашборда — ни
-// один последующий тик (usage:update, таймер 30с) её не перерисует, потому
-// что lastGh как был null, так и остаётся. Синтетика ok:false — та же форма,
-// что и настоящий error-путь usage-oauth.js/usage-ccusage.js/gh-info.js,
-// dashboard.js уже умеет её рисовать («недоступны»/SPEND_UNAVAILABLE_TEXT/
-// ghErrorText с фолбэком на неизвестный код).
+// Ленивые usage:get и gh:global при каждом открытии дашборда — почему так и
+// что делать при отказе, расписано в dashboard-fetch.js (вынесено туда ради
+// теста, ревью 09.08, C17). Здесь — только доступ к своим переменным.
 function fetchUsageOnDashboardOpen() {
-  window.api.usage.get().then((v) => {
-    lastUsage = v;
-    redrawUsageViews();
-  }).catch((err) => {
-    console.warn('[usage] usage:get при открытии дашборда не удался:', err);
-    lastUsage = {
-      limits: { ok: false, error: 'failed', fetchedAt: 0 },
-      spend: { ok: false, error: 'failed' },
-    };
-    redrawUsageViews();
-  });
-
-  window.api.gh.global().then((v) => {
-    lastGh = v;
-    redrawUsageViews();
-  }).catch((err) => {
-    console.warn('[gh] gh:global при открытии дашборда не удался:', err);
-    lastGh = {
-      ok: false, error: 'failed', prs: [], issues: [], notifications: 0,
-    };
-    redrawUsageViews();
+  fetchOnDashboardOpen({
+    api: window.api,
+    usage: { get: () => lastUsage, set: (v) => { lastUsage = v; } },
+    gh: { get: () => lastGh, set: (v) => { lastGh = v; } },
+    redraw: () => redrawUsageViews(),
   });
 }
 
@@ -845,9 +801,7 @@ async function attachTab(t, { activate = false } = {}) {
   // N)», но человек, открывший вкладку, смотрит в терминал — и без этой строки
   // видит просто застывший экран, на который не реагирует клавиатура.
   if (!shouldStartPty(t)) {
-    views.get(t.tabId)?.view.term.write(
-      '\r\n\x1b[2m— процесс не запущен · Ctrl+Shift+R продолжит сессию —\x1b[0m\r\n',
-    );
+    views.get(t.tabId)?.view.term.write(`\r\n\x1b[2m— ${deadTabHint(t)} —\x1b[0m\r\n`);
   }
   return t;
 }

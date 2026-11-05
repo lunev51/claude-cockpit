@@ -40,3 +40,19 @@
 export function shouldStartPty(tab) {
   return !!(tab && tab.alive === true);
 }
+
+// Подпись мёртвой вкладки в терминале (attachTab в app.js) — по тому, что на
+// деле сделает Ctrl+Shift+R (T1). Раньше всегда «продолжит сессию», а
+// restart() продолжает её, только зная id; без него открывает пикер сессий, а
+// после провала резюма поднимает чистую новую. Что именно — решает main
+// (sessions.js/restartMode) и отдаёт в tabs:list полем restartMode; здесь
+// только слова. Поля нет — не обещаем ничего конкретного.
+const RESTART_HINTS = {
+  resume: 'Ctrl+Shift+R продолжит сессию',
+  picker: 'Ctrl+Shift+R откроет выбор сессии',
+  fresh: 'Ctrl+Shift+R начнёт новую сессию',
+};
+export function deadTabHint(tab) {
+  const hint = RESTART_HINTS[tab && tab.restartMode] || 'Ctrl+Shift+R перезапустит вкладку';
+  return `процесс не запущен · ${hint}`;
+}

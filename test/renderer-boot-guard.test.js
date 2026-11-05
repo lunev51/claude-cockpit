@@ -115,7 +115,12 @@ test('attachTab передаёт решение shouldStartPty в initTerminal (
     'подключение снова стартует pty безусловно: мёртвая вкладка получит чистую новую сессию БЕЗ --resume, '
     + 'а её собственная потеряется',
   );
-  assert.match(APP_JS, /import\s+\{\s*shouldStartPty\s*\}\s+from\s+'\.\/attach-guards\.js'/, 'предикат больше не импортируется — значение autoStart взялось откуда-то ещё');
+  // Любая форма импорта — отдельной строкой или общим списком с другими
+  // гардами модуля (M4 ревью ветки: объединение импортов красило стража без
+  // изменения поведения).
+  const fromGuards = [...APP_JS.matchAll(/import\s*\{([^}]*)\}\s*from\s*'\.\/attach-guards\.js'/g)]
+    .flatMap((m) => m[1].split(',').map((s) => s.trim().split(/\s+as\s+/)[0]));
+  assert.ok(fromGuards.includes('shouldStartPty'), 'предикат больше не импортируется — значение autoStart взялось откуда-то ещё');
 });
 
 test('terminal.js просит поднять pty только под гардом autoStart', () => {

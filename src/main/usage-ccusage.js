@@ -256,7 +256,14 @@ function createCcusage({ run, cache, now = Date.now, ttlMs = 600000 }) {
   // doGet() сама никогда не бросает, так что .finally() достаточно, чтобы
   // гарантированно сбросить inFlight по завершении (успех или уже пойманная
   // внутри ошибка — без разницы).
+  //
+  // Исключение — cacheOnly (U1, живой кокпит 05.11): он ничего не спавнит,
+  // значит и ждать чужой прогон ему незачем. Раньше он присоединялся к
+  // inFlight, и usage:get отвечал браузеру через >90 с — ровно столько,
+  // сколько считал npx, хотя кэш был на руках. В inFlight cacheOnly не
+  // встаёт: его ответ мгновенный, и присоединять к нему некого.
   async function get(opts = {}) {
+    if (opts.cacheOnly) return doGet(opts);
     if (inFlight) return inFlight;
     inFlight = doGet(opts).finally(() => {
       inFlight = null;

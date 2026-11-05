@@ -563,3 +563,67 @@ test('инцидент 8ГБ: cacheOnly при СВЕЖЕМ кэше — обы�
   assert.strictEqual(snap.stale, false);
   assert.strictEqual(snap.error, null);
 });
+
+// U1 (живой кокпит 05.11): usage:get из браузера отвечал через >90 с — ждал
+// npx, хотя кэш расходов был. cacheOnly ничего не спавнит, значит и ждать
+// чужой идущий прогон ему незачем: single-flight его раньше присоединял к
+// inFlight, и «только кэш» на деле означал «жди, пока досчитает».
+const WAITS_NPX = 'ждёт npx';
+const raceTimeout = (p) => Promise.race([
+  p, new Promise((resolve) => { setTimeout(() => resolve(WAITS_NPX), 200); }),
+]);
+
+test('U1: cacheOnly при идущем прогоне отвечает кэшем сразу, не дожидаясь npx', async () => {
+  const calls = [];
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const run = async (args) => {
+    calls.push(args[1]);
+    await gate; // npx «считает» — сколько угодно долго
+    return runFixture({})(args);
+  };
+  const cached = {
+    totals: { costUsd: 10, tokens: 100, sessions: 1 }, byProject: [], byDay: [], byModel: [], fetchedAt: 1000,
+  };
+  const ccusage = createCcusage({
+    run, cache: { read: () => cached, write: () => {} }, now: () => 1000 + 600001,
+  });
+
+  const fresh = ccusage.get(); // TTL истёк — настоящий прогон, висит на gate
+  try {
+    const snap = await raceTimeout(ccusage.get({ cacheOnly: true }));
+    assert.notStrictEqual(snap, WAITS_NPX, 'cacheOnly присоединился к идущему прогону и ждёт npx');
+    assert.strictEqual(snap.ok, true);
+    assert.strictEqual(snap.stale, true);
+    assert.strictEqual(snap.error, 'deferred');
+    assert.strictEqual(snap.totals.costUsd, 10, 'cacheOnly отдал не кэш');
+    assert.deepStrictEqual(calls, ['daily'], 'cacheOnly запустил свой прогон');
+  } finally {
+    release();
+  }
+  const done = await fresh;
+  assert.strictEqual(done.totals.costUsd, 3497, 'настоящий прогон не довёлся до конца');
+  assert.deepStrictEqual(calls, ['daily', 'session']);
+});
+
+test('U1: обычный get() при идущем прогоне по-прежнему его присоединяет (single-flight)', async () => {
+  const calls = [];
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const run = async (args) => {
+    calls.push(args[1]);
+    await gate;
+    return runFixture({})(args);
+  };
+  const ccusage = createCcusage({ run, cache: noopCache(), now: () => 1000 });
+
+  const a = ccusage.get();
+  // cacheOnly посередине не должен ни сбить, ни подменить inFlight.
+  const mid = await raceTimeout(ccusage.get({ cacheOnly: true }));
+  const b = ccusage.get();
+  release();
+  assert.notStrictEqual(mid, WAITS_NPX, 'cacheOnly присоединился к идущему прогону и ждёт npx');
+  const [ra, rb] = await Promise.all([a, b]);
+  assert.strictEqual(ra, rb, 'второй get() не присоединился к идущему прогону');
+  assert.deepStrictEqual(calls, ['daily', 'session'], 'прогонов больше одного');
+});

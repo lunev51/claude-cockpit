@@ -122,6 +122,20 @@ function resetLabelIdentity(tab) {
   tab.labelGen += 1;
 }
 
+// Что сделает restart() с этой вкладкой (спека §3.14, три уровня):
+//   'resume' — session_id известен: --resume <id>, та же сессия;
+//   'fresh'  — прошлый оверрайд провалился: голые args, чистая новая сессия;
+//   'picker' — иначе: голый --resume, пикер сессий Claude Code.
+// Одна функция и для самого restart(), и для поля restartMode в list() (T1):
+// подпись мёртвой вкладки у подключившегося клиента («Ctrl+Shift+R продолжит
+// сессию») раньше была зашита и врала в двух случаях из трёх. Порознь эти два
+// места разъехались бы молча.
+function restartMode(tab) {
+  if (tab.sessionId) return 'resume';
+  if (tab.overrideFailed) return 'fresh';
+  return 'picker';
+}
+
 // Фолбэк-метка из текста промпта. Ставится ТОЛЬКО если метки ещё нет вовсе
 // и настоящий заголовок ещё не приходил (иначе он был бы затёрт сегодняшней
 // репликой). Возвращает true, если метка изменилась.
@@ -706,6 +720,8 @@ function createSessionManager({
     tab.gen = ++genSeq;
 
     const boundSessionId = tab.sessionId;
+    // ДО обнуления sessionId ниже — иначе 'resume' не выпал бы никогда.
+    const mode = restartMode(tab);
 
     if (tab.proc) {
       try { tab.proc.kill(); } catch { /* мог уже завершиться */ }
@@ -736,10 +752,10 @@ function createSessionManager({
       tab.titleReadInFlight = false; // висящее чтение отсечётся по gen
     }
 
-    if (boundSessionId) {
+    if (mode === 'resume') {
       // 1. session_id уже известен (из прошлого SessionStart) — резюмируем именно его.
       tab.pendingExtraArgs = ['--resume', boundSessionId];
-    } else if (tab.overrideFailed) {
+    } else if (mode === 'fresh') {
       // 3. Предыдущий спавн с оверрайдом (--resume <id> либо голый --resume) реально
       //    умер, не привязав сессию — не зацикливаемся на вечных попытках, голые args.
       tab.pendingExtraArgs = null;
@@ -1214,7 +1230,7 @@ function createSessionManager({
   // Внешняя копия вкладки — то, что отдают наружу list() и get().
   function publicTab({
     tabId, cwd, name, alive, status, subtitle, sessionId, ghostId,
-    waitingKind, waitingText, gen, sessionLabel, queue,
+    waitingKind, waitingText, gen, sessionLabel, queue, overrideFailed,
   }) {
     // waitingKind (C1) — нужен обвязке ipc.js, чтобы отличить резюмируемый
     // idle_prompt от блокирующего permission_prompt (resumableTabStatus).
@@ -1243,6 +1259,10 @@ function createSessionManager({
       // повторно, и на следующем Stop main вбрасывал всё дважды.
       // Копия, а не сам массив: снаружи он изменяемый.
       queue: queue.slice(),
+      // T1: что сделает Ctrl+Shift+R — подпись мёртвой вкладки у клиента
+      // (attach-guards.js/deadTabHint). Сам флаг overrideFailed наружу не
+      // отдаём: решение «какой из трёх» живёт в restartMode, а не у клиента.
+      restartMode: restartMode({ sessionId, overrideFailed }),
     };
   }
 

@@ -475,15 +475,21 @@ export function initTerminal(container, config, {
 
     // Размер шрифта: Ctrl (без Shift/Alt/Meta), сравнение по key и code
     // (e.code независим от раскладки клавиатуры).
+    //
+    // preventDefault обязателен (ревью ветки, M1): false отсюда xterm лишь
+    // не обрабатывает, но событие не гасит (_keyDown, xterm 6), и Chrome в
+    // браузере на ПК вместе со шрифтом масштабировал всю страницу — Ctrl+«+»,
+    // Ctrl+«−», Ctrl+0 у него свои. Тот же приём, что у Ctrl+колеса ниже. В
+    // окне Electron безвреден: меню выключено, своего зума там нет.
     if (ev.ctrlKey && !ev.shiftKey && !ev.altKey && !ev.metaKey) {
       if (ev.key === '+' || ev.key === '=' || ev.code === 'Equal' || ev.code === 'NumpadAdd') {
-        setFontSize(fontSize + 1); return false;
+        ev.preventDefault(); setFontSize(fontSize + 1); return false;
       }
       if (ev.key === '-' || ev.key === '_' || ev.code === 'Minus' || ev.code === 'NumpadSubtract') {
-        setFontSize(fontSize - 1); return false;
+        ev.preventDefault(); setFontSize(fontSize - 1); return false;
       }
       if (ev.key === '0' || ev.code === 'Digit0' || ev.code === 'Numpad0') {
-        setFontSize(cfg.fontSize); return false;
+        ev.preventDefault(); setFontSize(cfg.fontSize); return false;
       }
     }
 

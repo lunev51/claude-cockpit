@@ -607,6 +607,49 @@ function usageBroadcastKey(snap) {
   return `${snap.fetchedAt}|${snap.stale}|${snap.error}`;
 }
 
+// usage:get — вынесен из registerIpc ради теста (test/ipc-usage-get.test.js),
+// registerIpc зовёт ровно его с настоящими зависимостями.
+// spend — доступ к lastCcusageResult: { get(), set(value) }.
+//
+// U1 (живой кокпит 05.11): отвечаем СРАЗУ. Раньше ответ ждал ccusage.get(),
+// а это npx по гигабайтам транскриптов — браузер получил его через >90 с, и
+// всё это время кольца «5Ч»/«НЕДЕЛЯ» стояли в прочерках, хотя лимиты у main
+// были (snapshot() синхронный). И так после каждого переподключения:
+// браузер на обрыве перезагружает страницу и спрашивает заново.
+//
+// Теперь: лимиты — снапшот, расходы — последние известные, а если их ещё
+// нет — кэш (cacheOnly не спавнит и не ждёт чужой прогон, см.
+// usage-ccusage.js). Пересчёт — в фоне, и решает о нём сам ccusage: свежий
+// по TTL кэш он отдаст без npx, а идущий прогон присоединит (single-flight),
+// так что сколько бы клиентов ни спросило — прогон один. Результат уходит
+// всем через usage:update, renderer его уже слушает. В окно старта (инцидент
+// 8 ГБ) фонового пересчёта нет вовсе — его сделает deferredSpendTimer.
+function createUsageGetHandler({
+  smoke, usagePoller, ccusage, broadcast, inBootStorm, spend,
+}) {
+  // «Изменились ли расходы» — тот же приём, что usageBroadcastKey у лимитов.
+  // Без сравнения каждый usage:get рассылал бы всем тот же ответ ещё раз:
+  // клиентов, присоединившихся к одному прогону, несколько, а новость одна.
+  const spendKey = (s) => (s ? `${s.fetchedAt}|${s.ok}|${s.stale}|${s.error}` : '');
+
+  function recountInBackground() {
+    ccusage.get().then((fresh) => {
+      const before = spend.get();
+      spend.set(fresh);
+      if (spendKey(before) === spendKey(fresh)) return;
+      broadcast.emit('usage:update', { limits: usagePoller.snapshot(), spend: fresh });
+    }).catch(() => { /* ccusage.get сам не бросает; ремень на чужие сбои */ });
+  }
+
+  return async function usageGet() {
+    const limits = usagePoller.snapshot();
+    if (smoke) return { limits, spend: null };
+    if (!spend.get()) spend.set(await ccusage.get({ cacheOnly: true }));
+    if (!inBootStorm()) recountInBackground();
+    return { limits, spend: spend.get() };
+  };
+}
+
 // Task 5 carryover фазы 6 (задача 5 фазы 7, п.4 брифа): смоук-гейт git:get/
 // gh:repo/gh:global вынесен в отдельные функции с явными зависимостями.
 // ПРИЧИНА: ipc.js целиком не тестируется — модуль на верхнем уровне зовёт
@@ -1866,21 +1909,22 @@ function registerIpc(win, opts = {}) {
   registry.handle('night:get', () => nightGetHandler({ smoke, nightWatch }));
 
   // Task 3 фазы 5 (кольца лимитов): usagePoller.snapshot() — синхронный, без
-  // сети. ccusage.get() — лениво: первый usage:get и есть тот самый «первый
-  // запуск», дальше TTL-кэш внутри usage-ccusage.js сам не даёт бить по npx
-  // чаще ttlMs (проводить свой отдельный троттлинг здесь не нужно — это уже
-  // сделано в модуле). smoke: НИ сети, НИ npx — spend всегда null, ccusage.get()
-  // не зовётся вовсе.
-  registry.handle('usage:get', async () => {
-    const limits = usagePoller.snapshot();
-    if (smoke) return { limits, spend: null };
+  // сети. Расходы ответ НЕ ждёт (U1, 05.11): пересчёт идёт в фоне и приходит
+  // через usage:update, а TTL и single-flight — внутри usage-ccusage.js (свой
+  // троттлинг здесь не нужен). Подробности — у createUsageGetHandler.
+  // smoke: НИ сети, НИ npx — spend всегда null, ccusage.get() не зовётся вовсе.
+  const usageGet = createUsageGetHandler({
+    smoke,
+    usagePoller,
+    ccusage,
+    broadcast,
     // Инцидент 8ГБ (01.08): первые 90с после старта — шторм спавна сессий
     // restore; npx-прогоны ccusage по транскриптам в это окно складывались с
     // ним и вгоняли машину в своп намертво. cacheOnly до истечения окна.
-    const bootStorm = Date.now() - ipcBootAt < CCUSAGE_BOOT_DEFER_MS;
-    lastCcusageResult = await ccusage.get({ force: false, cacheOnly: bootStorm });
-    return { limits, spend: lastCcusageResult };
+    inBootStorm: () => Date.now() - ipcBootAt < CCUSAGE_BOOT_DEFER_MS,
+    spend: { get: () => lastCcusageResult, set: (v) => { lastCcusageResult = v; } },
   });
+  registry.handle('usage:get', () => usageGet());
 
   // Принудительное обновление ОБОИХ слоёв (кнопка/клик по кольцам, дашборд
   // Task 4). smoke — тот же гейт, что и usage:get.
@@ -2536,6 +2580,8 @@ module.exports = {
   // Task 2 фазы 8 («Ночная смена»): та же причина — см. комментарий у их
   // определения выше.
   nightToggleHandler, nightGetHandler,
+  // U1 (05.11): usage:get отвечает сразу — см. test/ipc-usage-get.test.js.
+  createUsageGetHandler,
   // Important 2 (ревью фикс-раунд 1, Task 2 фазы 8): чистая функция без
   // Electron — экспортирована ради собственного юнит-теста (см. комментарий
   // у определения выше).
