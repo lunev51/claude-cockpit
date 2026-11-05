@@ -1,129 +1,145 @@
 # Статус «фон» — вкладка с живой фоновой задачей
 
 > **Для исполнителей:** superpowers:subagent-driven-development, TDD. Шаги `- [ ]`.
+> **Состояние:** реализовано в ветке `feat/background-status` (ревью 05.11 —
+> APPROVE WITH FIXES, фиксы внесены). План ниже описывает то, что сделано, а
+> не первоначальный замысел: первоначальная схема (снимать задачи по
+> `<task-notification>` в UserPromptSubmit) отвергнута — см. «Откуда данные».
 
 **Цель:** вкладка, у которой Claude закончил ход, но оставил живую фоновую
-команду или фонового агента, стоит в «Работают» с подписью «фон · …», а не в
-«Готово»/«Наготове» (живая жалоба 05.11: запись флешки шла в фоне, вкладка —
-«Наготове»).
+команду, фонового агента или Workflow, стоит в «Работают» с подписью
+«фон · …», а не в «Готово»/«Наготове» (живая жалоба 05.11: запись флешки шла в
+фоне, вкладка — «Наготове»).
 
 **Решения владельца (05.11):** (1) секция «Работают», подпись «фон · 1
 команда», проверка на зависание к ней НЕ применяется; (2) долгоживущий фон
 (dev-сервер на всю сессию) держит вкладку в «Работают», пока жив, — без
 ограничения по времени.
 
-**Архитектура:** новый статус ядра `'background'`. Ядро (sessions.js) ведёт по
-вкладке множество живых фоновых задач из хуков, которые уже приходят
-(PostToolUse, UserPromptSubmit). Отдельный статус, а не `'working'`: ночная
-смена ловит остановку по лимиту на переходе из `'working'` в остановку; если бы
-Stop с фоном оставлял `'working'`, лимит-стоп вкладки с dev-сервером не
-детектился бы никогда.
+**Архитектура:** новый статус ядра `'background'`. Отдельный статус, а не
+`'working'`: ночная смена ловит остановку по лимиту на переходе из работы в
+остановку; если бы Stop с фоном оставлял `'working'`, лимит-стоп вкладки с
+dev-сервером не детектился бы никогда.
 
-## Откуда данные (проверено по журналу сессии Claude Code 2.1.318, 05.11)
+- **Источник истины — поле `background_tasks` хука Stop.** CLI (2.1.316+,
+  проверено по бинарю 2.1.316 и 2.1.318) собирает его из реестра задач:
+  всё, что `running`/`pending` и в фоне; пустой массив — ничего не летит.
+- **Журнал запусков `tab.bg` (Map id → вид) — из PostToolUse основного
+  потока.** Нужен только чтобы отличить свой фон от наблюдателей: Monitor в
+  списке Stop выглядит как обычная `'shell'` (local_bash с kind monitor).
+- **На каждом Stop** журнал сверяется со списком, остаётся только живое; не
+  пусто → `'background'` с подписью, пусто → `'done'`. Поэтому отдельная
+  очистка на SessionStart/рестарте не нужна: протухший id не переживает
+  первого же Stop.
+- **Нет поля `background_tasks`** (старый CLI) → `'done'`, как до фичи.
+
+## Откуда данные (бинарь Claude Code 2.1.318 + журналы сессий 05.11)
 
 Хук кокпита (`scripts/cockpit-hook.js`) пересылает payload целиком.
 
 | Что | Событие | Признак |
 |---|---|---|
-| фоновая команда запущена | PostToolUse, `tool_name` `Bash`/`PowerShell` | `tool_input.run_in_background === true`, `tool_response.backgroundTaskId` (напр. `"btlnghtdk"`) |
-| фоновый агент запущен | PostToolUse, `tool_name` `Agent` | `tool_response.isAsync === true`, `tool_response.agentId` (`status: "async_launched"`) |
+| фоновая команда запущена | PostToolUse, `tool_name` `Bash`/`PowerShell` | `tool_response.backgroundTaskId` (в т.ч. Ctrl+B и уход в фон по таймауту — `run_in_background` во входе тогда нет); НЕ считается при `backgroundEndsWithFinalResponse: true` (CLI снимет сам, без уведомления) |
+| фоновый агент запущен | PostToolUse, `tool_name` `Agent` | `tool_response.isAsync === true`, `tool_response.agentId` |
 | агент возобновлён | PostToolUse, `tool_name` `SendMessage` | `tool_response.resumedAgentId` |
-| задача снята вручную | PostToolUse, `tool_name` `TaskStop` | `tool_input.task_id` (устар. `shell_id`) |
-| задача закончилась | UserPromptSubmit | `prompt` содержит `<task-notification>…<task-id>ID</task-id>…<status>completed|failed|…</status>` (один prompt может нести несколько блоков) |
+| Workflow запущен | PostToolUse, `tool_name` `Workflow` | `tool_response.taskType === 'local_workflow'`, `taskId` непуст, нет `error` (операция над идущим прогоном отвечает `taskId: ''`; облачный — `taskType: 'remote_agent'`) |
+| что ещё живо | Stop | `background_tasks: [{id, type, status, description, command?, agent_type?, name?}]`; `id` = `backgroundTaskId`/`agentId`/`taskId` |
+| хук сабагента | любой хук инструмента | поле `agent_id` (основной поток его не несёт); `agent_id` = id агента в реестре |
+| ход начат уведомлением | UserPromptSubmit | `prompt` начинается с `<task-notification>` |
 
-Monitor и прочие инструменты НЕ считаются (это наблюдатели, не работа).
-Форма `tool_response` в хуке = `toolUseResult` в журнале — подтвердить живьём
-(координатор, стенд).
+Почему не уведомления: по 60 последним журналам 05.11 `<task-notification>`
+92 раза пришёл вложением прямо в идущий ход (`queued_command`), и у 69 задач
+из них UserPromptSubmit не увидел уведомления ни разу — журнал, который
+снимает задачи по уведомлениям, держал бы вкладку в «фоне» вечно.
+Отдельным ходом уведомление пришло 388 раз, UserPromptSubmit сработал на 387.
+
+Monitor и прочие инструменты не считаются (наблюдатели, не работа). Фон,
+запущенный сабагентом (`agent_id` в PostToolUse), — не фон вкладки: его
+уведомление уходит самому сабагенту.
 
 ## Таблица переходов
 
-Состояния: `working`, `waiting`, `done`, `stuck`, `dead`, `ready`, **`background`** (новое).
-`bg` — множество id живых фоновых задач вкладки.
+Состояния: `working`, `waiting`, `done`, `stuck`, `dead`, `ready`, **`background`**.
+`bg` — журнал запусков; `inTurn` — идёт ход основного потока (от
+UserPromptSubmit или первого его PreToolUse до Stop; сбрасывается и на
+spawn). `awaitingReply` для этого не годится: Notification снимает его
+посреди хода.
 
-| Событие | Условие | bg | Новый статус | Что видит человек |
+| Событие | Условие | bg / inTurn | Новый статус | Что видит человек |
 |---|---|---|---|---|
-| PostToolUse запуск фона (см. таблицу выше) | — | +id | без изменений (ход идёт, `working`) | «Работают», как сейчас |
-| PostToolUse TaskStop | — | −id | без изменений | — |
-| UserPromptSubmit | prompt с `<task-notification>` | −каждый id из блоков | `working` «думает…» (как сейчас) | «Работают» |
-| UserPromptSubmit | обычный промпт | без изменений | `working` (как сейчас) | «Работают» |
-| PreToolUse | — | — | `working` (как сейчас) | «Работают» |
-| Stop | `bg` не пуст | — | **`background`**, подпись `backgroundSubtitle(bg)`, `awaitingReply=false` | «Работают», «фон · 1 команда» |
-| Stop | `bg` пуст | — | `done` (как сейчас) | «Готово» |
-| Notification | — | без изменений | `waiting` (как сейчас) | «Ждут тебя» |
-| SessionStart | source ≠ `compact` | **очистить** | `ready` (как сейчас) | «Наготове» |
-| SessionStart | source = `compact` | без изменений | `working` (как сейчас) | «Работают» |
-| процесс вышел / рестарт | — | **очистить** | как сейчас (`dead`/…) | как сейчас |
-| markSeen | статус `background` | — | без изменений (трогает только `done`) | — |
-| детектор зависания | статус `background` | — | не трогает (только `working` + `awaitingReply`) | — |
+| PostToolUse основного потока, запуск фона | — | +id | без изменений | — |
+| PostToolUse/PreToolUse сабагента | `inTurn` | — | PreToolUse: `working` «Bash…» (как раньше) | «Работают» |
+| PostToolUse/PreToolUse сабагента | вне хода, процесс жив | +`agent_id` (вид agent) | **`background`** (и из `waiting`, `done`, `ready`); без события, если статус и подпись не изменились; ожидание ответа НЕ взводится | «Работают», «фон · 1 агент» |
+| UserPromptSubmit | — | inTurn=true | `working` «думает…»; payload `taskNotification: true`, если ход начат уведомлением | «Работают» |
+| PreToolUse основного потока | — | inTurn=true | `working` (как раньше) | «Работают» |
+| Stop | живое ∩ bg не пусто | bg=живое, inTurn=false | **`background`**, подпись `backgroundSubtitle`, `genProven` | «Работают», «фон · 1 команда» |
+| Stop | пусто или нет поля | bg=живое/пусто, inTurn=false | `done` (как раньше) | «Готово» |
+| Notification idle_prompt | статус `background` | — | без изменений, без события | «Работают» |
+| Notification | иначе | — | `waiting` (как раньше) | «Ждут тебя» |
+| markSeen | `background` | — | без изменений (только `done`) | — |
+| детект зависания | `background` | — | не трогает (только `working` + `awaitingReply`) | — |
 
-Побочные эффекты Stop (вброс очереди при `genProven`, `holdQueueFor`) — **как
-сейчас, независимо от bg**: Claude после хода принимает ввод, а при вечном
-dev-сервере очередь иначе не сошла бы никогда.
+Почему гарда idle-пинга: CLI глушит `idle_prompt` только при живых фоновых
+АГЕНТАХ, а при фоновой команде шлёт его через минуту без фокуса — вкладка с
+записью флешки уезжала бы в «Ждут тебя». Почему гарда хуков сабагента:
+инструмент фонового агента делал вкладку `working` с ожиданием ответа, Stop
+основного потока за этим не следует — через 5 минут тишины «Проблемы»
+(сценарий S1 ревью: фоновый агент спросил разрешение, человек ответил).
 
-## Глобальные ограничения
+Вброс очереди на Stop — **как раньше, независимо от bg**: Claude после хода
+принимает ввод, а при вечном dev-сервере очередь иначе не сошла бы никогда.
 
-- Живой каталог `C:\Users\Lunev\AssistClaude\claude-cockpit` НЕ трогать (там
-  работает кокпит владельца). Копия: `C:\Users\Lunev\AssistClaude\cockpit-wt-bg`,
-  ветка `feat/background-status` от `origin/main`.
-- `npm test` зелёный (старт: 1214). Новый тест сначала красный; стражи — мутацией.
-- Фикстуры хуков — реальной формы (см. таблицу «Откуда данные»; `manager.list()`
-  отдаёт `tabId`, не `id`).
-- Коммиты поимённо, `git commit -F`, по-русски, последняя строка
-  `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Electron не запускать.
+## Потребители статуса
 
-## На что смотреть ревью
+| Где | Как относится к `background` |
+|---|---|
+| `tab-group.js` | секция «Работают» (шов `KNOWN_STATUSES` ↔ `STATUSES` стережёт `test/tab-group-markup.test.js`) |
+| `app.css` | `.tab-dot.background` — цвет working, приглушённо |
+| `app.js` | ghost-буфер на конце хода — да; markSeen — нет; закрытие peek — да; блок ввода диалогом — нет |
+| `toasts.js` | тишина; из `background` в `working` по уведомлению (`taskNotification`) время до «готово» не сбрасывается, по новому промпту человека — сбрасывается (сценарий S2 ревью) |
+| `ipc.js` | `shouldDetectLimitStop`: `working/stuck → background` — остановка; тостеру прокидывается `taskNotification` |
+| `night-watch.js` | не в `NO_RESUME_STATUSES` — пробуждение продолжает |
+| `attention.js`, `badge.js`, `tabs.js` (счётчик ждущих), smoke в `main.js` | без изменений: считают только `waiting` или по секции |
 
-1. Задача снята в UI Claude Code (`/tasks`) без хука и без уведомления →
-   вкладка навсегда в `background`. Проверить, что SessionStart/выход процесса
-   чистят; задокументировать как известное ограничение, если других путей нет.
-2. Уведомление пришло ДО PostToolUse запуска (гонка порядка хуков) → id не
-   должен «залипнуть» навсегда.
-3. Один prompt с несколькими `<task-notification>` → все id сняты.
-4. Ночная смена: Stop с фоном по лимиту → `onTabStop` срабатывает
-   (`shouldDetectLimitStop` принимает переход в `background`); пробуждение
-   продолжает `background`-вкладку (не в `NO_RESUME_STATUSES`).
-5. Все потребители статусов в renderer и main знают `background` (страж
-   `KNOWN_STATUSES` ↔ `STATUSES` уже есть — test/tab-group-markup.test.js).
+## Известные ограничения
+
+- **Задача снята в `/tasks` без хука и без уведомления** — вкладка в «фоне»
+  до следующего Stop (любого следующего хода), не навсегда.
+- **После `/clear` при живом dev-сервере** — «Наготове» до следующего Stop
+  (SessionStart ставит `ready`; сверка со списком — только на Stop).
+- **Старый CLI без `background_tasks`** — `done`, как до фичи.
+- **Два фоновых агента:** инструмент второго уводит из «Ждут тебя» вопрос
+  первого (так же было и в ходе с обычными агентами); тост о вопросе к этому
+  моменту уже показан.
+- **Ход, начатый уведомлением, узнаётся по началу prompt.** Если CLI склеит
+  уведомление с промптом человека, тостер посчитает это новым ходом —
+  «готово» может не прийти для короткого хода.
+- **Мост режет тело больше 256 КБ** (`hook-bridge.js`): Stop с огромным
+  `last_assistant_message` не дойдёт — статус не сменится (как и раньше).
+
+**Вопрос владельцу (открыт, код не трогали):** вкладка с dev-сервером на всю
+сессию: каждый ответ кончается в `background` — нет тоста «готово» и секции
+«Готово» никогда.
 
 ---
 
-## Задача — одна, ветка `feat/background-status`
+## Задача — ветка `feat/background-status` (сделано)
 
-**Файлы (по меньшей мере):**
-- `src/main/sessions.js` — `STATUSES` + `'background'`; `tab.bg` (Set) в
-  создании вкладки; разбор хуков в `applyHookEvent`; очистка на SessionStart
-  (не compact) и выходе/рестарте процесса.
+**Файлы:**
 - `src/main/background-tasks.js` (новый, CJS, чистые функции):
-  - `launchedTaskId(toolName, toolInput, toolResponse)` → `{id, kind: 'shell'|'agent'} | null`;
-  - `stoppedTaskId(toolName, toolInput)` → `string | null` (TaskStop);
-  - `notifiedTaskIds(prompt)` → `string[]` (все `<task-id>` из `<task-notification>`);
-  - `backgroundSubtitle(bg)` → `'фон · 1 команда'`, `'фон · 2 команды'`,
-    `'фон · 5 команд'`, `'фон · 1 агент'`, `'фон · 2 агента'`,
-    `'фон · 1 команда, 1 агент'` (русская множественность: 1/21 — «команда/агент»,
-    2–4/22–24 — «команды/агента», 5–20/11–14 — «команд/агентов»).
-  - `bg` хранит `Map<id, kind>`, чтобы подпись знала виды.
-- `src/main/ipc.js` — `shouldDetectLimitStop`: остановкой считается и переход в
-  `background` (не только `done`); комментарий почему.
-- `src/renderer/js/tab-group.js` — `background: 'working'`.
-- `src/renderer/css/app.css` — `.tab-dot.background` (как `working`, можно
-  приглушённее — на усмотрение, одной строкой).
-- Пройти grep'ом всех потребителей статусов (`'working'`, `'done'`, `groupOf`,
-  счётчики трея `main.js:606`, `toasts.js`, `app.js` saveGhost на конце хода,
-  `attention.js`, `badge.js`, `night-watch.js`) и решить для каждого, как он
-  относится к `background`; в отчёте — список с решением. Конец хода
-  (`saveGhost` на `done`/`waiting`) — относится и к `background`.
+  `launchedTaskId(toolName, toolResponse)` → `{id, kind: 'shell'|'agent'|'workflow'} | null`;
+  `liveBackground(known, backgroundTasks)` → `Map | null`;
+  `backgroundSubtitle(bg)` → `'фон · 1 команда'`, `'фон · 2 команды, 1 агент'`,
+  `'фон · 1 команда, 1 агент, 2 workflow'` (русская множественность; «workflow»
+  не склоняется); `isTaskNotification(prompt)`.
+- `src/main/sessions.js` — `STATUSES` + `'background'`; `tab.bg`, `tab.inTurn`;
+  разбор хуков в `applyHookEvent`; `noteBackgroundAgent`.
+- `src/main/ipc.js`, `src/main/toasts.js`, `src/main/night-watch.js` (комментарий),
+  `src/renderer/js/tab-group.js`, `src/renderer/js/app.js`, `src/renderer/css/app.css`.
 
-**Тесты (сначала красные):**
-- `test/background-tasks.test.js` — все четыре функции на реальной форме
-  payload (из таблицы «Откуда данные»), включая prompt с двумя блоками и
-  мусорный prompt; множественность 1, 2, 5, 11, 21, 22.
-- `test/sessions.test.js` — по таблице переходов: запуск фона + Stop →
-  `background` с подписью; уведомление → `working`, затем Stop → `done`;
-  TaskStop снимает; SessionStart чистит; compact не чистит; процесс вышел —
-  чистит; `background` не становится `stuck` по таймеру; markSeen не трогает;
-  вброс очереди на Stop с фоном происходит как раньше.
-- `test/ipc-*.test.js` — `shouldDetectLimitStop(working → background)` = true.
-- `test/tab-group*.test.js` — `background` в «Работают» (шов STATUSES уже стережёт).
-
-**Отчёт:** коммиты; красные до правки; мутации; потребители статусов с решением;
-`npm test` итог.
+**Тесты:** `test/background-tasks.test.js`; раздел «фон» в
+`test/sessions.test.js` (включая S1 ревью и хуки сабагента в ходе/вне хода);
+`test/ipc-smoke-gate.test.js`, `test/tab-group.test.js`, `test/toasts.test.js`
+(включая S2), `test/night-watch.test.js`; стражи по исходнику
+`test/ghost-on-turn-end-guard.test.js`, `test/ipc-toaster-wiring-guard.test.js`.
+Каждый новый тест — красный до правки или проверен мутацией.
