@@ -150,12 +150,22 @@ function newFilesWord(n) {
   return 'новых';
 }
 
+// Ревью 09.08 (C8): ключ того, что панель нарисует из снимка. Без fetchedAt —
+// main ставит его заново на каждый git:get после TTL кэша (3 с), даже когда
+// дифф тот же, а панель его не показывает (undefined JSON.stringify
+// пропускает). Ссылки не годятся: по IPC каждый ответ — новый объект.
+function snapshotKey(snap) {
+  if (!snap) return 'null';
+  return JSON.stringify({ ...snap, fetchedAt: undefined });
+}
+
 export function createDiffPanel({ root, api }) {
   let isOpenFlag = false;
   let activeTabId = null;
   let requestSeq = 0; // гард гонки: устаревший ответ (вкладка сменилась, пока летел IPC) не должен перетереть свежий
   let debounceTimer = null;
   let fileAnchors = new Map(); // path → DOM-элемент строки "diff --git" в тексте диффа (для скролла по клику)
+  let renderedKey = null; // snapshotKey() того, что сейчас нарисовано; null — нарисовано мимо снимков
 
   // --- DOM: строится один раз, дальше только точечно обновляется ---
 
@@ -340,11 +350,34 @@ export function createDiffPanel({ root, api }) {
     renderTruncatedNote(truncatedLinesEl, lineCount, hiddenLines, 'строк диффа');
   }
 
+  // Ревью 09.08 (C8): git:changed приходит каждые пару секунд, пока Claude
+  // работает, а render() сносит и строит до ~2200 узлов — выделение в диффе
+  // пропадало, строка файла теряла фокус. Тот же дифф — DOM не трогаем вовсе.
+  // Новый — перестраиваем, но прокрутку возвращаем: человек читает середину
+  // диффа, и правка где-то в нём не повод выкидывать его к началу. Браузер сам
+  // поджимает её, если дифф стал короче.
+  function show(snap) {
+    if (!isOpenFlag) return;
+    const key = snapshotKey(snap);
+    if (key === renderedKey) return;
+    renderedKey = key;
+    const filesTop = filesEl.scrollTop;
+    const bodyTop = bodyEl.scrollTop;
+    const bodyLeft = bodyEl.scrollLeft;
+    render(snap);
+    filesEl.scrollTop = filesTop;
+    bodyEl.scrollTop = bodyTop;
+    bodyEl.scrollLeft = bodyLeft;
+  }
+
   // --- IPC + обновление ---
 
   async function refresh({ force = false } = {}) {
     if (!activeTabId) {
-      if (isOpenFlag) showEmpty('нет активной вкладки');
+      if (isOpenFlag) {
+        renderedKey = null; // нарисовано мимо снимков — следующий снимок рисуем, даже если он прежний
+        showEmpty('нет активной вкладки');
+      }
       return;
     }
     const seq = ++requestSeq;
@@ -356,7 +389,7 @@ export function createDiffPanel({ root, api }) {
       snap = null;
     }
     if (seq !== requestSeq) return; // вкладка сменилась/панель закрылась, пока летел запрос — ответ устарел
-    render(snap);
+    show(snap);
   }
 
   function scheduleGitChangedRefresh() {
