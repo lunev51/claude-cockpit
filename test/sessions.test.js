@@ -2880,13 +2880,40 @@ test('фон S1: фоновый агент спросил разрешение, 
   assert.strictEqual(statusOf(events, a.tabId).status, 'background');
 });
 
-test('фон: после разрешения первым может прийти и PostToolUse разрешённого инструмента — тоже назад в «фон»', () => {
+test('фон B3: вопрос агента висит, а его параллельный инструмент завершился — вкладка остаётся в «Ждут тебя»', () => {
+  // Сценарий B3 ре-ревью: агент пустил пачку инструментов, одному нужно
+  // разрешение, второй (Read) завершается раньше ответа человека. Его
+  // PostToolUse — не ответ на вопрос. Вернуть в «фон» может только следующий
+  // PreToolUse агента: он приходит, лишь когда пачка с разрешённым
+  // инструментом закончилась.
   const { mgr, events, a, gen } = tabWithBackgroundAgent();
   mgr.applyHookEvent(a.tabId, 'Notification', permission(), gen);
   mgr.applyHookEvent(a.tabId, 'PostToolUse', {
-    ...subagentPre(), hook_event_name: 'PostToolUse', tool_response: { stdout: 'ok', stderr: '', interrupted: false },
+    ...subagentPre('Read'), hook_event_name: 'PostToolUse', tool_input: { file_path: 'C:\\proj\\alpha\\a.txt' }, tool_response: { type: 'text', file: { content: '' } },
   }, gen);
+  assert.strictEqual(statusOf(events, a.tabId).status, 'waiting');
+  assert.strictEqual(statusOf(events, a.tabId).waitingKind, 'permission');
+  mgr.applyHookEvent(a.tabId, 'PreToolUse', subagentPre(), gen);
   assert.strictEqual(statusOf(events, a.tabId).status, 'background');
+  assert.strictEqual(statusOf(events, a.tabId).subtitle, 'фон · 1 агент');
+});
+
+test('фон: idle-ожидание (вопроса нет) — PostToolUse фонового агента возвращает в «фон»', () => {
+  // «Жду ввода» без открытого диалога: терять нечего, а хук — доказательство
+  // живой работы. Ждать для этого PreToolUse незачем.
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { ...hookBase('UserPromptSubmit'), prompt: 'что там' });
+  mgr.applyHookEvent(a.tabId, 'Stop', stop([]));
+  mgr.applyHookEvent(a.tabId, 'Notification', {
+    ...hookBase('Notification'), message: 'Claude is waiting for your input', notification_type: 'idle_prompt',
+  });
+  assert.strictEqual(statusOf(events, a.tabId).waitingKind, 'idle');
+  mgr.applyHookEvent(a.tabId, 'PostToolUse', { ...subagentPre('Read'), hook_event_name: 'PostToolUse', tool_response: {} });
+  assert.strictEqual(statusOf(events, a.tabId).status, 'background');
+  assert.strictEqual(statusOf(events, a.tabId).subtitle, 'фон · 1 агент');
 });
 
 test('фон: хук сабагента в ХОДЕ основного потока — «работает» с подписью инструмента, как раньше', () => {

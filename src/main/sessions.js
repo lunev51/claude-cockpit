@@ -900,9 +900,18 @@ function createSessionManager({
   // уводит из «Ждут тебя» вопрос первого — так же, как это уже было в ходе
   // с обычными агентами; тост о вопросе к этому моменту уже показан.
   // Следующий Stop сверит список, как и для остального фона.
-  function noteBackgroundAgent(tab, agentId) {
+  //
+  // afterTool — хук пришёл из PostToolUse. Открытый вопрос разрешения он не
+  // закрывает (ре-ревью 05.11, B3): это может быть параллельный инструмент
+  // той же пачки, завершившийся раньше ответа человека. Из такого 'waiting'
+  // в «фон» ведёт только PreToolUse агента — он приходит, лишь когда пачка с
+  // разрешённым инструментом закончилась; цена — пока разрешённый
+  // инструмент выполняется, вкладка остаётся в «Ждут тебя». idle-ожидание
+  // вопроса не держит, и терять там нечего — ему хватает и PostToolUse.
+  function noteBackgroundAgent(tab, agentId, afterTool) {
     if (!tab.proc) return; // поздний хук умершего процесса вкладку не воскрешает
     tab.bg.set(agentId, 'agent');
+    if (afterTool && tab.status === 'waiting' && tab.waitingKind === 'permission') return;
     const subtitle = backgroundSubtitle(tab.bg);
     // Без изменений — без события: renderer на каждый 'background' пишет
     // ghost-буфер, а инструменты агента идут десятками.
@@ -1130,10 +1139,10 @@ function createSessionManager({
         // в журнал (сверится на Stop). Фон сабагента — не наш: его
         // уведомление уходит самому сабагенту, а в списке Stop он может
         // остаться и после того, как ход вкладки к нему отношения не имеет.
-        // Сам хук сабагента после хода — признак живого фонового агента
-        // (после ответа на его вопрос первым приходит именно PostToolUse).
+        // Сам хук сабагента после хода — признак живого фонового агента;
+        // открытого вопроса разрешения он не закрывает (см. noteBackgroundAgent).
         if (fromSubagent(data)) {
-          if (!tab.inTurn) noteBackgroundAgent(tab, data.agent_id);
+          if (!tab.inTurn) noteBackgroundAgent(tab, data.agent_id, true);
         } else {
           const launched = launchedTaskId(data.tool_name, data.tool_response);
           if (launched) tab.bg.set(launched.id, launched.kind);
