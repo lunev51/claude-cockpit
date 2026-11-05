@@ -63,7 +63,10 @@ class FakeTerminal {
 
 const calls = { screenshotPaste: [], clipboardWrite: [] };
 
-function installGlobals() {
+// secure — есть ли Clipboard API. В окне Electron есть (защищённый контекст),
+// в браузере по http (макбук, браузер на ПК по сети) navigator.clipboard
+// попросту нет.
+function installGlobals({ secure = true } = {}) {
   globalThis.window = {
     Terminal: FakeTerminal,
     // proposeDimensions → undefined: терминал «не подогнан», в pty размер не
@@ -86,23 +89,22 @@ function installGlobals() {
   globalThis.document = { createElement: () => fakeEl() };
   globalThis.getComputedStyle = () => ({ position: 'relative', width: '800px', height: '600px' });
   globalThis.ResizeObserver = class { observe() {} disconnect() {} };
-  // Окно на ПК: Clipboard API есть (в Electron страница — защищённый контекст).
   Object.defineProperty(globalThis, 'navigator', {
     configurable: true,
     writable: true,
-    value: {
+    value: secure ? {
       clipboard: {
         readText: async () => 'из буфера',
         writeText: async (text) => { calls.clipboardWrite.push(text); },
       },
-    },
+    } : {},
   });
 }
 
 const FONT = 14;
 
-async function makeTerminal() {
-  installGlobals();
+async function makeTerminal({ secure = true } = {}) {
+  installGlobals({ secure });
   const { initTerminal } = await import(modUrl('terminal.js'));
   const container = fakeEl();
   const view = initTerminal(container, { terminal: { fontSize: FONT, fontFamily: 'x', scrollback: 1000 } }, {
@@ -209,22 +211,58 @@ test('Ctrl+колесо: в шпаргалке есть, и шрифт меня�
   t.view.dispose();
 });
 
-test('вставка: шпаргалка называет обычный Ctrl+V, и он правда вставляет', async () => {
-  // Именно обычный Ctrl+V (без Shift): ради него и правка 05.08 — по
-  // умолчанию xterm слал бы его в pty как 0x16 и ничего не вставлял.
-  await row(/(^|[^+\w])Ctrl\+V\b/, /встав/i, 'вставку обычным Ctrl+V');
-  await row(/Ctrl\+Shift\+V/, /встав/i, 'вставку Ctrl+Shift+V');
+// Вставка устроена по-разному в трёх местах, где показывается шпаргалка, и
+// строка обязана быть правдой во всех (ревью ветки, M2):
+//  - окно на ПК: Ctrl+V — наш обработчик, сначала скриншот (screenshot:paste),
+//    потом текст;
+//  - браузер на ПК по http: Clipboard API нет, обработчик отступает, не гася
+//    событие, — браузер вставляет сам, xterm ловит событие paste. Только
+//    текст: до скриншота дело не доходит;
+//  - мак (браузер): вставка — Cmd+V. Обработчик его не трогает, xterm 6 у
+//    meta-букв (кроме Cmd+A) событие не гасит (Keyboard.ts, ветка default),
+//    вставляет браузер. Control+V на маке не вставляет ничем.
+// Соседняя строка «Option (мак) / Shift (ПК)» — образец формы.
+test('вставка: шпаргалка различает ПК и мак и не обещает скриншот вне окна на ПК', async () => {
+  // Обычный Ctrl+V (без Shift) — ради него правка 05.08: по умолчанию xterm
+  // слал бы его в pty как 0x16 и ничего не вставлял.
+  const paste = await row(/(^|[^+\w])Ctrl\+V\b[^/]*\(ПК\)/, /встав/i, 'вставку Ctrl+V на ПК');
+  assert.match(paste.combo, /Cmd\+V\b[^/]*\(мак\)/, `строка «${paste.combo}» не говорит, чем вставлять на маке`);
+  assert.match(paste.desc, /скриншот[^;]*только в окне на ПК/,
+    `строка «${paste.desc}» обещает скриншот там, где его нет (браузер по http)`);
 
-  for (const shiftKey of [false, true]) {
-    const t = await makeTerminal();
+  // Окно на ПК: Ctrl+V — сначала скриншот, потом текст.
+  {
+    const t = await makeTerminal({ secure: true });
     calls.screenshotPaste.length = 0;
-    const r = t.key({ ctrlKey: true, shiftKey, key: shiftKey ? 'V' : 'v', code: 'KeyV' });
-    const name = shiftKey ? 'Ctrl+Shift+V' : 'Ctrl+V';
-    assert.strictEqual(r.ret, false, `${name} ушёл бы в pty`);
-    assert.deepStrictEqual(calls.screenshotPaste, ['t1'], `${name} не проверил скриншот в буфере`);
+    const r = t.key({ ctrlKey: true, key: 'v', code: 'KeyV' });
+    assert.strictEqual(r.ret, false, 'Ctrl+V ушёл бы в pty');
+    assert.deepStrictEqual(calls.screenshotPaste, ['t1'], 'в окне на ПК Ctrl+V не проверил скриншот в буфере');
     await flush();
     await flush();
-    assert.deepStrictEqual(t.term.pasted, ['из буфера'], `${name} не вставил текст из буфера`);
+    assert.deepStrictEqual(t.term.pasted, ['из буфера'], 'в окне на ПК Ctrl+V не вставил текст из буфера');
+    t.view.dispose();
+  }
+
+  // Браузер на ПК по http: вставляет сам браузер (событие не погашено), не в
+  // pty как 0x16 и без похода за скриншотом.
+  {
+    const t = await makeTerminal({ secure: false });
+    calls.screenshotPaste.length = 0;
+    const r = t.key({ ctrlKey: true, key: 'v', code: 'KeyV' });
+    assert.strictEqual(r.ret, false, 'Ctrl+V ушёл бы в pty как 0x16');
+    assert.ok(!r.ev.defaultPrevented, 'Ctrl+V погашен — браузер по http не вставит ничего');
+    assert.deepStrictEqual(calls.screenshotPaste, [], 'по http Ctrl+V пошёл за скриншотом');
+    t.view.dispose();
+  }
+
+  // Мак (браузер по http): Cmd+V не перехватываем и не гасим.
+  {
+    const t = await makeTerminal({ secure: false });
+    calls.screenshotPaste.length = 0;
+    const r = t.key({ metaKey: true, key: 'v', code: 'KeyV' });
+    assert.ok(!r.ev.defaultPrevented, 'Cmd+V погашен — на маке вставка умрёт');
+    assert.deepStrictEqual(calls.screenshotPaste, [], 'Cmd+V пошёл за скриншотом');
+    assert.deepStrictEqual(t.term.pasted, [], 'Cmd+V вставлен обработчиком в обход браузера');
     t.view.dispose();
   }
 });
