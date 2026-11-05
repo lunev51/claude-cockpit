@@ -140,6 +140,95 @@ test('события рассылки долетают до подключённ
   ws.close();
 });
 
+// --- C6 ревью 09.08: одна сериализация на событие ---------------------------
+// Каждый сокет подписывался на рассылку сам, и событие уходило в
+// JSON.stringify столько раз, сколько открыто вкладок браузера, — а term:data
+// идёт на каждый кусок вывода pty. Число сериализаций считаем через toJSON:
+// JSON.stringify зовёт его ровно один раз на проход.
+function countingPayload() {
+  const payload = { serialized: 0 };
+  Object.defineProperty(payload, 'toJSON', {
+    value: () => { payload.serialized += 1; return { tabId: 'T1', data: 'вывод' }; },
+  });
+  return payload;
+}
+
+// Кадры сокета до события-метки: ws сохраняет порядок, поэтому всё, что
+// сервер отправил раньше метки, к её приходу уже здесь. Без таймеров.
+function framesUntil(ws, marker) {
+  return new Promise((resolve) => {
+    const got = [];
+    const onMessage = (raw) => {
+      const frame = JSON.parse(raw);
+      if (frame.event === marker) { ws.off('message', onMessage); resolve(got); return; }
+      got.push(frame);
+    };
+    ws.on('message', onMessage);
+  });
+}
+
+test('событие сериализуется ОДИН раз на всех клиентов, а не на каждого (C6 ревью)', async () => {
+  const { server, broadcast } = makeServer();
+  const { port } = await server.start();
+  const sockets = [];
+  for (let i = 0; i < 3; i += 1) sockets.push(await open(`ws://127.0.0.1:${port}/ws`));
+  const frames = sockets.map(nextFrame);
+  const payload = countingPayload();
+  broadcast.emit('term:data', payload);
+  for (const frame of await Promise.all(frames)) {
+    assert.deepStrictEqual(frame, { event: 'term:data', payload: { tabId: 'T1', data: 'вывод' } });
+  }
+  assert.strictEqual(payload.serialized, 1, `событие сериализовано ${payload.serialized} раз на 3 клиентов`);
+  for (const ws of sockets) ws.close();
+});
+
+test('без сетевых клиентов событие не сериализуется вовсе (C6 ревью)', async () => {
+  // Сервер поднят всегда, а вывод pty идёт непрерывно: сериализовать его для
+  // пустого зала — та же лишняя работа, только хуже.
+  const { server, broadcast } = makeServer();
+  await server.start();
+  const payload = countingPayload();
+  broadcast.emit('term:data', payload);
+  assert.strictEqual(payload.serialized, 0);
+});
+
+test('остановленный сервер снимается с рассылки (C6 ревью)', async () => {
+  const { server, broadcast } = makeServer();
+  await server.start();
+  await server.stop();
+  assert.strictEqual(broadcast.clientCount(), 0, 'после stop() сервер всё ещё подписан на рассылку');
+});
+
+test('сокет, бросивший на отправке, не лишает события остальных (C6 ревью)', async () => {
+  // Раньше это давал try/catch на клиента внутри broadcast.emit; с одной
+  // подпиской на сервер изоляция сокетов — забота самого сервера.
+  const { server, broadcast } = makeServer();
+  const { port } = await server.start();
+  const sockets = [];
+  for (let i = 0; i < 3; i += 1) sockets.push(await open(`ws://127.0.0.1:${port}/ws`));
+  const collected = sockets.map((ws) => framesUntil(ws, 'метка'));
+
+  // Первая отправка во время рассылки бросает — так ведёт себя сокет, который
+  // ws ещё не открыл. Подмена живёт только на время emit.
+  const realSend = WebSocket.prototype.send;
+  let thrown = false;
+  WebSocket.prototype.send = function patchedSend(...args) {
+    if (!thrown) { thrown = true; throw new Error('сокет умер'); }
+    return realSend.apply(this, args);
+  };
+  try {
+    broadcast.emit('tab:status', { tabId: 'T1', status: 'working' });
+  } finally {
+    WebSocket.prototype.send = realSend;
+  }
+  broadcast.emit('метка', {});
+
+  const received = (await Promise.all(collected)).filter((frames) => frames.some((f) => f.event === 'tab:status'));
+  assert.strictEqual(thrown, true, 'подмена send не сработала — тест ничего не проверил');
+  assert.strictEqual(received.length, 2, 'один упавший сокет оборвал рассылку остальным');
+  for (const ws of sockets) ws.close();
+});
+
 test('net:buffer отдаёт накопленную историю вкладки', async () => {
   const { server, outputBuffer } = makeServer();
   outputBuffer.push('T1', 'старый вывод');

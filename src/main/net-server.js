@@ -255,6 +255,22 @@ function createNetServer({
   // же было бы неверно (браузер мог быть закрыт и открыт на другой машине).
   let nextClientId = 1;
 
+  // C6 ревью: раньше каждый сокет подписывался на рассылку сам, и событие
+  // сериализовалось столько раз, сколько открыто вкладок браузера, — а term:data
+  // идёт на каждый кусок вывода pty. Теперь у сервера ОДНА подписка (с start()
+  // до stop()): JSON.stringify один раз, дальше та же строка во все сокеты.
+  function fanOut(event, payload) {
+    // Сервер поднят всегда, а вывод идёт непрерывно — для пустого зала не
+    // сериализуем вовсе (раньше без сокетов не было и подписчиков).
+    if (clients.size === 0) return;
+    const frame = JSON.stringify({ event, payload });
+    for (const ws of clients) {
+      // Упавший сокет не лишает события остальных — раньше это давал
+      // try/catch на клиента внутри broadcast.emit.
+      try { ws.send(frame); } catch { /* мёртвый сокет отвалится сам */ }
+    }
+  }
+
   // Корни приводим к абсолютному виду ОДИН раз, здесь. Если этого не
   // сделать, относительный root (например 'src/renderer' вместо полного
   // пути) даёт на выходе path.join() относительный путь, а старая проверка
@@ -466,24 +482,23 @@ function createNetServer({
         wss.on('connection', (ws) => {
           const clientId = `c${nextClientId}`;
           nextClientId += 1;
-          const send = (event, payload) => ws.send(JSON.stringify({ event, payload }));
+          // В clients — значит и в рассылке (fanOut), отдельной подписки на
+          // сокет больше нет (C6).
           clients.add(ws);
           heartbeats.set(ws, true);
-          broadcast.addClient(send);
           // Своё имя клиент обязан узнать ДО первого кадра: без него он не
           // может понять, у него сейчас управление или у соседа. Без эстафеты
           // (ownership не передан) имя не значит ничего, и лишний кадр сразу
           // после подключения менял бы наблюдаемое поведение старых клиентов —
           // поэтому молчим: сервер без ownership работает ровно как раньше.
           if (ownership) {
-            try { send('net:hello', { clientId }); } catch { /* сокет ушёл сразу */ }
+            try { ws.send(JSON.stringify({ event: 'net:hello', payload: { clientId } })); } catch { /* сокет ушёл сразу */ }
           }
           ws.on('message', (raw) => onFrame(ws, raw, clientId));
           ws.on('pong', () => heartbeats.set(ws, true));
           const forget = () => {
             clients.delete(ws);
             heartbeats.delete(ws);
-            broadcast.removeClient(send);
             // Ушедший владелец управление НЕ теряет (спека: обрыв ≠ потеря),
             // ownership.drop лишь помечает его офлайн.
             if (ownership) ownership.drop(clientId);
@@ -520,6 +535,7 @@ function createNetServer({
           wss.removeListener('error', onStartError);
           wss.on('error', (err) => console.log(`[net] ошибка сервера: ${err.message}`));
           hostAllowlist = buildHostAllowlist(server.address().port, { host, allowedHosts });
+          broadcast.addClient(fanOut);
           server._cockpitHeartbeat = heartbeat; // чтобы stop() мог его погасить
           resolve({ port: server.address().port });
         });
@@ -527,6 +543,7 @@ function createNetServer({
     },
     stop() {
       return new Promise((resolve) => {
+        broadcast.removeClient(fanOut);
         if (server && server._cockpitHeartbeat) clearInterval(server._cockpitHeartbeat);
         for (const ws of clients) { try { ws.terminate(); } catch { /* уже мёртв */ } }
         clients.clear();
