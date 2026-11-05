@@ -272,6 +272,19 @@ const NEIGHBOURS = [
     },
   },
   {
+    name: 'форма рецепта',
+    async create(root) {
+      const { createRecipeForm } = await import(modUrl('recipe-form.js'));
+      const form = createRecipeForm({ root });
+      return {
+        // open() возвращает промис результата — тесту он не нужен, форма
+        // открывается синхронно внутри.
+        open: () => { form.open({ title: 'Рецепт', fields: [{ key: 'пакет', label: 'пакет' }] }); },
+        isOpen: () => form.isOpen(),
+      };
+    },
+  },
+  {
     name: 'дашборд',
     async create(root) {
       const { createDashboard } = await import(modUrl('dashboard.js'));
