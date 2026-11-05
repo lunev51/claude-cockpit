@@ -107,6 +107,31 @@ test('проводка: dropTabOutputBuffer зовётся из tabs:close РО�
 // (см. комментарий у его объявления), для outputBuffer приём не применили.
 //
 // Проверяем текстом: объявление обязано идти РАНЬШЕ первого использования.
+// Жалоба 05.11: подключившийся клиент получал сырой хвост 256 КБ, и у вкладки,
+// долго крутившей спиннер, пропадали рамки и статус-бар (полная перерисовка
+// ConPTY ушла за хвост). Теперь история — зеркало экрана (screen-mirror.js),
+// и смысл держится на двух вещах в registerIpc, которые под node --test не
+// исполняются: что создаётся именно зеркало, и что его размер — размер pty
+// из менеджера. sizeOf, всегда отдающий null, тихо выключил бы зеркало
+// целиком: push ничего не пишет, клиент видит пустой экран.
+test('история вкладок в registerIpc — зеркало экрана с размером pty из manager.size (жалоба 05.11)', () => {
+  const code = ipcSrc.split(/\r?\n/).filter((line) => !line.trim().startsWith('//')).join('\n');
+  const declarations = [...code.matchAll(/const outputBuffer = (\w+)\((\{[^\n]*\})\);/g)];
+  assert.strictEqual(declarations.length, 1, `объявлений outputBuffer в коде ipc.js: ${declarations.length}, ждали одно — страж разъехался с исходником`);
+  const [, factory, options] = declarations[0];
+  assert.strictEqual(factory, 'createTabHistory', `история вкладок снова ${factory} — клиент получит сырой хвост вместо экрана`);
+  assert.match(
+    options,
+    /^\{ sizeOf: \(tabId\) => \(manager \? manager\.size\(tabId\) : null\) \}$/,
+    `размер зеркала берётся не из manager.size: ${options}`,
+  );
+  // Импорт — тоже только текстом: ipc.js под тестом загружается, но
+  // registerIpc не исполняется, и пропавший require дал бы ReferenceError
+  // лишь в проде, на старте всего приложения (мутация «удалить require»
+  // без этой строки выживала).
+  assert.match(code, /^const \{ createTabHistory \} = require\('\.\/screen-mirror'\);$/m, 'createTabHistory не импортирован в ipc.js');
+});
+
 test('outputBuffer и broadcast объявлены раньше, чем ими пользуются замыкания', () => {
   const start = ipcSrc.indexOf('function registerIpc(');
   assert.notStrictEqual(start, -1, 'не найдена registerIpc — страж разъехался с исходником');
@@ -121,7 +146,7 @@ test('outputBuffer и broadcast объявлены раньше, чем ими �
   const codeOf = (line) => line.replace(/^\s*\/\/.*/, '').replace(/\/\/.*$/, '');
 
   for (const [name, declaration] of [
-    ['outputBuffer', 'const outputBuffer = createOutputBuffer('],
+    ['outputBuffer', 'const outputBuffer = createTabHistory('],
     ['broadcast', 'const broadcast = createBroadcast('],
   ]) {
     let declaredLine = -1;

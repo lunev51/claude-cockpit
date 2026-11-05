@@ -25,6 +25,7 @@ const {
 const { createCommandRegistry } = require('../src/main/command-registry');
 const { createBroadcast } = require('../src/main/broadcast');
 const { createOutputBuffer } = require('../src/main/output-buffer');
+const { createTabHistory } = require('../src/main/screen-mirror');
 const { createOwnership } = require('../src/main/ownership');
 const { isWriteChannel, WRITE_CHANNELS, FREE_CHANNELS } = require('../src/main/write-channels');
 
@@ -237,6 +238,24 @@ test('net:buffer отдаёт накопленную историю вкладк
   ws.send(JSON.stringify({ id: 4, channel: 'net:buffer', args: ['T1'] }));
   assert.deepStrictEqual(await nextFrame(ws), { id: 4, ok: true, result: 'старый вывод' });
   ws.close();
+});
+
+// Жалоба 05.11: история вкладки теперь — снимок зеркала экрана
+// (screen-mirror.js), и get отдаёт промис: запись в xterm асинхронная.
+// Без await в onFrame промис уехал бы клиенту как {} (JSON.stringify
+// промиса), и браузер не получил бы экрана вовсе. Зеркало настоящее.
+test('net:buffer: история-промис зеркала экрана доезжает до клиента строкой', async () => {
+  const outputBuffer = createTabHistory({ sizeOf: () => ({ cols: 80, rows: 24 }) });
+  outputBuffer.push('T1', '\x1b[2J\x1b[3;1Hэкран вкладки');
+  const { server } = makeServer({ outputBuffer });
+  const { port } = await server.start();
+  const ws = await open(`ws://127.0.0.1:${port}/ws`);
+  ws.send(JSON.stringify({ id: 6, channel: 'net:buffer', args: ['T1'] }));
+  const frame = await nextFrame(ws);
+  ws.close();
+  assert.strictEqual(frame.ok, true, `net:buffer ответил ошибкой: ${frame.error}`);
+  assert.strictEqual(typeof frame.result, 'string', `клиент получил ${JSON.stringify(frame.result)} вместо снимка`);
+  assert.ok(frame.result.includes('экран вкладки'), 'в снимке нет экрана вкладки');
 });
 
 test('битый кадр не роняет сервер', async () => {

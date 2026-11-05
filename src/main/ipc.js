@@ -14,7 +14,7 @@ const {
 } = require('electron');
 const { createCommandRegistry } = require('./command-registry');
 const { createBroadcast } = require('./broadcast');
-const { createOutputBuffer } = require('./output-buffer');
+const { createTabHistory } = require('./screen-mirror');
 const { createNetServer } = require('./net-server');
 const { createOwnership, isShareableSize } = require('./ownership');
 const { listDir, listDrives } = require('./fs-browse');
@@ -1078,7 +1078,8 @@ function sttStatusHandler({ smoke, getStt }) {
   }
 }
 
-// Important 1 (ревью задачи 4): наполнение output-buffer.js на term:data и
+// Important 1 (ревью задачи 4): наполнение истории вкладок (тогда сырой хвост
+// output-buffer.js, с 05.11 — зеркало экрана screen-mirror.js) на term:data и
 // очистка на tabs:close жили ИНЛАЙНОМ прямо внутри onEvent/tabs:close —
 // ревьюер вырезал обе строки и прогнал полный набор: 784 теста, 0 падений.
 // Смысл задачи 4 — не модуль output-buffer.js сам по себе (он покрыт), а
@@ -1418,10 +1419,22 @@ function registerIpc(win, opts = {}) {
   // место, которое обязано звать закрытие, а не значение.
   const broadcast = createBroadcast({ getWindow: () => win });
 
-  // Хвост вывода по вкладкам (output-buffer.js) — то, что отдаётся клиенту
-  // сразу при подключении: сетевой сервер сам xterm не видит, а история живёт
-  // только внутри окна ПК. Наполняется в onEvent менеджера сессий (ниже, там
-  // же, где term:data уходит в broadcast.emit), чистится на tabs:close.
+  // История вкладок — то, что отдаётся клиенту сразу при подключении: сетевой
+  // сервер сам xterm не видит, а история живёт только внутри окна ПК.
+  // Наполняется в onEvent менеджера сессий (ниже, там же, где term:data уходит
+  // в broadcast.emit), чистится на tabs:close.
+  //
+  // Это зеркало экрана (screen-mirror.js), а не сырой хвост вывода (жалоба
+  // 05.11: хвост 256 КБ терял рамки и статус-бар, если полная перерисовка
+  // ConPTY была старше хвоста). Зеркало живёт в сетке pty вкладки — её знает
+  // только менеджер; manager — модульный let, присваивается ниже, но sizeOf
+  // зовётся не раньше первого term:data, то есть уже после. Нет менеджера или
+  // вкладки — null, зеркало не заводится. Пакетов нет (pull без npm install)
+  // — createTabHistory сам откатывается на сырой хвост output-buffer.js.
+  //
+  // Имя outputBuffer оставлено: под ним объект ходит в bufferTermData,
+  // dropTabOutputBuffer и net-server.js, а контракт тот же (push/get/drop),
+  // только get теперь — промис.
   //
   // Объявлен ЗДЕСЬ, рядом с broadcast, и ровно по той же причине (ревью 09.08):
   // замыкание onEvent, которое его зовёт, создаётся на сотни строк выше, чем
@@ -1431,7 +1444,7 @@ function registerIpc(win, opts = {}) {
   // при создании менеджера, ловила бы ReferenceError (TDZ) на старте всего
   // приложения, причём только в проде: registerIpc под node --test не
   // запускается. Зависимостей у конструктора нет, переносить безопасно.
-  const outputBuffer = createOutputBuffer({});
+  const outputBuffer = createTabHistory({ sizeOf: (tabId) => (manager ? manager.size(tabId) : null) });
 
   // Слои usage (Task 3 фазы 5): инстансы создаются ВСЕГДА (конструктор — это
   // просто замыкания над зависимостями, никакого I/O до первого refresh()/get()),
@@ -1579,9 +1592,10 @@ function registerIpc(win, opts = {}) {
     readSessionTitle: (transcriptPath, sessionId) => sessionTitleReader.read(transcriptPath, sessionId),
     onEvent: (channel, payload) => {
       if (smoke && channel === 'term:data') smokeOutput += payload.data;
-      // Задача 4 (буфер вывода): наполняем ТУТ ЖЕ, в том самом месте, где
-      // событие term:data уходит в broadcast.emit ниже, — подключившийся
-      // клиент получает то же самое, что видит окно на ПК, ни байтом меньше.
+      // Задача 4 (история вкладки): наполняем ТУТ ЖЕ, в том самом месте, где
+      // событие term:data уходит в broadcast.emit ниже, — зеркало экрана
+      // видит тот же поток, что окно на ПК, ни байтом меньше, и подключившийся
+      // клиент получает тот же экран.
       // bufferTermData вынесена выше (Important 1 ревью) ради собственного
       // юнит-теста — эта строка зовёт РОВНО её, не копию.
       bufferTermData({ channel, payload, outputBuffer });
@@ -1973,7 +1987,10 @@ function registerIpc(win, opts = {}) {
   // вкладка сразу встала в правильную секцию, а не ждала следующего хука.
   registry.handle('tabs:list', () => manager.list());
 
-  // История вывода вкладки — хвост из output-buffer.js (задача 4). C2
+  // История вывода вкладки (задача 4) — с 05.11 снимок зеркала экрана
+  // (screen-mirror.js), а не сырой хвост: см. комментарий у объявления
+  // outputBuffer. get отдаёт промис (снимок снимается после разбора всего
+  // принятого), ipcMain.handle его дожидается сам. C2
   // финального ревью: канал существовал ТОЛЬКО внутри net-server.js, в форме
   // window.api его не было вовсе, и ни app.js, ни terminal.js его не звали —
   // то есть пункт спеки «подключившийся клиент видит, на чём остановилась
@@ -1986,7 +2003,7 @@ function registerIpc(win, opts = {}) {
   // работают, а xterm в окне только что создан с нуля. Оба читают ОДИН И ТОТ
   // ЖЕ экземпляр outputBuffer, разойтись им нечем.
   //
-  // Пустой хвост (вкладка только создана, вывода ещё не было) — нормальный
+  // Пустая история (вкладка только создана, вывода ещё не было) — нормальный
   // ответ, а не ошибка: отдаём пустую строку.
   registry.handle('net:buffer', (tabId) => (typeof tabId === 'string' ? outputBuffer.get(tabId) : ''));
 
@@ -2073,9 +2090,11 @@ function registerIpc(win, opts = {}) {
     // смены (lastStatusByTab) больше никому не нужна и не должна копиться в
     // памяти навсегда, тот же приём, что toaster.forget()/ghost-файл выше.
     lastStatusByTab.delete(tabId);
-    // Задача 4 (буфер вывода): без drop() буфер закрытой вкладки копится в
-    // памяти до перезапуска кокпита — тот же приём, что toaster.forget()/
-    // lastStatusByTab.delete() выше, только для output-buffer.js.
+    // Задача 4 (история вкладки): без drop() зеркало закрытой вкладки (целый
+    // headless-терминал с прокруткой) живёт в памяти до перезапуска кокпита —
+    // тот же приём, что toaster.forget()/lastStatusByTab.delete() выше.
+    // Хвост убитого pty, долетевший после этой строки, зеркало не воскресит:
+    // manager.close() выше уже убрал вкладку, sizeOf отдаёт null.
     // dropTabOutputBuffer вынесена выше (Important 1 ревью) ради собственного
     // юнит-теста — эта строка зовёт РОВНО её, не копию.
     dropTabOutputBuffer({ tabId, outputBuffer });
