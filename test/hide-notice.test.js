@@ -59,6 +59,38 @@ test('без центра уведомлений — молчим; неизве�
   assert.deepStrictEqual(shown, [HIDE_NOTICES.close], 'неизвестный путь съел «первый раз»');
 });
 
+// I1 ревью ветки: explainHide зовётся из win.on('close') — точки входа без
+// guarded(). Бросок оттуда уходит в uncaughtException → teardown() и
+// app.exit(1): все pty умирают ради тоста. Поэтому сама не бросает никогда.
+test('сбой центра уведомлений не вылетает из explainHide — ни в canNotify, ни в notify', () => {
+  const warn = console.warn;
+  const warned = [];
+  console.warn = (...args) => warned.push(args.join(' '));
+  try {
+    const noCenter = createHideExplainer({
+      canNotify: () => { throw new Error('нет центра уведомлений'); },
+      notify: () => { throw new Error('notify НЕ должен был вызваться'); },
+    });
+    assert.doesNotThrow(() => noCenter('close'), 'бросок canNotify вылетел из explainHide');
+    assert.strictEqual(noCenter('close'), null);
+    assert.ok(warned.length >= 1, 'сбой canNotify проглочен молча — в консоли ни слова');
+    warned.length = 0;
+
+    let calls = 0;
+    const brokenToast = createHideExplainer({
+      canNotify: () => true,
+      notify: () => { calls += 1; throw new Error('тост не показался'); },
+    });
+    assert.doesNotThrow(() => brokenToast('close'), 'бросок notify вылетел из explainHide');
+    // Сломанный тост не повторяем на каждом крестике: «первый раз» потрачен.
+    assert.doesNotThrow(() => brokenToast('handoff'));
+    assert.strictEqual(calls, 1, 'сломанный notify дёргается на каждом скрытии');
+    assert.strictEqual(warned.length, 1, 'сбой notify проглочен молча — в консоли ни слова');
+  } finally {
+    console.warn = warn;
+  }
+});
+
 // --- проводка в main.js ---
 
 const codeOnly = (source) => source
@@ -87,6 +119,8 @@ test('main.js: крестик прячет окно И объясняет это
   assert.ok(hidden, 'в обработчике close не найдена ветка if (!quitting) — страж разъехался');
   assert.match(hidden[1], /win\.hide\(\);/, 'крестик больше не прячет окно');
   assert.match(hidden[1], /explainHide\('close'\);/, 'крестик прячет окно молча — первое скрытие не объяснено');
+  // Сначала спрятать, потом объяснять: тост — украшение, окно — главное.
+  assert.match(hidden[1], /win\.hide\(\);\s*\n\s*explainHide\('close'\);/, 'объяснение стоит раньше win.hide()');
 });
 
 test('main.js: уход управления объясняется тем же explainHide, а не своим флагом', () => {

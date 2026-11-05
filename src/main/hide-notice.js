@@ -27,13 +27,32 @@ const HIDE_NOTICES = Object.freeze({
 // canNotify — есть ли центр уведомлений (Notification.isSupported()),
 // notify({title, body}) — показать. Возвращает функцию explainHide(reason):
 // reason — 'close' | 'handoff'; отдаёт показанный текст или null.
+//
+// НЕ бросает никогда (I1 ревью ветки): explainHide зовётся из win.on('close')
+// — точки входа без guarded(), — и бросок оттуда ушёл бы в uncaughtException
+// → teardown() и app.exit(1): все pty умерли бы ради тоста. Окно к этому
+// моменту уже спрятано (main.js зовёт нас после win.hide()). Сломанный тост
+// не повторяем: «первый раз» тратится до notify().
 function createHideExplainer({ canNotify, notify }) {
   let explained = false;
+  const supported = () => {
+    try {
+      return !!canNotify();
+    } catch (err) {
+      console.warn('[hide-notice] центр уведомлений недоступен:', err && err.message);
+      return false;
+    }
+  };
   return function explainHide(reason) {
     const notice = HIDE_NOTICES[reason];
-    if (!notice || explained || !canNotify()) return null;
+    if (!notice || explained || !supported()) return null;
     explained = true;
-    notify(notice);
+    try {
+      notify(notice);
+    } catch (err) {
+      console.warn('[hide-notice] уведомление не показалось:', err && err.message);
+      return null;
+    }
     return notice;
   };
 }
