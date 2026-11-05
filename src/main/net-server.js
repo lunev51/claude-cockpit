@@ -326,6 +326,9 @@ function createNetServer({
     const args = Array.isArray(msg.args) ? msg.args : [];
     try {
       let result;
+      // Всё, что сервер обслуживает сам, идёт МИМО гарда реестра, — сюда можно
+      // только каналы из FREE_CHANNELS (write-channels.js). Держит тест-зонд
+      // C3 в test/net-server.test.js: пишущий канал здесь его роняет.
       if (msg.channel === 'net:buffer') {
         // net:buffer обслуживает сервер, а не реестр: история — свойство
         // соединения, локальному окну она не нужна (у него свой xterm).

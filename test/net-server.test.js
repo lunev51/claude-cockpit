@@ -24,7 +24,7 @@ const { createCommandRegistry } = require('../src/main/command-registry');
 const { createBroadcast } = require('../src/main/broadcast');
 const { createOutputBuffer } = require('../src/main/output-buffer');
 const { createOwnership } = require('../src/main/ownership');
-const { isWriteChannel } = require('../src/main/write-channels');
+const { isWriteChannel, WRITE_CHANNELS, FREE_CHANNELS } = require('../src/main/write-channels');
 
 const fakeIpcMain = () => ({ handle: () => {}, on: () => {} });
 
@@ -966,6 +966,72 @@ test('уход клиента не отдаёт управление обрат�
   }
   assert.strictEqual(ownership.owner(), hello.payload.clientId, 'обрыв ≠ потеря управления');
   assert.strictEqual(ownership.ownerOnline(), false);
+});
+
+// --- C3 ревью 09.08: перехваты сервера идут мимо гарда ----------------------
+// net:buffer, owner:claim, owner:get сервер обслуживает сам, до реестра, — то
+// есть гард владения на них не зовётся никогда. Сегодня все три свободные, но
+// это держалось на совпадении: новый перехват пишущего канала (ради скорости,
+// ради личности сокета) молча открыл бы невладельцу запись. Тест зондирует
+// КАЖДЫЙ известный канал от невладельца и смотрит, спросили ли гард и чем
+// кончилось.
+
+test('мимо гарда сервер пропускает только свободные каналы, пишущие от невладельца получают отказ (C3 ревью)', async () => {
+  const { API_SHAPE } = await import('../src/renderer/js/api-shape.js');
+  const channels = new Set([...WRITE_CHANNELS, ...FREE_CHANNELS]);
+  for (const spec of Object.values(API_SHAPE)) if (spec.kind !== 'event') channels.add(spec.channel);
+
+  const ownership = createOwnership({});
+  const asked = new Set();
+  const registry = createCommandRegistry({
+    ipcMain: fakeIpcMain(),
+    // Тот же гард, что собирает ipc.js, плюс запись: кого о чём спросили.
+    guard: ({ channel, who }) => {
+      asked.add(channel);
+      return !isWriteChannel(channel) || ownership.canWrite(who);
+    },
+  });
+  for (const channel of channels) registry.handle(channel, () => 'ок');
+  const server = createNetServer({
+    registry,
+    ownership,
+    broadcast: createBroadcast({ getWindow: () => null }),
+    outputBuffer: createOutputBuffer({}),
+    staticRoots: { '/': path.join(__dirname, '..', 'src', 'renderer') },
+    port: 0,
+    host: '127.0.0.1',
+  });
+  activeServers.push(server);
+  const { port } = await server.start();
+  const ws = await openBuffered(`ws://127.0.0.1:${port}/ws`);
+  await takeFrame(ws); // net:hello
+
+  // owner:claim — последним: он отдал бы зонду руль, и пишущие каналы после
+  // него законно прошли бы гард.
+  const order = [...channels].filter((c) => c !== 'owner:claim').concat('owner:claim');
+  const bypassed = [];
+  const notDenied = [];
+  let id = 0;
+  for (const channel of order) {
+    id += 1;
+    const reply = await ask(ws, { id, channel, args: [] });
+    if (!asked.has(channel)) bypassed.push(channel);
+    if (isWriteChannel(channel) && reply.denied !== true) notDenied.push(channel);
+  }
+  ws.close();
+
+  // Сам детектор видит известные перехваты — иначе проверка ниже была бы
+  // пустой правдой. Перехват убран намеренно — убери его и отсюда.
+  for (const known of ['net:buffer', 'owner:claim', 'owner:get']) {
+    assert.ok(bypassed.includes(known), `зонд не заметил перехват ${known} — детектор сломан или перехват убран`);
+  }
+  assert.deepStrictEqual(
+    bypassed.filter((c) => !FREE_CHANNELS.has(c)), [],
+    'сервер обслуживает сам, мимо гарда, канал вне FREE_CHANNELS — невладелец пишет без управления',
+  );
+  // Второй обход: гард спросили, но не от имени этого сокета (например,
+  // сервер позвал реестр как 'local').
+  assert.deepStrictEqual(notDenied, [], 'пишущий канал от невладельца не получил отказ эстафеты');
 });
 
 test('закрытые сокеты не оставляют размеров в эстафете (C2 ревью, проводка close → drop)', async () => {
