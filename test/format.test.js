@@ -135,3 +135,35 @@ test('pluralTabs: мусор на входе не роняет — тракту�
   assert.strictEqual(pluralTabs(NaN), 'вкладок');
   assert.strictEqual(pluralTabs('3'), 'вкладки');
 });
+
+// limitColor (ревью 09.08, C14): окраска лимита по проценту. Была двумя
+// приватными копиями — colorFor в dashboard.js (полосы) и в rings.js (кольца
+// сайдбара) — с одинаковыми порогами, которые разъехались бы молча: кольцо
+// жёлтое, полоса того же лимита зелёная. Пороги по брифу: <60 ok, 60..85
+// warn, >85 err. Обе границы включительно в warn — проверяем каждую.
+test('limitColor: пороги 60/85 — по брифу, обе границы в warn', async () => {
+  const { limitColor } = await import('../src/renderer/js/format.js');
+  assert.strictEqual(limitColor(0), 'var(--ok)');
+  assert.strictEqual(limitColor(59), 'var(--ok)');
+  assert.strictEqual(limitColor(60), 'var(--warn)');
+  assert.strictEqual(limitColor(85), 'var(--warn)');
+  assert.strictEqual(limitColor(86), 'var(--err)');
+  assert.strictEqual(limitColor(100), 'var(--err)');
+});
+
+// Страж по исходнику: копия порогов в любом из двух потребителей — ровно тот
+// дубль, который разъезжается молча, и поведенческий тест его не увидит
+// (копия с теми же числами зелёная, пока числа не тронули).
+test('пороги лимитов и HH:MM — одна копия в format.js, потребители импортируют её', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const read = (name) => fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'js', name), 'utf8');
+  for (const name of ['dashboard.js', 'rings.js']) {
+    const src = read(name);
+    assert.doesNotMatch(src, /function\s+(?:colorFor|limitColor|formatTime|formatClock)\b/, `${name}: снова своя копия функции из format.js`);
+    assert.doesNotMatch(src, /[<>]=?\s*(?:60|85)\b/, `${name}: пороги окраски 60/85 снова зашиты локально`);
+    assert.match(src, /import\s*\{[^}]*\blimitColor\b[^}]*\}\s*from\s*'\.\/format\.js'/, `${name}: limitColor не импортируется из format.js`);
+  }
+  // formatTime в dashboard.js был дословной копией formatClock.
+  assert.match(read('dashboard.js'), /import\s*\{[^}]*\bformatClock\b[^}]*\}\s*from\s*'\.\/format\.js'/, 'dashboard.js: formatClock не импортируется из format.js');
+});

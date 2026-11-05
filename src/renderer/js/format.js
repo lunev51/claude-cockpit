@@ -54,15 +54,26 @@ export function pluralTabs(n) {
 
 // formatClock(ms) → «HH:MM» / null для мусора (не число/NaN/<=0) — Task 3
 // фазы 8 («Ночная смена»): секция дашборда форматирует так wakeAt (момент
-// запланированного пробуждения) и ts записей журнала. Тот же паттерн, что уже
-// была приватная formatTime() внутри dashboard.js (fetchedAt лимитов/расходов,
-// см. там же) — вынесена сюда экспортом специально для ночной секции, вторая
-// приватная копия внутри dashboard.js не трогается (не входит в эту задачу).
+// запланированного пробуждения) и ts записей журнала, а сам дашборд — «обновлено
+// в HH:MM» из fetchedAt лимитов/расходов. Там 0 значит «данных ещё не было»
+// (buildResult/zeroSnapshot), отсюда null вместо «01.01.1970». Приватная копия
+// formatTime в dashboard.js убрана (ревью 09.08, C14) — она была дословной.
 export function formatClock(ms) {
   if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return null;
   const d = new Date(ms);
   if (Number.isNaN(d.getTime())) return null;
   return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+// limitColor(percent) → цвет лимита: ok ниже 60%, warn от 60 до 85 включительно,
+// err выше 85 (бриф фазы 5). Одна копия на кольца сайдбара (rings.js) и полосы
+// дашборда (dashboard.js): раньше у каждого была своя colorFor с теми же
+// числами, и правка порогов в одной разъехалась бы с другой молча (ревью
+// 09.08, C14).
+export function limitColor(percent) {
+  if (percent > 85) return 'var(--err)';
+  if (percent >= 60) return 'var(--warn)';
+  return 'var(--ok)';
 }
 
 export function formatShortDate(isoOrMs) {
