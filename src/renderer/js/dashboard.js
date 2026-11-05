@@ -842,6 +842,7 @@ export function createDashboard({
     bodyEl = null;
     lastData = null;
     renderedKey = null; // следующий open() строит новый bodyEl — сверять не с чем
+    countdowns = []; // строки отсчёта держат через родителей весь отцепленный оверлей
     refreshing = false;
 
     const toFocus = previousActive;

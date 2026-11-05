@@ -12,6 +12,8 @@
 const { test } = require('node:test');
 const assert = require('node:assert');
 const path = require('node:path');
+const v8 = require('node:v8');
+const vm = require('node:vm');
 const { pathToFileURL } = require('node:url');
 
 const modUrl = (name) => pathToFileURL(
@@ -73,6 +75,8 @@ function makeDom() {
         if (!this.parent) return;
         this.parent.children = this.parent.children.filter((c) => c !== this);
         this.parent = null;
+        // Удалённый сфокусированный элемент отдаёт фокус <body> — как в браузере.
+        if (doc.activeElement && !doc.contains(doc.activeElement)) doc.activeElement = doc.body;
       },
       focus() { doc.activeElement = this; },
     };
@@ -304,4 +308,23 @@ test('вкладку переименовали — журнал ночной с
   tick(T0 + 30000);
 
   assert.ok(row().endsWith(' — cockpit: ревью продолжена'), `тик оставил в журнале старое имя вкладки: ${row()}`);
+});
+
+test('close() отпускает оверлей: строки отсчёта не держат его в памяти', async () => {
+  // Ревью ветки, M4. Список строк «сброс через …» держит их узлы, а через
+  // родителей — весь отцепленный оверлей, до следующего open(). Проверяем
+  // настоящей сборкой мусора: после close() оверлей должен собираться.
+  // node --test гоняет каждый файл своим процессом — флаг остаётся здесь.
+  v8.setFlagsFromString('--expose-gc');
+  const gc = vm.runInNewContext('gc');
+  const { root, dash } = await setup();
+  assert.strictEqual(findAll(root, 'limit-bar-reset').length, 3, 'строк отсчёта нет — сценарий не воспроизведён');
+  const overlay = new WeakRef(findOne(root, 'dashboard-overlay'));
+
+  dash.close();
+  // WeakRef держит цель до конца текущего задания — сборку зовём в следующем.
+  await new Promise((resolve) => { setImmediate(resolve); });
+  gc();
+
+  assert.strictEqual(overlay.deref(), undefined, 'закрытый дашборд остался в памяти — его держит список строк отсчёта');
 });
