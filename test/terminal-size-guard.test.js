@@ -51,25 +51,33 @@ function blockAfter(anchor) {
 }
 
 const ANY_RESIZE = /window\.api\.term\.resize\s*\(/g;
+// Вызов sendSize (объявление `const sendSize = (s) =>` сюда не попадает).
+const ANY_SEND = /\bsendSize\s*\(/g;
 
 // Ровно одна допустимая форма отправки: результат measure() в переменной, и
-// вызов под проверкой ЭТОЙ ЖЕ переменной, с её же cols/rows.
+// sendSize под проверкой ЭТОЙ ЖЕ переменной, с ней же.
 //   const s = measure();
-//   if (s) window.api.term.resize(tabId, s.cols, s.rows);
-const GUARDED_RESIZE = /const\s+(\w+)\s*=\s*measure\(\);\s*if\s*\(\s*\1\s*\)\s*window\.api\.term\.resize\(\s*tabId\s*,\s*\1\.cols\s*,\s*\1\.rows\s*\)/g;
+//   if (s) sendSize(s);
+// sendSize — единственное место, где размер уходит в pty (и наружу, соседним
+// вкладкам — см. adoptGrid).
+const GUARDED_SEND = /const\s+(\w+)\s*=\s*measure\(\);\s*if\s*\(\s*\1\s*\)\s*sendSize\(\s*\1\s*\)/g;
 
 function assertGuardedSite(body, where) {
-  const all = [...body.matchAll(ANY_RESIZE)].length;
-  const guarded = [...body.matchAll(GUARDED_RESIZE)].length;
+  const sends = [...body.matchAll(ANY_SEND)].length;
+  const guarded = [...body.matchAll(GUARDED_SEND)].length;
   assert.strictEqual(
     guarded, 1,
     `${where}: нет отправки размера под проверкой measure() — либо она пропала, либо снова безусловная `
     + '(тогда неподогнанный терминал опять шлёт pty умолчание 80×24)',
   );
   assert.strictEqual(
-    all, guarded,
-    `${where}: рядом с проверенной отправкой есть ещё ${all - guarded} безусловная — `
+    sends, guarded,
+    `${where}: рядом с проверенной отправкой есть ещё ${sends - guarded} безусловная — `
     + 'скрытая вкладка снова сообщит pty размер, которого у неё нет',
+  );
+  assert.strictEqual(
+    [...body.matchAll(ANY_RESIZE)].length, 0,
+    `${where}: window.api.term.resize в обход sendSize — мимо проверки и мимо раздачи сетки соседям`,
   );
 }
 
@@ -115,10 +123,24 @@ test('refit шлёт размер только подогнанного терм
 
 test('любая отправка term:resize в terminal.js — только в проверенной форме', () => {
   // Ловит и НОВОЕ место, которого страж поимённо не знает.
-  const all = [...SRC.matchAll(ANY_RESIZE)].length;
-  const guarded = [...SRC.matchAll(GUARDED_RESIZE)].length;
-  assert.ok(all > 0, 'в terminal.js не осталось ни одного term:resize — разбор расклеился с файлом');
-  assert.strictEqual(all, guarded, `из ${all} вызовов window.api.term.resize проверены measure() только ${guarded}`);
+  const sends = [...SRC.matchAll(ANY_SEND)].length;
+  const guarded = [...SRC.matchAll(GUARDED_SEND)].length;
+  assert.ok(sends > 0, 'в terminal.js не осталось ни одного sendSize — разбор расклеился с файлом');
+  assert.strictEqual(sends, guarded, `из ${sends} вызовов sendSize проверены measure() только ${guarded}`);
+
+  // Прямой вызов window.api.term.resize — ровно один, внутри sendSize, с её
+  // же аргументом. Любой второй — дверь в pty мимо проверки.
+  const direct = [...SRC.matchAll(ANY_RESIZE)].length;
+  assert.strictEqual(direct, 1, `window.api.term.resize встречается ${direct} раз(а) — ожидался один, внутри sendSize`);
+  const send = blockAfter('const sendSize = (');
+  assert.match(
+    send,
+    /window\.api\.term\.resize\(\s*tabId\s*,\s*(\w+)\.cols\s*,\s*\1\.rows\s*\)/,
+    'единственный window.api.term.resize не внутри sendSize',
+  );
+  const param = SRC.match(/const sendSize = \((\w+)\) =>/);
+  assert.ok(param, 'sendSize больше не принимает размер параметром');
+  assert.match(send, new RegExp(`window\\.api\\.term\\.resize\\(\\s*tabId\\s*,\\s*${param[1]}\\.cols`), 'sendSize шлёт не свой аргумент');
 });
 
 test('term.start не берёт term.cols/term.rows напрямую', () => {
@@ -134,6 +156,62 @@ test('term.start не берёт term.cols/term.rows напрямую', () => {
     /const\s+(\w+)\s*=\s*measure\(\);\s*window\.api\.term\.start\(\s*tabId\s*,\s*\1\s*\?\s*\1\.cols\s*:\s*null\s*,\s*\1\s*\?\s*\1\.rows\s*:\s*null\s*\)/,
     'term.start должен слать результат measure() или null (размер тогда выберет main — размер владельца)',
   );
+});
+
+// --- app.js: сетка видимой вкладки — скрытым (A6) ---------------------------
+// main раздаёт размер видимой вкладки ВСЕМ pty, а скрытые xterm подогнаться
+// не могут. app.js держит последнюю подогнанную сетку (sharedGrid) и отдаёт её
+// скрытым вкладкам: при каждой отправке размера (onGrid → shareGrid) и при
+// создании вкладки (adoptGrid сразу после initTerminal, ДО истории вывода —
+// иначе история ляжет в сетку 80×24).
+const APP = stripComments(fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'js', 'app.js'), 'utf8'));
+
+function appFunction(signature) {
+  const at = APP.indexOf(signature);
+  assert.notStrictEqual(at, -1, `в app.js не найдено «${signature}» — страж разъехался с исходником`);
+  const rest = APP.slice(at);
+  // Конец — строка из одной «}». Просто «\n}» не годится: у openTab параметры
+  // деструктурируются в несколько строк, и строка «} = {}) {» оборвала бы
+  // тело на списке параметров.
+  const end = rest.search(/\n\}(?=\n|$)/);
+  assert.notStrictEqual(end, -1, `не найден конец «${signature}»`);
+  return rest.slice(0, end);
+}
+
+test('shareGrid раздаёт сетку всем вкладкам, кроме той, что её прислала', () => {
+  const body = appFunction('function shareGrid(');
+  assert.match(body, /sharedGrid\s*=/, 'shareGrid не запоминает сетку — вкладка, открытая позже, её не получит');
+  assert.match(body, /for\s*\(\s*const\s*\[\s*(\w+)\s*,\s*(\w+)\s*\]\s*of\s*views\s*\)/, 'shareGrid не обходит views');
+  assert.match(body, /\.adoptGrid\(/, 'shareGrid не отдаёт сетку вкладкам (adoptGrid)');
+  assert.match(body, /!==\s*fromTabId|fromTabId\s*!==/, 'shareGrid не пропускает вкладку-источник');
+});
+
+for (const [fn, idExpr] of [['async function openTab(', 'tab.tabId'], ['async function attachTab(', 't.tabId']]) {
+  test(`${fn.replace('async function ', '').replace('(', '')}: вкладка получает общую сетку и раздаёт свою`, () => {
+    const body = appFunction(fn);
+    const idRe = idExpr.replace('.', '\\.');
+    assert.match(
+      body,
+      new RegExp(`onGrid:\\s*\\((\\w+)\\)\\s*=>\\s*shareGrid\\(\\s*${idRe}\\s*,\\s*\\1\\s*\\)`),
+      `initTerminal в ${fn} не получает onGrid → shareGrid: сетка этой вкладки не дойдёт до скрытых`,
+    );
+    const adopt = body.search(/if\s*\(\s*sharedGrid\s*\)\s*view\.adoptGrid\(\s*sharedGrid\s*\)/);
+    assert.notStrictEqual(adopt, -1, `${fn}: новая вкладка не принимает общую сетку — останется в 80×24 при pty в размере окна`);
+    assert.ok(adopt > body.indexOf('initTerminal('), `${fn}: adoptGrid раньше initTerminal`);
+  });
+}
+
+test('attachTab: сетка известна ДО истории вывода', () => {
+  // История (net:buffer) печатается как есть; в неподогнанной сетке 80×24 она
+  // разъедется, а перерисовки не будет — размер pty не изменится.
+  const body = appFunction('async function attachTab(');
+  const history = body.indexOf('await replayHistory(');
+  assert.notStrictEqual(history, -1, 'в attachTab нет replayHistory — страж разъехался с исходником');
+  const adopt = body.search(/view\.adoptGrid\(\s*sharedGrid\s*\)/);
+  assert.ok(adopt !== -1 && adopt < history, 'общая сетка принимается ПОСЛЕ истории — история ляжет в 80×24');
+  const refit = body.search(/\.refit\(\)/);
+  const activate = body.search(/activateTab\(\s*t\.tabId\s*\)/);
+  assert.ok(activate !== -1 && refit > activate && refit < history, 'активная вкладка не подгоняется синхронно между показом и историей');
 });
 
 test('догрузка шрифта перемеряет ячейку и снимает подписку в dispose', () => {

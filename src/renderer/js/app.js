@@ -712,13 +712,40 @@ async function openTab(cwd, {
       entry.fontSize = px;
     },
     onRestartRequest: (id) => restartSession(id),
+    onGrid: (size) => shareGrid(tab.tabId, size),
   });
   entry.view = view;
+  // Вкладка создана скрытой — встаёт в общую сетку сразу (см. shareGrid).
+  if (sharedGrid) view.adoptGrid(sharedGrid);
 
   tabStore.add(tab);
   refreshConnectBadge(tab.tabId);
   if (activate) activateTab(tab.tabId);
   return tab;
+}
+
+// --- общая сетка терминалов (план «размер терминала») ---
+//
+// main применяет размер видимой вкладки ко ВСЕМ pty (termResizeHandler в
+// ipc.js): область окна у вкладок одна, а скрытые свой размер не сообщают.
+// Но скрытый xterm сам подогнаться не может (контейнер display:none), и без
+// этой раздачи стоял бы в своей старой сетке — у ни разу не показанной
+// вкладки это умолчание 80×24. Вывод фоновой сессии ложился бы в чужую
+// сетку, а при показе ресайз pty выходил бы пустым (размер уже тот), и Claude
+// Code не перерисовался бы поверх испорченного экрана. До плана это
+// маскировал сам баг: скрытая вкладка слала pty 80×24, и показ давал
+// настоящий ресайз с перерисовкой.
+//
+// sharedGrid — последняя подогнанная сетка этого клиента; её получает и
+// вкладка, открытая позже (сразу после initTerminal). В pty adoptGrid не
+// шлёт ничего, подогнанную вкладку не трогает. Вкладка с другим размером
+// шрифта при показе подгонится сама и сообщит свою сетку — принятая цена.
+let sharedGrid = null;
+function shareGrid(fromTabId, size) {
+  sharedGrid = { cols: size.cols, rows: size.rows };
+  for (const [id, entry] of views) {
+    if (id !== fromTabId) entry.view?.adoptGrid(sharedGrid);
+  }
 }
 
 // --- подключение к УЖЕ живым вкладкам (C1/C2 финального ревью ветки) ---
@@ -777,8 +804,12 @@ async function attachTab(t, { activate = false } = {}) {
     // Ctrl+Shift+R внутри терминала — третья дверь к перезапуску; ведём её в
     // ту же функцию, что кнопку ⟳ и палитру.
     onRestartRequest: (id) => restartSession(id),
+    onGrid: (size) => shareGrid(t.tabId, size),
   });
   entry.view = view;
+  // Общая сетка — ДО истории вывода ниже: история печатается как есть, и в
+  // сетке 80×24 она разъехалась бы без перерисовки (см. shareGrid).
+  if (sharedGrid) view.adoptGrid(sharedGrid);
 
   tabStore.add(t);
   // Очередь промптов из менеджера (ревью 09.08, B9). Клиент собирает её из
@@ -805,7 +836,17 @@ async function attachTab(t, { activate = false } = {}) {
     tabStore.setStatus(t.tabId, t.status, t.subtitle, t.waitingText, t.waitingKind, t.sessionLabel);
   }
   refreshConnectBadge(t.tabId);
-  if (activate) activateTab(t.tabId);
+  if (activate) {
+    activateTab(t.tabId);
+    // Подогнать сразу, а не через 100 мс дебаунса ResizeObserver: история
+    // ниже должна лечь в настоящую сетку. Заодно сетка уходит в pty и
+    // остальным вкладкам (shareGrid) — следующие подключаемые её получат.
+    try {
+      view.refit();
+    } catch (err) {
+      console.warn('[attach] подгонка показанной вкладки не удалась:', err && err.message);
+    }
+  }
 
   await replayHistory(t.tabId);
   // Мёртвой вкладке говорим об этом ПРЯМО В ТЕРМИНАЛЕ, и только здесь —

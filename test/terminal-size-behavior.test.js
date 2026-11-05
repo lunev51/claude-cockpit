@@ -120,10 +120,10 @@ const CONFIG = {
 
 const sent = (kind) => env.calls.filter((c) => c[0] === kind);
 
-async function open(t) {
+async function open(t, extra = {}) {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const { initTerminal } = await import(url);
-  return initTerminal(env.container, CONFIG, { tabId: 'T1', onPtyStatus: () => {} });
+  return initTerminal(env.container, CONFIG, { tabId: 'T1', onPtyStatus: () => {}, ...extra });
 }
 
 function showWindow() {
@@ -206,6 +206,43 @@ test('догрузка шрифта у скрытой вкладки ячейк�
   env.state.cell = { width: 8, height: 19 };
   env.fontListeners.get('loadingdone')();
   assert.deepStrictEqual(sent('resize'), []);
+});
+
+// --- Сетка скрытых вкладок (A6) ----------------------------------------------
+// main раздаёт размер видимой вкладки ВСЕМ pty (termResizeHandler в ipc.js), а
+// скрытый xterm сам подогнаться не может. Без общей сетки фоновая сессия
+// рисовала бы в pty одного размера, а её xterm держал бы другой (80×24 у ни
+// разу не показанной) — и при показе ресайз pty выходил бы пустым (размер уже
+// тот), то есть Claude Code НЕ перерисовался бы поверх испорченного экрана.
+
+test('подогнанный размер уходит и наружу (onGrid) — для соседних вкладок', async (t) => {
+  const grids = [];
+  await open(t, { onGrid: (size) => grids.push(size) });
+  env.fireResize();
+  t.mock.timers.tick(100);
+  assert.deepStrictEqual(grids, [], 'неподогнанный терминал раздал свою сетку соседям');
+
+  showWindow();
+  env.fireResize();
+  t.mock.timers.tick(100);
+  assert.deepStrictEqual(grids, [{ cols: 279, rows: 69 }]);
+});
+
+test('adoptGrid: скрытый терминал принимает сетку видимой, ничего не отправляя в pty', async (t) => {
+  const view = await open(t);
+  env.calls.length = 0;
+  view.adoptGrid({ cols: 279, rows: 69 });
+  assert.deepStrictEqual([view.term.cols, view.term.rows], [279, 69], 'скрытый xterm остался в своей сетке');
+  assert.deepStrictEqual(sent('resize'), [], 'adoptGrid слал размер в pty — это решает только видимая вкладка');
+  assert.deepStrictEqual(sent('start'), []);
+});
+
+test('adoptGrid: подогнанный терминал чужую сетку не берёт', async (t) => {
+  const view = await open(t);
+  showWindow();
+  view.refit();
+  view.adoptGrid({ cols: 100, rows: 30 });
+  assert.deepStrictEqual([view.term.cols, view.term.rows], [279, 69]);
 });
 
 test('dispose снимает подписку на шрифты', async (t) => {

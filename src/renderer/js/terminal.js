@@ -73,6 +73,9 @@ export function initTerminal(container, config, {
   // Перезапуск по Ctrl+Shift+R отдаём наружу: проверка управления и объяснение
   // отказа живут в app.js, а импортировать его отсюда нельзя — цикл.
   onRestartRequest = null,
+  // Подогнанная сетка этой вкладки, только что отправленная в pty, — наружу:
+  // app.js раздаёт её скрытым вкладкам (adoptGrid ниже).
+  onGrid = () => {},
 }) {
   const cfg = config.terminal;
   const term = new window.Terminal({
@@ -157,6 +160,15 @@ export function initTerminal(container, config, {
     const size = fittedSize(fit.proposeDimensions(), { width: container.clientWidth, height: container.clientHeight });
     if (size) fit.fit();
     return size;
+  };
+
+  // Единственная дверь размера в pty — и только с результатом measure().
+  // Тот же размер уходит наружу (onGrid): main применяет его ко ВСЕМ pty
+  // (termResizeHandler в ipc.js), и скрытые xterm должны стоять в той же
+  // сетке, иначе вывод фоновой сессии ляжет в чужую.
+  const sendSize = (s) => {
+    window.api.term.resize(tabId, s.cols, s.rows);
+    onGrid(s);
   };
 
   measure();
@@ -298,7 +310,7 @@ export function initTerminal(container, config, {
     fontSize = Math.min(32, Math.max(8, Math.round(size)));
     term.options.fontSize = fontSize;
     const s = measure();
-    if (s) window.api.term.resize(tabId, s.cols, s.rows);
+    if (s) sendSize(s);
     onFontSize(fontSize);
     // Персист размера шрифта в конфиг с дебаунсом.
     clearTimeout(persistTimer);
@@ -480,7 +492,7 @@ export function initTerminal(container, config, {
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
       const s = measure();
-      if (s) window.api.term.resize(tabId, s.cols, s.rows);
+      if (s) sendSize(s);
     }, 100);
   });
   observer.observe(container);
@@ -511,7 +523,7 @@ export function initTerminal(container, config, {
     charSize.measure();
     if (charSize.width === was.width && charSize.height === was.height) return;
     const s = measure();
-    if (s) window.api.term.resize(tabId, s.cols, s.rows);
+    if (s) sendSize(s);
     term.refresh(0, term.rows - 1);
   };
   document.fonts?.addEventListener?.('loadingdone', onFontsLoaded);
@@ -549,8 +561,20 @@ export function initTerminal(container, config, {
     // размера у него нет, а не подставлять умолчание xterm.
     refit: () => {
       const s = measure();
-      if (s) window.api.term.resize(tabId, s.cols, s.rows);
+      if (s) sendSize(s);
       return s;
+    },
+    // Сетка видимой вкладки — для СКРЫТОЙ. Подогнаться сама скрытая вкладка не
+    // может (контейнер display:none), а её pty main уже переразмерил вместе со
+    // всеми (termResizeHandler в ipc.js). Без этого вывод фоновой сессии ложился
+    // в чужую сетку (у ни разу не показанной — 80×24), а при показе ресайз pty
+    // выходил пустым — размер-то уже тот, — и Claude Code не перерисовывался
+    // поверх испорченного экрана. В pty отсюда не уходит ничего: размер решает
+    // видимая вкладка. Подогнанная чужую сетку не берёт — у неё своя.
+    adoptGrid: (size) => {
+      if (!size) return;
+      if (fittedSize(fit.proposeDimensions(), { width: container.clientWidth, height: container.clientHeight })) return;
+      if (term.cols !== size.cols || term.rows !== size.rows) term.resize(size.cols, size.rows);
     },
     // Ghost-снимок буфера (Task 5): scrollback:2000 — достаточно контекста для
     // «о чём мы говорили», не раздувая ghost-файл на диске.
