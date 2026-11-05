@@ -139,6 +139,14 @@ const LISTEN_ANYWHERE = new Set(['0.0.0.0', '::', '::0']);
 // вывод через net:buffer — тот же путь, что при любом обрыве связи.
 const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 
+// Каналы, которые сервер обслуживает сам, до реестра, — то есть МИМО гарда
+// владения. Поэтому сюда можно только каналы из FREE_CHANNELS
+// (write-channels.js). Список один и явный (C3 ревью): onFrame перехватывает
+// только по нему, а тесты требуют SERVER_CHANNELS ⊂ FREE_CHANNELS и не дают
+// прочесть канал кадра в обход списка — раньше перехват жил цепочкой if, и
+// новый ('net:exec') проходил мимо всех тестов.
+const SERVER_CHANNELS = new Set(['net:buffer', 'owner:claim', 'owner:get']);
+
 // Белый список Host и проверка Origin — чистые функции уровня модуля, а не
 // замыкания createNetServer: так их видит тест (C5 ревью). Поведение на
 // порту 80 настоящим сервером не проверить — порт привилегированный или
@@ -400,6 +408,21 @@ function createNetServer({
     stream.pipe(res);
   }
 
+  // Ответ на канал из SERVER_CHANNELS — зовётся только для них.
+  function serveOwn(channel, args, clientId) {
+    if (channel === 'net:buffer') {
+      // История — свойство соединения, локальному окну она не нужна (у него
+      // свой xterm).
+      return outputBuffer.get(args[0]);
+    }
+    // owner:claim / owner:get: только сервер знает, ЧЕЙ это сокет. Реестр
+    // получил бы кадр без личности и не отличил бы захват макбуком от захвата
+    // локальным окном.
+    if (!ownership) throw new Error('эстафета не подключена');
+    if (channel === 'owner:claim') ownership.claim(clientId, args[0]);
+    return { owner: ownership.owner(), self: clientId, online: ownership.ownerOnline() };
+  }
+
   async function onFrame(ws, raw, clientId) {
     let msg;
     // Битый кадр не имеет права ронять сервер: на другом конце браузер,
@@ -444,24 +467,12 @@ function createNetServer({
     }
     const args = Array.isArray(msg.args) ? msg.args : [];
     try {
-      let result;
-      // Всё, что сервер обслуживает сам, идёт МИМО гарда реестра, — сюда можно
-      // только каналы из FREE_CHANNELS (write-channels.js). Держит тест-зонд
-      // C3 в test/net-server.test.js: пишущий канал здесь его роняет.
-      if (msg.channel === 'net:buffer') {
-        // net:buffer обслуживает сервер, а не реестр: история — свойство
-        // соединения, локальному окну она не нужна (у него свой xterm).
-        result = outputBuffer.get(args[0]);
-      } else if (msg.channel === 'owner:claim' || msg.channel === 'owner:get') {
-        // Тот же случай, что и net:buffer: только сервер знает, ЧЕЙ это
-        // сокет. Реестр получил бы кадр без личности и не смог бы отличить
-        // захват макбуком от захвата локальным окном.
-        if (!ownership) throw new Error('эстафета не подключена');
-        if (msg.channel === 'owner:claim') ownership.claim(clientId, args[0]);
-        result = { owner: ownership.owner(), self: clientId, online: ownership.ownerOnline() };
-      } else {
-        result = await registry.call(msg.channel, args, clientId);
-      }
+      // Перехват — только по SERVER_CHANNELS: всё, что сервер обслуживает сам,
+      // идёт мимо гарда реестра. Других обращений к msg.channel здесь нет и
+      // быть не должно (страж в test/net-server.test.js).
+      const result = SERVER_CHANNELS.has(msg.channel)
+        ? serveOwn(msg.channel, args, clientId)
+        : await registry.call(msg.channel, args, clientId);
       reply({ ok: true, result: result === undefined ? null : result });
     } catch (err) {
       // denied — штатный отказ эстафеты, а не поломка: браузерный мост по
@@ -595,7 +606,8 @@ function createNetServer({
 // MAX_FRAME_BYTES экспортируется ради теста: без него мутация «вернуть дефолт
 // 100 МиБ» проходила незамеченной — тесты задают потолок явным параметром, а
 // само значение по умолчанию не проверял никто. buildHostAllowlist и
-// isAllowedOrigin — тоже ради теста (порт 80, см. их шапку выше).
+// isAllowedOrigin — тоже ради теста (порт 80, см. их шапку выше),
+// SERVER_CHANNELS — ради сверки с FREE_CHANNELS.
 module.exports = {
-  createNetServer, MAX_FRAME_BYTES, buildHostAllowlist, isAllowedOrigin,
+  createNetServer, MAX_FRAME_BYTES, buildHostAllowlist, isAllowedOrigin, SERVER_CHANNELS,
 };

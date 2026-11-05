@@ -20,7 +20,7 @@ const net = require('node:net');
 const { EventEmitter } = require('node:events');
 const WebSocket = require('ws');
 const {
-  createNetServer, MAX_FRAME_BYTES, buildHostAllowlist, isAllowedOrigin,
+  createNetServer, MAX_FRAME_BYTES, buildHostAllowlist, isAllowedOrigin, SERVER_CHANNELS,
 } = require('../src/main/net-server');
 const { createCommandRegistry } = require('../src/main/command-registry');
 const { createBroadcast } = require('../src/main/broadcast');
@@ -1138,7 +1138,7 @@ test('уход клиента не отдаёт управление обрат�
 
 test('мимо гарда сервер пропускает только свободные каналы, пишущие от невладельца получают отказ (C3 ревью)', async () => {
   const { API_SHAPE } = await import('../src/renderer/js/api-shape.js');
-  const channels = new Set([...WRITE_CHANNELS, ...FREE_CHANNELS]);
+  const channels = new Set([...WRITE_CHANNELS, ...FREE_CHANNELS, ...SERVER_CHANNELS]);
   for (const spec of Object.values(API_SHAPE)) if (spec.kind !== 'event') channels.add(spec.channel);
 
   const ownership = createOwnership({});
@@ -1180,11 +1180,12 @@ test('мимо гарда сервер пропускает только сво�
   }
   ws.close();
 
-  // Сам детектор видит известные перехваты — иначе проверка ниже была бы
-  // пустой правдой. Перехват убран намеренно — убери его и отсюда.
-  for (const known of ['net:buffer', 'owner:claim', 'owner:get']) {
-    assert.ok(bypassed.includes(known), `зонд не заметил перехват ${known} — детектор сломан или перехват убран`);
-  }
+  // Мимо гарда идёт ровно объявленное в SERVER_CHANNELS — заодно самопроверка
+  // детектора: без неё проверка ниже могла бы быть пустой правдой.
+  assert.deepStrictEqual(
+    [...bypassed].sort(), [...SERVER_CHANNELS].sort(),
+    'мимо гарда идёт не то, что объявлено в SERVER_CHANNELS (или детектор сломан)',
+  );
   assert.deepStrictEqual(
     bypassed.filter((c) => !FREE_CHANNELS.has(c)), [],
     'сервер обслуживает сам, мимо гарда, канал вне FREE_CHANNELS — невладелец пишет без управления',
@@ -1192,6 +1193,49 @@ test('мимо гарда сервер пропускает только сво�
   // Второй обход: гард спросили, но не от имени этого сокета (например,
   // сервер позвал реестр как 'local').
   assert.deepStrictEqual(notDenied, [], 'пишущий канал от невладельца не получил отказ эстафеты');
+});
+
+// Зонд выше видит только каналы из известных списков: перехват нового имени
+// ('net:exec' прямо в onFrame) он пропускал зелёным (ре-ревью). Поэтому
+// перехваты объявлены одним списком, и два теста ниже держат его с обеих
+// сторон: список ⊂ FREE_CHANNELS, а в обход списка канал не прочесть.
+
+test('SERVER_CHANNELS — только свободные каналы (C3, ре-ревью)', () => {
+  assert.ok(SERVER_CHANNELS.size > 0, 'список перехватов пуст — тест ниже ничего не проверит');
+  assert.deepStrictEqual(
+    [...SERVER_CHANNELS].filter((c) => !FREE_CHANNELS.has(c)), [],
+    'сервер обслуживает сам, мимо гарда, канал вне FREE_CHANNELS',
+  );
+});
+
+test('onFrame читает канал кадра только для SERVER_CHANNELS и реестра — перехват в обход списка невозможен (C3, ре-ревью)', () => {
+  // Страж по исходнику: строки-комментарии выкидываем (в них msg.channel
+  // упоминается), разрешённые обращения вырезаем по одному, требуя, чтобы
+  // каждое нашлось ровно раз (иначе якорь цепляется не за то место). Всё,
+  // что осталось от msg кроме .id и .args, — путь к каналу мимо списка:
+  // сравнение msg.channel с литералом, includes, switch, псевдоним
+  // (const { channel } = msg), передача msg целиком в помощника.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'net-server.js'), 'utf8');
+  let code = src.split(/\r?\n/).filter((line) => !line.trim().startsWith('//')).join('\n');
+  const ALLOWED = [
+    /\blet msg;/,
+    /\bmsg = JSON\.parse\(/,
+    /if \(!msg \|\| typeof msg !== 'object' \|\| Array\.isArray\(msg\)\)/,
+    /hasOwnProperty\.call\(msg, 'id'\)/,
+    /typeof msg\.channel !== 'string'/,
+    /SERVER_CHANNELS\.has\(msg\.channel\)/,
+    /serveOwn\(msg\.channel, /,
+    /registry\.call\(msg\.channel, /,
+  ];
+  for (const re of ALLOWED) {
+    const found = code.split(new RegExp(re.source)).length - 1;
+    assert.strictEqual(found, 1, `разрешённое обращение ${re} найдено ${found} раз — страж потерял цель`);
+    code = code.replace(re, '«ок»');
+  }
+  const leftovers = code.split('\n')
+    .filter((line) => /\bmsg\b(?!\.(?:id|args)\b)/.test(line))
+    .map((line) => line.trim());
+  assert.deepStrictEqual(leftovers, [], 'onFrame добирается до кадра в обход SERVER_CHANNELS');
 });
 
 test('закрытые сокеты не оставляют размеров в эстафете (C2 ревью, проводка close → drop)', async () => {
