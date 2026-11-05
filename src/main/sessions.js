@@ -1211,7 +1211,11 @@ function createSessionManager({
     }
   }
 
-  function list() {
+  // Внешняя копия вкладки — то, что отдают наружу list() и get().
+  function publicTab({
+    tabId, cwd, name, alive, status, subtitle, sessionId, ghostId,
+    waitingKind, waitingText, gen, sessionLabel, queue,
+  }) {
     // waitingKind (C1) — нужен обвязке ipc.js, чтобы отличить резюмируемый
     // idle_prompt от блокирующего permission_prompt (resumableTabStatus).
     // gen (M2) — текущее поколение pty вкладки; обвязка передаёт его снимок
@@ -1227,24 +1231,33 @@ function createSessionManager({
     // и без этого поля поповер «ответить из сайдбара» показал бы пустоту до
     // конца ожидания. Поле аддитивное: все потребители list() (workspace-sync,
     // night-watch, обвязка ipc.js) читают его через деструктуризацию по именам.
-    return [...tabs.values()].map(({
+    return {
       tabId, cwd, name, alive, status, subtitle, sessionId, ghostId,
-      waitingKind, waitingText, gen, sessionLabel, queue,
-    }) => (
-      {
-        tabId, cwd, name, alive, status, subtitle, sessionId, ghostId,
-        waitingKind, waitingText, gen, sessionLabel,
-        // queue (ревью 09.08, B9) — тот же пробел, что уже закрывали для
-        // waitingText, только про очередь промптов. Клиент собирает её
-        // ИСКЛЮЧИТЕЛЬНО из событий queue:changed, а подключившийся к живым
-        // вкладкам (перезагрузка страницы, браузер с макбука, второе окно)
-        // ни одного такого события не застал — и видел пустую строку чипов
-        // там, где в вкладке реально ждут промпты. Человек добавлял их
-        // повторно, и на следующем Stop main вбрасывал всё дважды.
-        // Копия, а не сам массив: снаружи он изменяемый.
-        queue: queue.slice(),
-      }
-    ));
+      waitingKind, waitingText, gen, sessionLabel,
+      // queue (ревью 09.08, B9) — тот же пробел, что уже закрывали для
+      // waitingText, только про очередь промптов. Клиент собирает её
+      // ИСКЛЮЧИТЕЛЬНО из событий queue:changed, а подключившийся к живым
+      // вкладкам (перезагрузка страницы, браузер с макбука, второе окно)
+      // ни одного такого события не застал — и видел пустую строку чипов
+      // там, где в вкладке реально ждут промпты. Человек добавлял их
+      // повторно, и на следующем Stop main вбрасывал всё дважды.
+      // Копия, а не сам массив: снаружи он изменяемый.
+      queue: queue.slice(),
+    };
+  }
+
+  function list() {
+    return [...tabs.values()].map(publicTab);
+  }
+
+  // Одна вкладка в той же форме, что элемент list() (ревью 09.08, C24):
+  // обвязке ipc.js по tabId нужно поле-другое, а list() копирует ВСЕ вкладки
+  // с очередями — и искали в нём по одной, местами дважды на событие. Копия,
+  // а не внутренний объект: там живут pty и таймеры, и правка снаружи (или
+  // передача дальше по IPC) шла бы мимо ядра. Копия одной вкладки дешёвая.
+  function get(tabId) {
+    const tab = tabs.get(tabId);
+    return tab ? publicTab(tab) : null;
   }
 
   function disposeAll() {
@@ -1252,7 +1265,7 @@ function createSessionManager({
   }
 
   return {
-    open, start, write, resize, restart, close, list, disposeAll,
+    open, start, write, resize, restart, close, list, get, disposeAll,
     bindSession, has, findBySessionId, findUnboundByCwd, applyHookEvent, checkStuck, markSeen,
     enqueue, removeFromQueue, clearQueue, dequeueAll,
   };

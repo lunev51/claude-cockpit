@@ -1569,14 +1569,14 @@ function registerIpc(win, opts = {}) {
           // (getTabGen ниже), чтобы не резюмить в pty, который успел
           // смениться (авто-респавн/ручной рестарт в пикер сессий) между
           // детектом и пробуждением.
-          const tab = manager.list().find((t) => t.tabId === payload.tabId);
+          const tab = manager.get(payload.tabId);
           nightWatch.onTabStop(payload.tabId, 'working', tab ? tab.gen : undefined);
         }
       }
       // Task 2 фазы 4: тот же поток, что шлёт tab:status в renderer, — тостер
       // (toasts.js, чистый модуль) сам решает, показывать ли уведомление
       // Windows, по правилу «не уведомлять о том, на что смотришь». Имя
-      // вкладки берём из manager.list() — payload статуса его не несёт.
+      // вкладки берём из manager.get() — payload статуса его не несёт.
       // smoke: headless-прогон никогда не должен показывать тосты.
       // I2 (ре-ревью 01.08): labelOnly — событие, у которого изменилась ТОЛЬКО
       // метка сессии (заголовок дочитался из транскрипта), статус тот же.
@@ -1590,7 +1590,7 @@ function registerIpc(win, opts = {}) {
       // TypeError на старте всего приложения; сегодня спасает лишь то, что
       // фабрика sessions.js до return ничего не эмитит.
       if (!smoke && channel === 'tab:status' && toaster && manager && !payload.labelOnly) {
-        const tab = manager.list().find((t) => t.tabId === payload.tabId);
+        const tab = manager.get(payload.tabId);
         toaster.onStatus({
           tabId: payload.tabId,
           tabName: tab ? tab.name : payload.tabId,
@@ -1661,7 +1661,7 @@ function registerIpc(win, opts = {}) {
     // не в фокусе), никогда не продолжилась бы: ЛЮБОЙ 'waiting' считался бы
     // непродолжаемым диалогом (NO_RESUME_STATUSES ядра).
     getTabStatus: (tabId) => {
-      const tab = manager.list().find((t) => t.tabId === tabId);
+      const tab = manager.get(tabId);
       return tab ? resumableTabStatus(tab.status, tab.waitingKind) : null;
     },
     // M2 (ревью финальной волны): текущее поколение pty вкладки — ядро
@@ -1669,7 +1669,7 @@ function registerIpc(win, opts = {}) {
     // onTabStop(tabId, prevStatus, gen) в onEvent выше), чтобы не резюмить в
     // pty, который успел смениться между детектом и пробуждением.
     getTabGen: (tabId) => {
-      const tab = manager.list().find((t) => t.tabId === tabId);
+      const tab = manager.get(tabId);
       return tab ? tab.gen : undefined;
     },
     // Гард непустого текста + '\r' (бриф) — тот же приём, что normalizeForPty/
@@ -2034,10 +2034,10 @@ function registerIpc(win, opts = {}) {
   registry.handle('tabs:close', (tabId) => {
     if (typeof tabId !== 'string') return;
     // Резолвим ghostId ДО manager.close (Task 5) — close() удаляет вкладку
-    // из менеджера, и list() её больше не найдёт; отдельного ghost:delete
+    // из менеджера, и get() её больше не найдёт; отдельного ghost:delete
     // IPC не заводим — подчистка ghost-файла естественно живёт здесь же,
     // рядом с самим закрытием вкладки.
-    const tab = manager.list().find((t) => t.tabId === tabId);
+    const tab = manager.get(tabId);
     manager.close(tabId);
     // Task 5 carryover фазы 4/5 (утечка карт в toasts.js): manager.close()
     // инкрементит generation ДО kill() pty — закрытая (а не естественно
@@ -2078,7 +2078,7 @@ function registerIpc(win, opts = {}) {
     if (!payload || typeof payload !== 'object') return;
     const { tabId, text } = payload;
     if (typeof tabId !== 'string' || typeof text !== 'string') return;
-    const tab = manager.list().find((t) => t.tabId === tabId);
+    const tab = manager.get(tabId);
     if (!tab || !tab.ghostId) return;
     try {
       fs.mkdirSync(ghostDir(), { recursive: true });
@@ -2181,7 +2181,7 @@ function registerIpc(win, opts = {}) {
     scriptPath: path.join(appRoot(), 'scripts', 'cockpit-hook.js'),
     portFile: path.join(app.getPath('userData'), 'bridge-port'),
   });
-  const tabCwd = (tabId) => manager.list().find((t) => t.tabId === tabId)?.cwd || null;
+  const tabCwd = (tabId) => manager.get(tabId)?.cwd || null;
 
   // Находка 4б (ревью фазы 6): раньше клик по ⚡ гасил кнопку сразу же после
   // успешного connectProject() — но ТЕКУЩАЯ сессия CLI внутри уже запущенного

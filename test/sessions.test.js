@@ -2567,6 +2567,44 @@ test('list отдаёт очередь промптов — иначе подк�
   assert.strictEqual(снова.queue.length, 2, 'list отдал внутренний массив наружу — очередь можно испортить извне');
 });
 
+// === C24 (ревью 09.08): get(tabId) — одна вкладка без копии всех ==========
+// Обвязка ipc.js искала вкладку как list().find(...) — семь раз, дважды на одно
+// событие tab:status, а list() на каждый вызов копирует ВСЕ вкладки с очередями.
+
+test('get(tabId) отдаёт ту же форму, что элемент list(), а для чужого tabId — null', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha', sessionLabel: 'разбор логов' });
+  const b = mgr.open({ cwd: 'C:\\proj\\beta' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.enqueue(a.tabId, 'следующий промпт');
+  mgr.applyHookEvent(a.tabId, 'Notification', {
+    message: 'Claude is waiting for your input', notification_type: 'idle_prompt',
+  });
+
+  for (const id of [a.tabId, b.tabId]) {
+    assert.deepStrictEqual(mgr.get(id), mgr.list().find((t) => t.tabId === id));
+  }
+  assert.strictEqual(mgr.get(a.tabId).waitingKind, 'idle', 'фикстура не довела вкладку до ожидания');
+  assert.strictEqual(mgr.get('нет-такой-вкладки'), null);
+});
+
+test('get(tabId) — копия: правка снаружи не задевает ядро', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.enqueue(a.tabId, 'свой промпт');
+
+  const tab = mgr.get(a.tabId);
+  tab.queue.push('чужой элемент');
+  tab.status = 'dead';
+
+  const снова = mgr.get(a.tabId);
+  assert.strictEqual(снова.queue.length, 1, 'get отдал внутренний массив очереди');
+  assert.notStrictEqual(снова.status, 'dead', 'get отдал внутренний объект вкладки');
+});
+
 // === Статус «фон» (план 2026-11-05): ход окончен, фоновая работа жива =====
 //
 // Payload'ы — реальной формы (Claude Code 2.1.318). PostToolUse — как в
