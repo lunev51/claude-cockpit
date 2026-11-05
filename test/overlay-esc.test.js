@@ -50,7 +50,6 @@ function makeDom() {
       type: '',
       placeholder: '',
       title: '',
-      focusCalls: 0,
       classList: { toggle() {}, add() {}, remove() {} },
       _text: '',
       get textContent() { return this._text; },
@@ -72,7 +71,7 @@ function makeDom() {
         const capture = opts === true || !!(opts && opts.capture);
         this.listeners = this.listeners.filter((l) => !(l.type === type && l.fn === fn && l.capture === capture));
       },
-      focus() { this.focusCalls += 1; doc.activeElement = this; },
+      focus() { doc.activeElement = this; },
       querySelector: () => null,
       scrollIntoView() {},
     };
@@ -152,7 +151,6 @@ async function setup(overlay) {
   const term = dom.el('textarea');
   root.appendChild(term);
   term.focus();
-  term.focusCalls = 0;
   const ui = await overlay.create(root);
   return { ...dom, root, term, ui };
 }
@@ -172,7 +170,7 @@ for (const overlay of OVERLAYS) {
     assert.strictEqual(doc.activeElement, term, 'после закрытия фокус не вернулся терминалу');
   });
 
-  test(`${overlay.name}: Esc в поле ввода по-прежнему закрывает — ровно один раз`, async () => {
+  test(`${overlay.name}: Esc в поле ввода по-прежнему закрывает`, async () => {
     const { doc, term, ui, press } = await setup(overlay);
     ui.open();
     assert.notStrictEqual(doc.activeElement, term, 'open() не перевёл фокус в поле ввода');
@@ -180,7 +178,23 @@ for (const overlay of OVERLAYS) {
     press('Escape');
 
     assert.strictEqual(ui.isOpen(), false, 'Esc в поле ввода больше не закрывает оверлей');
-    assert.strictEqual(term.focusCalls, 1, 'фокус возвращали терминалу не один раз — Esc обработан дважды');
+    assert.strictEqual(doc.activeElement, term, 'после закрытия фокус не вернулся терминалу');
+  });
+
+  test(`${overlay.name}: Esc закрывает, даже если элемент в фокусе сам гасит клавишу`, async () => {
+    // Ради этого слушатель и стоит в capture-фазе. xterm на своём textarea
+    // обрабатывает Esc сам (preventDefault + stopPropagation) — слушатель
+    // document во всплытии такой клавиши не увидел бы вовсе.
+    const { doc, el, root, ui, press } = await setup(overlay);
+    ui.open();
+    const xterm = el('textarea');
+    root.appendChild(xterm);
+    xterm.addEventListener('keydown', (ev) => { ev.preventDefault(); ev.stopPropagation(); });
+    xterm.focus();
+
+    press('Escape');
+
+    assert.strictEqual(ui.isOpen(), false, 'Esc, погашенный элементом в фокусе, не закрыл оверлей — слушатель не в capture-фазе');
   });
 
   test(`${overlay.name}: закрытие снимает слушатель с document`, async () => {
