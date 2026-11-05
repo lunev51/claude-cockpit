@@ -328,3 +328,62 @@ test('close() отпускает оверлей: строки отсчёта н�
 
   assert.strictEqual(overlay.deref(), undefined, 'закрытый дашборд остался в памяти — его держит список строк отсчёта');
 });
+
+// Ревью ветки, M5: сверка обязана видеть каждую часть снимка. Каждый тест
+// меняет одну часть так, как её меняет живой источник, и проверяет экран.
+
+const card = (root, label) => {
+  const tile = findAll(root, 'dashboard-card-tile').find((n) => findOne(n, 'tile-label').textContent === label);
+  assert.ok(tile, `карточки «${label}» нет — разметка изменилась`);
+  return findOne(tile, 'tile-value').textContent;
+};
+
+test('ccusage пересчитал расходы — карточки новые', async () => {
+  const { root, state, T0, tick } = await setup();
+  assert.strictEqual(card(root, 'Сессии (всего)'), '812');
+
+  // usage:update после пересчёта: те же лимиты, новый spend (ccusage buildResult).
+  state.usage = {
+    ...state.usage,
+    spend: { ...state.usage.spend, fetchedAt: T0, totals: { ...state.usage.spend.totals, sessions: 813 } },
+  };
+  tick(T0 + 30000);
+
+  assert.strictEqual(card(root, 'Сессии (всего)'), '813', 'расходы пересчитаны, а карточка старая');
+});
+
+test('ночную смену включили — секция говорит «вооружена»', async () => {
+  const { root, state, T0, tick } = await setup();
+  const status = () => findOne(root, 'dashboard-night-status').textContent;
+  assert.strictEqual(status(), 'выключена');
+
+  // night:changed после night:toggle — новый снимок night-watch.js, журнал тот же.
+  state.night = { ...state.night, armed: true };
+  tick(T0 + 1000);
+
+  assert.strictEqual(status(), 'вооружена, сбросов обработано 1', 'смену включили, а дашборд пишет «выключена»');
+});
+
+test('GitHub пришёл после открытия — «загружаю…» сменяется списком', async () => {
+  // app.js/fetchUsageOnDashboardOpen: gh:global летит лениво, при открытии lastGh ещё null.
+  let gh;
+  const { root, state, T0, tick } = await setup({ before(s) { gh = s.gh; s.gh = null; } });
+  assert.strictEqual(findAll(root, 'dashboard-github-loading').length, 1, '«загружаю…» нет — сценарий не воспроизведён');
+
+  state.gh = gh;
+  tick(T0 + 1000);
+
+  assert.strictEqual(findAll(root, 'dashboard-github-loading').length, 0, 'GitHub пришёл, а висит «загружаю…»');
+  assert.strictEqual(findAll(root, 'dashboard-github-row').length, 1, 'PR не нарисован');
+});
+
+test('лимиты устарели при том же времени получения — пометка появилась', async () => {
+  // usage-oauth.js/applyError: сеть моргнула — stale:true и error, а fetchedAt прежний.
+  const { root, state, T0, tick } = await setup();
+  assert.strictEqual(findAll(root, 'dashboard-limits-stale').length, 0);
+
+  state.usage = { ...state.usage, limits: { ...state.usage.limits, stale: true, error: 'network' } };
+  tick(T0 + 1000);
+
+  assert.strictEqual(findAll(root, 'dashboard-limits-stale').length, 1, 'данные устарели, а пометки нет');
+});
