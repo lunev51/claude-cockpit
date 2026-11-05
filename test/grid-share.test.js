@@ -137,6 +137,21 @@ test('порог раздачи один и тот же в renderer (term-size.j
   assert.deepStrictEqual({ cols: renderer.cols, rows: renderer.rows }, { cols: main.cols, rows: main.rows }, 'пороги раздачи renderer и main разъехались');
 });
 
+test('renderer и main одинаково решают, раздавать ли размер, — и выше 500 колонок тоже', async () => {
+  // Одних порогов мало: у main сверху ещё validDim (2..500). Ре-ревью нашло
+  // расхождение на 4K с мелким шрифтом (~533 колонки): renderer раздавал такую
+  // сетку скрытым xterm, а main её не применял ни к одному pty.
+  const { isShareableGrid } = await import(pathToFileURL(path.join(__dirname, '..', 'src', 'renderer', 'js', 'term-size.js')).href);
+  const { isShareableSize } = require('../src/main/ownership');
+  const sizes = [
+    { cols: 150, rows: 46 }, { cols: 40, rows: 10 }, { cols: 39, rows: 10 }, { cols: 40, rows: 9 },
+    { cols: 500, rows: 500 }, { cols: 501, rows: 46 }, { cols: 600, rows: 100 }, { cols: 150, rows: 501 },
+  ];
+  for (const s of sizes) {
+    assert.strictEqual(isShareableGrid(s), isShareableSize(s), `разные ответы для ${s.cols}×${s.rows}`);
+  }
+});
+
 test('запись без view (initTerminal ещё не вернулся) пропускается без исключения', async () => {
   const { createGridShare } = await import(url);
   const grid = createGridShare();

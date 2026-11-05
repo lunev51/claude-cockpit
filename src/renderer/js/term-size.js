@@ -60,8 +60,15 @@ export function fittedSize(proposed, area, cell) {
 // Разъедутся — скрытые xterm и их pty окажутся в разных сетках.
 export const MIN_SHARED_GRID = Object.freeze({ cols: 40, rows: 10 });
 
+// Верх — тот же, что у main (validDim/isValidSize, 2..500): размер больше main
+// не применяет ни к одному pty, и раздать его скрытым xterm значило бы развести
+// их с pty (4K с мелким шрифтом — ~533 колонки, ре-ревью).
+const MAX_GRID_DIM = 500;
+
 export function isShareableGrid(size) {
-  return !!size && size.cols >= MIN_SHARED_GRID.cols && size.rows >= MIN_SHARED_GRID.rows;
+  return !!size
+    && size.cols >= MIN_SHARED_GRID.cols && size.rows >= MIN_SHARED_GRID.rows
+    && size.cols <= MAX_GRID_DIM && size.rows <= MAX_GRID_DIM;
 }
 
 // Дождаться шрифта терминала. xterm мерит ячейку один раз при открытии и
