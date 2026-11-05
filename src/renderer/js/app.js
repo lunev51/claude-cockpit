@@ -41,6 +41,7 @@ import { createRecipeForm } from './recipe-form.js';
 import { createHotkeysOverlay } from './hotkeys.js';
 import { pluralTabs } from './format.js';
 import { shouldMarkSeen } from './seen.js';
+import { singleFlight } from './single-flight.js';
 // Important (ре-ревью фикс-волны): подключение к вкладке без живого процесса
 // не должно его поднимать — обоснование в самом модуле.
 import { shouldStartPty } from './attach-guards.js';
@@ -663,10 +664,18 @@ function applyNightState(snapshot) {
 // Тумблер armed — общий для кнопки 🌙 панели действий (renderActionBar) и
 // одноимённого действия палитры (buildPaletteActions) — обе точки входа
 // зовут ТОЛЬКО api.night.toggle(), никогда не решая за main состояние сами.
-function toggleNight() {
-  window.api.night.toggle().then(applyNightState).catch((err) => {
+//
+// Ревью 09.08 (C16): через singleFlight. Двойной клик по 🌙 слал toggle
+// дважды — вооружал и тут же разоружал, а человек видел мелькнувшую кнопку и
+// считал, что включил. Второй вызов, пока первый в полёте, не делает ничего.
+const toggleNightOnce = singleFlight(() => window.api.night.toggle()
+  .then(applyNightState)
+  .catch((err) => {
     console.warn('[night] night:toggle не удался:', err);
-  });
+  }));
+
+function toggleNight() {
+  toggleNightOnce();
 }
 
 // Создать вкладку: контейнер + xterm + запись в стор. activate — переключиться сразу.
