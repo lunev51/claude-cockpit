@@ -1039,28 +1039,64 @@ test('несовпавший If-None-Match — обычный 200 с телом'
   assert.ok(raw.includes('import'), 'тело скрипта не пришло');
 });
 
-test('изменённый файл — новый ETag, старый больше не даёт 304', async () => {
-  // ETag из размера и времени изменения: обновление кокпита меняет файл, и
-  // браузер с меткой старой версии обязан получить новую.
+// ETag из размера и времени изменения: обновление кокпита меняет файл, и
+// браузер с меткой старой версии обязан получить новую. Ревью ветки: прежний
+// тест менял ОБА признака разом, и мутации «метка только из размера» и
+// «только из времени» выживали. Поэтому два случая, в каждом меняется ровно
+// один признак. Правка той же длины — обычное дело: поменять цифру версии,
+// флаг true/false.
+async function etagAfterEdit({ before, after, keepMtime }) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'net-server-etag-'));
   const file = path.join(tmp, 'app.js');
-  fs.writeFileSync(file, 'export const v = 1;\n', 'utf8');
+  fs.writeFileSync(file, before, 'utf8');
+  // Время — целые секунды и выставлено явно: дробные миллисекунды после
+  // utimes на Windows не возвращаются тем же числом, и «то же время» иначе не
+  // воспроизвести.
+  const base = new Date(Math.floor(Date.now() / 1000) * 1000 - 60000);
+  fs.utimesSync(file, base, base);
+  const was = fs.statSync(file);
   try {
     const { server } = makeServer({ staticRoots: { '/': tmp } });
     const { port } = await server.start();
     const first = await fetch(`http://127.0.0.1:${port}/app.js`);
     await first.text();
     const oldTag = first.headers.get('etag');
-    fs.writeFileSync(file, 'export const v = 22;\n', 'utf8');
-    const later = new Date(Date.now() + 5000);
-    fs.utimesSync(file, later, later);
+
+    fs.writeFileSync(file, after, 'utf8');
+    const when = keepMtime ? base : new Date(base.getTime() + 5000);
+    fs.utimesSync(file, when, when);
+    const now = fs.statSync(file);
+    // Предусловия: меняется ровно тот признак, что заявлен, — иначе тест
+    // снова проверял бы оба сразу.
+    if (keepMtime) {
+      assert.strictEqual(Math.floor(now.mtimeMs), Math.floor(was.mtimeMs), 'mtime не удалось сохранить — случай не воспроизведён');
+      assert.notStrictEqual(now.size, was.size, 'размер не изменился — случай не воспроизведён');
+    } else {
+      assert.strictEqual(now.size, was.size, 'правка не той же длины — случай не воспроизведён');
+      assert.notStrictEqual(Math.floor(now.mtimeMs), Math.floor(was.mtimeMs));
+    }
+
     const raw = await rawRequest(port, 'GET /app.js HTTP/1.1', `If-None-Match: ${oldTag}\r\n`);
-    assert.strictEqual(statusOf(raw), 200, 'старая метка дала 304 на изменённый файл — браузер остался бы со старым скриптом');
-    assert.ok(raw.includes('v = 22'), 'пришло не новое содержимое');
     const fresh = await fetch(`http://127.0.0.1:${port}/app.js`);
     await fresh.text();
-    assert.notStrictEqual(fresh.headers.get('etag'), oldTag);
+    return { status: statusOf(raw), raw, oldTag, newTag: fresh.headers.get('etag') };
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+}
+
+test('правка той же длины — новый ETag (по времени изменения), старый не даёт 304', async () => {
+  const r = await etagAfterEdit({ before: 'export const v = 1;\n', after: 'export const v = 2;\n', keepMtime: false });
+  assert.strictEqual(r.status, 200, 'старая метка дала 304 на изменённый файл той же длины — браузер остался бы со старым скриптом');
+  assert.ok(r.raw.includes('v = 2'), 'пришло не новое содержимое');
+  assert.notStrictEqual(r.newTag, r.oldTag);
+});
+
+test('другая длина при том же времени изменения — новый ETag (по размеру)', async () => {
+  // Копирование с сохранением времени (распаковка архива, robocopy /COPY:T)
+  // даёт ровно это: файл новый, mtime старый.
+  const r = await etagAfterEdit({ before: 'export const v = 1;\n', after: 'export const v = 22;\n', keepMtime: true });
+  assert.strictEqual(r.status, 200, 'старая метка дала 304 на файл другой длины');
+  assert.ok(r.raw.includes('v = 22'), 'пришло не новое содержимое');
+  assert.notStrictEqual(r.newTag, r.oldTag);
 });
