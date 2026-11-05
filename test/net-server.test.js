@@ -19,12 +19,14 @@ const os = require('node:os');
 const net = require('node:net');
 const { EventEmitter } = require('node:events');
 const WebSocket = require('ws');
-const { createNetServer, MAX_FRAME_BYTES } = require('../src/main/net-server');
+const {
+  createNetServer, MAX_FRAME_BYTES, buildHostAllowlist, isAllowedOrigin, SERVER_CHANNELS,
+} = require('../src/main/net-server');
 const { createCommandRegistry } = require('../src/main/command-registry');
 const { createBroadcast } = require('../src/main/broadcast');
 const { createOutputBuffer } = require('../src/main/output-buffer');
 const { createOwnership } = require('../src/main/ownership');
-const { isWriteChannel } = require('../src/main/write-channels');
+const { isWriteChannel, WRITE_CHANNELS, FREE_CHANNELS } = require('../src/main/write-channels');
 
 const fakeIpcMain = () => ({ handle: () => {}, on: () => {} });
 
@@ -136,6 +138,95 @@ test('события рассылки долетают до подключённ
   broadcast.emit('tab:status', { tabId: 'T1', status: 'working' });
   assert.deepStrictEqual(await frame, { event: 'tab:status', payload: { tabId: 'T1', status: 'working' } });
   ws.close();
+});
+
+// --- C6 ревью 09.08: одна сериализация на событие ---------------------------
+// Каждый сокет подписывался на рассылку сам, и событие уходило в
+// JSON.stringify столько раз, сколько открыто вкладок браузера, — а term:data
+// идёт на каждый кусок вывода pty. Число сериализаций считаем через toJSON:
+// JSON.stringify зовёт его ровно один раз на проход.
+function countingPayload() {
+  const payload = { serialized: 0 };
+  Object.defineProperty(payload, 'toJSON', {
+    value: () => { payload.serialized += 1; return { tabId: 'T1', data: 'вывод' }; },
+  });
+  return payload;
+}
+
+// Кадры сокета до события-метки: ws сохраняет порядок, поэтому всё, что
+// сервер отправил раньше метки, к её приходу уже здесь. Без таймеров.
+function framesUntil(ws, marker) {
+  return new Promise((resolve) => {
+    const got = [];
+    const onMessage = (raw) => {
+      const frame = JSON.parse(raw);
+      if (frame.event === marker) { ws.off('message', onMessage); resolve(got); return; }
+      got.push(frame);
+    };
+    ws.on('message', onMessage);
+  });
+}
+
+test('событие сериализуется ОДИН раз на всех клиентов, а не на каждого (C6 ревью)', async () => {
+  const { server, broadcast } = makeServer();
+  const { port } = await server.start();
+  const sockets = [];
+  for (let i = 0; i < 3; i += 1) sockets.push(await open(`ws://127.0.0.1:${port}/ws`));
+  const frames = sockets.map(nextFrame);
+  const payload = countingPayload();
+  broadcast.emit('term:data', payload);
+  for (const frame of await Promise.all(frames)) {
+    assert.deepStrictEqual(frame, { event: 'term:data', payload: { tabId: 'T1', data: 'вывод' } });
+  }
+  assert.strictEqual(payload.serialized, 1, `событие сериализовано ${payload.serialized} раз на 3 клиентов`);
+  for (const ws of sockets) ws.close();
+});
+
+test('без сетевых клиентов событие не сериализуется вовсе (C6 ревью)', async () => {
+  // Сервер поднят всегда, а вывод pty идёт непрерывно: сериализовать его для
+  // пустого зала — та же лишняя работа, только хуже.
+  const { server, broadcast } = makeServer();
+  await server.start();
+  const payload = countingPayload();
+  broadcast.emit('term:data', payload);
+  assert.strictEqual(payload.serialized, 0);
+});
+
+test('остановленный сервер снимается с рассылки (C6 ревью)', async () => {
+  const { server, broadcast } = makeServer();
+  await server.start();
+  await server.stop();
+  assert.strictEqual(broadcast.clientCount(), 0, 'после stop() сервер всё ещё подписан на рассылку');
+});
+
+test('сокет, бросивший на отправке, не лишает события остальных (C6 ревью)', async () => {
+  // Раньше это давал try/catch на клиента внутри broadcast.emit; с одной
+  // подпиской на сервер изоляция сокетов — забота самого сервера.
+  const { server, broadcast } = makeServer();
+  const { port } = await server.start();
+  const sockets = [];
+  for (let i = 0; i < 3; i += 1) sockets.push(await open(`ws://127.0.0.1:${port}/ws`));
+  const collected = sockets.map((ws) => framesUntil(ws, 'метка'));
+
+  // Первая отправка во время рассылки бросает — так ведёт себя сокет, который
+  // ws ещё не открыл. Подмена живёт только на время emit.
+  const realSend = WebSocket.prototype.send;
+  let thrown = false;
+  WebSocket.prototype.send = function patchedSend(...args) {
+    if (!thrown) { thrown = true; throw new Error('сокет умер'); }
+    return realSend.apply(this, args);
+  };
+  try {
+    broadcast.emit('tab:status', { tabId: 'T1', status: 'working' });
+  } finally {
+    WebSocket.prototype.send = realSend;
+  }
+  broadcast.emit('метка', {});
+
+  const received = (await Promise.all(collected)).filter((frames) => frames.some((f) => f.event === 'tab:status'));
+  assert.strictEqual(thrown, true, 'подмена send не сработала — тест ничего не проверил');
+  assert.strictEqual(received.length, 2, 'один упавший сокет оборвал рассылку остальным');
+  for (const ws of sockets) ws.close();
 });
 
 test('net:buffer отдаёт накопленную историю вкладки', async () => {
@@ -626,6 +717,54 @@ test('WebSocket без Origin (не браузер) подключается к�
   ws.close();
 });
 
+// --- C5 ревью 09.08: порт 80 и Host без порта -------------------------------
+// Порт по умолчанию для схемы браузер в Host и Origin не пишет: на
+// http://имя/ уходит 'Host: имя' и 'Origin: http://имя'. Белый список хранил
+// только 'имя:порт' — на port: 80 каждый апгрейд получал 403. Настоящий
+// сервер на 80-м в тесте не поднять (порт привилегированный или занят),
+// поэтому проверяем чистые функции, которые и зовёт verifyClient.
+
+test('порт 80: Host и Origin без порта проходят для разрешённых имён (C5 ревью)', () => {
+  const list = buildHostAllowlist(80, {
+    host: '100.120.245.85', allowedHosts: ['cockpit-desktop.tailXXXX.ts.net', 'fd7a:115c:1234::1'],
+  });
+  for (const name of ['cockpit-desktop.tailXXXX.ts.net', '100.120.245.85', 'localhost', '127.0.0.1', '[fd7a:115c:1234::1]']) {
+    assert.strictEqual(isAllowedOrigin(`http://${name}`, name, list), true, `${name} без порта на 80-м отклонён`);
+  }
+});
+
+test('порт 80: Host без порта не открывает дорогу DNS-rebinding (C5 ревью)', () => {
+  const list = buildHostAllowlist(80, { host: '127.0.0.1', allowedHosts: ['cockpit-desktop.tailXXXX.ts.net'] });
+  assert.strictEqual(isAllowedOrigin('http://evil.example.com', 'evil.example.com', list), false);
+  // Чужая страница на разрешённом Host — тоже нет: Origin сверяется с Host.
+  assert.strictEqual(isAllowedOrigin('http://evil.example.com', 'cockpit-desktop.tailXXXX.ts.net', list), false);
+});
+
+test('не на 80-м порту Host без порта не принимается — браузер так не пошлёт (C5 ревью)', () => {
+  // Вариант без порта законен только для порта по умолчанию: на 48300
+  // браузер всегда пишет порт, и голое имя значит, что запрос пришёл не
+  // напрямую от страницы этого сервера.
+  const list = buildHostAllowlist(48300, { host: '127.0.0.1', allowedHosts: ['cockpit-desktop.tailXXXX.ts.net'] });
+  assert.strictEqual(isAllowedOrigin('http://cockpit-desktop.tailXXXX.ts.net', 'cockpit-desktop.tailXXXX.ts.net', list), false);
+  assert.strictEqual(
+    isAllowedOrigin('http://cockpit-desktop.tailXXXX.ts.net:48300', 'cockpit-desktop.tailXXXX.ts.net:48300', list),
+    true, 'обычный вид с портом сломался',
+  );
+});
+
+test('Origin https:// отклоняется и на 80-м, и с портом — сервер без TLS (C5, ре-ревью)', () => {
+  // new URL('https://имя').host — это 'имя', ровно как Host на 80-м; с
+  // портом строки тоже совпадают. Отсекает ТОЛЬКО проверка схемы: страница
+  // по https не может быть нашей — TLS этот сервер не поднимает.
+  const name = 'cockpit-desktop.tailXXXX.ts.net';
+  const at80 = buildHostAllowlist(80, { host: '127.0.0.1', allowedHosts: [name] });
+  assert.strictEqual(isAllowedOrigin(`https://${name}`, name, at80), false, 'https-Origin на 80-м принят');
+  const at48300 = buildHostAllowlist(48300, { host: '127.0.0.1', allowedHosts: [name] });
+  assert.strictEqual(
+    isAllowedOrigin(`https://${name}:48300`, `${name}:48300`, at48300), false, 'https-Origin с портом принят',
+  );
+});
+
 // --- Мелочи: протокол отвечает ошибкой, а не тишиной ----------------------
 
 test('кадр с id, но без валидного channel — получает ok:false, а не тишину', async () => {
@@ -646,6 +785,27 @@ test('args не массивом — явная ошибка протокола,
   ws.send(JSON.stringify({ id: 7, channel: 'эхо', args: 'не массив' }));
   const frame = await nextFrame(ws);
   assert.strictEqual(frame.ok, false);
+  ws.close();
+});
+
+test('кадр без id ответа не получает — ни на успех, ни на ошибку (C7 ревью)', async () => {
+  // Ветки ошибок протокола молчали без id, а основной путь и ошибка
+  // обработчика отвечали всё равно — кадром без id и без event, который
+  // браузерному мосту некуда деть. Порядок ws сохраняет, и все кадры без id
+  // обработаны раньше последнего: их ответ, если он есть, пришёл бы первым.
+  const { server } = makeServer();
+  const { port } = await server.start();
+  const ws = await openBuffered(`ws://127.0.0.1:${port}/ws`);
+  ws.send(JSON.stringify({ channel: 'эхо', args: ['без id'] })); // успех
+  ws.send(JSON.stringify({ channel: 'рвётся', args: [] })); // обработчик бросил
+  ws.send(JSON.stringify({ channel: 'нет:такой', args: [] })); // неизвестная команда
+  ws.send(JSON.stringify({ channel: 'эхо', args: 'не массив' })); // ошибка протокола
+  ws.send(JSON.stringify({ args: [] })); // нет канала
+  ws.send(JSON.stringify({ id: 9, channel: 'эхо', args: ['с id'] }));
+  assert.deepStrictEqual(
+    await takeFrame(ws), { id: 9, ok: true, result: { эхо: 'с id' } },
+    'первым пришёл ответ на кадр без id',
+  );
   ws.close();
 });
 
@@ -966,6 +1126,138 @@ test('уход клиента не отдаёт управление обрат�
   }
   assert.strictEqual(ownership.owner(), hello.payload.clientId, 'обрыв ≠ потеря управления');
   assert.strictEqual(ownership.ownerOnline(), false);
+});
+
+// --- C3 ревью 09.08: перехваты сервера идут мимо гарда ----------------------
+// net:buffer, owner:claim, owner:get сервер обслуживает сам, до реестра, — то
+// есть гард владения на них не зовётся никогда. Сегодня все три свободные, но
+// это держалось на совпадении: новый перехват пишущего канала (ради скорости,
+// ради личности сокета) молча открыл бы невладельцу запись. Тест зондирует
+// КАЖДЫЙ известный канал от невладельца и смотрит, спросили ли гард и чем
+// кончилось.
+
+test('мимо гарда сервер пропускает только свободные каналы, пишущие от невладельца получают отказ (C3 ревью)', async () => {
+  const { API_SHAPE } = await import('../src/renderer/js/api-shape.js');
+  const channels = new Set([...WRITE_CHANNELS, ...FREE_CHANNELS, ...SERVER_CHANNELS]);
+  for (const spec of Object.values(API_SHAPE)) if (spec.kind !== 'event') channels.add(spec.channel);
+
+  const ownership = createOwnership({});
+  const asked = new Set();
+  const registry = createCommandRegistry({
+    ipcMain: fakeIpcMain(),
+    // Тот же гард, что собирает ipc.js, плюс запись: кого о чём спросили.
+    guard: ({ channel, who }) => {
+      asked.add(channel);
+      return !isWriteChannel(channel) || ownership.canWrite(who);
+    },
+  });
+  for (const channel of channels) registry.handle(channel, () => 'ок');
+  const server = createNetServer({
+    registry,
+    ownership,
+    broadcast: createBroadcast({ getWindow: () => null }),
+    outputBuffer: createOutputBuffer({}),
+    staticRoots: { '/': path.join(__dirname, '..', 'src', 'renderer') },
+    port: 0,
+    host: '127.0.0.1',
+  });
+  activeServers.push(server);
+  const { port } = await server.start();
+  const ws = await openBuffered(`ws://127.0.0.1:${port}/ws`);
+  await takeFrame(ws); // net:hello
+
+  // owner:claim — последним: он отдал бы зонду руль, и пишущие каналы после
+  // него законно прошли бы гард.
+  const order = [...channels].filter((c) => c !== 'owner:claim').concat('owner:claim');
+  const bypassed = [];
+  const notDenied = [];
+  let id = 0;
+  for (const channel of order) {
+    id += 1;
+    const reply = await ask(ws, { id, channel, args: [] });
+    if (!asked.has(channel)) bypassed.push(channel);
+    if (isWriteChannel(channel) && reply.denied !== true) notDenied.push(channel);
+  }
+  ws.close();
+
+  // Мимо гарда идёт ровно объявленное в SERVER_CHANNELS — заодно самопроверка
+  // детектора: без неё проверка ниже могла бы быть пустой правдой.
+  assert.deepStrictEqual(
+    [...bypassed].sort(), [...SERVER_CHANNELS].sort(),
+    'мимо гарда идёт не то, что объявлено в SERVER_CHANNELS (или детектор сломан)',
+  );
+  assert.deepStrictEqual(
+    bypassed.filter((c) => !FREE_CHANNELS.has(c)), [],
+    'сервер обслуживает сам, мимо гарда, канал вне FREE_CHANNELS — невладелец пишет без управления',
+  );
+  // Второй обход: гард спросили, но не от имени этого сокета (например,
+  // сервер позвал реестр как 'local').
+  assert.deepStrictEqual(notDenied, [], 'пишущий канал от невладельца не получил отказ эстафеты');
+});
+
+// Зонд выше видит только каналы из известных списков: перехват нового имени
+// ('net:exec' прямо в onFrame) он пропускал зелёным (ре-ревью). Поэтому
+// перехваты объявлены одним списком, и два теста ниже держат его с обеих
+// сторон: список ⊂ FREE_CHANNELS, а в обход списка канал не прочесть.
+
+test('SERVER_CHANNELS — только свободные каналы (C3, ре-ревью)', () => {
+  assert.ok(SERVER_CHANNELS.size > 0, 'список перехватов пуст — тест ниже ничего не проверит');
+  assert.deepStrictEqual(
+    [...SERVER_CHANNELS].filter((c) => !FREE_CHANNELS.has(c)), [],
+    'сервер обслуживает сам, мимо гарда, канал вне FREE_CHANNELS',
+  );
+});
+
+test('onFrame читает канал кадра только для SERVER_CHANNELS и реестра — перехват в обход списка невозможен (C3, ре-ревью)', () => {
+  // Страж по исходнику: строки-комментарии выкидываем (в них msg.channel
+  // упоминается), разрешённые обращения вырезаем по одному, требуя, чтобы
+  // каждое нашлось ровно раз (иначе якорь цепляется не за то место). Всё,
+  // что осталось от msg кроме .id и .args, — путь к каналу мимо списка:
+  // сравнение msg.channel с литералом, includes, switch, псевдоним
+  // (const { channel } = msg), передача msg целиком в помощника.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'net-server.js'), 'utf8');
+  let code = src.split(/\r?\n/).filter((line) => !line.trim().startsWith('//')).join('\n');
+  const ALLOWED = [
+    /\blet msg;/,
+    /\bmsg = JSON\.parse\(/,
+    /if \(!msg \|\| typeof msg !== 'object' \|\| Array\.isArray\(msg\)\)/,
+    /hasOwnProperty\.call\(msg, 'id'\)/,
+    /typeof msg\.channel !== 'string'/,
+    /SERVER_CHANNELS\.has\(msg\.channel\)/,
+    /serveOwn\(msg\.channel, /,
+    /registry\.call\(msg\.channel, /,
+  ];
+  for (const re of ALLOWED) {
+    const found = code.split(new RegExp(re.source)).length - 1;
+    assert.strictEqual(found, 1, `разрешённое обращение ${re} найдено ${found} раз — страж потерял цель`);
+    code = code.replace(re, '«ок»');
+  }
+  const leftovers = code.split('\n')
+    .filter((line) => /\bmsg\b(?!\.(?:id|args)\b)/.test(line))
+    .map((line) => line.trim());
+  assert.deepStrictEqual(leftovers, [], 'onFrame добирается до кадра в обход SERVER_CHANNELS');
+});
+
+test('закрытые сокеты не оставляют размеров в эстафете (C2 ревью, проводка close → drop)', async () => {
+  // Чистка живёт в ownership.drop, но зовёт её сервер — на закрытии сокета
+  // КАЖДОГО клиента, а не только владельца. Сузь вызов до «только владелец»,
+  // и карта снова растёт на каждое переподключение браузера.
+  const { server, ownership } = makeHandoffServer();
+  const { port } = await server.start();
+  ownership.claim('local', { cols: 200, rows: 50 });
+  for (let i = 0; i < 5; i += 1) {
+    const ws = await openBuffered(`ws://127.0.0.1:${port}/ws`);
+    await takeFrame(ws); // net:hello
+    await ask(ws, { id: 1, channel: 'owner:claim', args: [{ cols: 80, rows: 24 }] });
+    ownership.claim('local'); // окно ПК вернуло руль — браузер уже не владелец
+    ws.close();
+    const deadline = Date.now() + 2000;
+    while (server.clientCount() > 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  }
+  assert.strictEqual(ownership.sizeCount(), 1, 'после ухода браузеров должен остаться только размер окна ПК');
+  assert.deepStrictEqual(ownership.size(), { cols: 200, rows: 50 });
 });
 
 // --- Кэширование статики (план «размер терминала», задача A5) --------------

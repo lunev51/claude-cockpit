@@ -344,6 +344,285 @@ test('resets_at — мусорная строка (не дата) → resetsAt:n
   assert.strictEqual(snap.sevenDay.resetsAt, null);
 });
 
+// C20 (ревью 09.08, раздел C): кэш писался на диск на КАЖДЫЙ удачный опрос
+// (~480 раз в сутки), даже когда цифры не менялись. «Изменилось» — по данным,
+// а не по fetchedAt. Форма ответа — с живого кэша 05.11: сроки окон
+// five_hour/seven_day приходят с плавающими долями секунды (два опроса подряд
+// дали 16:09:59.855 и 16:10:00.086 — один и тот же срок), а у weekly_scoped
+// срок ровный.
+function liveBody({
+  fivePct = 28, fiveReset = '2026-11-05T16:09:59.855000+00:00',
+  sevenPct = 52, sevenReset = '2026-11-09T20:59:59.855000+00:00',
+  scoped = [{ label: 'Fable', percent: 0 }],
+} = {}) {
+  return {
+    five_hour: {
+      utilization: fivePct, resets_at: fiveReset, limit_dollars: null, used_dollars: null, remaining_dollars: null,
+    },
+    seven_day: {
+      utilization: sevenPct, resets_at: sevenReset, limit_dollars: null, used_dollars: null, remaining_dollars: null,
+    },
+    seven_day_opus: null,
+    limits: [
+      {
+        kind: 'session', group: 'session', percent: fivePct, severity: 'normal', resets_at: fiveReset, scope: null, is_active: true,
+      },
+      ...scoped.map((s) => ({
+        kind: 'weekly_scoped',
+        group: 'weekly',
+        percent: s.percent,
+        severity: 'normal',
+        resets_at: '2026-11-09T21:00:00+00:00',
+        scope: { model: { id: null, display_name: s.label }, surface: null },
+        is_active: false,
+      })),
+    ],
+    member_dashboard_available: false,
+  };
+}
+
+// write() отдаёт true — так настоящий кэш (ipc.js/createJsonFileCache)
+// сообщает, что запись легла на диск.
+function recordingCache() {
+  const writes = [];
+  return { read: () => null, write: (v) => { writes.push(v); return true; }, writes };
+}
+
+// Поллер, которому тест подсовывает ответ и время на каждый опрос.
+function scriptedPoller(cache) {
+  const ctl = { body: liveBody(), time: 1000 };
+  const poller = createUsagePoller({
+    readToken: () => TOKEN,
+    httpGet: async () => ({ status: 200, body: ctl.body }),
+    cache,
+    now: () => ctl.time,
+  });
+  return { poller, ctl };
+}
+
+test('C20: тот же ответ второй раз — кэш на диск не пишется, а снапшот в памяти свежий', async () => {
+  const cache = recordingCache();
+  const { poller, ctl } = scriptedPoller(cache);
+
+  await poller.refresh();
+  assert.strictEqual(cache.writes.length, 1, 'первый удачный опрос обязан записаться');
+
+  ctl.time = 181000; // следующий тик таймера
+  const snap = await poller.refresh();
+  assert.strictEqual(cache.writes.length, 1, 'цифры те же — писать нечего');
+  // Ночная смена меряет свежесть по fetchedAt снапшота (isSnapshotFreshEnough):
+  // пропуск записи на диск не должен его состарить.
+  assert.strictEqual(snap.fetchedAt, 181000);
+  assert.strictEqual(snap.stale, false);
+});
+
+test('C20: дрожь долей секунды в resets_at между опросами — не изменение', async () => {
+  const cache = recordingCache();
+  const { poller, ctl } = scriptedPoller(cache);
+
+  await poller.refresh();
+  ctl.body = liveBody({
+    fiveReset: '2026-11-05T16:10:00.086000+00:00',
+    sevenReset: '2026-11-09T21:00:00.086000+00:00',
+  });
+  ctl.time = 181000;
+  await poller.refresh();
+
+  assert.strictEqual(cache.writes.length, 1);
+});
+
+test('C20: дрожь срока НАЗАД (…00.086 → …59.855) — тоже не изменение', async () => {
+  const cache = recordingCache();
+  const { poller, ctl } = scriptedPoller(cache);
+  ctl.body = liveBody({
+    fiveReset: '2026-11-05T16:10:00.086000+00:00',
+    sevenReset: '2026-11-09T21:00:00.086000+00:00',
+  });
+  await poller.refresh();
+  ctl.body = liveBody(); // …16:09:59.855 / …20:59:59.855
+  ctl.time = 181000;
+  await poller.refresh();
+
+  assert.strictEqual(cache.writes.length, 1);
+});
+
+test('C20: срок окна пропал (null) при том же проценте — изменение; null и null — нет', async () => {
+  const cache = recordingCache();
+  const { poller, ctl } = scriptedPoller(cache);
+  await poller.refresh();
+
+  ctl.body = liveBody({ fiveReset: null });
+  ctl.time += 180000;
+  await poller.refresh();
+  assert.strictEqual(cache.writes.length, 2, 'срок окна сменился на «нет окна»');
+  assert.strictEqual(cache.writes[1].fiveHour.resetsAt, null);
+
+  ctl.time += 180000;
+  await poller.refresh();
+  assert.strictEqual(cache.writes.length, 2, 'null и null — один и тот же срок');
+});
+
+test('C20: проваленная запись (диск занят, ошибка проглочена кэшем) повторяется на следующем опросе', async () => {
+  const attempts = [];
+  let failNext = true;
+  const cache = {
+    read: () => null,
+    write: (v) => {
+      attempts.push(v);
+      if (failNext) { failNext = false; return false; }
+      return true;
+    },
+  };
+  const { poller, ctl } = scriptedPoller(cache);
+
+  await poller.refresh(); // запись не легла
+  ctl.time += 180000;
+  await poller.refresh(); // цифры те же, но на диске их нет
+  assert.strictEqual(attempts.length, 2, 'после проваленной записи кэш на диске остался бы старым');
+
+  ctl.time += 180000;
+  await poller.refresh();
+  assert.strictEqual(attempts.length, 2, 'после удачной записи — снова без записи');
+});
+
+test('C20: те же цифры дописываются раз в 30 минут — fetchedAt на диске не стареет на часы', async () => {
+  const cache = recordingCache();
+  const { poller, ctl } = scriptedPoller(cache);
+  const start = ctl.time;
+  await poller.refresh();
+
+  ctl.time = start + 30 * 60 * 1000 - 1;
+  await poller.refresh();
+  assert.strictEqual(cache.writes.length, 1, 'раньше 30 минут переписывать незачем');
+
+  ctl.time = start + 30 * 60 * 1000;
+  await poller.refresh();
+  assert.strictEqual(cache.writes.length, 2, 'прошло 30 минут — кэш дописан');
+  assert.strictEqual(cache.writes[1].fetchedAt, ctl.time);
+
+  ctl.time += 180000;
+  await poller.refresh();
+  assert.strictEqual(cache.writes.length, 2, 'отсчёт 30 минут — от последней записи');
+});
+
+test('C20: каждая настоящая смена данных записывается', async () => {
+  const cache = recordingCache();
+  const { poller, ctl } = scriptedPoller(cache);
+  const step = async (body, why) => {
+    const before = cache.writes.length;
+    ctl.body = body;
+    ctl.time += 180000;
+    await poller.refresh();
+    assert.strictEqual(cache.writes.length, before + 1, why);
+  };
+
+  await poller.refresh();
+  await step(liveBody({ fivePct: 30 }), 'процент 5-часового окна');
+  await step(liveBody({ fivePct: 30, fiveReset: '2026-11-05T21:09:59.855000+00:00' }), 'новое 5-часовое окно');
+  await step(liveBody({ fivePct: 30, fiveReset: '2026-11-05T21:09:59.855000+00:00', sevenPct: 53 }), 'процент недели');
+  const newWindow = { fivePct: 30, fiveReset: '2026-11-05T21:09:59.855000+00:00', sevenPct: 53 };
+  await step(liveBody({ ...newWindow, sevenReset: '2026-11-16T20:59:59.855000+00:00' }), 'новая неделя');
+  const newWeek = { ...newWindow, sevenReset: '2026-11-16T20:59:59.855000+00:00' };
+  await step(liveBody({ ...newWeek, scoped: [{ label: 'Fable', percent: 4 }] }), 'процент лимита модели');
+  await step(liveBody({ ...newWeek, scoped: [{ label: 'Opus', percent: 4 }] }), 'другая модель с тем же процентом');
+  await step(
+    liveBody({ ...newWeek, scoped: [{ label: 'Opus', percent: 4 }, { label: 'Fable', percent: 0 }] }),
+    'появился ещё один лимит модели',
+  );
+  await step(liveBody({ ...newWeek, scoped: [{ label: 'Opus', percent: 4 }] }), 'лимит модели пропал');
+
+  // Записывается полный снапшот с fetchedAt — форма кэша прежняя.
+  const last = cache.writes[cache.writes.length - 1];
+  assert.strictEqual(last.fetchedAt, ctl.time);
+  assert.strictEqual(last.fiveHour.percent, 30);
+});
+
+// C22 (ревью 09.08, раздел C): к refresh() ведут три пути — таймер поллера,
+// ночная смена и ручное обновление, — и у каждого был свой single-flight (или
+// никакого). Параллельные запросы к эндпоинту, который отвечает 429 и гасит
+// поллер на 10 минут, были возможны. Рубеж теперь один — в самом refresh().
+function deferredHttp() {
+  const calls = [];
+  const httpGet = () => new Promise((resolve) => { calls.push(resolve); });
+  return { httpGet, calls };
+}
+
+test('C22: два параллельных refresh() — ОДИН HTTP-запрос, оба получают его результат', async () => {
+  const http = deferredHttp();
+  const poller = createUsagePoller({
+    readToken: () => TOKEN, httpGet: http.httpGet, cache: noopCache(), now: () => 5000,
+  });
+
+  const p1 = poller.refresh();
+  const p2 = poller.refresh();
+  await Promise.resolve();
+  assert.strictEqual(http.calls.length, 1, 'второй вызов не должен был открыть свой запрос');
+
+  http.calls[0]({ status: 200, body: liveBody() });
+  const [s1, s2] = await Promise.all([p1, p2]);
+  assert.strictEqual(http.calls.length, 1);
+  for (const s of [s1, s2]) {
+    assert.strictEqual(s.ok, true);
+    assert.strictEqual(s.fetchedAt, 5000);
+    assert.strictEqual(s.fiveHour.percent, 28);
+  }
+});
+
+test('C22: тик таймера и ручной вызов во время него делят один запрос', async () => {
+  const http = deferredHttp();
+  const poller = createUsagePoller({
+    readToken: () => TOKEN, httpGet: http.httpGet, cache: noopCache(), now: () => 5000, intervalMs: 100000,
+  });
+
+  poller.start(); // немедленный тик уже в сети
+  const manual = poller.refresh();
+  await Promise.resolve();
+  assert.strictEqual(http.calls.length, 1);
+
+  http.calls[0]({ status: 200, body: liveBody({ fivePct: 41 }) });
+  const snap = await manual;
+  poller.stop();
+  assert.strictEqual(snap.fiveHour.percent, 41, 'ручной вызов получает свежий ответ общего запроса');
+  assert.strictEqual(http.calls.length, 1);
+});
+
+test('C22: после завершения запроса следующий refresh() снова идёт в сеть', async () => {
+  const http = deferredHttp();
+  const poller = createUsagePoller({
+    readToken: () => TOKEN, httpGet: http.httpGet, cache: noopCache(), now: () => 5000,
+  });
+
+  const first = poller.refresh();
+  await Promise.resolve();
+  http.calls[0]({ status: 200, body: liveBody() });
+  await first;
+
+  const second = poller.refresh();
+  await Promise.resolve();
+  assert.strictEqual(http.calls.length, 2, 'рубеж держит только ОДНОВРЕМЕННЫЕ вызовы');
+  http.calls[1]({ status: 200, body: liveBody() });
+  await second;
+});
+
+test('C22: рубеж снимается и после сбоя — следующий refresh() снова идёт в сеть', async () => {
+  let throwOnce = true;
+  let httpCalls = 0;
+  const poller = createUsagePoller({
+    readToken: () => {
+      if (throwOnce) { throwOnce = false; throw new Error('credentials заняты'); }
+      return TOKEN;
+    },
+    httpGet: async () => { httpCalls += 1; return { status: 200, body: liveBody() }; },
+    cache: noopCache(),
+    now: () => 5000,
+  });
+
+  await assert.rejects(poller.refresh(), /credentials заняты/);
+  const snap = await poller.refresh();
+  assert.strictEqual(httpCalls, 1, 'упавший вызов навсегда занял рубеж — лимиты больше не обновятся');
+  assert.strictEqual(snap.ok, true);
+});
+
 // FINDING 3 (ревью, minor): кэш проверялся только на наличие полей, не на их
 // форму — «percent: undefined» проходил бы как валидный кэш. Ужесточаем.
 test('кэш с некорректной формой (percent не число) отвергается — трактуем как отсутствие кэша', async () => {

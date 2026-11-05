@@ -139,6 +139,111 @@ const LISTEN_ANYWHERE = new Set(['0.0.0.0', '::', '::0']);
 // вывод через net:buffer — тот же путь, что при любом обрыве связи.
 const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 
+// Каналы, которые сервер обслуживает сам, до реестра, — то есть МИМО гарда
+// владения. Поэтому сюда можно только каналы из FREE_CHANNELS
+// (write-channels.js). Список один и явный (C3 ревью): onFrame перехватывает
+// только по нему, а тесты требуют SERVER_CHANNELS ⊂ FREE_CHANNELS и не дают
+// прочесть канал кадра в обход списка — раньше перехват жил цепочкой if, и
+// новый ('net:exec') проходил мимо всех тестов.
+const SERVER_CHANNELS = new Set(['net:buffer', 'owner:claim', 'owner:get']);
+
+// Белый список Host и проверка Origin — чистые функции уровня модуля, а не
+// замыкания createNetServer: так их видит тест (C5 ревью). Поведение на
+// порту 80 настоящим сервером не проверить — порт привилегированный или
+// занят, а именно там браузер шлёт Host без порта.
+
+// Литерал IPv6 в заголовке Host/URI ОБЯЗАН быть в квадратных скобках
+// (RFC 3986) — браузер шлёт 'Host: [::1]:порт', а не '::1:порт'. Без
+// обёртки адрес Tailscale IPv6 (выдаётся всегда, кроме IPv4) отрезал бы
+// браузер целиком, оставляя рабочим только заход по localhost. Признак
+// «это IPv6, а не DNS-имя с портом внутри» — двоеточие в самом имени:
+// легитимное DNS-имя/allowedHosts-запись их не содержит (формат — см.
+// комментарий у allowedHosts ниже), так что эвристика безопасна.
+function bracketed(name) {
+  return name.includes(':') && !name.startsWith('[') ? `[${name}]` : name;
+}
+
+function withPort(name, boundPort) {
+  return `${bracketed(name)}:${boundPort}`;
+}
+
+// C5 ревью: порт по умолчанию для схемы браузер в Host и Origin не пишет
+// (http://имя/ → 'Host: имя'), и на port: 80 белый список из одних
+// 'имя:80' отклонял каждый апгрейд. Голое имя добавляем ТОЛЬКО для 80:
+// сервер без TLS, 443 значил бы https-фронт, а Origin https:// ниже
+// отклоняется всё равно. Защиту от DNS-rebinding это не ослабляет — в
+// списке те же разрешённые имена, меняется лишь запись порта.
+const DEFAULT_HTTP_PORT = 80;
+
+// Белый список Host собирается ОДИН раз, когда становится известен
+// реальный порт (после listen — port:0 отдаёт эфемерный). Источники:
+// сам host конфигурации (кроме 0.0.0.0/:: — «везде», не имя), 127.0.0.1
+// и localhost всегда, и необязательный allowedHosts — доп. имена. Он
+// нужен, потому что к машине приходят и по IP, и по имени в тайлнете
+// одновременно, а в конфиге записан обычно один адрес: без allowedHosts
+// человек пропишет IP, зайдёт по имени — и получит тот же отказ, который
+// мы чиним, только с другой стороны.
+//
+// Формат каждой записи (host и элементы allowedHosts) — ГОЛОЕ имя или
+// адрес, БЕЗ порта и без квадратных скобок вокруг IPv6 (те добавляются
+// здесь сами): 'cockpit-desktop.tailXXXX.ts.net', '100.120.245.85',
+// 'fd7a:115c::1'. Порт в значении ('example.com:9999') не отрезается —
+// такая запись просто никогда не совпадёт, это на совести того, кто
+// писал конфиг, а не повод гадать, что имелось в виду.
+function buildHostAllowlist(boundPort, { host, allowedHosts } = {}) {
+  const names = new Set(['127.0.0.1', 'localhost']);
+  // Пробелы по краям и 0.0.0.0/:: — источник МОЛЧАЛИВО мёртвой записи:
+  // валидацию (это просто непустая строка) значение проходит, но никогда
+  // ни с чем не совпадёт. Фильтр общий для host и allowedHosts — раньше
+  // 0.0.0.0 отсекался только для host, а в allowedHosts проходил как есть.
+  const addName = (raw) => {
+    if (!raw) return;
+    const trimmed = String(raw).trim();
+    if (!trimmed || LISTEN_ANYWHERE.has(trimmed)) return;
+    names.add(trimmed);
+  };
+  addName(host);
+  for (const extra of allowedHosts || []) addName(extra);
+  const list = new Set();
+  for (const name of names) {
+    const lower = name.toLowerCase();
+    list.add(withPort(lower, boundPort));
+    if (boundPort === DEFAULT_HTTP_PORT) list.add(bracketed(lower));
+  }
+  return list;
+}
+
+// Разрешаем подключаться только странице, реально загруженной С ЭТОГО
+// сервера. Без этой проверки любая вкладка, открытая в браузере на том же
+// ПК, могла бы подключиться к сокету и вызвать ЛЮБУЮ команду реестра —
+// включая запись в терминал. WebSocket не подчиняется CORS/same-origin
+// сам по себе, это надо проверять руками на этапе апгрейда.
+//
+// DNS-rebinding: заголовок Host целиком контролирует клиент — браузер
+// ставит туда то имя, по которому его отправили, а не то, куда реально
+// подключился TCP-сокет. Атака: домен атакующего с коротким TTL сначала
+// указывает на его сервер (страница грузится и открывает ws на то же
+// имя), затем DNS перепривязывается на адрес кокпита — Origin и Host
+// совпадают, ОБА равны вредоносному имени. Проверка «Origin == Host» в
+// одиночку это ПРОПУСКАЕТ: оба совпадают именно потому, что оба
+// подделаны. Поэтому Host сверяется с белым списком ПЕРВЫМ (имя, которое
+// мы реально ожидаем), и только потом Origin — с уже проверенным Host.
+//
+// Origin отсутствует — не браузер (тестовый клиент, будущий нативный
+// инструмент): пропускаем. Подделать сам заголовок со страницы браузер
+// не даёт, риск именно в случаях, когда Origin ЕСТЬ и он чужой.
+function isAllowedOrigin(origin, requestHost, hostAllowlist) {
+  if (!origin) return true;
+  if (!requestHost || !hostAllowlist.has(requestHost.toLowerCase())) return false;
+  let originUrl;
+  try { originUrl = new URL(origin); } catch { return false; }
+  // Сервер не поднимает TLS: Origin со схемой https:// не может быть
+  // «нами», даже если имя и порт совпали — сравнение host было бы верным
+  // технически, но перестало бы означать «страницу отдали мы же».
+  if (originUrl.protocol !== 'http:') return false;
+  return originUrl.host.toLowerCase() === requestHost.toLowerCase();
+}
+
 // ownership — необязательный параметр: без него сервер работает ровно как
 // раньше (эстафеты нет, каждый кадр идёт в реестр как есть).
 // maxFrameBytes вынесен в параметры ради теста: слать настоящие 16 МиБ, чтобы
@@ -150,13 +255,29 @@ function createNetServer({
 }) {
   let server = null;
   let wss = null;
-  let hostAllowlist = null; // Set<'имя:порт'> в нижнем регистре — заполняется после listen()
+  let hostAllowlist = null; // Set<'имя:порт'> (на 80-м и голое имя) в нижнем регистре — заполняется после listen()
   const clients = new Set();
   const heartbeats = new Map(); // ws → жив ли с прошлого пинга
   // Имя клиента живёт ровно столько, сколько сокет: переподключившийся
   // макбук — НОВЫЙ клиент и захватывает управление заново. Считать его тем
   // же было бы неверно (браузер мог быть закрыт и открыт на другой машине).
   let nextClientId = 1;
+
+  // C6 ревью: раньше каждый сокет подписывался на рассылку сам, и событие
+  // сериализовалось столько раз, сколько открыто вкладок браузера, — а term:data
+  // идёт на каждый кусок вывода pty. Теперь у сервера ОДНА подписка (с start()
+  // до stop()): JSON.stringify один раз, дальше та же строка во все сокеты.
+  function fanOut(event, payload) {
+    // Сервер поднят всегда, а вывод идёт непрерывно — для пустого зала не
+    // сериализуем вовсе (раньше без сокетов не было и подписчиков).
+    if (clients.size === 0) return;
+    const frame = JSON.stringify({ event, payload });
+    for (const ws of clients) {
+      // Упавший сокет не лишает события остальных — раньше это давал
+      // try/catch на клиента внутри broadcast.emit.
+      try { ws.send(frame); } catch { /* мёртвый сокет отвалится сам */ }
+    }
+  }
 
   // Корни приводим к абсолютному виду ОДИН раз, здесь. Если этого не
   // сделать, относительный root (например 'src/renderer' вместо полного
@@ -287,6 +408,21 @@ function createNetServer({
     stream.pipe(res);
   }
 
+  // Ответ на канал из SERVER_CHANNELS — зовётся только для них.
+  function serveOwn(channel, args, clientId) {
+    if (channel === 'net:buffer') {
+      // История — свойство соединения, локальному окну она не нужна (у него
+      // свой xterm).
+      return outputBuffer.get(args[0]);
+    }
+    // owner:claim / owner:get: только сервер знает, ЧЕЙ это сокет. Реестр
+    // получил бы кадр без личности и не отличил бы захват макбуком от захвата
+    // локальным окном.
+    if (!ownership) throw new Error('эстафета не подключена');
+    if (channel === 'owner:claim') ownership.claim(clientId, args[0]);
+    return { owner: ownership.owner(), self: clientId, online: ownership.ownerOnline() };
+  }
+
   async function onFrame(ws, raw, clientId) {
     let msg;
     // Битый кадр не имеет права ронять сервер: на другом конце браузер,
@@ -302,7 +438,13 @@ function createNetServer({
     // единственный формат. Без отдельного try здесь клиент не получил бы
     // вообще ничего и завис бы на промисе навсегда, хотя протокол обещает
     // ok:false на любую свою ошибку.
+    //
+    // Без id отвечать некому — молчим (C7 ревью). Раньше это проверяли только
+    // ветки ошибок протокола, а успех и ошибка обработчика уходили кадром без
+    // id и без event, который браузерному мосту некуда деть. Проверка одна,
+    // здесь, — чтобы новая ветка не забыла её снова.
     const reply = (body) => {
+      if (!hasId) return;
       let payload;
       try {
         payload = JSON.stringify({ id: msg.id, ...body });
@@ -314,32 +456,23 @@ function createNetServer({
 
     // Протокол обещает {id, ok:false, error} на любую свою ошибку, а не
     // тишину: браузерный мост держит промис по id, и без ответа он повис бы
-    // навсегда. Молчим только когда id вообще нет — отвечать некому.
+    // навсегда. Кадр без id reply сам оставит без ответа (см. выше).
     if (typeof msg.channel !== 'string') {
-      if (hasId) reply({ ok: false, error: 'протокол: нет канала' });
+      reply({ ok: false, error: 'протокол: нет канала' });
       return;
     }
     if (msg.args !== undefined && !Array.isArray(msg.args)) {
-      if (hasId) reply({ ok: false, error: 'протокол: args должен быть массивом' });
+      reply({ ok: false, error: 'протокол: args должен быть массивом' });
       return;
     }
     const args = Array.isArray(msg.args) ? msg.args : [];
     try {
-      let result;
-      if (msg.channel === 'net:buffer') {
-        // net:buffer обслуживает сервер, а не реестр: история — свойство
-        // соединения, локальному окну она не нужна (у него свой xterm).
-        result = outputBuffer.get(args[0]);
-      } else if (msg.channel === 'owner:claim' || msg.channel === 'owner:get') {
-        // Тот же случай, что и net:buffer: только сервер знает, ЧЕЙ это
-        // сокет. Реестр получил бы кадр без личности и не смог бы отличить
-        // захват макбуком от захвата локальным окном.
-        if (!ownership) throw new Error('эстафета не подключена');
-        if (msg.channel === 'owner:claim') ownership.claim(clientId, args[0]);
-        result = { owner: ownership.owner(), self: clientId, online: ownership.ownerOnline() };
-      } else {
-        result = await registry.call(msg.channel, args, clientId);
-      }
+      // Перехват — только по SERVER_CHANNELS: всё, что сервер обслуживает сам,
+      // идёт мимо гарда реестра. Других обращений к msg.channel здесь нет и
+      // быть не должно (страж в test/net-server.test.js).
+      const result = SERVER_CHANNELS.has(msg.channel)
+        ? serveOwn(msg.channel, args, clientId)
+        : await registry.call(msg.channel, args, clientId);
       reply({ ok: true, result: result === undefined ? null : result });
     } catch (err) {
       // denied — штатный отказ эстафеты, а не поломка: браузерный мост по
@@ -348,81 +481,6 @@ function createNetServer({
       if (err && err.denied) body.denied = true;
       reply(body);
     }
-  }
-
-  // Литерал IPv6 в заголовке Host/URI ОБЯЗАН быть в квадратных скобках
-  // (RFC 3986) — браузер шлёт 'Host: [::1]:порт', а не '::1:порт'. Без
-  // обёртки адрес Tailscale IPv6 (выдаётся всегда, кроме IPv4) отрезал бы
-  // браузер целиком, оставляя рабочим только заход по localhost. Признак
-  // «это IPv6, а не DNS-имя с портом внутри» — двоеточие в самом имени:
-  // легитимное DNS-имя/allowedHosts-запись их не содержит (формат — см.
-  // комментарий у allowedHosts ниже), так что эвристика безопасна.
-  function withPort(name, boundPort) {
-    const bracketed = name.includes(':') && !name.startsWith('[') ? `[${name}]` : name;
-    return `${bracketed}:${boundPort}`;
-  }
-
-  // Белый список Host собирается ОДИН раз, когда становится известен
-  // реальный порт (после listen — port:0 отдаёт эфемерный). Источники:
-  // сам host конфигурации (кроме 0.0.0.0/:: — «везде», не имя), 127.0.0.1
-  // и localhost всегда, и необязательный allowedHosts — доп. имена. Он
-  // нужен, потому что к машине приходят и по IP, и по имени в тайлнете
-  // одновременно, а в конфиге записан обычно один адрес: без allowedHosts
-  // человек пропишет IP, зайдёт по имени — и получит тот же отказ, который
-  // мы чиним, только с другой стороны.
-  //
-  // Формат каждой записи (host и элементы allowedHosts) — ГОЛОЕ имя или
-  // адрес, БЕЗ порта и без квадратных скобок вокруг IPv6 (те добавляются
-  // здесь сами): 'cockpit-desktop.tailXXXX.ts.net', '100.120.245.85',
-  // 'fd7a:115c::1'. Порт в значении ('example.com:9999') не отрезается —
-  // такая запись просто никогда не совпадёт, это на совести того, кто
-  // писал конфиг, а не повод гадать, что имелось в виду.
-  function buildHostAllowlist(boundPort) {
-    const names = new Set(['127.0.0.1', 'localhost']);
-    // Пробелы по краям и 0.0.0.0/:: — источник МОЛЧАЛИВО мёртвой записи:
-    // валидацию (это просто непустая строка) значение проходит, но никогда
-    // ни с чем не совпадёт. Фильтр общий для host и allowedHosts — раньше
-    // 0.0.0.0 отсекался только для host, а в allowedHosts проходил как есть.
-    const addName = (raw) => {
-      if (!raw) return;
-      const trimmed = String(raw).trim();
-      if (!trimmed || LISTEN_ANYWHERE.has(trimmed)) return;
-      names.add(trimmed);
-    };
-    addName(host);
-    for (const extra of allowedHosts || []) addName(extra);
-    return new Set([...names].map((n) => withPort(n.toLowerCase(), boundPort)));
-  }
-
-  // Разрешаем подключаться только странице, реально загруженной С ЭТОГО
-  // сервера. Без этой проверки любая вкладка, открытая в браузере на том же
-  // ПК, могла бы подключиться к сокету и вызвать ЛЮБУЮ команду реестра —
-  // включая запись в терминал. WebSocket не подчиняется CORS/same-origin
-  // сам по себе, это надо проверять руками на этапе апгрейда.
-  //
-  // DNS-rebinding: заголовок Host целиком контролирует клиент — браузер
-  // ставит туда то имя, по которому его отправили, а не то, куда реально
-  // подключился TCP-сокет. Атака: домен атакующего с коротким TTL сначала
-  // указывает на его сервер (страница грузится и открывает ws на то же
-  // имя), затем DNS перепривязывается на адрес кокпита — Origin и Host
-  // совпадают, ОБА равны вредоносному имени. Проверка «Origin == Host» в
-  // одиночку это ПРОПУСКАЕТ: оба совпадают именно потому, что оба
-  // подделаны. Поэтому Host сверяется с белым списком ПЕРВЫМ (имя, которое
-  // мы реально ожидаем), и только потом Origin — с уже проверенным Host.
-  //
-  // Origin отсутствует — не браузер (тестовый клиент, будущий нативный
-  // инструмент): пропускаем. Подделать сам заголовок со страницы браузер
-  // не даёт, риск именно в случаях, когда Origin ЕСТЬ и он чужой.
-  function isAllowedOrigin(origin, requestHost) {
-    if (!origin) return true;
-    if (!requestHost || !hostAllowlist.has(requestHost.toLowerCase())) return false;
-    let originUrl;
-    try { originUrl = new URL(origin); } catch { return false; }
-    // Сервер не поднимает TLS: Origin со схемой https:// не может быть
-    // «нами», даже если имя и порт совпали — сравнение host было бы верным
-    // технически, но перестало бы означать «страницу отдали мы же».
-    if (originUrl.protocol !== 'http:') return false;
-    return originUrl.host.toLowerCase() === requestHost.toLowerCase();
   }
 
   return {
@@ -434,31 +492,30 @@ function createNetServer({
           path: '/ws',
           maxPayload: maxFrameBytes,
           verifyClient: (info, callback) => {
-            const ok = isAllowedOrigin(info.origin, info.req.headers.host);
+            const ok = isAllowedOrigin(info.origin, info.req.headers.host, hostAllowlist);
             callback(ok, ok ? undefined : 403, ok ? undefined : 'чужой origin/host');
           },
         });
         wss.on('connection', (ws) => {
           const clientId = `c${nextClientId}`;
           nextClientId += 1;
-          const send = (event, payload) => ws.send(JSON.stringify({ event, payload }));
+          // В clients — значит и в рассылке (fanOut), отдельной подписки на
+          // сокет больше нет (C6).
           clients.add(ws);
           heartbeats.set(ws, true);
-          broadcast.addClient(send);
           // Своё имя клиент обязан узнать ДО первого кадра: без него он не
           // может понять, у него сейчас управление или у соседа. Без эстафеты
           // (ownership не передан) имя не значит ничего, и лишний кадр сразу
           // после подключения менял бы наблюдаемое поведение старых клиентов —
           // поэтому молчим: сервер без ownership работает ровно как раньше.
           if (ownership) {
-            try { send('net:hello', { clientId }); } catch { /* сокет ушёл сразу */ }
+            try { ws.send(JSON.stringify({ event: 'net:hello', payload: { clientId } })); } catch { /* сокет ушёл сразу */ }
           }
           ws.on('message', (raw) => onFrame(ws, raw, clientId));
           ws.on('pong', () => heartbeats.set(ws, true));
           const forget = () => {
             clients.delete(ws);
             heartbeats.delete(ws);
-            broadcast.removeClient(send);
             // Ушедший владелец управление НЕ теряет (спека: обрыв ≠ потеря),
             // ownership.drop лишь помечает его офлайн.
             if (ownership) ownership.drop(clientId);
@@ -494,7 +551,8 @@ function createNetServer({
         server.listen(port, host, () => {
           wss.removeListener('error', onStartError);
           wss.on('error', (err) => console.log(`[net] ошибка сервера: ${err.message}`));
-          hostAllowlist = buildHostAllowlist(server.address().port);
+          hostAllowlist = buildHostAllowlist(server.address().port, { host, allowedHosts });
+          broadcast.addClient(fanOut);
           server._cockpitHeartbeat = heartbeat; // чтобы stop() мог его погасить
           resolve({ port: server.address().port });
         });
@@ -502,6 +560,7 @@ function createNetServer({
     },
     stop() {
       return new Promise((resolve) => {
+        broadcast.removeClient(fanOut);
         if (server && server._cockpitHeartbeat) clearInterval(server._cockpitHeartbeat);
         for (const ws of clients) { try { ws.terminate(); } catch { /* уже мёртв */ } }
         clients.clear();
@@ -539,12 +598,17 @@ function createNetServer({
         const hint = (allowedHosts || []).map((h) => String(h).trim()).find(Boolean);
         name = hint || '127.0.0.1';
       }
-      return `http://${name.includes(':') && !name.startsWith('[') ? `[${name}]` : name}:${boundPort}`;
+      // Скобки вокруг IPv6 — те же, что в белом списке Host (withPort).
+      return `http://${withPort(name, boundPort)}`;
     },
   };
 }
 
 // MAX_FRAME_BYTES экспортируется ради теста: без него мутация «вернуть дефолт
 // 100 МиБ» проходила незамеченной — тесты задают потолок явным параметром, а
-// само значение по умолчанию не проверял никто.
-module.exports = { createNetServer, MAX_FRAME_BYTES };
+// само значение по умолчанию не проверял никто. buildHostAllowlist и
+// isAllowedOrigin — тоже ради теста (порт 80, см. их шапку выше),
+// SERVER_CHANNELS — ради сверки с FREE_CHANNELS.
+module.exports = {
+  createNetServer, MAX_FRAME_BYTES, buildHostAllowlist, isAllowedOrigin, SERVER_CHANNELS,
+};

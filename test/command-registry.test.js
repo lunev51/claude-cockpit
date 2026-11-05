@@ -72,6 +72,53 @@ test('names/has: реестр знает свой состав', () => {
   assert.deepStrictEqual(reg.names().sort(), ['a:b', 'c:d']);
 });
 
+// --- C4 ревью 09.08: повторная регистрация канала ------------------------
+// Реестр молча перезаписывал карту имён. Настоящий ipcMain.handle на повтор
+// бросает — но уже ПОСЛЕ того, как карта подменена, а ipcMain.on не бросает
+// вовсе и вешает второго слушателя: локальное окно звало бы оба обработчика,
+// сеть — только последний. Фейковый ipcMain не бросает ничего, поэтому
+// отказ обязан выдавать сам реестр, до того как тронет хоть одну сторону.
+
+// Фейк, который считает обращения: повторная попытка не должна дойти до
+// ipcMain ни одним вызовом.
+function countingIpcMain() {
+  const ipc = fakeIpcMain();
+  ipc.calls = 0;
+  const { handle, on } = ipc;
+  ipc.handle = (ch, fn) => { ipc.calls += 1; handle(ch, fn); };
+  ipc.on = (ch, fn) => { ipc.calls += 1; on(ch, fn); };
+  return ipc;
+}
+
+test('повторный handle того же канала — ошибка, первый обработчик на месте в обоих транспортах (C4 ревью)', async () => {
+  const ipc = countingIpcMain();
+  const reg = createCommandRegistry({ ipcMain: ipc });
+  reg.handle('tabs:list', () => 'первый');
+
+  assert.throws(() => reg.handle('tabs:list', () => 'второй'), /tabs:list/);
+  assert.throws(() => reg.on('tabs:list', () => 'второй'), /tabs:list/);
+
+  assert.strictEqual(ipc.calls, 1, 'повторная регистрация дошла до ipcMain');
+  assert.ok(!ipc.oned.has('tabs:list'), 'повтор через on повесил слушателя в ipcMain');
+  assert.strictEqual(await reg.call('tabs:list', []), 'первый', 'сеть зовёт подменённый обработчик');
+  assert.strictEqual(await ipc.handled.get('tabs:list')({}), 'первый', 'локальное окно зовёт подменённый обработчик');
+});
+
+test('повторный on того же канала — тоже ошибка (C4 ревью)', async () => {
+  const ipc = countingIpcMain();
+  const reg = createCommandRegistry({ ipcMain: ipc });
+  const seen = [];
+  reg.on('term:write', (p) => seen.push(`первый:${p}`));
+
+  assert.throws(() => reg.on('term:write', (p) => seen.push(`второй:${p}`)), /term:write/);
+  assert.throws(() => reg.handle('term:write', () => 'второй'), /term:write/);
+
+  assert.strictEqual(ipc.calls, 1, 'повторная регистрация дошла до ipcMain');
+  await reg.call('term:write', ['x']);
+  ipc.oned.get('term:write')({}, 'y');
+  assert.deepStrictEqual(seen, ['первый:x', 'первый:y']);
+});
+
 test('ошибка внутри обработчика доезжает до вызывающего, а не теряется', async () => {
   const reg = createCommandRegistry({ ipcMain: fakeIpcMain() });
   reg.handle('плохая:команда', async () => { throw new Error('внутри рвануло'); });
