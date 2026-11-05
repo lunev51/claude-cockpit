@@ -26,6 +26,8 @@ import { linkState, onLinkChange, RELOAD_MARK_KEY } from './api-boot.js';
 import { initTerminal } from './terminal.js';
 // Шрифт терминала ждём до первого терминала — см. boot().
 import { waitForFont, FONT_WAIT_MS } from './term-size.js';
+// WebGL и unicode11 — только по флагу конфига и тоже до первого терминала.
+import { loadOptionalAddons } from './optional-addons.js';
 // Сетка видимой вкладки — скрытым (см. gridShare ниже).
 import { createGridShare } from './grid-share.js';
 import {
@@ -2863,6 +2865,15 @@ async function boot() {
 
   config = await window.api.config.get();
 
+  // Аддоны xterm по флагам конфига (terminal.webgl / terminal.unicode11) —
+  // ДО первого терминала: terminal.js читает window.WebglAddon синхронно при
+  // создании вкладки. По умолчанию обе фичи выключены, и не грузится ничего
+  // (раньше это были ~300 КБ тегами index.html на каждую загрузку страницы,
+  // ревью 09.08, C15). Качаются параллельно с ожиданием шрифта; ждём их
+  // ниже, до createTabStore. Отказ и таймаут не бросают — терминал откроется
+  // без фичи (см. optional-addons.js).
+  const addonsReady = loadOptionalAddons(config.terminal);
+
   // Шрифт терминала — ДО первого терминала. xterm мерит ячейку при открытии и
   // сам её не перемеряет, когда шрифт догрузился (см. terminal.js,
   // onFontsLoaded): на макбуке вшитый JetBrains Mono (1 МБ) ехал по сети
@@ -2885,6 +2896,7 @@ async function boot() {
   if (fontWait !== 'loaded') {
     console.warn(`[boot] шрифт терминала не дождались (${fontWait}) — открываю на запасном, перемерю при догрузке`);
   }
+  await addonsReady;
 
   tabStore = createTabStore({
     root: $('tab-groups'),
