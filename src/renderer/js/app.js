@@ -53,6 +53,8 @@ import { createRestoreKeyHandler } from './restore-keys.js';
 // Important (ре-ревью фикс-волны): подключение к вкладке без живого процесса
 // не должно его поднимать — обоснование в самом модуле.
 import { shouldStartPty } from './attach-guards.js';
+// Подпись мёртвой вкладки — по тому, что на деле сделает Ctrl+Shift+R (T1).
+import { deadTabHint } from './attach-guards.js';
 // Task 3 фазы 9 (голосовой ввод, push-to-talk по правому Shift): recorder —
 // портирован из Companion как есть (src/renderer/js/voice/recorder.js, см.
 // комментарий там же — ни одного изменённого пути импорта не понадобилось,
@@ -800,9 +802,7 @@ async function attachTab(t, { activate = false } = {}) {
   // N)», но человек, открывший вкладку, смотрит в терминал — и без этой строки
   // видит просто застывший экран, на который не реагирует клавиатура.
   if (!shouldStartPty(t)) {
-    views.get(t.tabId)?.view.term.write(
-      '\r\n\x1b[2m— процесс не запущен · Ctrl+Shift+R продолжит сессию —\x1b[0m\r\n',
-    );
+    views.get(t.tabId)?.view.term.write(`\r\n\x1b[2m— ${deadTabHint(t)} —\x1b[0m\r\n`);
   }
   return t;
 }
