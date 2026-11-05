@@ -1636,13 +1636,12 @@ function registerIpc(win, opts = {}) {
   // барьера теперь: (I2) если snapshot() уже свежий (ok, не stale, младше
   // USAGE_SNAPSHOT_FRESH_MS) — отдаём его синхронно, БЕЗ похода в сеть вовсе;
   // (Minor 5) иначе — single-flight, конкурентные детекты делят ОДИН запрос.
-  let usageRefreshInFlight = null;
+  // Сам single-flight живёт внутри usagePoller.refresh() (C22, ревью 09.08):
+  // свой здесь не видел ни таймера поллера, ни ручного usage:refresh.
   const refreshUsage = () => {
     const snap = usagePoller.snapshot();
     if (isSnapshotFreshEnough(snap, Date.now())) return Promise.resolve(snap);
-    return usageRefreshInFlight
-      || (usageRefreshInFlight = Promise.resolve(usagePoller.refresh())
-        .finally(() => { usageRefreshInFlight = null; }));
+    return Promise.resolve(usagePoller.refresh());
   };
   nightWatch = createNightWatch({
     now: Date.now,

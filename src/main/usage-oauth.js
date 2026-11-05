@@ -171,7 +171,21 @@ function createUsagePoller({
     }
   }
 
-  async function refresh() {
+  // Единственный рубеж против параллельных запросов (ревью 09.08, C22). К
+  // refresh() ведут три пути — свой таймер, ночная смена (ipc.js/refreshUsage)
+  // и ручное обновление (usage:refresh), — и прежние single-flight у двух из
+  // них друг друга не видели: тик таймера и клик по кольцам уходили в сеть
+  // параллельно. 429 гасит поллер на 10 минут, а ночная смена без свежих цифр
+  // не продолжит вкладку. Одновременный вызов получает ТОТ ЖЕ промис: ответ
+  // общего запроса свежий для каждого из вызывающих.
+  let inFlight = null;
+
+  function refresh() {
+    if (!inFlight) inFlight = fetchOnce().finally(() => { inFlight = null; });
+    return inFlight;
+  }
+
+  async function fetchOnce() {
     // 429-бэкофф — жёсткий гейт: не долбим сервер раньше времени, ни таймером, ни руками.
     if (now() < nextAllowedAt) return state;
 

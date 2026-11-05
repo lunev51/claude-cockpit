@@ -461,6 +461,73 @@ test('C20: каждая настоящая смена данных записы�
   assert.strictEqual(last.fiveHour.percent, 30);
 });
 
+// C22 (ревью 09.08, раздел C): к refresh() ведут три пути — таймер поллера,
+// ночная смена и ручное обновление, — и у каждого был свой single-flight (или
+// никакого). Параллельные запросы к эндпоинту, который отвечает 429 и гасит
+// поллер на 10 минут, были возможны. Рубеж теперь один — в самом refresh().
+function deferredHttp() {
+  const calls = [];
+  const httpGet = () => new Promise((resolve) => { calls.push(resolve); });
+  return { httpGet, calls };
+}
+
+test('C22: два параллельных refresh() — ОДИН HTTP-запрос, оба получают его результат', async () => {
+  const http = deferredHttp();
+  const poller = createUsagePoller({
+    readToken: () => TOKEN, httpGet: http.httpGet, cache: noopCache(), now: () => 5000,
+  });
+
+  const p1 = poller.refresh();
+  const p2 = poller.refresh();
+  await Promise.resolve();
+  assert.strictEqual(http.calls.length, 1, 'второй вызов не должен был открыть свой запрос');
+
+  http.calls[0]({ status: 200, body: liveBody() });
+  const [s1, s2] = await Promise.all([p1, p2]);
+  assert.strictEqual(http.calls.length, 1);
+  for (const s of [s1, s2]) {
+    assert.strictEqual(s.ok, true);
+    assert.strictEqual(s.fetchedAt, 5000);
+    assert.strictEqual(s.fiveHour.percent, 28);
+  }
+});
+
+test('C22: тик таймера и ручной вызов во время него делят один запрос', async () => {
+  const http = deferredHttp();
+  const poller = createUsagePoller({
+    readToken: () => TOKEN, httpGet: http.httpGet, cache: noopCache(), now: () => 5000, intervalMs: 100000,
+  });
+
+  poller.start(); // немедленный тик уже в сети
+  const manual = poller.refresh();
+  await Promise.resolve();
+  assert.strictEqual(http.calls.length, 1);
+
+  http.calls[0]({ status: 200, body: liveBody({ fivePct: 41 }) });
+  const snap = await manual;
+  poller.stop();
+  assert.strictEqual(snap.fiveHour.percent, 41, 'ручной вызов получает свежий ответ общего запроса');
+  assert.strictEqual(http.calls.length, 1);
+});
+
+test('C22: после завершения запроса следующий refresh() снова идёт в сеть', async () => {
+  const http = deferredHttp();
+  const poller = createUsagePoller({
+    readToken: () => TOKEN, httpGet: http.httpGet, cache: noopCache(), now: () => 5000,
+  });
+
+  const first = poller.refresh();
+  await Promise.resolve();
+  http.calls[0]({ status: 200, body: liveBody() });
+  await first;
+
+  const second = poller.refresh();
+  await Promise.resolve();
+  assert.strictEqual(http.calls.length, 2, 'рубеж держит только ОДНОВРЕМЕННЫЕ вызовы');
+  http.calls[1]({ status: 200, body: liveBody() });
+  await second;
+});
+
 // FINDING 3 (ревью, minor): кэш проверялся только на наличие полей, не на их
 // форму — «percent: undefined» проходил бы как валидный кэш. Ужесточаем.
 test('кэш с некорректной формой (percent не число) отвергается — трактуем как отсутствие кэша', async () => {
