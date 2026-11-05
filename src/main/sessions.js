@@ -1026,7 +1026,13 @@ function createSessionManager({
         // это продолжение прежней работы, а не новый промпт человека: время
         // до «готово» он меряет с её начала (toasts.js). Ключ только на таком
         // ходе — обычный payload не меняется ни на байт.
-        setStatus(tab, 'working', 'думает…', isTaskNotification(data.prompt) ? { taskNotification: true } : undefined);
+        // turnStart — тостеру: здесь начался новый ход (промпт человека или
+        // пробуждение уведомлением) при ЛЮБОМ прежнем статусе. По переходу
+        // статусов его не отличить: из «завис» в работу ведёт и ожившая
+        // выдача того же хода, и новый промпт после прерванного Esc.
+        setStatus(tab, 'working', 'думает…', isTaskNotification(data.prompt)
+          ? { turnStart: true, taskNotification: true }
+          : { turnStart: true });
         break;
       case 'PreToolUse':
         // Статус «фон»: инструмент фонового агента после хода — см.
@@ -1108,7 +1114,11 @@ function createSessionManager({
         // остановка для ночной смены.
         const live = liveBackground(tab.bg, data.background_tasks);
         tab.bg = live || new Map();
-        if (tab.bg.size) setStatus(tab, 'background', backgroundSubtitle(tab.bg), { genProven });
+        // turnEnd — тостеру: это конец хода Claude («ответил · фон ещё
+        // работает»), а не возврат в «фон» хуком фонового агента
+        // (noteBackgroundAgent). По прежнему статусу это не угадать: ход,
+        // кончившийся на вопросе разрешения, приходит сюда из 'waiting'.
+        if (tab.bg.size) setStatus(tab, 'background', backgroundSubtitle(tab.bg), { genProven, turnEnd: true });
         else setStatus(tab, 'done', '', { genProven });
         // Task 1 фазы 7 (очередь промптов): вбрасываем СТРОГО один элемент
         // очереди на этот Stop — не всю очередь разом. Гарды (pty жив,

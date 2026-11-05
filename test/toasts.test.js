@@ -240,6 +240,38 @@ test('forget(tabId): done сразу после forget без предшеств
   assert.strictEqual(h.notifications[0].title, 'proj: готово');
 });
 
+test('forget(tabId) чистит и начало хода — тост «фона» сразу после forget ведёт себя как для новой вкладки', () => {
+  // Без чистки turnSince карта копилась бы по закрытым вкладкам, и тост
+  // «фона» мерился бы от хода закрытой вкладки с тем же tabId.
+  const h = makeToaster();
+  h.setFocused(false);
+  h.setClock(0);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
+  h.setClock(1000);
+  h.toaster.forget('t1');
+  h.setClock(1500); // 500мс после forget; без чистки ход мерился бы от 0 — 1.5с, ниже порога
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '', subtitle: 'фон · 1 команда', turnEnd: true });
+  assert.strictEqual(h.notifications.length, 1);
+  assert.strictEqual(h.notifications[0].title, 'proj: ответил · фон ещё работает');
+});
+
+test('фон: новый промпт человека из «завис» (ход прерван Esc, Stop не пришёл) — новый ход, порог от него', () => {
+  // Ре-ревью PR #51: «завис → работает» по выводу — тот же ход, а по новому
+  // промпту (turnStart) — новый. Без этого 5-секундный ответ на вопрос после
+  // прерванного часового хода давал бы «ответил · фон ещё работает».
+  const h = makeToaster();
+  h.setFocused(false);
+  h.setClock(0);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '', turnStart: true });
+  h.setClock(700000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'stuck', waitingText: '' });
+  h.setClock(1000000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '', turnStart: true });
+  h.setClock(1005000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '', subtitle: 'фон · 1 команда', turnEnd: true });
+  assert.strictEqual(h.notifications.length, 0);
+});
+
 test('forget(tabId) сбрасывает и lastStatus — working после forget считается НОВЫМ переходом, а не повторным пингом', () => {
   const h = makeToaster();
   h.setClock(0);
@@ -264,17 +296,138 @@ test('forget(tabId) сбрасывает и lastStatus — working после fo
 // Статус «фон» (план 2026-11-05): ход окончен, фоновая задача жива — вкладка
 // в «Работают». «Готово» звать рано: результата, ради которого всё затевалось
 // (записанная флешка), ещё нет.
-test('фон: background — тишина, тоста «готово» нет', () => {
+// Решение владельца 05.11: вкладка с вечным dev-сервером каждый ход кончает в
+// «фоне», и без этого тоста о том, что Claude ответил, человек не узнал бы
+// никогда. Тост — не «готово» (работа ещё идёт), а «ответил · фон ещё работает».
+test('фон: конец хода дольше 30с с живым фоном → тост «ответил · фон ещё работает» с подписью', () => {
   const h = makeToaster();
+  h.setFocused(false);
   h.setClock(0);
-  h.toaster.onStatus({
-    tabId: 't1', tabName: 'proj', status: 'working', waitingText: '',
-  });
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
   h.setClock(60000);
   h.toaster.onStatus({
-    tabId: 't1', tabName: 'proj', status: 'background', waitingText: '',
+    tabId: 't1', tabName: 'proj', status: 'background', waitingText: '', subtitle: 'фон · 1 команда', turnEnd: true,
   });
+  assert.strictEqual(h.notifications.length, 1);
+  assert.strictEqual(h.notifications[0].title, 'proj: ответил · фон ещё работает');
+  assert.strictEqual(h.notifications[0].body, 'фон · 1 команда');
+  h.notifications[0].onClick();
+  assert.deepStrictEqual(h.focusCalls, ['t1']);
+});
+
+test('фон: конец хода из «завис» с живым фоном — тоже ответ, тост есть', () => {
+  const h = makeToaster();
+  h.setFocused(false);
+  h.setClock(0);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
+  h.setClock(400000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'stuck', waitingText: '' });
+  h.setClock(420000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '', subtitle: 'фон · 1 агент', turnEnd: true });
+  assert.strictEqual(h.notifications.length, 1);
+  assert.strictEqual(h.notifications[0].title, 'proj: ответил · фон ещё работает');
+});
+
+test('фон: «завис» → снова «работает» — тот же ход, порог тоста «фона» не сбрасывается', () => {
+  const h = makeToaster();
+  h.setFocused(false);
+  h.setClock(0);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
+  h.setClock(400000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'stuck', waitingText: '' });
+  h.setClock(410000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
+  h.setClock(420000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '', subtitle: 'фон · 1 команда', turnEnd: true });
+  assert.strictEqual(h.notifications.length, 1, 'ход длился 7 минут — тост обязан быть');
+});
+
+test('фон: короткий ход (до 30с) с живым фоном — тишина, тот же порог, что у «готово»', () => {
+  const h = makeToaster();
+  h.setFocused(false);
+  h.setClock(0);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
+  h.setClock(20000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '', subtitle: 'фон · 1 команда', turnEnd: true });
   assert.strictEqual(h.notifications.length, 0);
+});
+
+test('фон: человек смотрит на эту вкладку — тишина', () => {
+  const h = makeToaster();
+  h.setFocused(true);
+  h.setActive('t1');
+  h.setClock(0);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
+  h.setClock(60000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '', subtitle: 'фон · 1 команда', turnEnd: true });
+  assert.strictEqual(h.notifications.length, 0);
+});
+
+test('фон: «фон» без конца хода (хук фонового агента, смена подписи) — тишина', () => {
+  // sessions.js возвращает вкладку в «фон» хуком фонового агента из «Ждут
+  // тебя»/«Готово»/«Наготове» и шлёт новый «фон» при смене подписи — без
+  // turnEnd. Ни то, ни другое — не ответ Claude; тост здесь был бы ложным.
+  for (const from of ['waiting', 'done', 'ready', 'background']) {
+    const h = makeToaster();
+    h.setFocused(false);
+    h.setClock(0);
+    h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
+    h.setClock(60000);
+    h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: from, waitingText: 'вопрос' });
+    const before = h.notifications.length;
+    h.setClock(120000);
+    h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '', subtitle: 'фон · 2 агента' });
+    assert.strictEqual(h.notifications.length, before, `из «${from}» в «фон» тоста быть не должно`);
+  }
+});
+
+test('фон: короткие автоходы по уведомлению (события Monitor) при живом dev-сервере — тоста нет, порог от начала ТЕКУЩЕГО хода', () => {
+  // Ревью PR #51: события Monitor приходят тем же <task-notification>, CLI
+  // будит сессию на каждое. Меряй порог от начала первого хода человека —
+  // каждый трёхсекундный автоход давал бы «ответил · фон ещё работает».
+  const h = makeToaster();
+  h.setFocused(false);
+  h.setClock(0);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
+  h.setClock(44000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '', subtitle: 'фон · 2 команды', turnEnd: true });
+  assert.strictEqual(h.notifications.length, 1);
+  for (const at of [600000, 900000, 1200000]) {
+    h.setClock(at);
+    h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '', taskNotification: true });
+    h.setClock(at + 3000);
+    h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '', subtitle: 'фон · 2 команды', turnEnd: true });
+  }
+  assert.strictEqual(h.notifications.length, 1, 'на каждое событие Monitor тоста быть не должно');
+});
+
+test('фон: длинный автоход по уведомлению (дольше 30с), после которого фон ещё жив, — тост есть', () => {
+  const h = makeToaster();
+  h.setFocused(false);
+  h.setClock(0);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
+  h.setClock(44000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '', subtitle: 'фон · 2 команды', turnEnd: true });
+  h.setClock(600000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '', taskNotification: true });
+  h.setClock(650000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '', subtitle: 'фон · 1 команда', turnEnd: true });
+  assert.strictEqual(h.notifications.length, 2);
+  assert.strictEqual(h.notifications[1].title, 'proj: ответил · фон ещё работает');
+});
+
+test('фон: ход кончился на вопросе разрешения (Stop пришёл из «Ждут тебя») — тоже конец хода, тост есть', () => {
+  // Ревью PR #51: по прежнему статусу конец хода не угадать — sessions.js
+  // помечает Stop флагом turnEnd.
+  const h = makeToaster();
+  h.setFocused(false);
+  h.setClock(0);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
+  h.setClock(50000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'waiting', waitingText: 'Claude needs your permission to use Bash' });
+  h.setClock(60000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '', subtitle: 'фон · 1 команда', turnEnd: true });
+  assert.deepStrictEqual(h.notifications.map((n) => n.title), ['proj ждёт ответа', 'proj: ответил · фон ещё работает']);
 });
 
 test('фон: короткий ход после уведомления о конце фона даёт «готово» — время считается с начала всей работы', () => {
@@ -285,7 +438,7 @@ test('фон: короткий ход после уведомления о ко�
   h.setClock(0);
   h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
   h.setClock(20000);
-  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '' });
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '', turnEnd: true });
   h.setClock(620000);
   h.toaster.onStatus({
     tabId: 't1', tabName: 'proj', status: 'working', waitingText: '', taskNotification: true,
@@ -303,7 +456,7 @@ test('фон: НОВЫЙ промпт человека из «фона» — н�
   h.setClock(0);
   h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
   h.setClock(20000);
-  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '' });
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '', turnEnd: true });
   h.setClock(3 * 3600 * 1000);
   h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
   h.setClock(3 * 3600 * 1000 + 2000);

@@ -35,4 +35,19 @@ test('обвязка передаёт тостеру флаг taskNotification �
     /taskNotification:\s*payload\.taskNotification/,
     'флаг taskNotification не доезжает до тостера — «готово» после фоновой задачи будет мериться от последнего хода',
   );
+  assert.match(
+    literal,
+    /subtitle:\s*payload\.subtitle/,
+    'подпись статуса не доезжает до тостера — в тосте «ответил · фон ещё работает» не будет видно, что именно работает',
+  );
+  assert.match(
+    literal,
+    /turnEnd:\s*payload\.turnEnd/,
+    'флаг turnEnd не доезжает до тостера — тоста «ответил · фон ещё работает» не будет никогда',
+  );
+  assert.match(
+    literal,
+    /turnStart:\s*payload\.turnStart/,
+    'флаг turnStart не доезжает до тостера — ход после прерванного Esc мерился бы от прерванного',
+  );
 });
