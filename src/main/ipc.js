@@ -1603,6 +1603,8 @@ function registerIpc(win, opts = {}) {
           // turnEnd — что это конец хода Claude (Stop), а не хук фонового агента.
           subtitle: payload.subtitle,
           turnEnd: payload.turnEnd,
+          // turnStart — начало нового хода (UserPromptSubmit), порог тоста «фона».
+          turnStart: payload.turnStart,
         });
       }
       broadcast.emit(channel, payload);

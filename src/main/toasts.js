@@ -63,9 +63,10 @@ function createToaster({
   // taskNotification — ход начал сам CLI с уведомлением о конце фоновой
   // задачи (sessions.js, UserPromptSubmit), а не человек новым промптом.
   // subtitle — подпись статуса («фон · 1 команда»), идёт в тело тоста «фона».
-  // turnEnd — статус выставлен Stop'ом, то есть Claude закончил ход.
+  // turnEnd — статус выставлен Stop'ом, то есть Claude закончил ход;
+  // turnStart — UserPromptSubmit, то есть начался новый ход.
   function onStatus({
-    tabId, tabName, status, waitingText, taskNotification, subtitle, turnEnd,
+    tabId, tabName, status, waitingText, taskNotification, subtitle, turnEnd, turnStart,
   }) {
     const prevStatus = lastStatus.get(tabId);
 
@@ -79,8 +80,10 @@ function createToaster({
       // дал бы тост «готово» (ревью 05.11, S2).
       const continuesBackground = prevStatus === 'background' && taskNotification === true;
       if (prevStatus !== 'working' && !continuesBackground) workingSince.set(tabId, now());
-      // «Завис» → «работает» — тот же ход ожил, не новый.
-      if (prevStatus !== 'working' && prevStatus !== 'stuck') turnSince.set(tabId, now());
+      // «Завис» → «работает» по ожившей выдаче — тот же ход, не новый; а вот
+      // новый промпт (turnStart) — новый ход при любом прежнем статусе, в том
+      // числе после хода, прерванного Esc (Stop тогда не приходит).
+      if (turnStart === true || (prevStatus !== 'working' && prevStatus !== 'stuck')) turnSince.set(tabId, now());
       lastStatus.set(tabId, status);
       return;
     }

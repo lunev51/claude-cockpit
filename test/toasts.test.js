@@ -240,6 +240,38 @@ test('forget(tabId): done сразу после forget без предшеств
   assert.strictEqual(h.notifications[0].title, 'proj: готово');
 });
 
+test('forget(tabId) чистит и начало хода — тост «фона» сразу после forget ведёт себя как для новой вкладки', () => {
+  // Без чистки turnSince карта копилась бы по закрытым вкладкам, и тост
+  // «фона» мерился бы от хода закрытой вкладки с тем же tabId.
+  const h = makeToaster();
+  h.setFocused(false);
+  h.setClock(0);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
+  h.setClock(1000);
+  h.toaster.forget('t1');
+  h.setClock(1500); // 500мс после forget; без чистки ход мерился бы от 0 — 1.5с, ниже порога
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '', subtitle: 'фон · 1 команда', turnEnd: true });
+  assert.strictEqual(h.notifications.length, 1);
+  assert.strictEqual(h.notifications[0].title, 'proj: ответил · фон ещё работает');
+});
+
+test('фон: новый промпт человека из «завис» (ход прерван Esc, Stop не пришёл) — новый ход, порог от него', () => {
+  // Ре-ревью PR #51: «завис → работает» по выводу — тот же ход, а по новому
+  // промпту (turnStart) — новый. Без этого 5-секундный ответ на вопрос после
+  // прерванного часового хода давал бы «ответил · фон ещё работает».
+  const h = makeToaster();
+  h.setFocused(false);
+  h.setClock(0);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '', turnStart: true });
+  h.setClock(700000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'stuck', waitingText: '' });
+  h.setClock(1000000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '', turnStart: true });
+  h.setClock(1005000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '', subtitle: 'фон · 1 команда', turnEnd: true });
+  assert.strictEqual(h.notifications.length, 0);
+});
+
 test('forget(tabId) сбрасывает и lastStatus — working после forget считается НОВЫМ переходом, а не повторным пингом', () => {
   const h = makeToaster();
   h.setClock(0);

@@ -45,4 +45,9 @@ test('обвязка передаёт тостеру флаг taskNotification �
     /turnEnd:\s*payload\.turnEnd/,
     'флаг turnEnd не доезжает до тостера — тоста «ответил · фон ещё работает» не будет никогда',
   );
+  assert.match(
+    literal,
+    /turnStart:\s*payload\.turnStart/,
+    'флаг turnStart не доезжает до тостера — ход после прерванного Esc мерился бы от прерванного',
+  );
 });

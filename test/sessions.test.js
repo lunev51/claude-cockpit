@@ -2672,6 +2672,18 @@ test('фон: ход окончен, фоновая команда жива — 
   assert.strictEqual(st.turnEnd, true);
 });
 
+test('фон: промпт человека помечен turnStart — тостеру это начало нового хода при любом прежнем статусе', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { ...hookBase('UserPromptSubmit'), prompt: 'что там' });
+  assert.strictEqual(statusOf(events, a.tabId).turnStart, true);
+  // PreToolUse — продолжение хода, не его начало.
+  mgr.applyHookEvent(a.tabId, 'PreToolUse', { ...hookBase('PreToolUse'), tool_name: 'Bash', tool_input: { command: 'ls' } });
+  assert.notStrictEqual(statusOf(events, a.tabId).turnStart, true);
+});
+
 test('фон: конец хода, начатый из «Ждут тебя» (последний инструмент спрашивал разрешение), тоже помечен turnEnd', () => {
   const factory = makeFakePtyFactory();
   const { mgr, events } = makeManager(factory);
