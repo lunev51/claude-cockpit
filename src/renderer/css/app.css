@@ -109,6 +109,8 @@ html, body {
   background: var(--text-dim);
 }
 .tab-dot.working { background: var(--working); }
+/* «Фон»: работа идёт, но не ход Claude — тот же цвет, приглушённо. */
+.tab-dot.background { background: var(--working); opacity: 0.5; }
 .tab-dot.waiting { background: var(--accent); box-shadow: 0 0 6px var(--accent); animation: pulse 1.6s ease-in-out infinite; }
 .tab-dot.done    { background: var(--ok); }
 .tab-dot.error   { background: var(--err); }

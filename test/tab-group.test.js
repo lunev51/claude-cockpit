@@ -18,6 +18,13 @@ test('groupOf: рабочие статусы раскладываются по �
   assert.strictEqual(groupOf('done'), 'done');
 });
 
+test('groupOf: «фон» (ход окончен, фоновая задача жива) — в «Работают»', async () => {
+  // Решение владельца 05.11: запись флешки в фоне — это работа, а не
+  // «Наготове» и не «Готово».
+  const { groupOf } = await load();
+  assert.strictEqual(groupOf('background'), 'working');
+});
+
 test('groupOf: сломанное — в «Проблемы»', async () => {
   const { groupOf } = await load();
   assert.strictEqual(groupOf('stuck'), 'trouble');
@@ -55,7 +62,7 @@ test('GROUP_ORDER покрывает ВСЕ секции, куда groupOf ум�
   // Секция, в которую что-то кладут, но которой нет в порядке отрисовки, —
   // это молча пропавшая из сайдбара вкладка.
   const { GROUP_ORDER, groupOf } = await load();
-  const statuses = ['waiting', 'working', 'done', 'stuck', 'dead', 'ready', null, 'чужой'];
+  const statuses = ['waiting', 'working', 'done', 'stuck', 'dead', 'ready', 'background', null, 'чужой'];
   for (const s of statuses) {
     assert.ok(GROUP_ORDER.includes(groupOf(s)), `секция ${groupOf(s)} (статус ${s}) отсутствует в GROUP_ORDER`);
   }

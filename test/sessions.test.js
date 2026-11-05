@@ -2566,3 +2566,272 @@ test('list отдаёт очередь промптов — иначе подк�
   const снова = mgr.list().find((t) => t.tabId === a.tabId);
   assert.strictEqual(снова.queue.length, 2, 'list отдал внутренний массив наружу — очередь можно испортить извне');
 });
+
+// === Статус «фон» (план 2026-11-05): ход окончен, фоновая работа жива =====
+//
+// Payload'ы — реальной формы (Claude Code 2.1.318). PostToolUse — как в
+// журнале сессии; Stop — по схеме хука того же бинаря: поле background_tasks
+// CLI заполняет из реестра задач («что ещё летит», пустой массив — ничего).
+
+const BG_SHELL = 'btlnghtdk';
+const BG_AGENT = 'a12f8ef3df5eb51b4';
+
+function hookBase(event) {
+  return {
+    session_id: 'S1',
+    transcript_path: 'C:\\Users\\x\\.claude\\projects\\p\\S1.jsonl',
+    cwd: 'C:\\proj\\alpha',
+    permission_mode: 'default',
+    hook_event_name: event,
+  };
+}
+
+function bashBackground(extra = {}) {
+  return {
+    ...hookBase('PostToolUse'),
+    tool_name: 'Bash',
+    tool_input: { command: 'dd if=img of=/dev/sdb bs=4M', description: 'Запись образа', run_in_background: true },
+    tool_response: {
+      stdout: '', stderr: '', interrupted: false, isImage: false, backgroundTaskId: BG_SHELL,
+    },
+    tool_use_id: 'toolu_01GUHrijoZxNCcftNPJBY3Ar',
+    ...extra,
+  };
+}
+
+function agentAsync() {
+  return {
+    ...hookBase('PostToolUse'),
+    tool_name: 'Agent',
+    tool_input: { description: 'Ревью ветки', prompt: '...', run_in_background: true },
+    tool_response: {
+      isAsync: true,
+      status: 'async_launched',
+      agentId: BG_AGENT,
+      description: 'Ревью ветки',
+      prompt: '...',
+      outputFile: `C:\\Users\\x\\AppData\\Local\\Temp\\claude\\p\\S1\\tasks\\${BG_AGENT}.output`,
+    },
+    tool_use_id: 'toolu_01AgentLaunch',
+  };
+}
+
+const LIVE_SHELL = {
+  id: BG_SHELL, type: 'shell', status: 'running', description: 'Запись образа', command: 'dd if=img of=/dev/sdb bs=4M',
+};
+const LIVE_AGENT = {
+  id: BG_AGENT, type: 'subagent', status: 'running', description: 'Ревью ветки', agent_type: 'general-purpose',
+};
+
+function stop(backgroundTasks) {
+  const data = {
+    ...hookBase('Stop'),
+    stop_hook_active: false,
+    last_assistant_message: 'Запустил запись в фоне, напишу, когда закончится.',
+    session_crons: [],
+  };
+  if (backgroundTasks !== undefined) data.background_tasks = backgroundTasks;
+  return data;
+}
+
+function taskNotification(id) {
+  return {
+    ...hookBase('UserPromptSubmit'),
+    prompt: `<task-notification>\n<task-id>${id}</task-id>\n<tool-use-id>toolu_01GUHrijoZxNCcftNPJBY3Ar</tool-use-id>\n`
+      + `<output-file>C:\\Users\\x\\AppData\\Local\\Temp\\claude\\p\\S1\\tasks\\${id}.output</output-file>\n`
+      + '<status>completed</status>\n<summary>Background command "Запись образа" completed (exit code 0)</summary>\n</task-notification>',
+  };
+}
+
+// Вкладка, у которой ход только что закончился с живой фоновой командой.
+function tabInBackground(opts) {
+  const factory = makeFakePtyFactory();
+  const env = makeManager(factory, opts);
+  const a = env.mgr.open({ cwd: 'C:\\proj\\alpha' });
+  env.mgr.start(a.tabId, 80, 24);
+  const gen = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  env.mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { ...hookBase('UserPromptSubmit'), prompt: 'запиши образ на флешку' }, gen);
+  env.mgr.applyHookEvent(a.tabId, 'PostToolUse', bashBackground(), gen);
+  env.mgr.applyHookEvent(a.tabId, 'Stop', stop([LIVE_SHELL]), gen);
+  return {
+    ...env, factory, a, gen,
+  };
+}
+
+test('фон: ход окончен, фоновая команда жива — «фон · 1 команда», а не «готово»', () => {
+  const { events, a } = tabInBackground();
+  const st = statusOf(events, a.tabId);
+  assert.strictEqual(st.status, 'background');
+  assert.strictEqual(st.subtitle, 'фон · 1 команда');
+  // Ночная смена ловит остановку по лимиту на этом же событии — признак
+  // доказанного поколения обязан доехать и сюда, как у 'done'.
+  assert.strictEqual(st.genProven, true);
+});
+
+test('фон: команда и фоновый агент — подпись перечисляет оба вида', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'PostToolUse', agentAsync());
+  mgr.applyHookEvent(a.tabId, 'PostToolUse', bashBackground());
+  mgr.applyHookEvent(a.tabId, 'Stop', stop([LIVE_AGENT, LIVE_SHELL]));
+  assert.strictEqual(statusOf(events, a.tabId).status, 'background');
+  assert.strictEqual(statusOf(events, a.tabId).subtitle, 'фон · 1 команда, 1 агент');
+});
+
+test('фон: задача кончилась посреди хода (уведомление ушло в ход, мимо хука) — Stop с пустым списком даёт «готово»', () => {
+  // Самый частый живой случай: CLI вкладывает <task-notification> прямо в
+  // идущий ход, UserPromptSubmit его не видит. Если бы ядро верило своему
+  // журналу запусков, вкладка висела бы в «фоне» до перезапуска.
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'PostToolUse', bashBackground());
+  mgr.applyHookEvent(a.tabId, 'Stop', stop([]));
+  assert.strictEqual(statusOf(events, a.tabId).status, 'done');
+  assert.strictEqual(statusOf(events, a.tabId).subtitle, '');
+});
+
+test('фон: CLI без поля background_tasks — «готово», как до фичи (угадывать не беремся)', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'PostToolUse', bashBackground());
+  mgr.applyHookEvent(a.tabId, 'Stop', stop(undefined));
+  assert.strictEqual(statusOf(events, a.tabId).status, 'done');
+});
+
+test('фон: живой Monitor (в списке Stop он «shell») вкладку в фоне не держит', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'PostToolUse', {
+    ...hookBase('PostToolUse'),
+    tool_name: 'Monitor',
+    tool_input: { command: 'until grep -q DONE log; do sleep 5; done', description: 'ждёт сборку' },
+    tool_response: { taskId: 'bmon12345' },
+    tool_use_id: 'toolu_01Monitor',
+  });
+  mgr.applyHookEvent(a.tabId, 'Stop', stop([{
+    id: 'bmon12345', type: 'shell', status: 'running', description: 'ждёт сборку', command: 'until grep -q DONE log; do sleep 5; done',
+  }]));
+  assert.strictEqual(statusOf(events, a.tabId).status, 'done');
+});
+
+test('фон: фоновая команда, запущенная сабагентом (agent_id в payload), — не фон вкладки', () => {
+  // Её уведомление уходит самому сабагенту, а не в ход вкладки.
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'PostToolUse', bashBackground({ agent_id: BG_AGENT, agent_type: 'general-purpose' }));
+  mgr.applyHookEvent(a.tabId, 'Stop', stop([LIVE_SHELL]));
+  assert.strictEqual(statusOf(events, a.tabId).status, 'done');
+});
+
+test('фон: уведомление о конце задачи → «думает…», следующий Stop без фона → «готово»', () => {
+  const { mgr, events, a, gen } = tabInBackground();
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', taskNotification(BG_SHELL), gen);
+  assert.strictEqual(statusOf(events, a.tabId).status, 'working');
+  assert.strictEqual(statusOf(events, a.tabId).subtitle, 'думает…');
+  mgr.applyHookEvent(a.tabId, 'Stop', stop([]), gen);
+  assert.strictEqual(statusOf(events, a.tabId).status, 'done');
+});
+
+test('фон: вкладка не залипает после рестарта — старые id сверяются со списком нового процесса', () => {
+  const { mgr, events, a, factory } = tabInBackground();
+  mgr.restart(a.tabId);
+  const gen2 = Number(factory.spawned[1].opts.env.COCKPIT_TAB_GEN);
+  mgr.applyHookEvent(a.tabId, 'SessionStart', { ...hookBase('SessionStart'), source: 'resume' }, gen2);
+  mgr.applyHookEvent(a.tabId, 'UserPromptSubmit', { ...hookBase('UserPromptSubmit'), prompt: 'ну что там' }, gen2);
+  mgr.applyHookEvent(a.tabId, 'Stop', stop([]), gen2);
+  assert.strictEqual(statusOf(events, a.tabId).status, 'done');
+});
+
+test('фон: вброс очереди на Stop происходит как раньше — Claude после хода принимает ввод', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr, events } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  const gen = Number(factory.spawned[0].opts.env.COCKPIT_TAB_GEN);
+  mgr.enqueue(a.tabId, 'следующее поручение');
+  mgr.applyHookEvent(a.tabId, 'PostToolUse', bashBackground(), gen);
+  mgr.applyHookEvent(a.tabId, 'Stop', stop([LIVE_SHELL]), gen);
+  assert.strictEqual(statusOf(events, a.tabId).status, 'background');
+  assert.deepStrictEqual(factory.spawned[0].written, ['следующее поручение\r']);
+});
+
+test('фон: проверка на зависание к «фону» не применяется, сколько бы он ни шёл', () => {
+  const { mgr, events, a, tick } = tabInBackground();
+  tick(60 * 60 * 1000);
+  mgr.checkStuck();
+  assert.strictEqual(statusOf(events, a.tabId).status, 'background');
+});
+
+test('фон: markSeen «фон» не трогает — двигает только «готово»', () => {
+  const { mgr, events, a } = tabInBackground();
+  mgr.markSeen(a.tabId);
+  assert.strictEqual(statusOf(events, a.tabId).status, 'background');
+});
+
+test('фон: idle-пинг CLI («жду ввода» через минуту без фокуса) из «Работают» не уводит', () => {
+  // CLI 2.1.318 глушит idle_prompt только при живых фоновых АГЕНТАХ, а при
+  // фоновой команде шлёт его как обычно — без этой гарды вкладка с записью
+  // флешки через минуту уехала бы в «Ждут тебя».
+  const { mgr, events, a, gen } = tabInBackground();
+  const before = events.length;
+  mgr.applyHookEvent(a.tabId, 'Notification', {
+    ...hookBase('Notification'), message: 'Claude is waiting for your input', notification_type: 'idle_prompt',
+  }, gen);
+  assert.strictEqual(statusOf(events, a.tabId).status, 'background');
+  assert.strictEqual(statusOf(events, a.tabId).subtitle, 'фон · 1 команда');
+  assert.strictEqual(events.slice(before).filter((e) => e.channel === 'tab:status').length, 0, 'лишний tab:status на пинг');
+});
+
+test('фон: вопрос разрешения уводит в «Ждут тебя» как обычно', () => {
+  const { mgr, events, a, gen } = tabInBackground();
+  mgr.applyHookEvent(a.tabId, 'Notification', {
+    ...hookBase('Notification'), message: 'Claude needs your permission to use Bash', notification_type: 'permission_prompt',
+  }, gen);
+  assert.strictEqual(statusOf(events, a.tabId).status, 'waiting');
+  assert.strictEqual(statusOf(events, a.tabId).waitingKind, 'permission');
+});
+
+test('фон: инструмент фонового агента (PreToolUse с agent_id) не делает вкладку «работающей» и не ведёт к «зависла»', () => {
+  // Хуки инструментов сабагента приходят в ту же сессию с полем agent_id.
+  // Без гарды фоновый агент переводил бы вкладку в 'working' с ожиданием
+  // ответа, а Stop основного потока за этим не последовал бы — через пять
+  // минут без вывода вкладка уехала бы в «Проблемы».
+  const factory = makeFakePtyFactory();
+  const { mgr, events, tick } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 80, 24);
+  mgr.applyHookEvent(a.tabId, 'PostToolUse', agentAsync());
+  mgr.applyHookEvent(a.tabId, 'Stop', stop([LIVE_AGENT]));
+  mgr.applyHookEvent(a.tabId, 'PreToolUse', {
+    ...hookBase('PreToolUse'),
+    tool_name: 'Bash',
+    tool_input: { command: 'npm test' },
+    tool_use_id: 'toolu_01Sub',
+    agent_id: BG_AGENT,
+    agent_type: 'general-purpose',
+  });
+  assert.strictEqual(statusOf(events, a.tabId).status, 'background');
+  assert.strictEqual(statusOf(events, a.tabId).subtitle, 'фон · 1 агент');
+  tick(10 * 60 * 1000);
+  mgr.checkStuck();
+  assert.strictEqual(statusOf(events, a.tabId).status, 'background');
+});
+
+test('фон: PreToolUse основного потока (без agent_id) — снова «работает»', () => {
+  const { mgr, events, a, gen } = tabInBackground();
+  mgr.applyHookEvent(a.tabId, 'PreToolUse', {
+    ...hookBase('PreToolUse'), tool_name: 'Read', tool_input: { file_path: 'C:\\proj\\alpha\\log.txt' }, tool_use_id: 'toolu_01Main',
+  }, gen);
+  assert.strictEqual(statusOf(events, a.tabId).status, 'working');
+  assert.strictEqual(statusOf(events, a.tabId).subtitle, 'Read…');
+});

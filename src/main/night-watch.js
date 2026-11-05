@@ -78,7 +78,8 @@ const DEFAULT_CONFIG = {
 // нет вовсе (getTabStatus вернул null). ВАЖНО (Important 5а ревью): это
 // СПИСОК ИСКЛЮЧЕНИЙ, не вайтлист — 'done' и 'stuck' (в бою вкладка после
 // реального Stop-хука стоит именно в 'done', см. sessions.js) сюда НЕ
-// входят и обязаны продолжаться так же, как 'working'.
+// входят и обязаны продолжаться так же, как 'working'. То же — 'background'
+// (Stop при живой фоновой задаче): ход встал по лимиту, фон жив, продолжать.
 const NO_RESUME_STATUSES = new Set(['waiting', 'dead']);
 
 function createNightWatch({

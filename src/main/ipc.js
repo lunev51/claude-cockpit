@@ -79,9 +79,9 @@ let nightWatch = null;   // Task 2 фазы 8 («Ночная смена»): и�
 // Task 2 фазы 8, КРИТИЧЕСКАЯ ЛОВУШКА (найдена на ревью Task 1, зафиксирована в
 // брифе Task 2): sessions.js на Stop-хуке СИНХРОННО ставит статус 'done' и
 // наружу отдаёт ТОЛЬКО событие 'tab:status' с уже НОВЫМ статусом (см.
-// sessions.js/applyHookEvent, case 'Stop' → setStatus(tab,'done','') —
-// единственное место во всём коде, где статус вкладки переходит именно
-// working→done, других путей в 'done' нет). Если бы обвязка читала prevStatus
+// sessions.js/applyHookEvent, case 'Stop' → setStatus(tab,'done','') или,
+// при живой фоновой задаче, 'background' — единственное место во всём коде,
+// где статус вкладки переходит из работы в остановку). Если бы обвязка читала prevStatus
 // ПОСЛЕ обновления этой карты, prev всегда совпадал бы с уже новым статусом
 // ('done'), nightWatch.onTabStop никогда не увидел бы условие
 // prevStatus==='working' — детект остановки по лимиту превратился бы в
@@ -318,8 +318,12 @@ function hasRealUserInput(data) {
 // доказательство, что working→done принадлежит СВОЕЙ (кокпитной) сессии, а
 // не стороннему процессу той же сессии вне кокпита (маршрутизация по
 // session_id без COCKPIT_TAB_GEN, заявленная фича port-file — см. I4 фазы 7).
+//
+// Статус «фон» (план 2026-11-05): Stop при живой фоновой задаче даёт
+// 'background', а не 'done' — это та же остановка хода. Без него вкладка с
+// вечным dev-сервером, вставшая по лимиту, не детектилась бы никогда.
 function shouldDetectLimitStop(prev, payload) {
-  if (!payload || payload.status !== 'done') return false;
+  if (!payload || (payload.status !== 'done' && payload.status !== 'background')) return false;
   if (payload.genProven !== true) return false;
   return prev === 'working' || prev === 'stuck';
 }

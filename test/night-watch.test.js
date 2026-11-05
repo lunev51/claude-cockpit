@@ -552,6 +552,25 @@ test('Important 5а: статус stuck на пробуждении — тоже
   assert.strictEqual(lastEntry(ctx).detail, '1 of 1');
 });
 
+// Статус «фон» (план 2026-11-05): ход встал по лимиту, а фоновая команда
+// (dev-сервер, запись флешки) ещё жива — Stop даёт 'background', не 'done'.
+// Такую вкладку пробуждение обязано продолжить так же, как 'done'.
+test('фон: статус background на пробуждении — вкладка живая, продолжаем', async () => {
+  const resetsAt = 1000;
+  const refreshUsage = makeUsageToggle({ resetsAt });
+  const ctx = setup({ refreshUsage });
+  ctx.statuses.set('tab1', 'background');
+  ctx.nw.arm();
+  await ctx.nw.onTabStop('tab1', 'working');
+
+  refreshUsage.markReset();
+  ctx.clock.set(resetsAt + 60000);
+  await ctx.timers.fire(ctx.timers.lastId());
+
+  assert.strictEqual(ctx.write.calls.length, 1);
+  assert.strictEqual(lastEntry(ctx).detail, '1 of 1');
+});
+
 // Important 5б (ревью раунд 1): бриф явно требовал ассерт wakeAt на
 // MAX(resetsAt) среди pending — до этого раунда покрыт не был. Обе стороны:
 // более поздний resetsAt у второй вкладки должен ПЕРЕПЛАНИРОВАТЬ таймер

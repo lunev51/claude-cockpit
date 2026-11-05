@@ -14,6 +14,9 @@ export const GROUP_ORDER = ['waiting', 'working', 'done', 'trouble', 'ready'];
 const GROUP_OF = {
   waiting: 'waiting',
   working: 'working',
+  // «Фон»: ход окончен, но фоновая команда/агент ещё живы — это работа, а не
+  // «Готово» (решение владельца 05.11, жалоба про запись флешки).
+  background: 'working',
   done: 'done',
   stuck: 'trouble',
   dead: 'trouble',

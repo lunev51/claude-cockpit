@@ -63,7 +63,10 @@ function createToaster({
     if (status === 'working') {
       // Переход в working только если ДО этого статус не был working —
       // иначе это просто очередной PreToolUse того же хода, отметку не трогаем.
-      if (prevStatus !== 'working') workingSince.set(tabId, now());
+      // Из «фона» — тоже не новое начало: ход после уведомления о конце фона
+      // (запись флешки) короткий, и порог 30с, мерь его отсюда, проглотил бы
+      // тот самый «готово», которого ждут. Время — с начала всей работы.
+      if (prevStatus !== 'working' && prevStatus !== 'background') workingSince.set(tabId, now());
       lastStatus.set(tabId, status);
       return;
     }
@@ -71,6 +74,7 @@ function createToaster({
     lastStatus.set(tabId, status);
 
     // stuck и любые прочие статусы — тишина по контракту (working обработан выше).
+    // «Фон» тоже: результата ещё нет, вкладка в «Работают».
     if (status !== 'waiting' && status !== 'done' && status !== 'dead') return;
 
     if (status === 'dead') {
