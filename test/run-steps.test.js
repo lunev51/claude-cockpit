@@ -134,6 +134,8 @@ function assertEachInOwnStep(body, calls, where) {
     );
     owners.set(idx, c);
   }
+  // Номер шага каждого вызова — для проверок порядка.
+  return new Map([...owners].map(([idx, c]) => [c, idx]));
 }
 
 test('disposeSessions гасит каждого держателя процессов отдельным шагом', () => {
@@ -164,12 +166,21 @@ test('flushWorkspace отрезает запись манифеста, даже 
 test('выход из main.js идёт через один каскад шагов', () => {
   const code = codeOnly(read('main.js'));
   const body = topLevelBody(code, 'function teardown(', 'main.js');
-  assertEachInOwnStep(body, [
+  const stepOf = assertEachInOwnStep(body, [
     'destroyTray',
     'flushWorkspace',
     'disposeSessions',
     'netServer.stop()',
   ], 'teardown');
+
+  // Порядок несущий: manager.disposeAll() шлёт tabs:changed на каждую
+  // закрытую вкладку, и пока markQuitting() не выполнен (он внутри
+  // flushWorkspace), wsync.sync() пишет в pending всё более пустой список —
+  // flush затем сохраняет на диск {tabs: []}. Вчерашний воркспейс потерян.
+  assert.ok(
+    stepOf.get('flushWorkspace') < stepOf.get('disposeSessions'),
+    'teardown закрывает вкладки ДО записи манифеста: на диск уйдёт пустой воркспейс',
+  );
 
   // Три двери выхода, и каждая обязана пройти через teardown — а не через
   // свою копию цепочки, где первый же сбой снова обрывает остальное.
