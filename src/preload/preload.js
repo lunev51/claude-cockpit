@@ -41,9 +41,10 @@ contextBridge.exposeInMainWorld('api', {
     openExternal: (url) => ipcRenderer.invoke('shell:openExternal', url),
   },
   net: {
-    // История вывода вкладки (C2 финального ревью ветки): хвост из
-    // output-buffer.js, который подключившийся клиент печатает в свежий xterm
-    // ДО первого живого term:data. В Electron этот путь тоже настоящий:
+    // История вывода вкладки (C2 финального ревью ветки): снимок экрана из
+    // зеркала в main (screen-mirror.js; без @xterm/headless — сырой хвост
+    // output-buffer.js), который подключившийся клиент печатает в свежий
+    // xterm ДО первого живого term:data. В Electron этот путь тоже настоящий:
     // перезагрузка renderer (Ctrl+R) при живом main оставляет вкладки
     // работающими, а окно получает пустой терминал.
     buffer: (tabId) => ipcRenderer.invoke('net:buffer', tabId),

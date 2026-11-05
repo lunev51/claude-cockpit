@@ -69,6 +69,29 @@ test('start спавнит pty с cwd вкладки, write/resize маршру�
   assert.strictEqual(started.length, 2);
 });
 
+// Зеркало экрана в main (screen-mirror.js, жалоба 05.11) живёт в размере pty
+// вкладки — size() обязан отдавать размер именно pty, а не последний
+// запрошенный: повторный start живой вкладки pty не трогает.
+test('size: размер pty вкладки после start и resize, null для неизвестной и закрытой', () => {
+  const factory = makeFakePtyFactory();
+  const { mgr } = makeManager(factory);
+  const a = mgr.open({ cwd: 'C:\\proj\\alpha' });
+  mgr.start(a.tabId, 100, 30);
+  assert.deepStrictEqual(mgr.size(a.tabId), { cols: 100, rows: 30 });
+  assert.deepStrictEqual([factory.spawned[0].opts.cols, factory.spawned[0].opts.rows], [100, 30]);
+
+  mgr.start(a.tabId, 50, 10); // подключился второй клиент — pty тот же
+  assert.deepStrictEqual(mgr.size(a.tabId), { cols: 100, rows: 30 });
+
+  mgr.resize(a.tabId, 120, 40);
+  assert.deepStrictEqual(mgr.size(a.tabId), { cols: 120, rows: 40 });
+  assert.deepStrictEqual([factory.spawned[0].cols, factory.spawned[0].rows], [120, 40]);
+
+  assert.strictEqual(mgr.size('нет-такой-вкладки'), null);
+  mgr.close(a.tabId);
+  assert.strictEqual(mgr.size(a.tabId), null, 'закрытая вкладка всё ещё с размером — зеркало воскресло бы от хвоста убитого pty');
+});
+
 test('open с явным ghostId переиспользует его; без него — минтит новый (ревью Task 5, finding 1a)', () => {
   const factory = makeFakePtyFactory();
   const { mgr } = makeManager(factory);

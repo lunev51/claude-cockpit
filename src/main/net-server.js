@@ -135,8 +135,8 @@ const LISTEN_ANYWHERE = new Set(['0.0.0.0', '::', '::0']);
 // docs/review-fable-2026-08-09.md.
 //
 // Превышение не теряет работу: ws закрывает соединение кодом 1009, клиент
-// переподключается сам (reconnectLoop в api-boot.js) и добирает пропущенный
-// вывод через net:buffer — тот же путь, что при любом обрыве связи.
+// переподключается сам (reconnectLoop в api-boot.js) и получает текущий экран
+// вкладки через net:buffer — тот же путь, что при любом обрыве связи.
 const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 
 // Каналы, которые сервер обслуживает сам, до реестра, — то есть МИМО гарда
@@ -412,7 +412,8 @@ function createNetServer({
   function serveOwn(channel, args, clientId) {
     if (channel === 'net:buffer') {
       // История — свойство соединения, локальному окну она не нужна (у него
-      // свой xterm).
+      // свой xterm). С 05.11 это снимок зеркала экрана (screen-mirror.js), и
+      // get отдаёт промис — onFrame обязан его дождаться (см. там).
       return outputBuffer.get(args[0]);
     }
     // owner:claim / owner:get: только сервер знает, ЧЕЙ это сокет. Реестр
@@ -470,8 +471,12 @@ function createNetServer({
       // Перехват — только по SERVER_CHANNELS: всё, что сервер обслуживает сам,
       // идёт мимо гарда реестра. Других обращений к msg.channel здесь нет и
       // быть не должно (страж в test/net-server.test.js).
+      //
+      // await на обеих ветках: serveOwn для net:buffer отдаёт промис снимка
+      // экрана. Без него промис ушёл бы в JSON.stringify и доехал до клиента
+      // как {} — браузер после подключения остался бы без экрана (жалоба 05.11).
       const result = SERVER_CHANNELS.has(msg.channel)
-        ? serveOwn(msg.channel, args, clientId)
+        ? await serveOwn(msg.channel, args, clientId)
         : await registry.call(msg.channel, args, clientId);
       reply({ ok: true, result: result === undefined ? null : result });
     } catch (err) {

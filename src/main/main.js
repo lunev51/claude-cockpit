@@ -18,6 +18,7 @@ const { decidePermission } = require('./permissions');
 const { createAttention } = require('./attention');
 const { createToaster } = require('./toasts');
 const { runSteps } = require('./run-steps');
+const { createHideExplainer } = require('./hide-notice');
 
 const SMOKE = process.argv.includes('--smoke');
 
@@ -39,9 +40,15 @@ let netServer = null;
 // выхода (app.quit() откуда угодно) не упёрся в preventDefault на close.
 let tray = null;
 let quitting = false;
-// Первое скрытие окна объясняем один раз за запуск: без этого пропажа окна из
-// панели задач и Alt+Tab выглядит как «приложение закрылось само».
-let hideExplained = false;
+// Первое скрытие окна объясняем один раз за запуск — любым путём, крестиком
+// тоже: без этого пропажа окна из панели задач и Alt+Tab выглядит как
+// «приложение закрылось само». Раньше обещание держал только уход управления,
+// а крестик молчал (ревью 09.08, C28) — тексты и правило в hide-notice.js.
+// Notification.isSupported() — лениво, в момент скрытия (после app ready).
+const explainHide = createHideExplainer({
+  canNotify: () => Notification.isSupported(),
+  notify: ({ title, body }) => new Notification({ title, body }).show(),
+});
 // Показ окна умеет только замыкание внутри whenReady (ему нужны и win, и
 // ownership), а звать его надо и снаружи — из обработчика second-instance,
 // объявленного здесь, на уровне модуля. Ссылка присваивается там же, где
@@ -208,6 +215,7 @@ function createWindow() {
     if (!quitting) {
       e.preventDefault();
       win.hide();
+      explainHide('close');
     }
   });
 
@@ -445,12 +453,7 @@ app.whenReady().then(() => {
   const hideWindow = guarded('скрытие окна', () => {
     if (win.isDestroyed() || !win.isVisible()) return;
     win.hide();
-    if (hideExplained || !Notification.isSupported()) return;
-    hideExplained = true;
-    new Notification({
-      title: 'Cockpit свёрнут в трей',
-      body: 'Управление ушло на другую машину. Значок в трее вернёт окно.',
-    }).show();
+    explainHide('handoff');
   });
 
   const toggleAutostart = guarded('переключение автозапуска', () => {

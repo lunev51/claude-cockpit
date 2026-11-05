@@ -14,7 +14,7 @@ const {
 } = require('electron');
 const { createCommandRegistry } = require('./command-registry');
 const { createBroadcast } = require('./broadcast');
-const { createOutputBuffer } = require('./output-buffer');
+const { createTabHistory } = require('./screen-mirror');
 const { createNetServer } = require('./net-server');
 const { createOwnership, isShareableSize } = require('./ownership');
 const { listDir, listDrives } = require('./fs-browse');
@@ -607,6 +607,49 @@ function usageBroadcastKey(snap) {
   return `${snap.fetchedAt}|${snap.stale}|${snap.error}`;
 }
 
+// usage:get — вынесен из registerIpc ради теста (test/ipc-usage-get.test.js),
+// registerIpc зовёт ровно его с настоящими зависимостями.
+// spend — доступ к lastCcusageResult: { get(), set(value) }.
+//
+// U1 (живой кокпит 05.11): отвечаем СРАЗУ. Раньше ответ ждал ccusage.get(),
+// а это npx по гигабайтам транскриптов — браузер получил его через >90 с, и
+// всё это время кольца «5Ч»/«НЕДЕЛЯ» стояли в прочерках, хотя лимиты у main
+// были (snapshot() синхронный). И так после каждого переподключения:
+// браузер на обрыве перезагружает страницу и спрашивает заново.
+//
+// Теперь: лимиты — снапшот, расходы — последние известные, а если их ещё
+// нет — кэш (cacheOnly не спавнит и не ждёт чужой прогон, см.
+// usage-ccusage.js). Пересчёт — в фоне, и решает о нём сам ccusage: свежий
+// по TTL кэш он отдаст без npx, а идущий прогон присоединит (single-flight),
+// так что сколько бы клиентов ни спросило — прогон один. Результат уходит
+// всем через usage:update, renderer его уже слушает. В окно старта (инцидент
+// 8 ГБ) фонового пересчёта нет вовсе — его сделает deferredSpendTimer.
+function createUsageGetHandler({
+  smoke, usagePoller, ccusage, broadcast, inBootStorm, spend,
+}) {
+  // «Изменились ли расходы» — тот же приём, что usageBroadcastKey у лимитов.
+  // Без сравнения каждый usage:get рассылал бы всем тот же ответ ещё раз:
+  // клиентов, присоединившихся к одному прогону, несколько, а новость одна.
+  const spendKey = (s) => (s ? `${s.fetchedAt}|${s.ok}|${s.stale}|${s.error}` : '');
+
+  function recountInBackground() {
+    ccusage.get().then((fresh) => {
+      const before = spend.get();
+      spend.set(fresh);
+      if (spendKey(before) === spendKey(fresh)) return;
+      broadcast.emit('usage:update', { limits: usagePoller.snapshot(), spend: fresh });
+    }).catch(() => { /* ccusage.get сам не бросает; ремень на чужие сбои */ });
+  }
+
+  return async function usageGet() {
+    const limits = usagePoller.snapshot();
+    if (smoke) return { limits, spend: null };
+    if (!spend.get()) spend.set(await ccusage.get({ cacheOnly: true }));
+    if (!inBootStorm()) recountInBackground();
+    return { limits, spend: spend.get() };
+  };
+}
+
 // Task 5 carryover фазы 6 (задача 5 фазы 7, п.4 брифа): смоук-гейт git:get/
 // gh:repo/gh:global вынесен в отдельные функции с явными зависимостями.
 // ПРИЧИНА: ipc.js целиком не тестируется — модуль на верхнем уровне зовёт
@@ -1078,7 +1121,8 @@ function sttStatusHandler({ smoke, getStt }) {
   }
 }
 
-// Important 1 (ревью задачи 4): наполнение output-buffer.js на term:data и
+// Important 1 (ревью задачи 4): наполнение истории вкладок (тогда сырой хвост
+// output-buffer.js, с 05.11 — зеркало экрана screen-mirror.js) на term:data и
 // очистка на tabs:close жили ИНЛАЙНОМ прямо внутри onEvent/tabs:close —
 // ревьюер вырезал обе строки и прогнал полный набор: 784 теста, 0 падений.
 // Смысл задачи 4 — не модуль output-buffer.js сам по себе (он покрыт), а
@@ -1418,10 +1462,22 @@ function registerIpc(win, opts = {}) {
   // место, которое обязано звать закрытие, а не значение.
   const broadcast = createBroadcast({ getWindow: () => win });
 
-  // Хвост вывода по вкладкам (output-buffer.js) — то, что отдаётся клиенту
-  // сразу при подключении: сетевой сервер сам xterm не видит, а история живёт
-  // только внутри окна ПК. Наполняется в onEvent менеджера сессий (ниже, там
-  // же, где term:data уходит в broadcast.emit), чистится на tabs:close.
+  // История вкладок — то, что отдаётся клиенту сразу при подключении: сетевой
+  // сервер сам xterm не видит, а история живёт только внутри окна ПК.
+  // Наполняется в onEvent менеджера сессий (ниже, там же, где term:data уходит
+  // в broadcast.emit), чистится на tabs:close.
+  //
+  // Это зеркало экрана (screen-mirror.js), а не сырой хвост вывода (жалоба
+  // 05.11: хвост 256 КБ терял рамки и статус-бар, если полная перерисовка
+  // ConPTY была старше хвоста). Зеркало живёт в сетке pty вкладки — её знает
+  // только менеджер; manager — модульный let, присваивается ниже, но sizeOf
+  // зовётся не раньше первого term:data, то есть уже после. Нет менеджера или
+  // вкладки — null, зеркало не заводится. Пакетов нет (pull без npm install)
+  // — createTabHistory сам откатывается на сырой хвост output-buffer.js.
+  //
+  // Имя outputBuffer оставлено: под ним объект ходит в bufferTermData,
+  // dropTabOutputBuffer и net-server.js, а контракт тот же (push/get/drop),
+  // только get теперь — промис.
   //
   // Объявлен ЗДЕСЬ, рядом с broadcast, и ровно по той же причине (ревью 09.08):
   // замыкание onEvent, которое его зовёт, создаётся на сотни строк выше, чем
@@ -1431,7 +1487,7 @@ function registerIpc(win, opts = {}) {
   // при создании менеджера, ловила бы ReferenceError (TDZ) на старте всего
   // приложения, причём только в проде: registerIpc под node --test не
   // запускается. Зависимостей у конструктора нет, переносить безопасно.
-  const outputBuffer = createOutputBuffer({});
+  const outputBuffer = createTabHistory({ sizeOf: (tabId) => (manager ? manager.size(tabId) : null) });
 
   // Слои usage (Task 3 фазы 5): инстансы создаются ВСЕГДА (конструктор — это
   // просто замыкания над зависимостями, никакого I/O до первого refresh()/get()),
@@ -1579,9 +1635,10 @@ function registerIpc(win, opts = {}) {
     readSessionTitle: (transcriptPath, sessionId) => sessionTitleReader.read(transcriptPath, sessionId),
     onEvent: (channel, payload) => {
       if (smoke && channel === 'term:data') smokeOutput += payload.data;
-      // Задача 4 (буфер вывода): наполняем ТУТ ЖЕ, в том самом месте, где
-      // событие term:data уходит в broadcast.emit ниже, — подключившийся
-      // клиент получает то же самое, что видит окно на ПК, ни байтом меньше.
+      // Задача 4 (история вкладки): наполняем ТУТ ЖЕ, в том самом месте, где
+      // событие term:data уходит в broadcast.emit ниже, — зеркало экрана
+      // видит тот же поток, что окно на ПК, ни байтом меньше, и подключившийся
+      // клиент получает тот же экран.
       // bufferTermData вынесена выше (Important 1 ревью) ради собственного
       // юнит-теста — эта строка зовёт РОВНО её, не копию.
       bufferTermData({ channel, payload, outputBuffer });
@@ -1866,21 +1923,22 @@ function registerIpc(win, opts = {}) {
   registry.handle('night:get', () => nightGetHandler({ smoke, nightWatch }));
 
   // Task 3 фазы 5 (кольца лимитов): usagePoller.snapshot() — синхронный, без
-  // сети. ccusage.get() — лениво: первый usage:get и есть тот самый «первый
-  // запуск», дальше TTL-кэш внутри usage-ccusage.js сам не даёт бить по npx
-  // чаще ttlMs (проводить свой отдельный троттлинг здесь не нужно — это уже
-  // сделано в модуле). smoke: НИ сети, НИ npx — spend всегда null, ccusage.get()
-  // не зовётся вовсе.
-  registry.handle('usage:get', async () => {
-    const limits = usagePoller.snapshot();
-    if (smoke) return { limits, spend: null };
+  // сети. Расходы ответ НЕ ждёт (U1, 05.11): пересчёт идёт в фоне и приходит
+  // через usage:update, а TTL и single-flight — внутри usage-ccusage.js (свой
+  // троттлинг здесь не нужен). Подробности — у createUsageGetHandler.
+  // smoke: НИ сети, НИ npx — spend всегда null, ccusage.get() не зовётся вовсе.
+  const usageGet = createUsageGetHandler({
+    smoke,
+    usagePoller,
+    ccusage,
+    broadcast,
     // Инцидент 8ГБ (01.08): первые 90с после старта — шторм спавна сессий
     // restore; npx-прогоны ccusage по транскриптам в это окно складывались с
     // ним и вгоняли машину в своп намертво. cacheOnly до истечения окна.
-    const bootStorm = Date.now() - ipcBootAt < CCUSAGE_BOOT_DEFER_MS;
-    lastCcusageResult = await ccusage.get({ force: false, cacheOnly: bootStorm });
-    return { limits, spend: lastCcusageResult };
+    inBootStorm: () => Date.now() - ipcBootAt < CCUSAGE_BOOT_DEFER_MS,
+    spend: { get: () => lastCcusageResult, set: (v) => { lastCcusageResult = v; } },
   });
+  registry.handle('usage:get', () => usageGet());
 
   // Принудительное обновление ОБОИХ слоёв (кнопка/клик по кольцам, дашборд
   // Task 4). smoke — тот же гейт, что и usage:get.
@@ -1973,7 +2031,10 @@ function registerIpc(win, opts = {}) {
   // вкладка сразу встала в правильную секцию, а не ждала следующего хука.
   registry.handle('tabs:list', () => manager.list());
 
-  // История вывода вкладки — хвост из output-buffer.js (задача 4). C2
+  // История вывода вкладки (задача 4) — с 05.11 снимок зеркала экрана
+  // (screen-mirror.js), а не сырой хвост: см. комментарий у объявления
+  // outputBuffer. get отдаёт промис (снимок снимается после разбора всего
+  // принятого), ipcMain.handle его дожидается сам. C2
   // финального ревью: канал существовал ТОЛЬКО внутри net-server.js, в форме
   // window.api его не было вовсе, и ни app.js, ни terminal.js его не звали —
   // то есть пункт спеки «подключившийся клиент видит, на чём остановилась
@@ -1986,7 +2047,7 @@ function registerIpc(win, opts = {}) {
   // работают, а xterm в окне только что создан с нуля. Оба читают ОДИН И ТОТ
   // ЖЕ экземпляр outputBuffer, разойтись им нечем.
   //
-  // Пустой хвост (вкладка только создана, вывода ещё не было) — нормальный
+  // Пустая история (вкладка только создана, вывода ещё не было) — нормальный
   // ответ, а не ошибка: отдаём пустую строку.
   registry.handle('net:buffer', (tabId) => (typeof tabId === 'string' ? outputBuffer.get(tabId) : ''));
 
@@ -2073,9 +2134,11 @@ function registerIpc(win, opts = {}) {
     // смены (lastStatusByTab) больше никому не нужна и не должна копиться в
     // памяти навсегда, тот же приём, что toaster.forget()/ghost-файл выше.
     lastStatusByTab.delete(tabId);
-    // Задача 4 (буфер вывода): без drop() буфер закрытой вкладки копится в
-    // памяти до перезапуска кокпита — тот же приём, что toaster.forget()/
-    // lastStatusByTab.delete() выше, только для output-buffer.js.
+    // Задача 4 (история вкладки): без drop() зеркало закрытой вкладки (целый
+    // headless-терминал с прокруткой) живёт в памяти до перезапуска кокпита —
+    // тот же приём, что toaster.forget()/lastStatusByTab.delete() выше.
+    // Хвост убитого pty, долетевший после этой строки, зеркало не воскресит:
+    // manager.close() выше уже убрал вкладку, sizeOf отдаёт null.
     // dropTabOutputBuffer вынесена выше (Important 1 ревью) ради собственного
     // юнит-теста — эта строка зовёт РОВНО её, не копию.
     dropTabOutputBuffer({ tabId, outputBuffer });
@@ -2536,6 +2599,8 @@ module.exports = {
   // Task 2 фазы 8 («Ночная смена»): та же причина — см. комментарий у их
   // определения выше.
   nightToggleHandler, nightGetHandler,
+  // U1 (05.11): usage:get отвечает сразу — см. test/ipc-usage-get.test.js.
+  createUsageGetHandler,
   // Important 2 (ревью фикс-раунд 1, Task 2 фазы 8): чистая функция без
   // Electron — экспортирована ради собственного юнит-теста (см. комментарий
   // у определения выше).

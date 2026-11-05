@@ -150,12 +150,23 @@ function newFilesWord(n) {
   return 'новых';
 }
 
+// Ревью 09.08 (C8): ключ того, что панель нарисует из снимка. Без fetchedAt —
+// main ставит его заново на каждый git:get после TTL кэша (3 с), даже когда
+// дифф тот же, а панель его не показывает (undefined JSON.stringify
+// пропускает). Ссылки не годятся: по IPC каждый ответ — новый объект.
+function snapshotKey(snap) {
+  if (!snap) return 'null';
+  return JSON.stringify({ ...snap, fetchedAt: undefined });
+}
+
 export function createDiffPanel({ root, api }) {
   let isOpenFlag = false;
   let activeTabId = null;
   let requestSeq = 0; // гард гонки: устаревший ответ (вкладка сменилась, пока летел IPC) не должен перетереть свежий
   let debounceTimer = null;
   let fileAnchors = new Map(); // path → DOM-элемент строки "diff --git" в тексте диффа (для скролла по клику)
+  let renderedKey = null; // snapshotKey() того, что сейчас нарисовано; null — нарисовано мимо снимков
+  let tabChanged = false; // вкладка сменилась, а её дифф ещё не показан — показать с начала (см. show)
 
   // --- DOM: строится один раз, дальше только точечно обновляется ---
 
@@ -340,11 +351,46 @@ export function createDiffPanel({ root, api }) {
     renderTruncatedNote(truncatedLinesEl, lineCount, hiddenLines, 'строк диффа');
   }
 
+  // Ревью 09.08 (C8): git:changed приходит каждые пару секунд, пока Claude
+  // работает, а render() сносит и строит до ~2200 узлов — выделение в диффе
+  // пропадало, строка файла теряла фокус. Главное здесь: тот же дифф — DOM не
+  // трогаем вовсе, и узлы, фокус и выделение остаются.
+  //
+  // Прокрутку при настоящей пересборке Chromium сам не сбрасывает: раскладка
+  // ленивая, а между очисткой и новой сборкой размеры никто не читает (ревью
+  // ветки проверило прежний код в headless Chrome — прокрутка цела). Явное
+  // сохранение ниже — страховка: если в render() появится чтение размеров
+  // посреди сборки, браузер поджал бы прокрутку к пустой панели. Если дифф
+  // стал короче, браузер сам поджимает её к концу.
+  //
+  // Ревью ветки (M2): первый показ после смены вкладки — с начала, даже если
+  // дифф тот же (вторая вкладка того же проекта): место, где человек
+  // остановился в прошлой вкладке, к этой не относится.
+  function show(snap) {
+    if (!isOpenFlag) return;
+    const fromTop = tabChanged;
+    tabChanged = false;
+    const filesTop = fromTop ? 0 : filesEl.scrollTop;
+    const bodyTop = fromTop ? 0 : bodyEl.scrollTop;
+    const bodyLeft = fromTop ? 0 : bodyEl.scrollLeft;
+    const key = snapshotKey(snap);
+    if (key !== renderedKey) {
+      renderedKey = key;
+      render(snap);
+    }
+    filesEl.scrollTop = filesTop;
+    bodyEl.scrollTop = bodyTop;
+    bodyEl.scrollLeft = bodyLeft;
+  }
+
   // --- IPC + обновление ---
 
   async function refresh({ force = false } = {}) {
     if (!activeTabId) {
-      if (isOpenFlag) showEmpty('нет активной вкладки');
+      if (isOpenFlag) {
+        renderedKey = null; // нарисовано мимо снимков — следующий снимок рисуем, даже если он прежний
+        showEmpty('нет активной вкладки');
+      }
       return;
     }
     const seq = ++requestSeq;
@@ -356,7 +402,7 @@ export function createDiffPanel({ root, api }) {
       snap = null;
     }
     if (seq !== requestSeq) return; // вкладка сменилась/панель закрылась, пока летел запрос — ответ устарел
-    render(snap);
+    show(snap);
   }
 
   function scheduleGitChangedRefresh() {
@@ -398,6 +444,7 @@ export function createDiffPanel({ root, api }) {
   // последней вкладки) — обновляет содержимое, только если панель открыта;
   // если закрыта, просто запоминает activeTabId на будущее открытие.
   function setActiveTab(tabId) {
+    if (tabId !== activeTabId) tabChanged = true;
     activeTabId = tabId;
     if (isOpenFlag) refresh({ force: false });
   }
