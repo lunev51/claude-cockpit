@@ -180,17 +180,27 @@ function makeRepo() {
   let clock = Date.UTC(2026, 10, 5, 12, 0, 0);
   const info = createGitInfo({ run, now: () => (clock += 5000), cache: new Map() });
   const fetched = [];
-  const api = {
+  const repo = { state, fetched, hold: null };
+  repo.api = {
     git: {
       async get(tabId, opts) {
         // IPC отдаёт копию: ссылка на прошлый ответ никогда не совпадает.
         const snap = structuredClone(await info.get(`C:\\proj\\${tabId}`, opts));
+        // hold — ответ «ещё в пути»: тест сам решает, когда он долетит.
+        if (repo.hold) await repo.hold;
         fetched.push(snap.fetchedAt);
         return snap;
       },
     },
   };
-  return { state, api, fetched };
+  return repo;
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((r) => { resolve = r; });
+  promise.resolve = resolve;
+  return promise;
 }
 
 const flush = () => new Promise((resolve) => { setImmediate(resolve); });
@@ -203,6 +213,7 @@ async function setup(t) {
   const repo = makeRepo();
   const root = dom.el('div');
   const panel = createDiffPanel({ root, api: repo.api });
+  repo.panel = panel;
   panel.setActiveTab('t1');
   panel.open();
   await flush();
@@ -231,7 +242,7 @@ async function setup(t) {
     t.mock.timers.tick(1500);
     await flush();
   }
-  return { ...repo, ...ui, panel, gitChanged };
+  return { ...ui, repo, ...repo, gitChanged };
 }
 
 test('тот же дифф второй раз: DOM не перестраивается, прокрутка на месте', async (t) => {
@@ -288,4 +299,28 @@ test('после «нет активной вкладки» тот же дифф
   panel.setActiveTab('t1');
   await flush();
   assert.strictEqual(text.children.length, 120, 'вернулись к вкладке с тем же диффом — а панель пустая');
+});
+
+test('закрыли панель, пока летел git:get, дифф изменился — при открытии новый дифф', async (t) => {
+  // Ответ долетает в закрытую панель: рисовать некуда, и запоминать его как
+  // «нарисованный» нельзя — иначе при открытии тот же снимок совпадёт со
+  // сверкой и на экране останется прежний дифф.
+  const { repo, panel, state, text, gitChanged } = await setup(t);
+
+  state.edited = 5;
+  repo.hold = deferred();
+  await gitChanged(); // запрос ушёл, ответ в пути
+  panel.close(); // Ctrl+G
+  const hold = repo.hold;
+  repo.hold = null;
+  hold.resolve();
+  await flush();
+
+  panel.open();
+  await flush();
+
+  assert.ok(
+    text.children.some((n) => n.textContent === '+  // вторая правка, уже после первого чтения'),
+    'открыли панель после изменения диффа — а на экране прежний',
+  );
 });
