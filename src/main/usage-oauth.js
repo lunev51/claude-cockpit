@@ -88,6 +88,11 @@ function isGoodCacheShape(c) {
 // кэше 05.11 два опроса подряд дали 16:09:59.855 и 16:10:00.086 — это один
 // срок, а настоящая смена окна сдвигает его на часы. Отсюда допуск.
 const RESETS_AT_JITTER_MS = 5000;
+// fetchedAt в кэше — то, что дашборд после перезапуска без сети покажет как
+// «обновлено в HH:MM». Без дозаписи при тех же цифрах он отставал бы на часы
+// (ре-ревью: 181 мин на экране при реальной давности в 1 мин). Раз в 30 минут
+// — не больше 48 записей в сутки вместо ~480.
+const CACHE_MAX_AGE_MS = 30 * 60 * 1000;
 
 // null при вычитании даёт 0: null с null совпадает, null со сроком — нет.
 function samePart(a, b) {
@@ -114,6 +119,7 @@ function createUsagePoller({
   let haveGood = false; // получали ли реальные данные — живьём в эту сессию или из кэша
   let lastGood = null; // { fiveHour, sevenDay, scoped, fetchedAt }
   let persisted = null; // данные последней удачной записи кэша — см. sameUsageData
+  let persistedAt = 0; // fetchedAt последней удачной записи — см. CACHE_MAX_AGE_MS
   let currentIntervalMs = intervalMs; // рабочий интервал автопоследовательности (растёт при 401/429)
   let nextAllowedAt = 0; // now() раньше которого refresh() не бьёт по сети (жёсткий гейт 429)
   let started = false;
@@ -138,13 +144,14 @@ function createUsagePoller({
     };
     // Снапшот в памяти (и его fetchedAt, по которому ночная смена судит о
     // свежести) обновлён выше всегда; пропускается только запись на диск.
-    if (sameUsageData(parsed, persisted)) return;
+    if (sameUsageData(parsed, persisted) && fetchedAt - persistedAt < CACHE_MAX_AGE_MS) return;
     try {
       // Отметку ставим только по true: настоящий кэш (ipc.js/createJsonFileCache)
       // ошибку диска глотает сам, и проваленная запись иначе считалась бы
       // сделанной — кэш на диске остался бы старым до смены цифр.
       if (cache.write(lastGood) === true) {
         persisted = parsed;
+        persistedAt = fetchedAt;
       }
     } catch (err) {
       safeLog(`[usage-oauth] cache.write упал: ${err.message}`);

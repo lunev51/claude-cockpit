@@ -454,6 +454,26 @@ test('C20: проваленная запись (диск занят, ошибк�
   assert.strictEqual(attempts.length, 2, 'после удачной записи — снова без записи');
 });
 
+test('C20: те же цифры дописываются раз в 30 минут — fetchedAt на диске не стареет на часы', async () => {
+  const cache = recordingCache();
+  const { poller, ctl } = scriptedPoller(cache);
+  const start = ctl.time;
+  await poller.refresh();
+
+  ctl.time = start + 30 * 60 * 1000 - 1;
+  await poller.refresh();
+  assert.strictEqual(cache.writes.length, 1, 'раньше 30 минут переписывать незачем');
+
+  ctl.time = start + 30 * 60 * 1000;
+  await poller.refresh();
+  assert.strictEqual(cache.writes.length, 2, 'прошло 30 минут — кэш дописан');
+  assert.strictEqual(cache.writes[1].fetchedAt, ctl.time);
+
+  ctl.time += 180000;
+  await poller.refresh();
+  assert.strictEqual(cache.writes.length, 2, 'отсчёт 30 минут — от последней записи');
+});
+
 test('C20: каждая настоящая смена данных записывается', async () => {
   const cache = recordingCache();
   const { poller, ctl } = scriptedPoller(cache);
