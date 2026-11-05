@@ -165,11 +165,17 @@ test('Ctrl+«+» и Ctrl+«−»: в шпаргалке есть, и шрифт 
   let r = t.key({ ctrlKey: true, key: '=', code: 'Equal' });
   assert.strictEqual(r.ret, false, 'Ctrl+«+» ушёл бы в pty');
   assert.strictEqual(t.fontSize(), FONT + 1, 'Ctrl+«+» не увеличил шрифт');
+  // M1 ревью ветки: false от обработчика xterm событие не гасит (_keyDown,
+  // xterm 6), и Chrome в браузере на ПК вместе со шрифтом масштабировал всю
+  // страницу. Тот же preventDefault, что у Ctrl+колеса.
+  assert.ok(r.ev.defaultPrevented, 'Ctrl+«+» не погасил зум страницы в браузере');
   r = t.key({ ctrlKey: true, key: '+', code: 'NumpadAdd' });
   assert.strictEqual(t.fontSize(), FONT + 2, 'Ctrl+«+» на цифровом блоке не увеличил шрифт');
+  assert.ok(r.ev.defaultPrevented, 'Ctrl+«+» на цифровом блоке не погасил зум страницы');
   r = t.key({ ctrlKey: true, key: '-', code: 'Minus' });
   assert.strictEqual(r.ret, false, 'Ctrl+«−» ушёл бы в pty');
   assert.strictEqual(t.fontSize(), FONT + 1, 'Ctrl+«−» не уменьшил шрифт');
+  assert.ok(r.ev.defaultPrevented, 'Ctrl+«−» не погасил зум страницы в браузере');
   t.view.dispose();
 });
 
@@ -183,6 +189,7 @@ test('Ctrl+0: в шпаргалке есть, и шрифт возвращает
   const r = t.key({ ctrlKey: true, key: '0', code: 'Digit0' });
   assert.strictEqual(r.ret, false, 'Ctrl+0 ушёл бы в pty');
   assert.strictEqual(t.fontSize(), FONT, 'Ctrl+0 не вернул шрифт к размеру из конфига');
+  assert.ok(r.ev.defaultPrevented, 'Ctrl+0 не погасил сброс зума страницы в браузере');
   t.view.dispose();
 });
 
