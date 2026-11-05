@@ -752,6 +752,19 @@ test('не на 80-м порту Host без порта не принимает�
   );
 });
 
+test('Origin https:// отклоняется и на 80-м, и с портом — сервер без TLS (C5, ре-ревью)', () => {
+  // new URL('https://имя').host — это 'имя', ровно как Host на 80-м; с
+  // портом строки тоже совпадают. Отсекает ТОЛЬКО проверка схемы: страница
+  // по https не может быть нашей — TLS этот сервер не поднимает.
+  const name = 'cockpit-desktop.tailXXXX.ts.net';
+  const at80 = buildHostAllowlist(80, { host: '127.0.0.1', allowedHosts: [name] });
+  assert.strictEqual(isAllowedOrigin(`https://${name}`, name, at80), false, 'https-Origin на 80-м принят');
+  const at48300 = buildHostAllowlist(48300, { host: '127.0.0.1', allowedHosts: [name] });
+  assert.strictEqual(
+    isAllowedOrigin(`https://${name}:48300`, `${name}:48300`, at48300), false, 'https-Origin с портом принят',
+  );
+});
+
 // --- Мелочи: протокол отвечает ошибкой, а не тишиной ----------------------
 
 test('кадр с id, но без валидного channel — получает ok:false, а не тишину', async () => {
