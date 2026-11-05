@@ -55,15 +55,23 @@ function createToaster({
     showNotification({ title, body, onClick: () => focusTab(tabId) });
   }
 
+  // taskNotification — ход начал сам CLI с уведомлением о конце фоновой
+  // задачи (sessions.js, UserPromptSubmit), а не человек новым промптом.
   function onStatus({
-    tabId, tabName, status, waitingText,
+    tabId, tabName, status, waitingText, taskNotification,
   }) {
     const prevStatus = lastStatus.get(tabId);
 
     if (status === 'working') {
       // Переход в working только если ДО этого статус не был working —
       // иначе это просто очередной PreToolUse того же хода, отметку не трогаем.
-      if (prevStatus !== 'working') workingSince.set(tabId, now());
+      // Из «фона» по уведомлению о его конце — тоже не новое начало: такой ход
+      // короткий, и порог 30с, мерь его отсюда, проглотил бы тот самый
+      // «готово» (флешка записана), которого ждут. Новый же промпт человека
+      // из «фона» — новый ход: иначе ответ за 2с после трёх часов dev-сервера
+      // дал бы тост «готово» (ревью 05.11, S2).
+      const continuesBackground = prevStatus === 'background' && taskNotification === true;
+      if (prevStatus !== 'working' && !continuesBackground) workingSince.set(tabId, now());
       lastStatus.set(tabId, status);
       return;
     }
@@ -71,6 +79,7 @@ function createToaster({
     lastStatus.set(tabId, status);
 
     // stuck и любые прочие статусы — тишина по контракту (working обработан выше).
+    // «Фон» тоже: результата ещё нет, вкладка в «Работают».
     if (status !== 'waiting' && status !== 'done' && status !== 'dead') return;
 
     if (status === 'dead') {

@@ -261,6 +261,56 @@ test('forget(tabId) сбрасывает и lastStatus — working после fo
   assert.strictEqual(h.notifications.length, 0);
 });
 
+// Статус «фон» (план 2026-11-05): ход окончен, фоновая задача жива — вкладка
+// в «Работают». «Готово» звать рано: результата, ради которого всё затевалось
+// (записанная флешка), ещё нет.
+test('фон: background — тишина, тоста «готово» нет', () => {
+  const h = makeToaster();
+  h.setClock(0);
+  h.toaster.onStatus({
+    tabId: 't1', tabName: 'proj', status: 'working', waitingText: '',
+  });
+  h.setClock(60000);
+  h.toaster.onStatus({
+    tabId: 't1', tabName: 'proj', status: 'background', waitingText: '',
+  });
+  assert.strictEqual(h.notifications.length, 0);
+});
+
+test('фон: короткий ход после уведомления о конце фона даёт «готово» — время считается с начала всей работы', () => {
+  // Запись флешки: ход 20с → фон 10 минут → уведомление запускает ход на
+  // 15с → Stop. Мерить от начала последнего хода — 15с, ниже порога, и
+  // человек не узнал бы, что флешка готова. Фон — продолжение работы.
+  const h = makeToaster();
+  h.setClock(0);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
+  h.setClock(20000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '' });
+  h.setClock(620000);
+  h.toaster.onStatus({
+    tabId: 't1', tabName: 'proj', status: 'working', waitingText: '', taskNotification: true,
+  });
+  h.setClock(635000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'done', waitingText: '' });
+  assert.strictEqual(h.notifications.length, 1);
+  assert.strictEqual(h.notifications[0].title, 'proj: готово');
+});
+
+test('фон: НОВЫЙ промпт человека из «фона» — новый ход, порог 30с меряется от него (сценарий S2 ревью)', () => {
+  // Три часа живого dev-сервера, потом короткий вопрос с ответом за 2с —
+  // тост «готово» с длительностью «3 часа» был бы враньём.
+  const h = makeToaster();
+  h.setClock(0);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
+  h.setClock(20000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'background', waitingText: '' });
+  h.setClock(3 * 3600 * 1000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'working', waitingText: '' });
+  h.setClock(3 * 3600 * 1000 + 2000);
+  h.toaster.onStatus({ tabId: 't1', tabName: 'proj', status: 'done', waitingText: '' });
+  assert.strictEqual(h.notifications.length, 0);
+});
+
 test('неизвестный статус не показывает тост и не падает', () => {
   const h = makeToaster();
   assert.doesNotThrow(() => {

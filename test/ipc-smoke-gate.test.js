@@ -503,6 +503,21 @@ test('shouldDetectLimitStop: payload отсутствует вовсе → false
   assert.strictEqual(shouldDetectLimitStop('working', undefined), false);
 });
 
+// Статус «фон» (план 2026-11-05): Stop при живой фоновой задаче даёт
+// 'background', а не 'done'. Это тоже конец хода — и остановка по лимиту
+// вкладки с вечным dev-сервером иначе не детектилась бы никогда.
+test('shouldDetectLimitStop: working → background (ход встал, фон жив), genProven=true → true', () => {
+  assert.strictEqual(shouldDetectLimitStop('working', { status: 'background', genProven: true }), true);
+  assert.strictEqual(shouldDetectLimitStop('stuck', { status: 'background', genProven: true }), true);
+});
+
+test('shouldDetectLimitStop: background без доказанного поколения или не из работы → false', () => {
+  assert.strictEqual(shouldDetectLimitStop('working', { status: 'background', genProven: false }), false);
+  assert.strictEqual(shouldDetectLimitStop('working', { status: 'background' }), false);
+  assert.strictEqual(shouldDetectLimitStop('background', { status: 'background', genProven: true }), false);
+  assert.strictEqual(shouldDetectLimitStop('background', { status: 'done', genProven: true }), false);
+});
+
 // ------------------------------------------------------------- resumableTabStatus --
 // C1 (Critical, ревью финальной волны): idle_prompt vs permission_prompt.
 
