@@ -731,6 +731,9 @@ async function historySearchHandler({
 // UI (search.js) им не пользуется напрямую (полагается на встроенный
 // ленивый пересбор внутри historySearchHandler выше), задел на будущую
 // кнопку «Обновить индекс». Вынесена по той же причине, что historySearchHandler.
+// Отдаёт только счётчик (ревью 09.08, C27): раньше уходил весь индекс —
+// первое сообщение и cwd каждой сессии, — в том числе браузеру по сети, хотя
+// кнопке нужен только итог. Поле то же, что в конверте history:search.
 async function historyRefreshHandler({
   smoke, opts, state, historyIndex, now = Date.now,
 }) {
@@ -739,7 +742,7 @@ async function historyRefreshHandler({
   const entries = await historyIndex.refresh({ force });
   state.builtAt = now();
   state.size = entries.length;
-  return entries;
+  return { indexSize: state.size };
 }
 
 // Дыра тестов №1 (ревью финальной волны фазы 7): recipes:* добавлены в ЭТОЙ

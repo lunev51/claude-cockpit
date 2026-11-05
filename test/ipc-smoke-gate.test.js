@@ -248,19 +248,28 @@ test('historyRefreshHandler: smoke:true → null, historyIndex.refresh НИКО�
   assert.strictEqual(res, null);
 });
 
-test('historyRefreshHandler: smoke:false → зовёт historyIndex.refresh({force}), обновляет state.builtAt/size, отдаёт entries', async () => {
+// C27 (ревью 09.08): канал отдавал наружу ВЕСЬ индекс (первые сообщения и cwd
+// каждой сессии) — в том числе браузеру по сети, — хотя вызывающему нужен
+// только итог. Отдаёт счётчик в том же поле, что и конверт history:search.
+test('historyRefreshHandler: smoke:false → зовёт historyIndex.refresh({force}), обновляет state.builtAt/size, отдаёт только счётчик', async () => {
   const state = createHistoryIndexState();
   const calls = [];
   const historyIndex = {
-    refresh: async (opts) => { calls.push(opts); return [{ a: 1 }]; },
+    refresh: async (opts) => {
+      calls.push(opts);
+      return [
+        { sessionId: 's1', cwd: 'C:\\proj', firstUserText: 'первый вопрос' },
+        { sessionId: 's2', cwd: 'C:\\proj', firstUserText: 'второй вопрос' },
+      ];
+    },
   };
   const res = await historyRefreshHandler({
     smoke: false, opts: { force: true }, state, historyIndex, now: () => 4242,
   });
-  assert.deepStrictEqual(res, [{ a: 1 }]);
+  assert.deepStrictEqual(res, { indexSize: 2 });
   assert.deepStrictEqual(calls, [{ force: true }]);
   assert.strictEqual(state.builtAt, 4242);
-  assert.strictEqual(state.size, 1);
+  assert.strictEqual(state.size, 2);
 });
 
 // ------------------------------------------------------------ recipes:* handlers --
