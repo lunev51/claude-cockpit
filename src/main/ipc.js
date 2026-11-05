@@ -16,7 +16,7 @@ const { createCommandRegistry } = require('./command-registry');
 const { createBroadcast } = require('./broadcast');
 const { createOutputBuffer } = require('./output-buffer');
 const { createNetServer } = require('./net-server');
-const { createOwnership } = require('./ownership');
+const { createOwnership, isShareableSize } = require('./ownership');
 const { listDir, listDrives } = require('./fs-browse');
 const { isWriteChannel } = require('./write-channels');
 const { getConfig, setConfig } = require('./config');
@@ -1074,9 +1074,79 @@ function dropTabOutputBuffer({ tabId, outputBuffer }) {
 // Живой замер (09.08): фоновая вкладка после возврата руля оставалась в
 // размере ушедшего клиента (140 колонок при окне на 105), чинилась только
 // переключением на неё — ResizeObserver в terminal.js слал term:resize сам.
+//
+// Раздаётся только размер не уже порога (isShareableSize, MIN_SHARED_GRID в
+// ownership.js): узкий размер видимой вкладки перерисовал бы все сессии в
+// 14 колонок (ре-ревью). Узкое сюда приходить и не должно (ownership его не
+// запоминает, termResizeHandler шлёт его только своей вкладке), но раздача
+// всем — одна точка, и правило держится здесь, а не у каждого вызывающего.
 function applyHandoffSize({ manager, size }) {
-  if (!size || !(size.cols > 0) || !(size.rows > 0)) return;
+  if (!isShareableSize(size)) return;
   for (const tab of manager.list()) manager.resize(tab.tabId, size.cols, size.rows);
+}
+
+// Размер, в котором поднять процесс вкладки. Renderer шлёт размер ТОЛЬКО
+// подогнанного терминала (terminal.js/measure), а вкладка создаётся в скрытом
+// контейнере — значит на старте размера у неё обычно нет, и это норма, а не
+// повод молча не поднимать процесс (как было: невалидный размер = выход).
+// Раньше «размер» тут был умолчанием xterm 80×24, и запись кадров на стенде
+// 05.11 показала, как он расползался по сессиям.
+//
+// Порядок: свой валидный размер → размер владельца (под него сейчас стоят все
+// pty, см. termResizeHandler) → 80×24, если не знаем никакого. Первый же
+// видимый fit уточнит размер ресайзом.
+function resolveStartSize(cols, rows, ownerSize) {
+  if (validDim(cols) && validDim(rows)) return { cols, rows };
+  if (ownerSize && validDim(ownerSize.cols) && validDim(ownerSize.rows)) {
+    return { cols: ownerSize.cols, rows: ownerSize.rows };
+  }
+  return { cols: 80, rows: 24 };
+}
+
+// term:start. Вынесен из registerIpc ради теста (тот же приём, что у
+// bufferTermData): без него «старт без размера» проверить было бы нечем.
+// tabId обязателен по-прежнему — без него поднимать нечего.
+function termStartHandler({ manager, ownership, payload }) {
+  // Payload может прийти не объектом (null и т.п.) — деструктуризация упала
+  // бы через uncaughtException прямо в app.exit(1). Отсекаем заранее.
+  if (!payload || typeof payload !== 'object') return;
+  const { tabId, cols, rows } = payload;
+  if (typeof tabId !== 'string') return;
+  const size = resolveStartSize(cols, rows, ownership.size());
+  manager.start(tabId, size.cols, size.rows);
+}
+
+// term:resize. Сюда доходят ТОЛЬКО ресайзы владельца: канал пишущий, чужие
+// отсеял гард эстафеты.
+//
+// Размер применяется ко ВСЕМ живым вкладкам, а не к одной: все вкладки
+// рисуются в одну и ту же область окна, а скрытые свой размер больше не
+// сообщают вовсе (у неподогнанного терминала его нет — terminal.js/measure).
+// Без этого фоновая вкладка оставалась бы в размере, с которым её подняли,
+// до первого переключения на неё. Цена принята сознательно: вкладка с другим
+// размером шрифта (Ctrl+колесо) живёт в сетке видимой, пока её не покажут, —
+// тогда она сама сообщит свою, и подгонятся все.
+//
+// Затем размер запоминается за владельцем. Живая жалоба 05.08: «при возврате
+// на ПК размер ломается, приходится дёргать окно» — владение знало размер
+// лишь с момента захвата, и возврат ставил pty в размер загрузки страницы.
+//
+// Узкий размер (уже MIN_SHARED_GRID: ре-ревью поймало 14×27 в браузере ~720px
+// с диф-панелью) — только своей вкладке и без запоминания: раздача всем
+// перерисовала бы все сессии в 14 колонок, а renderer тем же порогом не
+// раздаёт такую сетку скрытым xterm (grid-share.js) — их pty и xterm остаются
+// в последней общей сетке.
+function termResizeHandler({ manager, ownership, payload }) {
+  if (!payload || typeof payload !== 'object') return;
+  const { tabId, cols, rows } = payload;
+  if (typeof tabId !== 'string') return;
+  if (!validDim(cols) || !validDim(rows)) return;
+  if (!isShareableSize({ cols, rows })) {
+    manager.resize(tabId, cols, rows);
+    return;
+  }
+  applyHandoffSize({ manager, size: { cols, rows } });
+  ownership.noteSize({ cols, rows });
 }
 
 // Вся проводка эстафеты одним куском: владение + гард записи. Вынесена из
@@ -2230,14 +2300,9 @@ function registerIpc(win, opts = {}) {
     }
   });
 
+  // Без размера (скрытая вкладка) — размер владельца, см. resolveStartSize.
   registry.on('term:start', (payload) => {
-    // Payload может прийти не объектом (null и т.п.) — деструктуризация упала
-    // бы через uncaughtException прямо в app.exit(1). Отсекаем заранее.
-    if (!payload || typeof payload !== 'object') return;
-    const { tabId, cols, rows } = payload;
-    if (typeof tabId !== 'string') return;
-    if (!validDim(cols) || !validDim(rows)) return;
-    manager.start(tabId, cols, rows);
+    termStartHandler({ manager, ownership, payload });
   });
 
   registry.on('term:restart', (payload) => {
@@ -2263,19 +2328,10 @@ function registerIpc(win, opts = {}) {
     if (nightWatch && hasRealUserInput(data)) nightWatch.onUserInput(tabId);
   });
 
+  // Размер владельца — всем живым вкладкам и в память владения; почему всем —
+  // у termResizeHandler.
   registry.on('term:resize', (payload) => {
-    if (!payload || typeof payload !== 'object') return;
-    const { tabId, cols, rows } = payload;
-    if (typeof tabId !== 'string') return;
-    if (!validDim(cols) || !validDim(rows)) return;
-    manager.resize(tabId, cols, rows);
-    // Запоминаем размер за текущим владельцем: сюда доходят ТОЛЬКО его
-    // ресайзы (term:resize — пишущий канал, чужие отсеял гард эстафеты), а
-    // без этого владение знало размер лишь с момента захвата. Живая жалоба:
-    // «при возврате на ПК размер ломается, приходится дёргать окно» — возврат
-    // ставил pty в размер, снятый при загрузке страницы, и Claude Code
-    // перерисовывался под чужую ширину.
-    ownership.noteSize({ cols, rows });
+    termResizeHandler({ manager, ownership, payload });
   });
 
   // Task 1 фазы 7 (очередь промптов): fire-and-forget, тот же приём, что
@@ -2415,6 +2471,9 @@ module.exports = {
   // экспортируется не для чужого кода, а чтобы её вообще можно было проверить:
   // непокрытой она бесследно исчезала под мутациями.
   applyHandoffSize, createHandoffWiring,
+  // План «размер терминала» (A3): старт без размера и размер владельца всем
+  // вкладкам — см. test/ipc-handoff-wiring.test.js.
+  resolveStartSize, termStartHandler, termResizeHandler,
   historySearchHandler, historyRefreshHandler, createHistoryIndexState, HISTORY_INDEX_TTL_MS,
   recipesListHandler, recipesSavePromptHandler, recipesDeletePromptHandler,
   recipesListWorkspacesHandler, recipesSaveWorkspaceHandler, recipesDeleteWorkspaceHandler,

@@ -415,8 +415,22 @@ body.no-control #btn-new-tab,
 body.no-control .tab-close,
 body.no-control .tab-connect,
 body.no-control .tab-peek { opacity: 0.4; }
-/* Контейнеры терминалов вкладок (Task 4 создаёт .term-view на вкладку) */
-.term-view { position: absolute; inset: 0; padding: 4px 0 0 8px; }
+/* Контейнеры терминалов вкладок (Task 4 создаёт .term-view на вкладку).
+
+   box-sizing: content-box — ради FitAddon, не ради раскладки. Он берёт
+   высоту и ширину контейнера из getComputedStyle(parent).height/width, а при
+   глобальном border-box это рамочный размер ВМЕСТЕ с отступом: строк и
+   колонок выходило на 4px/8px больше, чем влезает, и нижняя строка (статус-бар
+   Claude Code) уезжала под край. Отступ самого .xterm FitAddon вычитает, а
+   отступ родителя — нет.
+
+   Раскладка от этого не меняется вовсе: ширина и высота здесь auto, блок
+   растянут inset'ами, и его рамка совпадает с #terminal-host в обоих режимах;
+   меняется только то, что отвечает getComputedStyle (контентный размер, то
+   есть область минус отступ). Перенос отступа на .xterm был бы хуже:
+   .xterm-viewport позиционирован абсолютно по рамке отступа .xterm и залез бы
+   на отступ вместе с полосой прокрутки. */
+.term-view { position: absolute; inset: 0; padding: 4px 0 0 8px; box-sizing: content-box; }
 .term-view.hidden { display: none; }
 
 /* --- Панель диффа (Task 2 фазы 6): 380px справа от терминала, flex:none —

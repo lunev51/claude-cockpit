@@ -24,6 +24,10 @@ import './api-boot.js';
 // читается здесь ровно один раз (takeAutoReloadMark ниже).
 import { linkState, onLinkChange, RELOAD_MARK_KEY } from './api-boot.js';
 import { initTerminal } from './terminal.js';
+// Шрифт терминала ждём до первого терминала — см. boot().
+import { waitForFont, FONT_WAIT_MS } from './term-size.js';
+// Сетка видимой вкладки — скрытым (см. gridShare ниже).
+import { createGridShare } from './grid-share.js';
 import {
   curtainState, selfId, controlBlock, shouldClaimOnLoad,
 } from './handoff-view.js';
@@ -710,14 +714,23 @@ async function openTab(cwd, {
       entry.fontSize = px;
     },
     onRestartRequest: (id) => restartSession(id),
+    onGrid: (size) => gridShare.share(views, tab.tabId, size),
   });
   entry.view = view;
+  // Вкладка создана скрытой — встаёт в общую сетку сразу (см. grid-share.js).
+  gridShare.adopt(view);
 
   tabStore.add(tab);
   refreshConnectBadge(tab.tabId);
   if (activate) activateTab(tab.tabId);
   return tab;
 }
+
+// Общая сетка терминалов: подогнанная сетка видимой вкладки — скрытым, иначе
+// вывод фоновой сессии ложится в чужую сетку (почему — в grid-share.js). До
+// плана «размер терминала» это маскировал сам баг: скрытая вкладка слала pty
+// 80×24, и показ давал настоящий ресайз с перерисовкой.
+const gridShare = createGridShare();
 
 // --- подключение к УЖЕ живым вкладкам (C1/C2 финального ревью ветки) ---
 //
@@ -775,8 +788,12 @@ async function attachTab(t, { activate = false } = {}) {
     // Ctrl+Shift+R внутри терминала — третья дверь к перезапуску; ведём её в
     // ту же функцию, что кнопку ⟳ и палитру.
     onRestartRequest: (id) => restartSession(id),
+    onGrid: (size) => gridShare.share(views, t.tabId, size),
   });
   entry.view = view;
+  // Общая сетка — ДО истории вывода ниже: история печатается как есть, и в
+  // сетке 80×24 она разъехалась бы без перерисовки (см. grid-share.js).
+  gridShare.adopt(view);
 
   tabStore.add(t);
   // Очередь промптов из менеджера (ревью 09.08, B9). Клиент собирает её из
@@ -803,7 +820,17 @@ async function attachTab(t, { activate = false } = {}) {
     tabStore.setStatus(t.tabId, t.status, t.subtitle, t.waitingText, t.waitingKind, t.sessionLabel);
   }
   refreshConnectBadge(t.tabId);
-  if (activate) activateTab(t.tabId);
+  if (activate) {
+    activateTab(t.tabId);
+    // Подогнать сразу, а не через 100 мс дебаунса ResizeObserver: история
+    // ниже должна лечь в настоящую сетку. Заодно сетка уходит в pty и
+    // остальным вкладкам (shareGrid) — следующие подключаемые её получат.
+    try {
+      view.refit();
+    } catch (err) {
+      console.warn('[attach] подгонка показанной вкладки не удалась:', err && err.message);
+    }
+  }
 
   await replayHistory(t.tabId);
   // Мёртвой вкладке говорим об этом ПРЯМО В ТЕРМИНАЛЕ, и только здесь —
@@ -2429,11 +2456,27 @@ function parkFocusOnCurtain() {
 }
 
 // Размер берём у терминала активной вкладки: pty переразмеривается ровно под
-// того, кто за рулём. Вкладок может не быть вовсе (пустой кокпит) — тогда
-// захват всё равно обязан пройти, отсюда запасной размер.
+// того, кто за рулём. Вкладок может не быть вовсе (пустой кокпит, загрузка
+// страницы до первой вкладки) или активная не подогнана (окно свёрнуто) —
+// тогда размера НЕТ, null, и захват уходит без него.
+//
+// Раньше здесь был запасной 80×24, и запись кадров на стенде 05.11 показала
+// цену: первым кадром загрузки страницы уходил owner:claim {80×24}, а main при
+// смене владельца раздаёт размер ВСЕМ живым pty. Без размера main не трогает
+// pty вовсе (ownership.claim: кривой размер = отсутствующий), а настоящий
+// размер приедет первым же term:resize подогнанного терминала.
+//
+// refit(), а не term.cols: у скрытого или ни разу не показанного терминала
+// term.cols — умолчание xterm, а refit() отвечает null, если не подогнан.
 function termSize() {
-  const term = views.get(tabStore?.activeId)?.view?.term;
-  return term ? { cols: term.cols, rows: term.rows } : { cols: 80, rows: 24 };
+  const view = views.get(tabStore?.activeId)?.view;
+  if (!view) return null;
+  try {
+    return view.refit();
+  } catch (err) {
+    console.warn('[эстафета] размер терминала не снялся:', err && err.message);
+    return null;
+  }
 }
 
 function renderCurtain() {
@@ -2485,10 +2528,14 @@ async function resumeInputAfterClaim() {
     console.warn('[эстафета] tabs:list после захвата не ответил:', err.message);
     return;
   }
+  // Без размера: живой вкладке main его всё равно не применяет (sessions.js/
+  // start только повторяет term:started), а большинство вкладок здесь скрыты,
+  // и их term.cols — умолчание xterm 80×24. Если процесс успел умереть, main
+  // поднимет его в размере владельца (resolveStartSize в ipc.js).
   for (const t of Array.isArray(live) ? live : []) {
     const entry = views.get(t.tabId);
     if (!entry || !shouldStartPty(t)) continue;
-    window.api.term.start(t.tabId, entry.view.term.cols, entry.view.term.rows);
+    window.api.term.start(t.tabId, null, null);
   }
 }
 
@@ -2586,18 +2633,20 @@ function afterControlLost() {
 }
 
 // Захват уезжает с размером НАШЕГО терминала, и main подгоняет под него все
-// живые pty (applyHandoffSize). Если активной вкладки нет, termSize() отдаёт
-// запасные 80×24 — и они применились бы ко ВСЕМ сессиям: широкое окно, а
-// Claude Code перерисован в 80 колонок. А активной вкладки закономерно НЕ
-// бывает у того, кому вкладки приехали синхронизацией (их завёл сосед —
-// syncTabsFromMain подключает без активации, чтобы не дёргать человека).
+// живые pty (applyHandoffSize). Если активной вкладки нет, размера у нас нет
+// (termSize() отдаёт null), и main при смене владельца не подогнал бы pty
+// вовсе — остались бы в раскладке ушедшего клиента до первого ресайза. (До
+// плана «размер терминала» здесь были запасные 80×24, и они применялись ко
+// ВСЕМ сессиям.) А активной вкладки закономерно НЕ бывает у того, кому
+// вкладки приехали синхронизацией (их завёл сосед — syncTabsFromMain
+// подключает без активации, чтобы не дёргать человека).
 //
 // Поэтому перед захватом показываем вкладку: размер становится настоящим, и
 // человек, забравший управление, видит терминал, а не пустой экран.
 function ensureActiveTabForHandoff() {
   if (views.has(tabStore?.activeId)) return;
   const first = [...views.keys()][0];
-  if (!first) return; // вкладок нет вовсе — запасной размер безвреден, ресайзить нечего
+  if (!first) return; // вкладок нет вовсе — захват уйдёт без размера, ресайзить нечего
   activateTab(first);
   // refit синхронно: activateTab только показывает контейнер, а term.cols до
   // пересчёта остаётся прежним — в claim уехал бы размер скрытого терминала.
@@ -2610,10 +2659,11 @@ function ensureActiveTabForHandoff() {
 
 async function claimControl() {
   ensureActiveTabForHandoff();
-  const { cols, rows } = termSize();
+  // null — подогнанного терминала нет: захват без размера (см. termSize).
+  const size = termSize();
   const hadControl = hasControl();
   try {
-    const state = await window.api.owner.claim(cols, rows);
+    const state = await window.api.owner.claim(size ? size.cols : null, size ? size.rows : null);
     // null приходит, когда main отклонил вызов гардом (такого для owner:claim
     // быть не должно — канал свободный), а undefined — если ответа нет вовсе.
     if (state) ownerState = { ...ownerState, ...state };
@@ -2805,6 +2855,29 @@ async function boot() {
   })) await claimControl();
 
   config = await window.api.config.get();
+
+  // Шрифт терминала — ДО первого терминала. xterm мерит ячейку при открытии и
+  // сам её не перемеряет, когда шрифт догрузился (см. terminal.js,
+  // onFontsLoaded): на макбуке вшитый JetBrains Mono (1 МБ) ехал по сети
+  // дольше, чем создавался первый терминал, ячейка считалась по Menlo, строк
+  // выходило больше, чем влезает, и статус-бар Claude Code уезжал за край.
+  //
+  // Строка — весь список семейств из конфига, без разбора: FontFaceSet.load
+  // грузит подходящие @font-face для КАЖДОГО семейства списка, системные и
+  // родовые (Consolas, monospace) просто пропускает. Так ждём ровно вшитый
+  // шрифт, где бы в списке он ни стоял, — и не ждём ничего, если конфиг его
+  // не упоминает (стенд с запасным Consolas).
+  //
+  // Не дождались за FONT_WAIT_MS (3 с; нет сети, шрифт заблокирован) — дальше:
+  // терминал откроется на запасном, а догрузку поймает terminal.js.
+  const fontWait = await waitForFont(
+    document.fonts,
+    `${config.terminal.fontSize}px ${config.terminal.fontFamily}`,
+    FONT_WAIT_MS,
+  );
+  if (fontWait !== 'loaded') {
+    console.warn(`[boot] шрифт терминала не дождались (${fontWait}) — открываю на запасном, перемерю при догрузке`);
+  }
 
   tabStore = createTabStore({
     root: $('tab-groups'),
@@ -3204,7 +3277,7 @@ async function boot() {
     showToast(text, level);
   });
 
-  // Захват в начале boot() ушёл с запасными 80×24 — терминалов тогда ещё не
+  // Захват в начале boot() ушёл без размера — терминалов тогда ещё не
   // было. Повторный owner:claim ТЕМ ЖЕ владельцем не меняет владельца и не
   // трогает pty (ownership.js: who === owner → без onChange), он только
   // запоминает НАСТОЯЩИЙ размер этого клиента — чтобы возврат управления сюда

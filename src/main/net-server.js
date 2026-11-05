@@ -28,6 +28,37 @@ const MIME = {
   '.json': 'application/json; charset=utf-8',
 };
 
+// Кэширование статики. Раньше заголовков не было вовсе, и вшитый шрифт
+// терминала (JetBrainsMono NF, 1 МБ) браузер на макбуке качал заново на
+// каждой загрузке страницы — xterm успевал измерить ячейку по запасному
+// шрифту, и статус-бар Claude Code уезжал за край (план «размер терминала»).
+//
+// Шрифты и картинки меняются только с обновлением самого кокпита — неделя.
+// Всё остальное (разметка, скрипты, стили, json, карты) — no-cache: браузер
+// хранит копию, но КАЖДЫЙ раз перепроверяет её по ETag. Старый app.js после
+// обновления не залипает, а перепроверка без изменений — пустой 304.
+const LONG_CACHE = new Set(['.woff2', '.ico', '.png', '.svg']);
+
+function cacheControlFor(file) {
+  return LONG_CACHE.has(path.extname(file).toLowerCase()) ? 'max-age=604800' : 'no-cache';
+}
+
+// Слабая метка из размера и времени изменения — тот же приём, что у
+// express/serve-static: хэш содержимого потребовал бы читать файл на каждую
+// перепроверку. Обновление файла меняет mtime, а с ним и метку.
+function etagFor(stat) {
+  return `W/"${stat.size.toString(16)}-${Math.floor(stat.mtimeMs).toString(16)}"`;
+}
+
+// If-None-Match: список меток через запятую или «*»; сравнение слабое
+// (RFC 9110 §13.1.2) — префикс W/ не учитывается.
+function etagMatches(header, etag) {
+  if (typeof header !== 'string' || !header) return false;
+  const bare = (tag) => tag.trim().replace(/^W\//, '');
+  const want = bare(etag);
+  return header.split(',').some((tag) => tag.trim() === '*' || bare(tag) === want);
+}
+
 // Разбираем URL-путь на сегменты по ЛЮБОМУ разделителю ('/' или '\'), а не
 // только по '/'. Причина: итоговый path.join() всё равно работает с
 // ОС-семантикой, а на Windows он трактует '\' как разделитель независимо от
@@ -189,7 +220,10 @@ function createNetServer({
         }
         continue;
       }
-      if (stat.isFile()) return abs;
+      // stat отдаём вместе с путём: из него ETag и Last-Modified (повторный
+      // statSync в onHttp был бы тем же лишним вызовом и тем же окном гонки,
+      // что закрыто выше).
+      if (stat.isFile()) return { file: abs, stat };
       // Файла тут нет — пробуем СЛЕДУЮЩИЙ корень, а не сдаёмся сразу: иначе
       // первый совпавший по префиксу, но безуспешный корень обрывал бы
       // поиск в остальных.
@@ -211,8 +245,20 @@ function createNetServer({
       res.end('битый путь');
       return;
     }
-    const file = resolveFile(decoded);
-    if (!file) { res.writeHead(404); res.end('нет такого'); return; }
+    const found = resolveFile(decoded);
+    if (!found) { res.writeHead(404); res.end('нет такого'); return; }
+    const { file, stat } = found;
+    const cacheHeaders = {
+      'cache-control': cacheControlFor(file),
+      etag: etagFor(stat),
+      'last-modified': stat.mtime.toUTCString(),
+    };
+    // Копия у браузера совпадает с файлом — тело не шлём вовсе.
+    if (etagMatches(req.headers['if-none-match'], cacheHeaders.etag)) {
+      res.writeHead(304, cacheHeaders);
+      res.end();
+      return;
+    }
     // .pipe() слушает ошибки только на ПРИЁМНИКЕ (res), не на источнике —
     // ошибка чтения (EBUSY: антивирус, npm install поверх node_modules,
     // автообновление, редактор с открытым файлом — злоумышленник для этого
@@ -236,7 +282,7 @@ function createNetServer({
       }
     });
     stream.on('open', () => {
-      res.writeHead(200, { 'content-type': MIME[path.extname(file)] || 'application/octet-stream' });
+      res.writeHead(200, { 'content-type': MIME[path.extname(file)] || 'application/octet-stream', ...cacheHeaders });
     });
     stream.pipe(res);
   }
