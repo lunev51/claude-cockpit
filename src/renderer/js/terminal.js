@@ -175,16 +175,28 @@ export function initTerminal(container, config, {
     const c = term._core?._renderService?.dimensions?.css?.cell;
     return c ? { width: c.width, height: c.height } : null;
   };
-  // Ячейка ПОСЛЕДНЕЙ подгонки — по ней посчитана текущая сетка. Сверяет её
-  // onFontsLoaded ниже: xterm перемеряет ячейку и сам (после ресайза), и тогда
-  // «до и после моего замера» уже одинаковы, хотя сетка посчитана по старой.
-  let fittedCell = null;
+  // Размер СИМВОЛА последней подгонки — по нему посчитана текущая сетка.
+  // Сверяет его onFontsLoaded ниже: xterm перемеряет символ и сам (после
+  // ресайза), и тогда «до и после моего замера» уже одинаковы, хотя сетка
+  // посчитана по старому.
+  //
+  // Символ (_charSizeService), а не ячейка рендера: ячейку DOM-рендерер
+  // пересчитывает от числа колонок — round(device.cell · cols / dpr) / cols
+  // (DomRenderer._updateDimensions, xterm 6.0.0), — и после любой подгонки
+  // она «изменилась» сама по себе. Ре-ревью: догрузка чужого шрифта слала
+  // ресайз в 186 случаях из 200. Символ от сетки не зависит — только от
+  // шрифта.
+  const charNow = () => {
+    const c = term._core?._charSizeService;
+    return c ? { width: c.width, height: c.height } : null;
+  };
+  let fittedChar = null;
   const measure = () => {
-    const cell = cellNow();
-    const size = fittedSize(fit.proposeDimensions(), cellArea(), cell);
+    const char = charNow();
+    const size = fittedSize(fit.proposeDimensions(), cellArea(), cellNow());
     if (size) {
       fit.fit();
-      fittedCell = cell;
+      fittedChar = char;
     }
     return size;
   };
@@ -541,21 +553,21 @@ export function initTerminal(container, config, {
   // chaining — чтобы другая версия xterm без этого поля не роняла терминал.
   //
   // Событие приходит на ЛЮБОЙ догруженный шрифт (Inter интерфейса, жирное
-  // начертание при первом жирном тексте) — шлём размер, только если ячейка
-  // отличается от той, по которой посчитана текущая сетка (fittedCell в
+  // начертание при первом жирном тексте) — шлём размер, только если символ
+  // отличается от того, по которому посчитана текущая сетка (fittedChar в
   // measure): иначе каждый такой шрифт гонял бы ресайз всех pty.
   //
-  // Сверка именно с ячейкой последней подгонки, а не «до и после своего
+  // Сверка именно с символом последней подгонки, а не «до и после своего
   // замера» (замечание ревью): если между догрузкой и событием прошёл ресайз,
-  // xterm уже перемерил ячейку сам (_afterResize), а строки fit посчитал по
-  // старой. Замер здесь тогда ничего не меняет — но сетка всё равно неверна.
+  // xterm уже перемерил символ сам (_afterResize), а строки fit посчитал по
+  // старому. Замер здесь тогда ничего не меняет — но сетка всё равно неверна.
   // Ни разу не подогнанному терминалу пересчитывать нечего: его первая
-  // подгонка возьмёт уже новую ячейку.
+  // подгонка возьмёт уже новый символ.
   const onFontsLoaded = () => {
     term._core?._charSizeService?.measure?.();
-    if (!fittedCell) return;
-    const cell = cellNow();
-    if (!cell || (cell.width === fittedCell.width && cell.height === fittedCell.height)) return;
+    if (!fittedChar) return;
+    const char = charNow();
+    if (!char || (char.width === fittedChar.width && char.height === fittedChar.height)) return;
     const s = measure();
     if (s) sendSize(s);
     term.refresh(0, term.rows - 1);

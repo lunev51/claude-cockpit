@@ -85,7 +85,7 @@ test('measure() решает по fittedSize и не трогает xterm, по�
   const body = blockAfter('const measure = () => {');
   assert.match(
     body,
-    /const\s+(\w+)\s*=\s*cellNow\(\);[\s\S]*fittedSize\(\s*fit\.proposeDimensions\(\)\s*,\s*cellArea\(\)\s*,\s*\1\s*\)/,
+    /fittedSize\(\s*fit\.proposeDimensions\(\)\s*,\s*cellArea\(\)\s*,\s*cellNow\(\)\s*\)/,
     'measure() больше не спрашивает fittedSize с областью под клетки и ячейкой — проверка «подогнан ли» потеряна',
   );
   // fit() на контейнере 0×0 (свёрнутое окно) ужал бы сам xterm до 2×1: буфер

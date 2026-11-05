@@ -18,7 +18,14 @@
 //     getComputedStyle родителя, минус полоса прокрутки 14px, зажим cols ≥ 2,
 //     rows ≥ 1;
 //   - ячейка — из _renderService.dimensions.css.cell, а её перемер — в open()
-//     и после каждого ресайза с изменением сетки (_afterResize в xterm 6).
+//     и после каждого ресайза с изменением сетки (_afterResize в xterm 6);
+//   - css.cell считается как в DomRenderer._updateDimensions (xterm 6.0.0,
+//     src/browser/renderer/dom/DomRenderer.ts): из размера символа, dpr и
+//     ЧИСЛА КОЛОНОК/СТРОК — round(device.cell · cols / dpr) / cols. То есть
+//     ячейка меняется от ресайза, даже когда шрифт тот же (ре-ревью: внутри
+//     refit — в 280 случаях из 300). С целыми метриками и dpr 1 формула даёт
+//     постоянную ячейку, поэтому сценарии с этой зависимостью задают дробные
+//     метрики явно.
 const { test, beforeEach } = require('node:test');
 const assert = require('node:assert');
 const path = require('node:path');
@@ -53,7 +60,8 @@ beforeEach(() => {
   const state = {
     hidden: true, // вкладка создаётся в .term-view.hidden
     host: { width: 0, height: 0 },
-    font: { width: 8, height: 19 }, // что вернёт замер ячейки сейчас
+    font: { width: 8, height: 19 }, // что вернёт замер символа сейчас
+    dpr: 1,
   };
   const container = fakeEl();
   const content = () => ({
@@ -69,15 +77,27 @@ beforeEach(() => {
     height: 0,
     measure() { this.width = state.font.width; this.height = state.font.height; },
   };
+  // DomRenderer._updateDimensions, дословно по формулам (letterSpacing 0,
+  // lineHeight 1 — умолчания xterm, terminal.js их не меняет).
+  const domCell = (t) => {
+    const { dpr } = state;
+    const devCellW = charSize.width * dpr;
+    const devCellH = Math.floor(Math.ceil(charSize.height * dpr) * 1);
+    return {
+      width: Math.round((devCellW * t.cols) / dpr) / t.cols,
+      height: Math.round((devCellH * t.rows) / dpr) / t.rows,
+    };
+  };
   class Terminal {
     constructor(opts) {
+      const self = this;
       this.cols = 80;
       this.rows = 24;
       this.options = { ...opts };
       this.element = null;
       this._core = {
         _charSizeService: charSize,
-        _renderService: { dimensions: { css: { get cell() { return { width: charSize.width, height: charSize.height }; } } } },
+        _renderService: { dimensions: { css: { get cell() { return domCell(self); } } } },
       };
     }
     loadAddon(addon) { if (addon && typeof addon.activate === 'function') addon.activate(this); }
@@ -249,18 +269,45 @@ test('refit видимого терминала отдаёт размер и ш�
   assert.deepStrictEqual(sent('resize'), [['resize', 'T1', 279, 69]]);
 });
 
-test('догрузка шрифта перемеряет ячейку и шлёт новый размер; пустая догрузка молчит', async (t) => {
+test('пустая догрузка шрифта молчит — и когда ячейка рендера зависит от числа колонок', async (t) => {
+  // Ре-ревью: обработчик сверял ячейку DOM-рендерера, а она пересчитывается
+  // от числа колонок (round(device.cell · cols / dpr) / cols). После любой
+  // подгонки «ячейка изменилась», и догрузка ЧУЖОГО шрифта (Inter интерфейса,
+  // жирное начертание) слала ресайз — в 186 случаях из 200, изредка на ±1
+  // колонку, то есть с перерисовкой всех сессий.
+  // Метрики настоящие: JetBrains Mono 14px — 8.4 px по ширине и 1.32 em =
+  // 18.48 px по высоте, масштаб Windows 125%.
+  env.state.font = { width: 8.4, height: 18.48 };
+  env.state.dpr = 1.25;
+  const view = await open(t);
+  const onDone = env.fontListeners.get('loadingdone');
+  assert.strictEqual(typeof onDone, 'function', 'подписки на loadingdone нет');
+  env.state.hidden = false;
+  let noisy = 0;
+  let checked = 0;
+  for (let w = 600; w <= 2600; w += 37) {
+    env.state.host = { width: w, height: 300 + (w % 900) };
+    if (!view.refit()) continue;
+    checked += 1;
+    env.calls.length = 0;
+    onDone(); // догрузился чужой шрифт — символ тот же
+    if (sent('resize').length) noisy += 1;
+  }
+  assert.ok(checked > 40, `проверено подгонок: ${checked} — сценарий не воспроизведён`);
+  assert.strictEqual(noisy, 0, `пустая догрузка шрифта слала ресайз всех pty в ${noisy} случаях из ${checked}`);
+});
+
+test('догрузка шрифта перемеряет символ и шлёт новый размер', async (t) => {
   const view = await open(t);
   showWindow();
   view.refit();
   env.calls.length = 0;
 
   const onDone = env.fontListeners.get('loadingdone');
-  assert.strictEqual(typeof onDone, 'function', 'подписки на loadingdone нет');
 
-  // Догрузился чужой шрифт (Inter интерфейса) — ячейка та же, ресайзить нечего.
+  // Догрузился чужой шрифт (Inter интерфейса) — символ тот же, ресайзить нечего.
   onDone();
-  assert.deepStrictEqual(sent('resize'), [], 'догрузка шрифта без смены ячейки гоняет ресайз всех pty');
+  assert.deepStrictEqual(sent('resize'), [], 'догрузка шрифта без смены символа гоняет ресайз всех pty');
 
   // Догрузился JetBrains Mono: строка выше запасной — строк влезает меньше.
   env.state.font = { width: 8, height: 21 };
