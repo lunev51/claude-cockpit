@@ -2526,7 +2526,7 @@ function renderCurtain() {
 // забирал управление и не мог печатать до F5). Просим main повторить
 // 'term:started' — второго pty при этом не появляется (sessions.js/start), а
 // мёртвые вкладки не трогаем вовсе: тот же гард shouldStartPty, что и при
-// подключении (спавн без --resume потерял бы сессию).
+// подключении (перезапуск мёртвой вкладки — решение человека, см. там).
 async function resumeInputAfterClaim() {
   let live = [];
   try {
