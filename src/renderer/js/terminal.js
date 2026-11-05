@@ -191,6 +191,11 @@ export function initTerminal(container, config, {
       'font-size:12px',
       'padding:2px 4px',
     ].join(';');
+    // Ревью 09.08 (C10): Enter/Esc панели слушает только поле ввода, а клик
+    // по кнопке на mousedown уводил фокус на неё — после ▼ мышью клавиши
+    // были мертвы. Тот же приём, что строки палитры и кнопка дашборда:
+    // фокус остаётся в поле, click доходит как обычно.
+    b.addEventListener('mousedown', (ev) => ev.preventDefault());
     return b;
   };
   const btnPrev = mkBtn('▲');
