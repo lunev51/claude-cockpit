@@ -250,22 +250,123 @@ test('сервер отдаёт каждый путь манифеста как 
 });
 
 // --- 4. boot ждёт загрузку до первого терминала ---
+//
+// Рубеж — не какая-то одна строка boot(), а ВСЕ пути к initTerminal. Первая
+// редакция стража брала за рубеж createTabStore («все пути требуют
+// tabStore»), и это неправда: openTab/attachTab зовут initTerminal раньше,
+// чем трогают tabStore, — подписка tabs.onChanged, поставленная выше
+// ожидания, прошла бы мимо стража (ревью ветки, мутация выжила).
+//
+// Поэтому граф: какие функции верхнего уровня app.js транзитивно доходят до
+// initTerminal(. Любое упоминание такой функции в boot() обязано стоять после
+// `await <загрузка аддонов>` — и вызов (bootWorkspace), и подписка
+// (tabs.onChanged → syncTabsFromMain), и колбэк при создании UI-объекта
+// (createBrowse с openTab, createPalette с buildPaletteActions).
+//
+// Сами UI-объекты (browse, palette…) в граф НЕ входят: «+ Проект» и горячие
+// клавиши доходят до терминала только через них, а до своего создания в boot
+// они null — browse.open() бросит, palette?.open() промолчит, вкладка не
+// появится. Сеть через упоминание объекта, наоборот, утянула бы в граф всё
+// подряд (activateTab зовёт palette?.close()) и сделала бы правило
+// невыполнимым. Поэтому раньше ожидания можно привязать кнопку или хоткей, но
+// нельзя создать объект с колбэком на путь к терминалу.
 
-test('boot() дожидается аддонов после конфига и до первого терминала', () => {
+// Комментарии и строки — до разбора: цитата кода в комментарии и строка
+// '[boot] …' в логе выглядели бы как вызов.
+const codeOnly = (src) => src
+  .replace(/\/\/.*$/gm, '')
+  .replace(/'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"/g, "''");
+
+const mention = (name) => new RegExp(`(?<![.\\w$])${name.replace(/\$/g, '\\$')}\\b`, 'g');
+const mentions = (body, name) => [...body.matchAll(mention(name))].map((m) => m.index);
+
+// Узлы графа — объявления верхнего уровня (с колонки 0): function и
+// const/let (обёртки вроде singleFlight(async () => …) тоже функции).
+function topUnits(appCode) {
+  const top = [];
+  let cur = null;
+  for (const line of appCode.split(/\r?\n/)) {
+    const m = line.match(/^(?:async\s+)?function\s+([\w$]+)|^(?:const|let|var)\s+([\w$]+)/);
+    if (m) { cur = { name: m[1] || m[2], body: '' }; top.push(cur); }
+    if (cur) cur.body += `${line}\n`;
+  }
+  return top;
+}
+
+function reachingInitTerminal(top) {
+  const reach = new Set(top.filter((u) => /(?<![.\w$])initTerminal\s*\(/.test(u.body)).map((u) => u.name));
+  // boot — корень, его никто не зовёт; распространять от него нечего.
+  const spreads = () => [...reach].filter((n) => n !== 'boot');
+  for (let grown = true; grown;) {
+    grown = false;
+    for (const u of top) {
+      if (!reach.has(u.name) && spreads().some((n) => mentions(u.body, n).length)) {
+        reach.add(u.name);
+        grown = true;
+      }
+    }
+  }
+  return reach;
+}
+
+test('boot() запускает аддоны после конфига, параллельно со шрифтом, и ждёт их до любого пути к initTerminal', () => {
   assert.match(APP_JS, /import\s*\{\s*loadOptionalAddons\s*\}\s*from\s*'\.\/optional-addons\.js'/, 'загрузчик не импортирован');
-  const boot = APP_JS.slice(APP_JS.indexOf('async function boot()'));
-  assert.ok(boot.length < APP_JS.length, 'в app.js не найдено async function boot() — страж разъехался');
-  const cfgAt = boot.indexOf('config = await window.api.config.get()');
-  const start = boot.match(/const (\w+) = loadOptionalAddons\(config\.terminal\)/);
-  assert.ok(cfgAt !== -1, 'в boot не найдено чтение конфига');
-  assert.ok(start, 'boot не запускает загрузку аддонов по config.terminal');
-  const startAt = start.index;
-  const awaitAt = boot.indexOf(`await ${start[1]}`);
-  // Все пути к initTerminal (bootWorkspace, восстановление, «+ Проект», палитра)
-  // требуют tabStore — его создание и есть рубеж «терминалов ещё нет».
-  const storeAt = boot.indexOf('tabStore = createTabStore(');
-  assert.ok(storeAt !== -1, 'в boot не найдено создание tabStore — страж разъехался');
-  assert.ok(cfgAt < startAt, 'загрузка аддонов запущена до чтения конфига — флагов ещё нет');
+  const top = topUnits(codeOnly(APP_JS));
+  const unit = (n) => {
+    const found = top.find((x) => x.name === n);
+    assert.ok(found, `в app.js не найдено объявление ${n} — страж разъехался`);
+    return found.body;
+  };
+  const body = unit('boot');
+  const cfgAt = body.indexOf('config = await window.api.config.get()');
+  const start = body.match(/const (\w+) = loadOptionalAddons\(config\.terminal\)/);
+  const fontAt = body.indexOf('await waitForFont(');
+  assert.ok(cfgAt !== -1 && start && fontAt !== -1, 'в boot не найдены чтение конфига, запуск аддонов или ожидание шрифта — страж разъехался');
+  const awaitAt = body.indexOf(`await ${start[1]};`);
   assert.ok(awaitAt !== -1, 'загрузку аддонов никто не ждёт — первый терминал создастся без WebglAddon');
-  assert.ok(startAt < awaitAt && awaitAt < storeAt, 'ожидание аддонов стоит после создания tabStore — первый терминал может их не застать');
+  assert.ok(cfgAt < start.index, 'загрузка аддонов запущена до чтения конфига — флагов ещё нет');
+  // Параллельность: аддоны уходят в сеть раньше, чем boot сядет ждать шрифт,
+  // иначе их загрузка прибавится к его 3 с ожидания вместо того, чтобы идти
+  // одновременно.
+  assert.ok(start.index < fontAt, 'аддоны грузятся только после шрифта — их время прибавляется к ожиданию шрифта');
+
+  const reach = reachingInitTerminal(top);
+  // Страховка от холостого графа: эти пути к терминалу есть сегодня точно.
+  for (const n of ['openTab', 'attachTab', 'syncTabsFromMain', 'bootWorkspace', 'buildPaletteActions', 'showRestoreOverlay']) {
+    assert.ok(reach.has(n), `граф не видит путь к initTerminal через ${n} — разбор расклеился с app.js`);
+  }
+  // И UI-объекты с колбэками на терминал правило видит через их аргументы.
+  for (const obj of ['browse', 'palette', 'historySearch']) {
+    const at = body.search(new RegExp(`^ {2}${obj} = create\\w+\\(`, 'm'));
+    assert.ok(at !== -1, `в boot не найдено создание ${obj} — страж разъехался`);
+    const stmt = body.slice(at, body.indexOf('\n  });', at));
+    assert.ok([...reach].some((n) => n !== 'boot' && mentions(stmt, n).length), `создание ${obj} не упоминает путь к терминалу — его ранний перенос правило не заметит`);
+  }
+
+  // До ожидания разрешены ровно эти: подписки эстафеты ставятся первым делом
+  // (M1 ревью). До initTerminal они доходят только через bootWorkspace за
+  // гейтом workspaceBootPending, а его поднимает лишь сам bootWorkspace (или
+  // afterControlLost при открытом оверлее восстановления, который показывает
+  // тоже он). Гейт проверяется ниже по коду, а не на слово.
+  const GATED = new Set(['afterControlGained', 'claimControl']);
+  const early = [];
+  for (const n of reach) {
+    if (n === 'boot' || GATED.has(n)) continue;
+    for (const at of mentions(body, n)) if (at < awaitAt) early.push(n);
+  }
+  assert.deepStrictEqual(early, [], `boot() трогает путь к initTerminal до ожидания аддонов: ${early.join(', ')}`);
+
+  const reachIn = (n) => [...reach].filter((r) => r !== n && r !== 'boot' && mentions(unit(n), r).length);
+  assert.deepStrictEqual(reachIn('claimControl'), ['afterControlGained'], 'claimControl дошёл до терминала мимо гейта afterControlGained');
+  assert.deepStrictEqual(reachIn('afterControlGained'), ['bootWorkspace'], 'afterControlGained дошёл до терминала мимо bootWorkspace');
+  const gained = unit('afterControlGained');
+  const gateAt = gained.search(/if \(!workspaceBootPending\) return;/);
+  assert.ok(gateAt !== -1 && gateAt < gained.search(/(?<![.\w$])bootWorkspace\(/), 'afterControlGained зовёт bootWorkspace без гейта workspaceBootPending');
+  const raisers = top.filter((x) => /workspaceBootPending\s*=\s*true/.test(x.body)).map((x) => x.name).sort();
+  assert.deepStrictEqual(raisers, ['afterControlLost', 'bootWorkspace'], 'workspaceBootPending поднимает кто-то ещё — гейт больше не держит «до первого bootWorkspace»');
+  const lost = unit('afterControlLost');
+  assert.ok(lost.indexOf('if (!restoreOverlayDismiss) return;') < lost.search(/workspaceBootPending\s*=\s*true/), 'afterControlLost поднимает гейт без открытого оверлея восстановления');
+  const dismissSetters = top.filter((x) => /restoreOverlayDismiss\s*=\s*\(/.test(x.body)).map((x) => x.name);
+  assert.deepStrictEqual(dismissSetters, ['showRestoreOverlay'], 'оверлей восстановления взводится не только из showRestoreOverlay');
+  assert.ok(reach.has('showRestoreOverlay'), 'showRestoreOverlay выпал из графа — его ранний вызов не будет пойман');
 });
