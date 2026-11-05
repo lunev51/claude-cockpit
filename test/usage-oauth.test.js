@@ -431,6 +431,37 @@ test('C20: дрожь долей секунды в resets_at между опро
   assert.strictEqual(cache.writes.length, 1);
 });
 
+test('C20: дрожь срока НАЗАД (…00.086 → …59.855) — тоже не изменение', async () => {
+  const cache = recordingCache();
+  const { poller, ctl } = scriptedPoller(cache);
+  ctl.body = liveBody({
+    fiveReset: '2026-11-05T16:10:00.086000+00:00',
+    sevenReset: '2026-11-09T21:00:00.086000+00:00',
+  });
+  await poller.refresh();
+  ctl.body = liveBody(); // …16:09:59.855 / …20:59:59.855
+  ctl.time = 181000;
+  await poller.refresh();
+
+  assert.strictEqual(cache.writes.length, 1);
+});
+
+test('C20: срок окна пропал (null) при том же проценте — изменение; null и null — нет', async () => {
+  const cache = recordingCache();
+  const { poller, ctl } = scriptedPoller(cache);
+  await poller.refresh();
+
+  ctl.body = liveBody({ fiveReset: null });
+  ctl.time += 180000;
+  await poller.refresh();
+  assert.strictEqual(cache.writes.length, 2, 'срок окна сменился на «нет окна»');
+  assert.strictEqual(cache.writes[1].fiveHour.resetsAt, null);
+
+  ctl.time += 180000;
+  await poller.refresh();
+  assert.strictEqual(cache.writes.length, 2, 'null и null — один и тот же срок');
+});
+
 test('C20: проваленная запись (диск занят, ошибка проглочена кэшем) повторяется на следующем опросе', async () => {
   const attempts = [];
   let failNext = true;
@@ -571,6 +602,25 @@ test('C22: после завершения запроса следующий ref
   assert.strictEqual(http.calls.length, 2, 'рубеж держит только ОДНОВРЕМЕННЫЕ вызовы');
   http.calls[1]({ status: 200, body: liveBody() });
   await second;
+});
+
+test('C22: рубеж снимается и после сбоя — следующий refresh() снова идёт в сеть', async () => {
+  let throwOnce = true;
+  let httpCalls = 0;
+  const poller = createUsagePoller({
+    readToken: () => {
+      if (throwOnce) { throwOnce = false; throw new Error('credentials заняты'); }
+      return TOKEN;
+    },
+    httpGet: async () => { httpCalls += 1; return { status: 200, body: liveBody() }; },
+    cache: noopCache(),
+    now: () => 5000,
+  });
+
+  await assert.rejects(poller.refresh(), /credentials заняты/);
+  const snap = await poller.refresh();
+  assert.strictEqual(httpCalls, 1, 'упавший вызов навсегда занял рубеж — лимиты больше не обновятся');
+  assert.strictEqual(snap.ok, true);
 });
 
 // FINDING 3 (ревью, minor): кэш проверялся только на наличие полей, не на их
