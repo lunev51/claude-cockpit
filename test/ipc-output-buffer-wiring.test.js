@@ -132,6 +132,23 @@ test('история вкладок в registerIpc — зеркало экран
   assert.match(code, /^const \{ createTabHistory \} = require\('\.\/screen-mirror'\);$/m, 'createTabHistory не импортирован в ipc.js');
 });
 
+// Ревью ветки (m6, мутация M12): обработчик net:buffer в реестре — путь окна
+// ПК после Ctrl+R (renderer перезагружен, main и вкладки живы, xterm пустые).
+// Сетевой сервер перехватывает канал сам, так что подмена обработчика на
+// `() => ''` не задевала ни одного теста: окно ПК после перезагрузки молча
+// показывало бы пустые вкладки. registerIpc под тестом не исполняется —
+// проверяем текстом, как остальную проводку выше.
+test('net:buffer в реестре отдаёт историю вкладки из того же outputBuffer (окно ПК после Ctrl+R)', () => {
+  const code = ipcSrc.split(/\r?\n/).filter((line) => !line.trim().startsWith('//')).join('\n');
+  const handlers = [...code.matchAll(/registry\.handle\('net:buffer', ([^\n]*)\);/g)];
+  assert.strictEqual(handlers.length, 1, `обработчиков net:buffer в коде ipc.js: ${handlers.length}, ждали один — страж разъехался с исходником`);
+  assert.strictEqual(
+    handlers[0][1],
+    "(tabId) => (typeof tabId === 'string' ? outputBuffer.get(tabId) : '')",
+    'обработчик net:buffer больше не отдаёт историю вкладки из outputBuffer — окно ПК после Ctrl+R останется пустым',
+  );
+});
+
 test('outputBuffer и broadcast объявлены раньше, чем ими пользуются замыкания', () => {
   const start = ipcSrc.indexOf('function registerIpc(');
   assert.notStrictEqual(start, -1, 'не найдена registerIpc — страж разъехался с исходником');
