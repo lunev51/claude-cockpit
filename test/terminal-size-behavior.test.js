@@ -3,18 +3,30 @@
 //
 // Страж по исходнику (terminal-size-guard.test.js) держит форму кода; здесь —
 // то, что из неё следует: какие вызовы реально уходят в window.api.term при
-// скрытом, свёрнутом и видимом контейнере и при догрузке шрифта. Подделки
-// повторяют ровно те ответы настоящих библиотек, на которых держится баг:
-//   - proposeDimensions у контейнера display:none → {NaN, NaN} (getComputedStyle
-//     даёт 'auto'), у контейнера 0×0 → зажатый минимум {2, 1};
-//   - fit() на NaN молча выходит, на 2×1 честно ужимает терминал;
-//   - новый xterm до первого fit — 80×24.
+// скрытом, свёрнутом, узком и видимом контейнере и при догрузке шрифта.
+//
+// Подделки повторяют НАСТОЯЩУЮ форму данных — первая редакция этого файла
+// задавала коробку свёрнутого окна как {0, 0}, а настоящий DOM отдаёт
+// clientWidth/Height = 8×4 (отступ .term-view 4px 0 0 8px входит в client*).
+// На такой фикстуре тест был холостым: зелёный, пока прод слал pty 2×1
+// (ревью ветки в headless Chrome с настоящими xterm 6.0.0 + addon-fit 0.11.0).
+// Поэтому теперь:
+//   - getComputedStyle(контейнер) — как у .term-view с box-sizing: content-box:
+//     у display:none 'auto', иначе контентный блок = хост минус отступ (не
+//     меньше нуля); clientWidth/Height — контент ПЛЮС отступ;
+//   - FitAddon.proposeDimensions — формула addon-fit 0.11.0 дословно: из
+//     getComputedStyle родителя, минус полоса прокрутки 14px, зажим cols ≥ 2,
+//     rows ≥ 1;
+//   - ячейка — из _renderService.dimensions.css.cell, а её перемер — в open()
+//     и после каждого ресайза с изменением сетки (_afterResize в xterm 6).
 const { test, beforeEach } = require('node:test');
 const assert = require('node:assert');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 
 const url = pathToFileURL(path.join(__dirname, '..', 'src', 'renderer', 'js', 'terminal.js')).href;
+
+const PAD = { left: 8, top: 4 }; // .term-view { padding: 4px 0 0 8px }
 
 function fakeEl() {
   return {
@@ -29,30 +41,47 @@ function fakeEl() {
   };
 }
 
+function styleOf(props) {
+  return { ...props, getPropertyValue: (name) => props[name] };
+}
+
 let env;
 
 beforeEach(() => {
   const calls = [];
   const fontListeners = new Map();
   const state = {
-    proposed: { cols: NaN, rows: NaN }, // как у .term-view.hidden
-    box: { width: 0, height: 0 },
-    cell: { width: 8, height: 17 },
+    hidden: true, // вкладка создаётся в .term-view.hidden
+    host: { width: 0, height: 0 },
+    font: { width: 8, height: 19 }, // что вернёт замер ячейки сейчас
   };
+  const container = fakeEl();
+  const content = () => ({
+    width: Math.max(0, state.host.width - PAD.left),
+    height: Math.max(0, state.host.height - PAD.top),
+  });
+  Object.defineProperty(container, 'clientWidth', { get: () => (state.hidden ? 0 : content().width + PAD.left) });
+  Object.defineProperty(container, 'clientHeight', { get: () => (state.hidden ? 0 : content().height + PAD.top) });
+  const termElement = { parentElement: container };
+
   const charSize = {
-    width: 8,
-    height: 17,
-    measure() { this.width = state.cell.width; this.height = state.cell.height; },
+    width: 0,
+    height: 0,
+    measure() { this.width = state.font.width; this.height = state.font.height; },
   };
   class Terminal {
     constructor(opts) {
       this.cols = 80;
       this.rows = 24;
       this.options = { ...opts };
-      this._core = { _charSizeService: charSize };
+      this.element = null;
+      this._core = {
+        _charSizeService: charSize,
+        _renderService: { dimensions: { css: { get cell() { return { width: charSize.width, height: charSize.height }; } } } },
+      };
     }
     loadAddon(addon) { if (addon && typeof addon.activate === 'function') addon.activate(this); }
-    open() {}
+    open() { this.element = termElement; charSize.measure(); }
     onSelectionChange() {}
     attachCustomKeyEventHandler() {}
     write() {}
@@ -60,16 +89,36 @@ beforeEach(() => {
     focus() {}
     hasSelection() { return false; }
     refresh(a, b) { calls.push(['refresh', a, b]); }
-    resize(cols, rows) { this.cols = cols; this.rows = rows; calls.push(['xterm.resize', cols, rows]); }
+    resize(cols, rows) {
+      if (cols === this.cols && rows === this.rows) return;
+      this.cols = cols;
+      this.rows = rows;
+      calls.push(['xterm.resize', cols, rows]);
+      charSize.measure(); // _afterResize
+    }
     dispose() {}
   }
+  // addon-fit 0.11.0, proposeDimensions/fit — по исходнику lib/addon-fit.js.
   class FitAddon {
     activate(t) { this.t = t; }
-    proposeDimensions() { return state.proposed; }
+    proposeDimensions() {
+      const t = this.t;
+      if (!t.element || !t.element.parentElement) return undefined;
+      const cell = t._core._renderService.dimensions.css.cell;
+      if (cell.width === 0 || cell.height === 0) return undefined;
+      const scrollbar = t.options.scrollback === 0 ? 0 : (t.options.overviewRuler?.width || 14);
+      const ps = getComputedStyle(t.element.parentElement);
+      const h = parseInt(ps.getPropertyValue('height'), 10);
+      const w = Math.max(0, parseInt(ps.getPropertyValue('width'), 10));
+      const es = getComputedStyle(t.element);
+      const availH = h - (parseInt(es.getPropertyValue('padding-top'), 10) + parseInt(es.getPropertyValue('padding-bottom'), 10));
+      const availW = w - (parseInt(es.getPropertyValue('padding-right'), 10) + parseInt(es.getPropertyValue('padding-left'), 10)) - scrollbar;
+      return { cols: Math.max(2, Math.floor(availW / cell.width)), rows: Math.max(1, Math.floor(availH / cell.height)) };
+    }
     fit() {
       const p = this.proposeDimensions();
-      if (!p || Number.isNaN(p.cols) || Number.isNaN(p.rows)) return;
-      if (p.cols !== this.t.cols || p.rows !== this.t.rows) this.t.resize(p.cols, p.rows);
+      if (!p || !this.t || Number.isNaN(p.cols) || Number.isNaN(p.rows)) return;
+      if (this.t.rows !== p.rows || this.t.cols !== p.cols) this.t.resize(p.cols, p.rows);
     }
   }
   let roCallback = null;
@@ -78,7 +127,16 @@ beforeEach(() => {
     observe() {}
     disconnect() { calls.push(['ro.disconnect']); }
   };
-  globalThis.getComputedStyle = () => ({ position: 'absolute' });
+  globalThis.getComputedStyle = (el) => {
+    if (el === container) {
+      if (state.hidden) return styleOf({ position: 'absolute', width: 'auto', height: 'auto' });
+      const c = content();
+      return styleOf({ position: 'absolute', width: `${c.width}px`, height: `${c.height}px` });
+    }
+    return styleOf({
+      position: 'relative', 'padding-top': '0px', 'padding-bottom': '0px', 'padding-left': '0px', 'padding-right': '0px',
+    });
+  };
   globalThis.document = {
     createElement: () => fakeEl(),
     fonts: {
@@ -104,9 +162,6 @@ beforeEach(() => {
       config: { set() {} },
     },
   };
-  const container = fakeEl();
-  Object.defineProperty(container, 'clientWidth', { get: () => state.box.width });
-  Object.defineProperty(container, 'clientHeight', { get: () => state.box.height });
   env = {
     calls, state, container, fontListeners, fireResize: () => roCallback(),
   };
@@ -126,17 +181,23 @@ async function open(t, extra = {}) {
   return initTerminal(env.container, CONFIG, { tabId: 'T1', onPtyStatus: () => {}, ...extra });
 }
 
+// Хост 2254×1332 → контент 2246×1328 → (2246 − 14) / 8 = 279 колонок,
+// 1328 / 19 = 69 строк: тот самый кадр со стенда.
 function showWindow() {
-  env.state.box = { width: 2360, height: 1332 };
-  env.state.proposed = { cols: 279, rows: 69 };
+  env.state.hidden = false;
+  env.state.host = { width: 2254, height: 1332 };
+}
+
+function settle(t) {
+  env.fireResize();
+  t.mock.timers.tick(100);
 }
 
 test('вкладка в скрытом контейнере стартует БЕЗ размера и не шлёт resize', async (t) => {
   const view = await open(t);
   assert.deepStrictEqual(sent('start'), [['start', 'T1', null, null]], 'term:start ушёл с размером неподогнанного терминала');
 
-  env.fireResize();
-  t.mock.timers.tick(100);
+  settle(t);
   assert.deepStrictEqual(sent('resize'), [], 'ResizeObserver скрытой вкладки снова прислал pty умолчание 80×24');
   assert.strictEqual(view.refit(), null, 'refit скрытой вкладки обязан сказать «не подогнан»');
   assert.deepStrictEqual(sent('resize'), []);
@@ -145,10 +206,8 @@ test('вкладка в скрытом контейнере стартует Б�
 test('показ вкладки — первый и единственный размер, настоящий', async (t) => {
   await open(t);
   showWindow();
-  env.fireResize();
-  t.mock.timers.tick(100);
+  settle(t);
   assert.deepStrictEqual(sent('resize'), [['resize', 'T1', 279, 69]]);
-  assert.strictEqual(env.calls.some((c) => c[0] === 'resize' && c[2] === 80 && c[3] === 24), false);
 });
 
 test('видимый контейнер при создании — старт сразу в настоящем размере', async (t) => {
@@ -157,21 +216,31 @@ test('видимый контейнер при создании — старт �
   assert.deepStrictEqual(sent('start'), [['start', 'T1', 279, 69]]);
 });
 
-test('свёрнутое окно (контейнер 0×0) — ни 2×1 в pty, ни ужатого xterm', async (t) => {
-  const view = await open(t);
-  showWindow();
-  env.fireResize();
-  t.mock.timers.tick(100);
-  env.calls.length = 0;
+// Ревью в Chrome: хост 0×0 → client 8×4, FitAddon {2, 1} — и первая редакция
+// это отправляла; хост 0×500 → client 8×500 и {2, 29}, которые main уже не
+// отсекает (validDim 2..500): все pty уходили в две колонки.
+for (const [name, host] of [
+  ['свёрнутое окно (хост 0×0)', { width: 0, height: 0 }],
+  ['узкое окно с диф-панелью (хост 0×500)', { width: 0, height: 500 }],
+  ['ширина меньше двух клеток с полосой прокрутки (хост 30×500)', { width: 30, height: 500 }],
+]) {
+  test(`${name} — ни зажатой сетки в pty, ни ужатого xterm`, async (t) => {
+    const grids = [];
+    const view = await open(t, { onGrid: (s) => grids.push(s) });
+    showWindow();
+    settle(t);
+    env.calls.length = 0;
+    grids.length = 0;
 
-  env.state.box = { width: 0, height: 0 };
-  env.state.proposed = { cols: 2, rows: 1 }; // так FitAddon отвечает на нулевой контейнер
-  env.fireResize();
-  t.mock.timers.tick(100);
-  assert.deepStrictEqual(sent('resize'), [], 'свёрнутое окно прислало pty 2×1');
-  assert.deepStrictEqual(sent('xterm.resize'), [], 'xterm ужат до 2×1 — буфер переложится в две колонки');
-  assert.strictEqual(view.term.cols, 279);
-});
+    env.state.host = host;
+    settle(t);
+    assert.strictEqual(view.refit(), null, 'refit не сказал «не подогнан»');
+    assert.deepStrictEqual(sent('resize'), [], 'в pty ушла зажатая сетка FitAddon');
+    assert.deepStrictEqual(sent('xterm.resize'), [], 'xterm ужат — буфер переложится в две колонки');
+    assert.deepStrictEqual(grids, [], 'зажатая сетка разнесена по скрытым вкладкам');
+    assert.deepStrictEqual([view.term.cols, view.term.rows], [279, 69]);
+  });
+}
 
 test('refit видимого терминала отдаёт размер и шлёт его', async (t) => {
   const view = await open(t);
@@ -194,16 +263,34 @@ test('догрузка шрифта перемеряет ячейку и шлё�
   assert.deepStrictEqual(sent('resize'), [], 'догрузка шрифта без смены ячейки гоняет ресайз всех pty');
 
   // Догрузился JetBrains Mono: строка выше запасной — строк влезает меньше.
-  env.state.cell = { width: 8, height: 19 };
-  env.state.proposed = { cols: 279, rows: 62 };
+  env.state.font = { width: 8, height: 21 };
   onDone();
-  assert.deepStrictEqual(sent('resize'), [['resize', 'T1', 279, 62]]);
+  assert.deepStrictEqual(sent('resize'), [['resize', 'T1', 279, 63]]); // 1328 / 21 = 63
   assert.strictEqual(sent('refresh').length, 1, 'после перемера экран не перерисован');
+});
+
+test('шрифт догрузился, а ресайз успел раньше loadingdone — строки всё равно пересчитаны', async (t) => {
+  // Замечание ревью: xterm сам перемеряет ячейку в _afterResize. Если между
+  // догрузкой шрифта и событием прошёл ресайз, fit посчитал строки по СТАРОЙ
+  // ячейке, а замер после него уже видит новую. Обработчик, сравнивающий
+  // ячейку до и после своего замера, видел «без изменений» и не подгонял.
+  const view = await open(t);
+  showWindow();
+  view.refit();
+
+  env.state.font = { width: 8, height: 21 }; // шрифт уже есть, замера ещё не было
+  env.state.host = { width: 2262, height: 1332 }; // окно чуть шире: 280 колонок
+  settle(t);
+  assert.deepStrictEqual(sent('resize').at(-1), ['resize', 'T1', 280, 69], 'ресайз посчитан не по старой ячейке — сценарий не воспроизведён');
+  env.calls.length = 0;
+
+  env.fontListeners.get('loadingdone')();
+  assert.deepStrictEqual(sent('resize'), [['resize', 'T1', 280, 63]], 'строки остались посчитаны по запасному шрифту');
 });
 
 test('догрузка шрифта у скрытой вкладки ячейку перемеряет, но pty не трогает', async (t) => {
   await open(t);
-  env.state.cell = { width: 8, height: 19 };
+  env.state.font = { width: 8, height: 21 };
   env.fontListeners.get('loadingdone')();
   assert.deepStrictEqual(sent('resize'), []);
 });
@@ -218,13 +305,11 @@ test('догрузка шрифта у скрытой вкладки ячейк�
 test('подогнанный размер уходит и наружу (onGrid) — для соседних вкладок', async (t) => {
   const grids = [];
   await open(t, { onGrid: (size) => grids.push(size) });
-  env.fireResize();
-  t.mock.timers.tick(100);
+  settle(t);
   assert.deepStrictEqual(grids, [], 'неподогнанный терминал раздал свою сетку соседям');
 
   showWindow();
-  env.fireResize();
-  t.mock.timers.tick(100);
+  settle(t);
   assert.deepStrictEqual(grids, [{ cols: 279, rows: 69 }]);
 });
 
@@ -235,6 +320,18 @@ test('adoptGrid: скрытый терминал принимает сетку �
   assert.deepStrictEqual([view.term.cols, view.term.rows], [279, 69], 'скрытый xterm остался в своей сетке');
   assert.deepStrictEqual(sent('resize'), [], 'adoptGrid слал размер в pty — это решает только видимая вкладка');
   assert.deepStrictEqual(sent('start'), []);
+});
+
+test('adoptGrid: смена ТОЛЬКО строк или ТОЛЬКО колонок тоже доходит', async (t) => {
+  // Замечание ревью: условие «сетка другая» стерегла только форма кода —
+  // мутация `||` → `&&` выживала, и окно, ставшее ниже при той же ширине, не
+  // доходило бы до скрытых вкладок.
+  const view = await open(t);
+  view.adoptGrid({ cols: 279, rows: 69 });
+  view.adoptGrid({ cols: 279, rows: 50 });
+  assert.deepStrictEqual([view.term.cols, view.term.rows], [279, 50], 'смена одних строк не дошла');
+  view.adoptGrid({ cols: 200, rows: 50 });
+  assert.deepStrictEqual([view.term.cols, view.term.rows], [200, 50], 'смена одних колонок не дошла');
 });
 
 test('adoptGrid: подогнанный терминал чужую сетку не берёт', async (t) => {

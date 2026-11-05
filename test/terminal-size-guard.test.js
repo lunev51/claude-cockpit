@@ -85,8 +85,8 @@ test('measure() решает по fittedSize и не трогает xterm, по�
   const body = blockAfter('const measure = () => {');
   assert.match(
     body,
-    /fittedSize\(\s*fit\.proposeDimensions\(\)\s*,\s*\{\s*width:\s*container\.clientWidth\s*,\s*height:\s*container\.clientHeight\s*\}\s*\)/,
-    'measure() больше не спрашивает fittedSize с коробкой контейнера — проверка «подогнан ли» потеряна',
+    /const\s+(\w+)\s*=\s*cellNow\(\);[\s\S]*fittedSize\(\s*fit\.proposeDimensions\(\)\s*,\s*cellArea\(\)\s*,\s*\1\s*\)/,
+    'measure() больше не спрашивает fittedSize с областью под клетки и ячейкой — проверка «подогнан ли» потеряна',
   );
   // fit() на контейнере 0×0 (свёрнутое окно) ужал бы сам xterm до 2×1: буфер
   // переложился бы в две колонки, а с ним и вся прокрутка.
@@ -94,10 +94,29 @@ test('measure() решает по fittedSize и не трогает xterm, по�
   assert.strictEqual(fits, 1, `fit.fit() в measure() встречается ${fits} раз(а), ожидался один под проверкой`);
   assert.match(
     body,
-    /if\s*\(\s*(\w+)\s*\)\s*fit\.fit\(\)/,
+    /if\s*\(\s*(\w+)\s*\)\s*\{?\s*fit\.fit\(\)/,
     'fit.fit() в measure() не под проверкой результата fittedSize — свёрнутое окно ужмёт терминал до 2×1',
   );
   assert.match(SRC, /import\s*\{\s*fittedSize\s*\}\s*from\s*'\.\/term-size\.js'/, 'fittedSize не импортируется из term-size.js');
+});
+
+test('область под клетки — по содержимому контейнера, не по clientWidth/clientHeight', () => {
+  // Ревью в Chrome: clientWidth/Height включают отступ .term-view (4px 0 0 8px).
+  // Хост 0×0 давал 8×4, хост 0×500 — 8×500, и зажатые FitAddon 2×1 / 2×29
+  // проходили проверку и уезжали в pty. Первая редакция этого стража именно
+  // эту неверную коробку и закрепляла.
+  assert.doesNotMatch(SRC, /\bclient(Width|Height)\b/, 'terminal.js снова берёт clientWidth/clientHeight — коробка с отступом');
+  const area = blockAfter('const cellArea = () => {');
+  assert.match(area, /getComputedStyle\(\s*container\s*\)/, 'cellArea не читает getComputedStyle контейнера');
+  assert.match(area, /parseFloat\(\s*(\w+)\.width\s*\)\s*-\s*(\w+)/, 'ширина области — не контентная ширина минус полоса прокрутки');
+  assert.match(area, /parseFloat\(\s*(\w+)\.height\s*\)/, 'высота области — не контентная высота');
+  assert.match(area, /overviewRuler\?\.width\s*\|\|\s*14/, 'полоса прокрутки считается не так, как в addon-fit 0.11.0');
+  const adopt = blockAfter('adoptGrid: (size) => {');
+  assert.match(
+    adopt,
+    /fittedSize\(\s*fit\.proposeDimensions\(\)\s*,\s*cellArea\(\)\s*,\s*cellNow\(\)\s*\)/,
+    'adoptGrid решает «подогнан ли» не той же проверкой, что measure()',
+  );
 });
 
 test('ResizeObserver шлёт размер только подогнанного терминала', () => {

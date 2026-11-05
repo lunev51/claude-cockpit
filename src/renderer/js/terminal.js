@@ -156,9 +156,36 @@ export function initTerminal(container, config, {
   //
   // fit() — только ПОСЛЕ проверки: на контейнере 0×0 (свёрнутое окно) FitAddon
   // предлагает 2×1 и честно ужал бы сам xterm, переложив буфер в две колонки.
+  //
+  // Область под клетки — по СОДЕРЖИМОМУ контейнера, из того же
+  // getComputedStyle, что читает FitAddon (при box-sizing: content-box у
+  // .term-view это область без отступа; у display:none — 'auto', то есть NaN).
+  // НЕ clientWidth/clientHeight: они включают отступ .term-view (4px 0 0 8px),
+  // и ревью в Chrome поймало цену — хост 0×0 давал 8×4, хост 0×500 — 8×500, и
+  // зажатые 2×1 / 2×29 уходили в pty, а A6 разносил их по скрытым вкладкам.
+  // Полоса прокрутки вычитается так же, как в addon-fit 0.11.0
+  // (proposeDimensions): 0 без прокрутки, иначе ширина overviewRuler или 14.
+  const cellArea = () => {
+    const cs = getComputedStyle(container);
+    const scrollbar = term.options.scrollback === 0 ? 0 : (term.options.overviewRuler?.width || 14);
+    return { width: parseFloat(cs.width) - scrollbar, height: parseFloat(cs.height) };
+  };
+  // Ячейка, по которой FitAddon считает сетку (_core в нём же, см. addon-fit).
+  const cellNow = () => {
+    const c = term._core?._renderService?.dimensions?.css?.cell;
+    return c ? { width: c.width, height: c.height } : null;
+  };
+  // Ячейка ПОСЛЕДНЕЙ подгонки — по ней посчитана текущая сетка. Сверяет её
+  // onFontsLoaded ниже: xterm перемеряет ячейку и сам (после ресайза), и тогда
+  // «до и после моего замера» уже одинаковы, хотя сетка посчитана по старой.
+  let fittedCell = null;
   const measure = () => {
-    const size = fittedSize(fit.proposeDimensions(), { width: container.clientWidth, height: container.clientHeight });
-    if (size) fit.fit();
+    const cell = cellNow();
+    const size = fittedSize(fit.proposeDimensions(), cellArea(), cell);
+    if (size) {
+      fit.fit();
+      fittedCell = cell;
+    }
     return size;
   };
 
@@ -515,13 +542,20 @@ export function initTerminal(container, config, {
   //
   // Событие приходит на ЛЮБОЙ догруженный шрифт (Inter интерфейса, жирное
   // начертание при первом жирном тексте) — шлём размер, только если ячейка
-  // правда изменилась: иначе каждый такой шрифт гонял бы ресайз всех pty.
+  // отличается от той, по которой посчитана текущая сетка (fittedCell в
+  // measure): иначе каждый такой шрифт гонял бы ресайз всех pty.
+  //
+  // Сверка именно с ячейкой последней подгонки, а не «до и после своего
+  // замера» (замечание ревью): если между догрузкой и событием прошёл ресайз,
+  // xterm уже перемерил ячейку сам (_afterResize), а строки fit посчитал по
+  // старой. Замер здесь тогда ничего не меняет — но сетка всё равно неверна.
+  // Ни разу не подогнанному терминалу пересчитывать нечего: его первая
+  // подгонка возьмёт уже новую ячейку.
   const onFontsLoaded = () => {
-    const charSize = term._core?._charSizeService;
-    if (!charSize || typeof charSize.measure !== 'function') return;
-    const was = { width: charSize.width, height: charSize.height };
-    charSize.measure();
-    if (charSize.width === was.width && charSize.height === was.height) return;
+    term._core?._charSizeService?.measure?.();
+    if (!fittedCell) return;
+    const cell = cellNow();
+    if (!cell || (cell.width === fittedCell.width && cell.height === fittedCell.height)) return;
     const s = measure();
     if (s) sendSize(s);
     term.refresh(0, term.rows - 1);
@@ -573,7 +607,7 @@ export function initTerminal(container, config, {
     // видимая вкладка. Подогнанная чужую сетку не берёт — у неё своя.
     adoptGrid: (size) => {
       if (!size) return;
-      if (fittedSize(fit.proposeDimensions(), { width: container.clientWidth, height: container.clientHeight })) return;
+      if (fittedSize(fit.proposeDimensions(), cellArea(), cellNow())) return;
       if (term.cols !== size.cols || term.rows !== size.rows) term.resize(size.cols, size.rows);
     },
     // Ghost-снимок буфера (Task 5): scrollback:2000 — достаточно контекста для
