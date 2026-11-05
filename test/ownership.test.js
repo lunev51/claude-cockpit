@@ -111,6 +111,47 @@ test('размер помнится ПО ВЛАДЕЛЬЦУ — вернувши
   assert.deepStrictEqual(own.size(), { cols: 80, rows: 24 }, 'и размер макбука тоже свой');
 });
 
+test('захват с пустым размером {cols:null, rows:null} — как без размера (C1 ревью)', () => {
+  // Renderer шлёт claim(null, null), когда у него нет подогнанного терминала
+  // (загрузка страницы до первой вкладки). Раньше любой объект считался
+  // размером: {null, null} затирал запомненный размер владельца, и следующая
+  // пересадка раздавала сессиям мусор.
+  const { own, changes } = make();
+  own.claim('c1', { cols: 279, rows: 69 });
+  own.claim('c1', { cols: null, rows: null });
+  assert.deepStrictEqual(own.size(), { cols: 279, rows: 69 }, 'пустой размер затёр настоящий');
+  own.claim('c1', { cols: undefined });
+  own.claim('c1', {});
+  assert.deepStrictEqual(own.size(), { cols: 279, rows: 69 });
+
+  // И при смене владельца: вернувшийся без размера получает СВОЙ прежний.
+  own.claim('local', { cols: 200, rows: 50 });
+  own.claim('c1', { cols: null, rows: null });
+  assert.deepStrictEqual(own.size(), { cols: 279, rows: 69 });
+  assert.deepStrictEqual(changes[changes.length - 1].size, { cols: 279, rows: 69 });
+});
+
+test('захват с кривым размером не запоминается — те же границы, что у pty (2..500, целые)', () => {
+  const { own, changes } = make();
+  for (const bad of [
+    { cols: 0, rows: 0 }, { cols: 1, rows: 24 }, { cols: 80, rows: 1 }, { cols: 501, rows: 24 },
+    { cols: 80.5, rows: 24 }, { cols: '80', rows: '24' }, { cols: NaN, rows: NaN }, 'мусор', 42,
+  ]) {
+    own.claim('c9', bad);
+    assert.strictEqual(own.size(), null, `запомнен кривой размер ${JSON.stringify(bad)}`);
+  }
+  assert.strictEqual(changes[0].size, null, 'onChange получил кривой размер вместо null');
+});
+
+test('noteSize: размер за пределами 2..500 не запоминается', () => {
+  const { own } = make();
+  own.claim('local', { cols: 100, rows: 30 });
+  own.noteSize({ cols: 1, rows: 1 });
+  own.noteSize({ cols: 9999, rows: 30 });
+  own.noteSize({ cols: null, rows: null });
+  assert.deepStrictEqual(own.size(), { cols: 100, rows: 30 });
+});
+
 test('незнакомый владелец без размера не тащит чужой', () => {
   const { own, changes } = make();
   own.claim('local', { cols: 200, rows: 50 });

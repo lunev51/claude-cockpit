@@ -262,14 +262,141 @@ test('term:resize запоминает размер за владельцем', 
   // мимо него. Без этой строки возврат снова начнёт ставить pty в размер,
   // снятый при загрузке страницы, — и тесты выше этого не заметят: они про
   // ownership, а не про то, что его кто-то уведомляет.
+  //
+  // Сам обработчик вынесен в termResizeHandler (его поведение — тесты ниже),
+  // здесь стережём, что registerIpc зовёт именно его и отдаёт ему ownership.
   const body = registerIpcBody();
   const handler = body.match(/registry\.on\('term:resize'[\s\S]*?\n {2}\}\);/);
   assert.ok(handler, 'обработчик term:resize в registerIpc не найден');
   assert.match(
     handler[0],
-    /ownership\.noteSize\(/,
-    'term:resize не уведомляет владение о новом размере',
+    /termResizeHandler\(\{[^}]*\bownership\b[^}]*\}\)/,
+    'term:resize в registerIpc не зовёт termResizeHandler с ownership — размер не уедет ни во владение, ни во вкладки',
   );
+});
+
+test('term:start в registerIpc идёт через termStartHandler с ownership', () => {
+  // Без ownership термин «размер владельца» для старта без размера пуст: main
+  // снова поднимал бы процесс в 80×24 или не поднимал вовсе.
+  const body = registerIpcBody();
+  const handler = body.match(/registry\.on\('term:start'[\s\S]*?\n {2}\}\);/);
+  assert.ok(handler, 'обработчик term:start в registerIpc не найден');
+  assert.match(
+    handler[0],
+    /termStartHandler\(\{[^}]*\bownership\b[^}]*\}\)/,
+    'term:start в registerIpc не зовёт termStartHandler с ownership',
+  );
+});
+
+// --- Размер на старте и на ресайзе (план «размер терминала», задача A3) ----
+// Запись кадров на стенде 05.11: renderer слал term:start и term:resize из
+// СКРЫТЫХ вкладок с умолчанием xterm 80×24. Теперь он шлёт только подогнанный
+// размер, а скрытая вкладка стартует без размера — значит размер для неё
+// выбирает main, и размер видимой вкладки main раздаёт всем.
+
+const { resolveStartSize, termStartHandler, termResizeHandler } = require('../src/main/ipc');
+const { createOwnership } = require('../src/main/ownership');
+
+test('resolveStartSize: свой размер, иначе размер владельца, иначе 80×24', () => {
+  assert.deepStrictEqual(resolveStartSize(120, 40, { cols: 279, rows: 69 }), { cols: 120, rows: 40 }, 'свой валидный размер главнее');
+  assert.deepStrictEqual(resolveStartSize(null, null, { cols: 279, rows: 69 }), { cols: 279, rows: 69 }, 'без размера — размер владельца');
+  assert.deepStrictEqual(resolveStartSize(undefined, undefined, { cols: 279, rows: 69 }), { cols: 279, rows: 69 });
+  assert.deepStrictEqual(resolveStartSize(null, null, null), { cols: 80, rows: 24 }, 'не знаем ничего — умолчание терминала');
+  // Кривой «свой» размер — как отсутствующий, а не повод молча не стартовать.
+  assert.deepStrictEqual(resolveStartSize(0, 0, { cols: 279, rows: 69 }), { cols: 279, rows: 69 });
+  assert.deepStrictEqual(resolveStartSize(120, null, { cols: 279, rows: 69 }), { cols: 279, rows: 69 }, 'половина размера — не размер');
+  assert.deepStrictEqual(resolveStartSize(9999, 40, null), { cols: 80, rows: 24 });
+  // Кривой размер владельца тоже не берём.
+  assert.deepStrictEqual(resolveStartSize(null, null, { cols: 1, rows: 1 }), { cols: 80, rows: 24 });
+  assert.deepStrictEqual(resolveStartSize(null, null, { cols: '279', rows: '69' }), { cols: 80, rows: 24 });
+});
+
+test('term:start без размера поднимает процесс в размере владельца', () => {
+  const { mgr, spawned } = realManager();
+  const { tabId } = mgr.open({ cwd: 'C:\\A' });
+  const ownership = createOwnership();
+  ownership.claim('local', { cols: 279, rows: 69 }); // тот же владелец — только запоминает размер
+
+  termStartHandler({ manager: mgr, ownership, payload: { tabId, cols: null, rows: null } });
+
+  assert.strictEqual(spawned.length, 1, 'без размера процесс не поднялся вовсе — раньше term:start так и выходил молча');
+  assert.deepStrictEqual(
+    { cols: spawned[0].opts.cols, rows: spawned[0].opts.rows },
+    { cols: 279, rows: 69 },
+    'скрытая вкладка поднялась не в размере владельца',
+  );
+});
+
+test('term:start без размера и без размера владельца — 80×24, но процесс поднят', () => {
+  const { mgr, spawned } = realManager();
+  const { tabId } = mgr.open({ cwd: 'C:\\A' });
+  termStartHandler({ manager: mgr, ownership: createOwnership(), payload: { tabId } });
+  assert.strictEqual(spawned.length, 1);
+  assert.deepStrictEqual({ cols: spawned[0].opts.cols, rows: spawned[0].opts.rows }, { cols: 80, rows: 24 });
+});
+
+test('term:start со своим размером — свой размер', () => {
+  const { mgr, spawned } = realManager();
+  const { tabId } = mgr.open({ cwd: 'C:\\A' });
+  const ownership = createOwnership();
+  ownership.claim('local', { cols: 279, rows: 69 });
+  termStartHandler({ manager: mgr, ownership, payload: { tabId, cols: 120, rows: 40 } });
+  assert.deepStrictEqual({ cols: spawned[0].opts.cols, rows: spawned[0].opts.rows }, { cols: 120, rows: 40 });
+});
+
+test('term:start без tabId или с мусором вместо payload — ничего', () => {
+  const { mgr, spawned } = realManager();
+  mgr.open({ cwd: 'C:\\A' });
+  const ownership = createOwnership();
+  for (const payload of [null, undefined, 'T1', { cols: 80, rows: 24 }, { tabId: 5 }]) {
+    assert.doesNotThrow(() => termStartHandler({ manager: mgr, ownership, payload }));
+  }
+  assert.strictEqual(spawned.length, 0);
+});
+
+test('term:resize владельца переразмеривает ВСЕ живые вкладки, не только свою', () => {
+  // Все вкладки рисуются в одну и ту же область окна. Скрытые вкладки свой
+  // размер больше не сообщают (у неподогнанного терминала его нет), поэтому
+  // размер видимой — единственный источник для всех. Проверяем по
+  // настоящему менеджеру и настоящему следствию — размеру, доехавшему до pty.
+  const { mgr, spawned } = realManager();
+  const ids = ['A', 'B', 'C'].map((name) => mgr.open({ cwd: `C:\\${name}` }).tabId);
+  for (const tabId of ids) mgr.start(tabId, 80, 24);
+  const ownership = createOwnership();
+
+  termResizeHandler({ manager: mgr, ownership, payload: { tabId: ids[0], cols: 279, rows: 69 } });
+
+  assert.deepStrictEqual(
+    spawned.map((p) => ({ cols: p.cols, rows: p.rows })),
+    [{ cols: 279, rows: 69 }, { cols: 279, rows: 69 }, { cols: 279, rows: 69 }],
+    'размер видимой вкладки доехал не до всех pty — фоновые остались в 80×24',
+  );
+  assert.deepStrictEqual(ownership.size(), { cols: 279, rows: 69 }, 'размер не запомнен за владельцем');
+});
+
+test('term:resize: форма вкладок — та, что отдаёт manager.list() (tabId)', () => {
+  // Фейковый менеджер проверяет форму фикстуры: tabId, а не id (урок
+  // applyHandoffSize — фикстура {id} держала зелёным неработавший переразмер).
+  const manager = fakeManager([{ tabId: 'T1' }, { tabId: 'T2' }]);
+  termResizeHandler({ manager, ownership: createOwnership(), payload: { tabId: 'T2', cols: 100, rows: 30 } });
+  assert.deepStrictEqual(manager.calls, [
+    { tabId: 'T1', cols: 100, rows: 30 },
+    { tabId: 'T2', cols: 100, rows: 30 },
+  ]);
+});
+
+test('term:resize с кривым размером не трогает pty и не запоминается', () => {
+  const manager = fakeManager([{ tabId: 'T1' }]);
+  const ownership = createOwnership();
+  ownership.claim('local', { cols: 120, rows: 40 });
+  for (const payload of [
+    null, 'T1', { tabId: 'T1' }, { tabId: 'T1', cols: 0, rows: 0 }, { tabId: 'T1', cols: 1, rows: 1 },
+    { tabId: 'T1', cols: 9999, rows: 40 }, { tabId: 'T1', cols: 80.5, rows: 24 }, { cols: 80, rows: 24 },
+  ]) {
+    assert.doesNotThrow(() => termResizeHandler({ manager, ownership, payload }));
+  }
+  assert.deepStrictEqual(manager.calls, []);
+  assert.deepStrictEqual(ownership.size(), { cols: 120, rows: 40 });
 });
 
 test('ownership доезжает до сетевого сервера и наружу, в main.js', () => {

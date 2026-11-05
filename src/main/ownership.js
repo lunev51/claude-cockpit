@@ -12,6 +12,17 @@
 // на макбуке закрыли крышку. Но знать об этом надо всем — раньше drop менял
 // только внутренний флаг, и строка «(не на связи)» в трее и на заглушке была
 // недостижима в проде, хотя тесты на неё были зелёные.
+// Размер, который вообще можно запомнить: целые 2..500 по обеим осям — те же
+// границы, что validDim в ipc.js отдаёт pty. C1 ревью: claim считал размером
+// ЛЮБОЙ объект, и renderer без подогнанного терминала (загрузка страницы до
+// первой вкладки) слал {cols: null, rows: null} — это затирало запомненный
+// размер владельца, и следующая пересадка раздавала сессиям мусор. Кривое
+// теперь значит то же, что отсутствующее: «размера не знаю».
+function isValidSize(s) {
+  const dim = (n) => Number.isInteger(n) && n >= 2 && n <= 500;
+  return !!s && typeof s === 'object' && dim(s.cols) && dim(s.rows);
+}
+
 function createOwnership({ onChange, onPresence } = {}) {
   let owner = 'local';
   let online = true;
@@ -23,7 +34,7 @@ function createOwnership({ onChange, onPresence } = {}) {
   const sizes = new Map();
 
   function claim(who, nextSize) {
-    if (nextSize) sizes.set(who, { cols: nextSize.cols, rows: nextSize.rows });
+    if (isValidSize(nextSize)) sizes.set(who, { cols: nextSize.cols, rows: nextSize.rows });
     if (who === owner) {
       // Тот же хозяин вернулся после обрыва — смены владельца нет, но факт
       // «снова на связи» касается всех: у остальных клиентов на заглушке и в
@@ -52,11 +63,11 @@ function createOwnership({ onChange, onPresence } = {}) {
   // только ручной ресайз окна: он будил наблюдателя, тот слал настоящий размер.
   //
   // Владельца и событий не трогаем — это не захват, а уточнение факта.
-  // Нулевой/отрицательный размер игнорируем: скрытое окно даёт контейнер
-  // нулевого размера, и запомнить 0×0 значило бы вернуться к нему при
-  // следующем захвате.
+  // Кривой размер игнорируем (та же isValidSize, что у claim): скрытое окно
+  // даёт контейнер нулевого размера, и запомнить 0×0 значило бы вернуться к
+  // нему при следующем захвате.
   function noteSize(nextSize) {
-    if (!nextSize || !(nextSize.cols > 0) || !(nextSize.rows > 0)) return;
+    if (!isValidSize(nextSize)) return;
     sizes.set(owner, { cols: nextSize.cols, rows: nextSize.rows });
   }
 
