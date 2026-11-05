@@ -139,6 +139,103 @@ const LISTEN_ANYWHERE = new Set(['0.0.0.0', '::', '::0']);
 // вывод через net:buffer — тот же путь, что при любом обрыве связи.
 const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 
+// Белый список Host и проверка Origin — чистые функции уровня модуля, а не
+// замыкания createNetServer: так их видит тест (C5 ревью). Поведение на
+// порту 80 настоящим сервером не проверить — порт привилегированный или
+// занят, а именно там браузер шлёт Host без порта.
+
+// Литерал IPv6 в заголовке Host/URI ОБЯЗАН быть в квадратных скобках
+// (RFC 3986) — браузер шлёт 'Host: [::1]:порт', а не '::1:порт'. Без
+// обёртки адрес Tailscale IPv6 (выдаётся всегда, кроме IPv4) отрезал бы
+// браузер целиком, оставляя рабочим только заход по localhost. Признак
+// «это IPv6, а не DNS-имя с портом внутри» — двоеточие в самом имени:
+// легитимное DNS-имя/allowedHosts-запись их не содержит (формат — см.
+// комментарий у allowedHosts ниже), так что эвристика безопасна.
+function bracketed(name) {
+  return name.includes(':') && !name.startsWith('[') ? `[${name}]` : name;
+}
+
+function withPort(name, boundPort) {
+  return `${bracketed(name)}:${boundPort}`;
+}
+
+// C5 ревью: порт по умолчанию для схемы браузер в Host и Origin не пишет
+// (http://имя/ → 'Host: имя'), и на port: 80 белый список из одних
+// 'имя:80' отклонял каждый апгрейд. Голое имя добавляем ТОЛЬКО для 80:
+// сервер без TLS, 443 значил бы https-фронт, а Origin https:// ниже
+// отклоняется всё равно. Защиту от DNS-rebinding это не ослабляет — в
+// списке те же разрешённые имена, меняется лишь запись порта.
+const DEFAULT_HTTP_PORT = 80;
+
+// Белый список Host собирается ОДИН раз, когда становится известен
+// реальный порт (после listen — port:0 отдаёт эфемерный). Источники:
+// сам host конфигурации (кроме 0.0.0.0/:: — «везде», не имя), 127.0.0.1
+// и localhost всегда, и необязательный allowedHosts — доп. имена. Он
+// нужен, потому что к машине приходят и по IP, и по имени в тайлнете
+// одновременно, а в конфиге записан обычно один адрес: без allowedHosts
+// человек пропишет IP, зайдёт по имени — и получит тот же отказ, который
+// мы чиним, только с другой стороны.
+//
+// Формат каждой записи (host и элементы allowedHosts) — ГОЛОЕ имя или
+// адрес, БЕЗ порта и без квадратных скобок вокруг IPv6 (те добавляются
+// здесь сами): 'cockpit-desktop.tailXXXX.ts.net', '100.120.245.85',
+// 'fd7a:115c::1'. Порт в значении ('example.com:9999') не отрезается —
+// такая запись просто никогда не совпадёт, это на совести того, кто
+// писал конфиг, а не повод гадать, что имелось в виду.
+function buildHostAllowlist(boundPort, { host, allowedHosts } = {}) {
+  const names = new Set(['127.0.0.1', 'localhost']);
+  // Пробелы по краям и 0.0.0.0/:: — источник МОЛЧАЛИВО мёртвой записи:
+  // валидацию (это просто непустая строка) значение проходит, но никогда
+  // ни с чем не совпадёт. Фильтр общий для host и allowedHosts — раньше
+  // 0.0.0.0 отсекался только для host, а в allowedHosts проходил как есть.
+  const addName = (raw) => {
+    if (!raw) return;
+    const trimmed = String(raw).trim();
+    if (!trimmed || LISTEN_ANYWHERE.has(trimmed)) return;
+    names.add(trimmed);
+  };
+  addName(host);
+  for (const extra of allowedHosts || []) addName(extra);
+  const list = new Set();
+  for (const name of names) {
+    const lower = name.toLowerCase();
+    list.add(withPort(lower, boundPort));
+    if (boundPort === DEFAULT_HTTP_PORT) list.add(bracketed(lower));
+  }
+  return list;
+}
+
+// Разрешаем подключаться только странице, реально загруженной С ЭТОГО
+// сервера. Без этой проверки любая вкладка, открытая в браузере на том же
+// ПК, могла бы подключиться к сокету и вызвать ЛЮБУЮ команду реестра —
+// включая запись в терминал. WebSocket не подчиняется CORS/same-origin
+// сам по себе, это надо проверять руками на этапе апгрейда.
+//
+// DNS-rebinding: заголовок Host целиком контролирует клиент — браузер
+// ставит туда то имя, по которому его отправили, а не то, куда реально
+// подключился TCP-сокет. Атака: домен атакующего с коротким TTL сначала
+// указывает на его сервер (страница грузится и открывает ws на то же
+// имя), затем DNS перепривязывается на адрес кокпита — Origin и Host
+// совпадают, ОБА равны вредоносному имени. Проверка «Origin == Host» в
+// одиночку это ПРОПУСКАЕТ: оба совпадают именно потому, что оба
+// подделаны. Поэтому Host сверяется с белым списком ПЕРВЫМ (имя, которое
+// мы реально ожидаем), и только потом Origin — с уже проверенным Host.
+//
+// Origin отсутствует — не браузер (тестовый клиент, будущий нативный
+// инструмент): пропускаем. Подделать сам заголовок со страницы браузер
+// не даёт, риск именно в случаях, когда Origin ЕСТЬ и он чужой.
+function isAllowedOrigin(origin, requestHost, hostAllowlist) {
+  if (!origin) return true;
+  if (!requestHost || !hostAllowlist.has(requestHost.toLowerCase())) return false;
+  let originUrl;
+  try { originUrl = new URL(origin); } catch { return false; }
+  // Сервер не поднимает TLS: Origin со схемой https:// не может быть
+  // «нами», даже если имя и порт совпали — сравнение host было бы верным
+  // технически, но перестало бы означать «страницу отдали мы же».
+  if (originUrl.protocol !== 'http:') return false;
+  return originUrl.host.toLowerCase() === requestHost.toLowerCase();
+}
+
 // ownership — необязательный параметр: без него сервер работает ровно как
 // раньше (эстафеты нет, каждый кадр идёт в реестр как есть).
 // maxFrameBytes вынесен в параметры ради теста: слать настоящие 16 МиБ, чтобы
@@ -150,7 +247,7 @@ function createNetServer({
 }) {
   let server = null;
   let wss = null;
-  let hostAllowlist = null; // Set<'имя:порт'> в нижнем регистре — заполняется после listen()
+  let hostAllowlist = null; // Set<'имя:порт'> (на 80-м и голое имя) в нижнем регистре — заполняется после listen()
   const clients = new Set();
   const heartbeats = new Map(); // ws → жив ли с прошлого пинга
   // Имя клиента живёт ровно столько, сколько сокет: переподключившийся
@@ -353,81 +450,6 @@ function createNetServer({
     }
   }
 
-  // Литерал IPv6 в заголовке Host/URI ОБЯЗАН быть в квадратных скобках
-  // (RFC 3986) — браузер шлёт 'Host: [::1]:порт', а не '::1:порт'. Без
-  // обёртки адрес Tailscale IPv6 (выдаётся всегда, кроме IPv4) отрезал бы
-  // браузер целиком, оставляя рабочим только заход по localhost. Признак
-  // «это IPv6, а не DNS-имя с портом внутри» — двоеточие в самом имени:
-  // легитимное DNS-имя/allowedHosts-запись их не содержит (формат — см.
-  // комментарий у allowedHosts ниже), так что эвристика безопасна.
-  function withPort(name, boundPort) {
-    const bracketed = name.includes(':') && !name.startsWith('[') ? `[${name}]` : name;
-    return `${bracketed}:${boundPort}`;
-  }
-
-  // Белый список Host собирается ОДИН раз, когда становится известен
-  // реальный порт (после listen — port:0 отдаёт эфемерный). Источники:
-  // сам host конфигурации (кроме 0.0.0.0/:: — «везде», не имя), 127.0.0.1
-  // и localhost всегда, и необязательный allowedHosts — доп. имена. Он
-  // нужен, потому что к машине приходят и по IP, и по имени в тайлнете
-  // одновременно, а в конфиге записан обычно один адрес: без allowedHosts
-  // человек пропишет IP, зайдёт по имени — и получит тот же отказ, который
-  // мы чиним, только с другой стороны.
-  //
-  // Формат каждой записи (host и элементы allowedHosts) — ГОЛОЕ имя или
-  // адрес, БЕЗ порта и без квадратных скобок вокруг IPv6 (те добавляются
-  // здесь сами): 'cockpit-desktop.tailXXXX.ts.net', '100.120.245.85',
-  // 'fd7a:115c::1'. Порт в значении ('example.com:9999') не отрезается —
-  // такая запись просто никогда не совпадёт, это на совести того, кто
-  // писал конфиг, а не повод гадать, что имелось в виду.
-  function buildHostAllowlist(boundPort) {
-    const names = new Set(['127.0.0.1', 'localhost']);
-    // Пробелы по краям и 0.0.0.0/:: — источник МОЛЧАЛИВО мёртвой записи:
-    // валидацию (это просто непустая строка) значение проходит, но никогда
-    // ни с чем не совпадёт. Фильтр общий для host и allowedHosts — раньше
-    // 0.0.0.0 отсекался только для host, а в allowedHosts проходил как есть.
-    const addName = (raw) => {
-      if (!raw) return;
-      const trimmed = String(raw).trim();
-      if (!trimmed || LISTEN_ANYWHERE.has(trimmed)) return;
-      names.add(trimmed);
-    };
-    addName(host);
-    for (const extra of allowedHosts || []) addName(extra);
-    return new Set([...names].map((n) => withPort(n.toLowerCase(), boundPort)));
-  }
-
-  // Разрешаем подключаться только странице, реально загруженной С ЭТОГО
-  // сервера. Без этой проверки любая вкладка, открытая в браузере на том же
-  // ПК, могла бы подключиться к сокету и вызвать ЛЮБУЮ команду реестра —
-  // включая запись в терминал. WebSocket не подчиняется CORS/same-origin
-  // сам по себе, это надо проверять руками на этапе апгрейда.
-  //
-  // DNS-rebinding: заголовок Host целиком контролирует клиент — браузер
-  // ставит туда то имя, по которому его отправили, а не то, куда реально
-  // подключился TCP-сокет. Атака: домен атакующего с коротким TTL сначала
-  // указывает на его сервер (страница грузится и открывает ws на то же
-  // имя), затем DNS перепривязывается на адрес кокпита — Origin и Host
-  // совпадают, ОБА равны вредоносному имени. Проверка «Origin == Host» в
-  // одиночку это ПРОПУСКАЕТ: оба совпадают именно потому, что оба
-  // подделаны. Поэтому Host сверяется с белым списком ПЕРВЫМ (имя, которое
-  // мы реально ожидаем), и только потом Origin — с уже проверенным Host.
-  //
-  // Origin отсутствует — не браузер (тестовый клиент, будущий нативный
-  // инструмент): пропускаем. Подделать сам заголовок со страницы браузер
-  // не даёт, риск именно в случаях, когда Origin ЕСТЬ и он чужой.
-  function isAllowedOrigin(origin, requestHost) {
-    if (!origin) return true;
-    if (!requestHost || !hostAllowlist.has(requestHost.toLowerCase())) return false;
-    let originUrl;
-    try { originUrl = new URL(origin); } catch { return false; }
-    // Сервер не поднимает TLS: Origin со схемой https:// не может быть
-    // «нами», даже если имя и порт совпали — сравнение host было бы верным
-    // технически, но перестало бы означать «страницу отдали мы же».
-    if (originUrl.protocol !== 'http:') return false;
-    return originUrl.host.toLowerCase() === requestHost.toLowerCase();
-  }
-
   return {
     start() {
       return new Promise((resolve, reject) => {
@@ -437,7 +459,7 @@ function createNetServer({
           path: '/ws',
           maxPayload: maxFrameBytes,
           verifyClient: (info, callback) => {
-            const ok = isAllowedOrigin(info.origin, info.req.headers.host);
+            const ok = isAllowedOrigin(info.origin, info.req.headers.host, hostAllowlist);
             callback(ok, ok ? undefined : 403, ok ? undefined : 'чужой origin/host');
           },
         });
@@ -497,7 +519,7 @@ function createNetServer({
         server.listen(port, host, () => {
           wss.removeListener('error', onStartError);
           wss.on('error', (err) => console.log(`[net] ошибка сервера: ${err.message}`));
-          hostAllowlist = buildHostAllowlist(server.address().port);
+          hostAllowlist = buildHostAllowlist(server.address().port, { host, allowedHosts });
           server._cockpitHeartbeat = heartbeat; // чтобы stop() мог его погасить
           resolve({ port: server.address().port });
         });
@@ -549,5 +571,8 @@ function createNetServer({
 
 // MAX_FRAME_BYTES экспортируется ради теста: без него мутация «вернуть дефолт
 // 100 МиБ» проходила незамеченной — тесты задают потолок явным параметром, а
-// само значение по умолчанию не проверял никто.
-module.exports = { createNetServer, MAX_FRAME_BYTES };
+// само значение по умолчанию не проверял никто. buildHostAllowlist и
+// isAllowedOrigin — тоже ради теста (порт 80, см. их шапку выше).
+module.exports = {
+  createNetServer, MAX_FRAME_BYTES, buildHostAllowlist, isAllowedOrigin,
+};

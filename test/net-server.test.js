@@ -19,7 +19,9 @@ const os = require('node:os');
 const net = require('node:net');
 const { EventEmitter } = require('node:events');
 const WebSocket = require('ws');
-const { createNetServer, MAX_FRAME_BYTES } = require('../src/main/net-server');
+const {
+  createNetServer, MAX_FRAME_BYTES, buildHostAllowlist, isAllowedOrigin,
+} = require('../src/main/net-server');
 const { createCommandRegistry } = require('../src/main/command-registry');
 const { createBroadcast } = require('../src/main/broadcast');
 const { createOutputBuffer } = require('../src/main/output-buffer');
@@ -624,6 +626,41 @@ test('WebSocket без Origin (не браузер) подключается к�
   ws.send(JSON.stringify({ id: 1, channel: 'эхо', args: ['свой'] }));
   assert.deepStrictEqual(await nextFrame(ws), { id: 1, ok: true, result: { эхо: 'свой' } });
   ws.close();
+});
+
+// --- C5 ревью 09.08: порт 80 и Host без порта -------------------------------
+// Порт по умолчанию для схемы браузер в Host и Origin не пишет: на
+// http://имя/ уходит 'Host: имя' и 'Origin: http://имя'. Белый список хранил
+// только 'имя:порт' — на port: 80 каждый апгрейд получал 403. Настоящий
+// сервер на 80-м в тесте не поднять (порт привилегированный или занят),
+// поэтому проверяем чистые функции, которые и зовёт verifyClient.
+
+test('порт 80: Host и Origin без порта проходят для разрешённых имён (C5 ревью)', () => {
+  const list = buildHostAllowlist(80, {
+    host: '100.120.245.85', allowedHosts: ['cockpit-desktop.tailXXXX.ts.net', 'fd7a:115c:1234::1'],
+  });
+  for (const name of ['cockpit-desktop.tailXXXX.ts.net', '100.120.245.85', 'localhost', '127.0.0.1', '[fd7a:115c:1234::1]']) {
+    assert.strictEqual(isAllowedOrigin(`http://${name}`, name, list), true, `${name} без порта на 80-м отклонён`);
+  }
+});
+
+test('порт 80: Host без порта не открывает дорогу DNS-rebinding (C5 ревью)', () => {
+  const list = buildHostAllowlist(80, { host: '127.0.0.1', allowedHosts: ['cockpit-desktop.tailXXXX.ts.net'] });
+  assert.strictEqual(isAllowedOrigin('http://evil.example.com', 'evil.example.com', list), false);
+  // Чужая страница на разрешённом Host — тоже нет: Origin сверяется с Host.
+  assert.strictEqual(isAllowedOrigin('http://evil.example.com', 'cockpit-desktop.tailXXXX.ts.net', list), false);
+});
+
+test('не на 80-м порту Host без порта не принимается — браузер так не пошлёт (C5 ревью)', () => {
+  // Вариант без порта законен только для порта по умолчанию: на 48300
+  // браузер всегда пишет порт, и голое имя значит, что запрос пришёл не
+  // напрямую от страницы этого сервера.
+  const list = buildHostAllowlist(48300, { host: '127.0.0.1', allowedHosts: ['cockpit-desktop.tailXXXX.ts.net'] });
+  assert.strictEqual(isAllowedOrigin('http://cockpit-desktop.tailXXXX.ts.net', 'cockpit-desktop.tailXXXX.ts.net', list), false);
+  assert.strictEqual(
+    isAllowedOrigin('http://cockpit-desktop.tailXXXX.ts.net:48300', 'cockpit-desktop.tailXXXX.ts.net:48300', list),
+    true, 'обычный вид с портом сломался',
+  );
 });
 
 // --- Мелочи: протокол отвечает ошибкой, а не тишиной ----------------------
