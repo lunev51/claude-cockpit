@@ -968,6 +968,28 @@ test('уход клиента не отдаёт управление обрат�
   assert.strictEqual(ownership.ownerOnline(), false);
 });
 
+test('закрытые сокеты не оставляют размеров в эстафете (C2 ревью, проводка close → drop)', async () => {
+  // Чистка живёт в ownership.drop, но зовёт её сервер — на закрытии сокета
+  // КАЖДОГО клиента, а не только владельца. Сузь вызов до «только владелец»,
+  // и карта снова растёт на каждое переподключение браузера.
+  const { server, ownership } = makeHandoffServer();
+  const { port } = await server.start();
+  ownership.claim('local', { cols: 200, rows: 50 });
+  for (let i = 0; i < 5; i += 1) {
+    const ws = await openBuffered(`ws://127.0.0.1:${port}/ws`);
+    await takeFrame(ws); // net:hello
+    await ask(ws, { id: 1, channel: 'owner:claim', args: [{ cols: 80, rows: 24 }] });
+    ownership.claim('local'); // окно ПК вернуло руль — браузер уже не владелец
+    ws.close();
+    const deadline = Date.now() + 2000;
+    while (server.clientCount() > 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  }
+  assert.strictEqual(ownership.sizeCount(), 1, 'после ухода браузеров должен остаться только размер окна ПК');
+  assert.deepStrictEqual(ownership.size(), { cols: 200, rows: 50 });
+});
+
 // --- Кэширование статики (план «размер терминала», задача A5) --------------
 // Шрифт терминала JetBrainsMono NF — 1 МБ, и отдавался он БЕЗ единого
 // заголовка кэширования: браузер на макбуке качал его заново на каждой
