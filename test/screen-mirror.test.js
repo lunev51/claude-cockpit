@@ -238,6 +238,23 @@ test('createTabHistory: пакет без нужного экспорта — т
   assert.strictEqual(warns.length, 1);
 });
 
+// Ревью ветки (m6, мутация M6): проверка экспорта только у Terminal выживала —
+// пакеты без нужного экспорта с обеих сторон ловились и так.
+test('createTabHistory: экспорт есть только у одного пакета — запасной путь, а не зеркало без половины', async () => {
+  for (const missing of ['@xterm/headless', '@xterm/addon-serialize']) {
+    const warns = [];
+    const history = createTabHistory({
+      sizeOf: () => SIZE,
+      load: (name) => (name === missing ? {} : require(name)),
+      warn: (...args) => warns.push(args.join(' ')),
+    });
+    history.push('T1', 'вывод');
+    // eslint-disable-next-line no-await-in-loop
+    assert.strictEqual(await history.get('T1'), 'вывод', `без экспорта ${missing} история не стала сырым хвостом`);
+    assert.strictEqual(warns.length, 1, `без экспорта ${missing}: предупреждений ${warns.length}`);
+  }
+});
+
 test('createTabHistory: пакеты на месте — зеркало экрана, а не сырой поток', async () => {
   const loaded = [];
   const warns = [];
@@ -254,4 +271,233 @@ test('createTabHistory: пакеты на месте — зеркало экра
   assert.notStrictEqual(snapshot, raw, 'get отдал сырой поток — зеркало не подключено');
   const screen = await readScreen(snapshot, COLS, ROWS);
   assert.strictEqual(screen[4], '  привет');
+});
+
+// --- Режимы терминала, которые аддон serialize не переносит (ревью ветки, I1) ---
+//
+// Окно ПК — xterm, видевший сырой поток; клиент — свежий xterm, получивший
+// снимок. Всё, что клиент делает по-другому, человек видит как поломку:
+// ConPTY ставит ?1000h ?1002h ?1003h ?1006h (живые буферы владельца), аддон
+// переносит слежение, но не кодировку SGR — колесо уходит в onBinary
+// как \e[M…, а terminal.js слушает только onData: прокрутка мертва.
+//
+// Публичного способа послать событие мыши в headless нет (нет DOM) —
+// событие шлётся через coreMouseService, как в эксперименте ревьюера; и
+// видимость курсора с кодировкой публично не читаются. _core здесь — только
+// оракул теста: сравнивается клиент с окном ПК, а не с ожиданием, записанным
+// руками.
+function mouseBytes(term) {
+  const data = [];
+  const binary = [];
+  const d1 = term.onData((s) => data.push(s));
+  const d2 = term.onBinary((s) => binary.push(s));
+  const mouse = term._core.coreMouseService;
+  mouse.triggerMouseEvent({ col: 10, row: 5, x: 0, y: 0, button: 4, action: 0, ctrl: false, alt: false, shift: false }); // колесо
+  mouse.triggerMouseEvent({ col: 10, row: 5, x: 0, y: 0, button: 0, action: 1, ctrl: false, alt: false, shift: false }); // клик
+  d1.dispose();
+  d2.dispose();
+  return { data, binary };
+}
+
+function terminalState(term) {
+  return {
+    mouseEncoding: term._core.coreMouseService.activeEncoding,
+    mouseTracking: term.modes.mouseTrackingMode,
+    cursorHidden: term._core.coreService.isCursorHidden,
+    bracketedPaste: term.modes.bracketedPasteMode,
+    bufferType: term.buffer.active.type,
+  };
+}
+
+// Поток → (окно ПК, клиент со снимком зеркала) того же размера.
+async function pcAndClient(stream) {
+  const mirror = createScreenMirror({ Terminal, SerializeAddon, sizeOf: () => SIZE });
+  mirror.push('T1', stream);
+  const pc = new Terminal({ cols: COLS, rows: ROWS, scrollback: 1000, allowProposedApi: true });
+  await writeAsync(pc, stream);
+  const client = new Terminal({ cols: COLS, rows: ROWS, scrollback: 5000, allowProposedApi: true });
+  await writeAsync(client, await mirror.get('T1'));
+  mirror.drop('T1');
+  return { pc, client };
+}
+
+test('мышь: снимок переносит кодировку SGR (?1006h) — колесо и клик уходят в onData, как у окна ПК (I1)', async () => {
+  const { pc, client } = await pcAndClient(`${ESC}[?1000h${ESC}[?1002h${ESC}[?1003h${ESC}[?1006h${ESC}[2J${ESC}[Hэкран`);
+  const want = mouseBytes(pc);
+  // Самопроверка оракула: окно ПК шлёт SGR в onData.
+  assert.deepStrictEqual(want, { data: [`${ESC}[<64;11;6M`, `${ESC}[<0;11;6M`], binary: [] });
+  assert.deepStrictEqual(mouseBytes(client), want, 'клиент после снимка шлёт мышь не так, как окно ПК — колесо мёртвое');
+  pc.dispose();
+  client.dispose();
+});
+
+// Равенство состояния с окном ПК на последовательностях со сбросами. Таблица
+// держит именно поведение xterm 6, а не «как должно быть по стандарту»:
+// RIS (\ec) сбрасывает кодировку мыши, но скрытый курсор оставляет скрытым;
+// DECSTR (\e[!p) показывает курсор, мышь не трогает. Обновление xterm с
+// другой логикой покраснит здесь, а не у человека на экране.
+const MODE_CASES = [
+  ['скрытый курсор', `${ESC}[?25l`],
+  ['скрыт и снова показан', `${ESC}[?25l${ESC}[?25h`],
+  ['мышь и курсор одним кадром, несколько параметров', `${ESC}[?1002;1006h${ESC}[?25l`],
+  ['SGR_PIXELS', `${ESC}[?1003h${ESC}[?1016h`],
+  ['1006 снят через 1016l', `${ESC}[?1002h${ESC}[?1006h${ESC}[?1016l`],
+  ['1006 снят через 1006l', `${ESC}[?1002h${ESC}[?1006h${ESC}[?1006l`],
+  ['подпараметр 1006:1', `${ESC}[?1002h${ESC}[?1006:1h`],
+  ['DECSTR после режимов', `${ESC}[?1002h${ESC}[?1006h${ESC}[?25l${ESC}[!p`],
+  ['RIS после режимов', `${ESC}[?1002h${ESC}[?1006h${ESC}[?25l${ESC}c`],
+  ['RIS, затем режимы заново', `${ESC}[?1006h${ESC}c${ESC}[?1003h${ESC}[?1006h`],
+  ['bracketed paste (?2004h)', `${ESC}[?2004h`],
+  ['альтернативный экран с режимами', `${ESC}[?1003h${ESC}[?1006h${ESC}[?25l${ESC}[?1049hальт`],
+];
+
+for (const [label, modes] of MODE_CASES) {
+  test(`режимы после снимка = окно ПК: ${label}`, async () => {
+    const { pc, client } = await pcAndClient(`${modes}${at(3, 1)}текст`);
+    assert.deepStrictEqual(terminalState(client), terminalState(pc));
+    pc.dispose();
+    client.dispose();
+  });
+}
+
+// --- push и get не бросают (ревью ветки, m2) ---
+//
+// push зовётся из onEvent менеджера сессий, то есть из onData node-pty: брошенное
+// там исключение — uncaughtException в main и выход всего кокпита, а term:data
+// этого куска не уходит клиентам (bufferTermData стоит до broadcast.emit).
+// Реальный повод — очередь xterm сверх 50 МБ: write бросает «write data
+// discarded». Тот же класс — serialize, брошенный внутри колбэка записи: он
+// исполняется в таймере xterm, мимо любого try вызывающего.
+test('push не бросает, когда xterm отказывает в записи: одно предупреждение, вкладка жива', async () => {
+  class DiscardingTerminal extends Terminal {
+    write(data, callback) {
+      if (data) throw new Error('write data discarded, use flow control to avoid losing data');
+      return super.write(data, callback);
+    }
+  }
+  const warns = [];
+  const mirror = createScreenMirror({
+    Terminal: DiscardingTerminal, SerializeAddon, sizeOf: () => SIZE, warn: (...args) => warns.push(args.join(' ')),
+  });
+  for (let i = 0; i < 3; i += 1) assert.doesNotThrow(() => mirror.push('T1', `кусок ${i}`));
+  assert.strictEqual(warns.length, 1, `предупреждений ${warns.length} — на каждый кусок вывода засыпали бы журнал`);
+  assert.match(warns[0], /write data discarded/);
+  assert.strictEqual(typeof await mirror.get('T1'), 'string');
+});
+
+test('createTabHistory: предупреждения зеркала идут в тот же warn, что и отказ загрузки', async () => {
+  class DiscardingTerminal extends Terminal {
+    write(data, callback) {
+      if (data) throw new Error('write data discarded, use flow control to avoid losing data');
+      return super.write(data, callback);
+    }
+  }
+  const warns = [];
+  const history = createTabHistory({
+    sizeOf: () => SIZE,
+    load: (name) => (name === '@xterm/headless' ? { Terminal: DiscardingTerminal } : require(name)),
+    warn: (...args) => warns.push(args.join(' ')),
+  });
+  history.push('T1', 'вывод');
+  assert.strictEqual(warns.length, 1, 'предупреждение зеркала ушло мимо warn истории');
+  assert.match(warns[0], /write data discarded/);
+});
+
+test('get не роняет main, если serialize бросил: пустая история и предупреждение', async () => {
+  class BrokenSerialize extends SerializeAddon {
+    serialize() { throw new Error('serialize сломан'); }
+  }
+  const warns = [];
+  const mirror = createScreenMirror({
+    Terminal, SerializeAddon: BrokenSerialize, sizeOf: () => SIZE, warn: (...args) => warns.push(args.join(' ')),
+  });
+  mirror.push('T1', 'вывод');
+  const outcome = await Promise.race([
+    mirror.get('T1'),
+    new Promise((resolve) => { setTimeout(() => resolve('висит'), 500); }),
+  ]);
+  assert.strictEqual(outcome, '');
+  assert.strictEqual(warns.length, 1);
+  assert.match(warns[0], /serialize сломан/);
+});
+
+// --- Выжившие мутации ревью (m6) ---
+
+// M2: колбэк записи зовётся и ПОСЛЕ dispose (exp-dispose-cb ревью), и serialize
+// на разобранном терминале печатает в журнал трассу «Trying to add a disposable
+// to a DisposableStore that has already been disposed». Ответ ждущему уже дан
+// в drop — снимать снимок с разобранного терминала нельзя.
+test('drop во время ожидания снимка: serialize на разобранном терминале не зовётся', async () => {
+  const serializers = [];
+  class CountingSerialize extends SerializeAddon {
+    constructor() {
+      super();
+      this.calls = 0;
+      serializers.push(this);
+    }
+
+    serialize(options) {
+      this.calls += 1;
+      return super.serialize(options);
+    }
+  }
+  const mirror = createScreenMirror({ Terminal, SerializeAddon: CountingSerialize, sizeOf: () => SIZE });
+  mirror.push('T1', 'вывод');
+  const pending = mirror.get('T1');
+  mirror.drop('T1');
+  assert.strictEqual(await pending, '');
+  // Очередь записи xterm разбирается таймером: даём ей дойти до колбэка.
+  await new Promise((resolve) => { setTimeout(resolve, 100); });
+  assert.strictEqual(serializers[0].calls, 0, 'снимок снят с разобранного терминала — в журнале трасса DisposableStore');
+});
+
+// M3: подгонка сравнивала только ширину.
+test('ресайз только по высоте: зеркало подгоняется и строки ложатся в новую сетку', async () => {
+  const { Recording, made } = recordingTerminal();
+  let size = { cols: 100, rows: 30 };
+  const mirror = createScreenMirror({ Terminal: Recording, SerializeAddon, sizeOf: () => size });
+  mirror.push('T1', `${ESC}[2J${ESC}[Hверх`);
+  size = { cols: 100, rows: 40 };
+  mirror.push('T1', `${ESC}[2J${at(40, 1)}низ высокого экрана`);
+  assert.deepStrictEqual([made[0].cols, made[0].rows], [100, 40], 'зеркало осталось в старой высоте');
+  await writeAsync(made[0], '');
+  const screen = await readScreen(await mirror.get('T1'), 100, 40);
+  assert.strictEqual(screen[39], 'низ высокого экрана');
+});
+
+// M4: правило валидного размера — общее с эстафетой и pty (isValidSize,
+// 2..500 целые). Размер вне его зеркало не заводит: xterm принял бы 600
+// колонок, и снимок лёг бы в сетку, которой у pty быть не может.
+test('невалидный размер от sizeOf — зеркало не создаётся, предупреждений нет', async () => {
+  for (const bad of [{ cols: 0, rows: 0 }, { cols: 600, rows: 30 }, { cols: 80, rows: 1 }, { cols: '80', rows: '24' }, { cols: 80.5, rows: 24 }, {}]) {
+    const { Recording, made } = recordingTerminal();
+    const warns = [];
+    const mirror = createScreenMirror({
+      Terminal: Recording, SerializeAddon, sizeOf: () => bad, warn: (...args) => warns.push(args.join(' ')),
+    });
+    mirror.push('T1', 'вывод');
+    assert.strictEqual(made.length, 0, `зеркало создано в размере ${JSON.stringify(bad)}`);
+    assert.deepStrictEqual(warns, [], `размер ${JSON.stringify(bad)} дошёл до xterm и уронил запись`);
+    // eslint-disable-next-line no-await-in-loop
+    assert.strictEqual(await mirror.get('T1'), '');
+  }
+});
+
+// M8/M9: история над экраном (прокрутка) — часть снимка. ConPTY переводов
+// строки почти не пишет, но когда пишет, уехавшее вверх — это и есть «на чём
+// остановилась работа».
+test('история над экраном попадает в снимок (прокрутка зеркала и serialize)', async () => {
+  const mirror = createScreenMirror({ Terminal, SerializeAddon, sizeOf: () => SIZE });
+  let text = '';
+  for (let i = 0; i < 100; i += 1) text += `строка ${i}\r\n`;
+  mirror.push('T1', text);
+  const client = new Terminal({ cols: COLS, rows: ROWS, scrollback: 5000, allowProposedApi: true });
+  await writeAsync(client, await mirror.get('T1'));
+  const buf = client.buffer.active;
+  const all = [];
+  for (let y = 0; y < buf.length; y += 1) all.push(buf.getLine(y).translateToString(true));
+  client.dispose();
+  for (const want of ['строка 0', 'строка 50', 'строка 99']) {
+    assert.ok(all.includes(want), `в снимке нет «${want}» — история над экраном потеряна`);
+  }
 });
